@@ -1,0 +1,66 @@
+site_name: ApplyGo Engineering Portal
+site_description: Product discovery, value-stream analysis, architecture research, and technical decisions for ApplyGo
+repo_name: jasonsheinkopf/ApplyGo
+repo_url: https://github.com/jasonsheinkopf/ApplyGo
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Discovery:
+      - Overview: discovery/index.md
+      - Problem and Product Thesis: discovery/problem-thesis.md
+      - Current-State Value Stream: discovery/value-stream.md
+      - Human, AI, and System Boundaries: discovery/system-boundaries.md
+      - Research Method: discovery/research-method.md
+  - Market Landscape:
+      - Overview: market/index.md
+      - Existing Workflow Tools: market/existing-tools.md
+      - Competitive Gap Analysis: market/gap-analysis.md
+  - Product Strategy:
+      - Progressive Autonomy: product/progressive-autonomy.md
+      - Capability Map: product/capability-map.md
+      - Requirements: product/requirements.md
+  - Technology:
+      - Technology Landscape: technology/index.md
+      - Execution and Deployment: technology/execution-deployment.md
+      - Browser Automation: technology/browser-automation.md
+      - Models and Orchestration: technology/models-orchestration.md
+      - Evaluation and Observability: technology/evaluation-observability.md
+  - Decisions:
+      - Decision Register: decisions/index.md
+      - Initial Recommendations: decisions/initial-recommendations.md
+  - Roadmap:
+      - Phases and Exit Criteria: roadmap/phases.md
