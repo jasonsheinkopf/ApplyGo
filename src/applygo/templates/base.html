@@ -2,12 +2,18 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>{% block title %}ApplyGo{% endblock %}</title>
   <link rel="stylesheet" href="/static/app.css">
+  <script defer src="/static/device.js"></script>
 </head>
 <body>
-<header><a href="/">ApplyGo</a><span>Private candidate intelligence</span></header>
+<header class="topbar">
+  <a class="brand" href="/"><span class="brand-mark">A</span><span>ApplyGo</span></a>
+  <nav><a href="/">Home</a><a href="/setup">Setup</a></nav>
+  <span class="device-pill"><span data-device-label>Device</span> view</span>
+</header>
 <main>{% block content %}{% endblock %}</main>
+<nav class="mobile-nav"><a href="/">Home</a><a href="/setup">Setup</a></nav>
 </body>
 </html>
