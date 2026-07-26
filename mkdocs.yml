@@ -53,6 +53,8 @@ nav:
       - Progressive Autonomy: product/progressive-autonomy.md
       - Capability Map: product/capability-map.md
       - Requirements: product/requirements.md
+  - Architecture:
+      - Local and Cloudflare Dual Mode: architecture/local-cloudflare-dual-mode.md
   - Technology:
       - Technology Landscape: technology/index.md
       - Execution and Deployment: technology/execution-deployment.md
@@ -65,5 +67,6 @@ nav:
       - Decision Register: decisions/index.md
       - Initial Recommendations: decisions/initial-recommendations.md
       - ADR-013 Private Runtime Data: decisions/adr-013-private-runtime-data.md
+      - ADR-014 Local and Cloudflare Modes: decisions/adr-014-dual-mode-cloudflare.md
   - Roadmap:
       - Phases and Exit Criteria: roadmap/phases.md
