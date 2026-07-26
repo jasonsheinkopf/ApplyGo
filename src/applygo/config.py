@@ -1,0 +1,27 @@
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="APPLYGO_", extra="ignore")
+
+    env: str = "development"
+    database_url: str = "sqlite:///./data/applygo.db"
+    storage_dir: Path = Path("./data/private")
+    secret_key: str = "development-only-change-me"
+    model_provider: str = "mock"
+    model_name: str = "mock-fit-v1"
+
+    def ensure_runtime_dirs(self) -> None:
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        if self.database_url.startswith("sqlite"):
+            Path("./data").mkdir(parents=True, exist_ok=True)
+
+
+@lru_cache
+def get_settings() -> Settings:
+    settings = Settings()
+    settings.ensure_runtime_dirs()
+    return settings
