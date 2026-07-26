@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}ApplyGo Dashboard{% endblock %}
+{% block content %}
+<section class="hero"><h1>First production vertical slice</h1><p>Create a private profile, upload a résumé or notes, verify evidence, then paste a job description for a grounded fit assessment.</p></section>
+<div class="grid">
+<section class="card">
+<h2>Create candidate profile</h2>
+<form method="post" action="/profiles">
+<label>Name<input name="display_name" required></label>
+<label>Profile label<input name="label" value="Primary profile"></label>
+<label>Summary<textarea name="summary" placeholder="Optional overview"></textarea></label>
+<button>Create profile</button>
+</form>
+</section>
+<section class="card">
+<h2>Profiles</h2>
+{% if profiles %}<ul>{% for profile in profiles %}<li><a href="/profiles/{{ profile.id }}">{{ profile.user.display_name }} — {{ profile.label }}</a></li>{% endfor %}</ul>{% else %}<p>No profiles yet.</p>{% endif %}
+</section>
+</div>
+<section class="card">
+<h2>Analyze a job</h2>
+{% if profiles %}
+<form method="post" action="/jobs">
+<label>Candidate<select name="profile_id">{% for profile in profiles %}<option value="{{ profile.id }}">{{ profile.user.display_name }} — {{ profile.label }}</option>{% endfor %}</select></label>
+<label>Job title<input name="title" required></label>
+<label>Company<input name="company" required></label>
+<label>Source URL<input name="source_url" type="url"></label>
+<label>Job description<textarea name="description" rows="14" required></textarea></label>
+<button>Save and assess</button>
+</form>
+{% else %}<p>Create a profile first.</p>{% endif %}
+</section>
+<section class="card"><h2>Recent jobs</h2>{% if jobs %}<ul>{% for job in jobs %}<li><a href="/jobs/{{ job.id }}">{{ job.title }} at {{ job.company }}</a></li>{% endfor %}</ul>{% else %}<p>No jobs yet.</p>{% endif %}</section>
+{% endblock %}
