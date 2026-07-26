@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,6 +14,14 @@ class Settings(BaseSettings):
     secret_key: str = "development-only-change-me"
     model_provider: str = "mock"
     model_name: str = "mock-fit-v1"
+
+    openai_api_key: str | None = Field(default=None, validation_alias="OPENAI_API_KEY")
+    anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
+    ollama_base_url: str = Field(
+        default="http://localhost:11434/v1",
+        validation_alias="OLLAMA_BASE_URL",
+    )
+    ollama_api_key: str = Field(default="ollama", validation_alias="OLLAMA_API_KEY")
 
     def ensure_runtime_dirs(self) -> None:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
