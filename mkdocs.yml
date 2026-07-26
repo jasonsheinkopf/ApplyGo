@@ -59,8 +59,11 @@ nav:
       - Browser Automation: technology/browser-automation.md
       - Models and Orchestration: technology/models-orchestration.md
       - Evaluation and Observability: technology/evaluation-observability.md
+  - Implementation Stages:
+      - First Vertical Slice: stages/first-vertical-slice.md
   - Decisions:
       - Decision Register: decisions/index.md
       - Initial Recommendations: decisions/initial-recommendations.md
+      - ADR-013 Private Runtime Data: decisions/adr-013-private-runtime-data.md
   - Roadmap:
       - Phases and Exit Criteria: roadmap/phases.md
