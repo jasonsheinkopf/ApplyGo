@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}{{ job.title }} — ApplyGo{% endblock %}
+{% block content %}
+<a href="/">← Dashboard</a><h1>{{ job.title }}</h1><p>{{ job.company }}</p>{% if job.source_url %}<p><a href="{{ job.source_url }}">Original posting</a></p>{% endif %}
+<section class="card"><h2>Normalized signals</h2><pre>{{ job.normalized | tojson(indent=2) }}</pre></section>
+{% for assessment in assessments %}<section class="card"><h2>Fit assessment</h2><p><strong>Score:</strong> {{ assessment.result.overall_score }}/100 · <strong>Recommendation:</strong> {{ assessment.result.recommendation }}</p><p><small>{{ assessment.provider }}/{{ assessment.model }} · {{ assessment.latency_ms }} ms · prompt {{ assessment.prompt_version }}</small></p><h3>Strong matches</h3>{% if assessment.result.strong_matches %}<ul>{% for match in assessment.result.strong_matches %}<li>{{ match.claim }} <small>[evidence {{ match.evidence_id }}]</small></li>{% endfor %}</ul>{% else %}<p>No verified evidence matches yet.</p>{% endif %}<h3>Evidence gaps</h3><ul>{% for gap in assessment.result.evidence_gaps %}<li>{{ gap }}</li>{% endfor %}</ul><h3>Questions</h3><ul>{% for question in assessment.result.questions_for_user %}<li>{{ question }}</li>{% endfor %}</ul><p class="notice">{{ assessment.result.grounding_notice }}</p></section>{% else %}<p>No assessment available.</p>{% endfor %}
+<section class="card"><details><summary>Raw job description</summary><pre>{{ job.raw_description }}</pre></details></section>
+{% endblock %}
