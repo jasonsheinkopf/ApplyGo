@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}{{ profile.user.display_name }} — ApplyGo{% endblock %}
+{% block content %}
+<a href="/">← Dashboard</a>
+<h1>{{ profile.user.display_name }}</h1><p>{{ profile.label }}</p><p>{{ profile.summary }}</p>
+<div class="grid">
+<section class="card"><h2>Upload private source document</h2><p>Files are written under the gitignored private storage directory and indexed in the database. They are not committed to Git.</p><form method="post" action="/profiles/{{ profile.id }}/documents" enctype="multipart/form-data"><label>PDF, text, or Markdown<input type="file" name="file" accept=".pdf,.txt,.md" required></label><button>Upload and extract</button></form></section>
+<section class="card"><h2>Add detailed notes</h2><form method="post" action="/profiles/{{ profile.id }}/notes"><label>Career facts and context<textarea name="notes" rows="10" required></textarea></label><button>Convert to reviewable evidence</button></form></section>
+</div>
+<section class="card"><h2>Evidence review</h2><p>Imported statements cannot be used in an assessment until you confirm them and mark them usable.</p>
+{% if evidence %}{% for item in evidence %}<article class="evidence"><p>{{ item.claim }}</p><small>{{ item.verification_status }}{% if item.usable_in_applications %} · usable{% endif %}</small><form method="post" action="/evidence/{{ item.id }}/review"><select name="status"><option>unreviewed</option><option value="user_confirmed">user_confirmed</option><option>verified</option><option>rejected</option></select><label class="inline"><input type="checkbox" name="usable" value="true"> Allow in applications</label><button>Save review</button></form></article>{% endfor %}{% else %}<p>No evidence imported yet.</p>{% endif %}</section>
+{% endblock %}
