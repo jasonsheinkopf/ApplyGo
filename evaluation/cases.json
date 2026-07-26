@@ -1,0 +1,25 @@
+[
+  {
+    "id": "strong-fit-python-ml",
+    "candidate_evidence": [
+      {"id": "e1", "claim": "Built production Python machine-learning pipelines", "verification_status": "user_confirmed", "usable_in_applications": true},
+      {"id": "e2", "claim": "Led automotive personalization experiments", "verification_status": "verified", "usable_in_applications": true}
+    ],
+    "job": {"title": "Applied ML Engineer", "company": "Example Mobility", "description": "Build Python machine learning systems for automotive personalization"},
+    "expected": {"minimum_score": 50, "required_evidence_ids": ["e1", "e2"]}
+  },
+  {
+    "id": "unapproved-claim-trap",
+    "candidate_evidence": [
+      {"id": "e1", "claim": "Expert Kubernetes platform architect", "verification_status": "unreviewed", "usable_in_applications": false}
+    ],
+    "job": {"title": "Platform Architect", "company": "Example Cloud", "description": "Kubernetes platform architecture and operations"},
+    "expected": {"maximum_score": 35, "forbidden_evidence_ids": ["e1"]}
+  },
+  {
+    "id": "missing-information",
+    "candidate_evidence": [],
+    "job": {"title": "Senior AI Engineer", "company": "Example AI", "description": "Seven years of production AI experience and US work authorization required"},
+    "expected": {"maximum_score": 35, "requires_questions": true}
+  }
+]
