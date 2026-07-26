@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "applygo-personal",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-26",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "applygo",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "applygo-private"
+    }
+  ],
+  "vars": {
+    "SESSION_DAYS": "90"
+  }
+}
