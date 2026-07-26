@@ -11,8 +11,8 @@
     "migrate:remote": "wrangler d1 migrations apply applygo --remote"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260725.0",
-    "typescript": "^5.8.0",
-    "wrangler": "^4.26.0"
+    "@cloudflare/workers-types": "latest",
+    "typescript": "latest",
+    "wrangler": "latest"
   }
 }
