@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="APPLYGO_", extra="ignore")
+    model_config = SettingsConfigDict(env_file=(".env", "data/private/provider.env"), env_prefix="APPLYGO_", extra="ignore")
 
     env: str = "development"
     database_url: str = "sqlite:///./data/applygo.db"
@@ -21,24 +21,12 @@ class Settings(BaseSettings):
 
     openai_api_key: str | None = Field(default=None, validation_alias="OPENAI_API_KEY")
     anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
-    ollama_base_url: str = Field(
-        default="http://localhost:11434/v1",
-        validation_alias="OLLAMA_BASE_URL",
-    )
+    ollama_base_url: str = Field(default="http://localhost:11434/v1", validation_alias="OLLAMA_BASE_URL")
     ollama_api_key: str = Field(default="ollama", validation_alias="OLLAMA_API_KEY")
-    openai_compatible_base_url: str = Field(
-        default="http://localhost:1234/v1",
-        validation_alias="OPENAI_COMPATIBLE_BASE_URL",
-    )
-    openai_compatible_api_key: str = Field(
-        default="local",
-        validation_alias="OPENAI_COMPATIBLE_API_KEY",
-    )
+    openai_compatible_base_url: str = Field(default="http://localhost:1234/v1", validation_alias="OPENAI_COMPATIBLE_BASE_URL")
+    openai_compatible_api_key: str = Field(default="local", validation_alias="OPENAI_COMPATIBLE_API_KEY")
     claude_routine_url: str | None = Field(default=None, validation_alias="CLAUDE_ROUTINE_URL")
-    claude_routine_token: str | None = Field(
-        default=None,
-        validation_alias="CLAUDE_ROUTINE_TOKEN",
-    )
+    claude_routine_token: str | None = Field(default=None, validation_alias="CLAUDE_ROUTINE_TOKEN")
 
     @property
     def model_routes(self) -> dict[str, dict[str, Any]]:
