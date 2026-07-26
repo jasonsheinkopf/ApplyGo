@@ -9,7 +9,7 @@ Architecture decisions begin as candidates and become accepted only after eviden
 | ADR-003 | Use PostgreSQL as the production system of record | superseded in part | local and Cloudflare mode evaluation |
 | ADR-004 | Use Playwright as the baseline browser engine | proposed | ATS benchmark |
 | ADR-005 | Keep Steel.dev as an optional remote-browser adapter | proposed | cost, reliability, CAPTCHA/handoff spike |
-| ADR-006 | Support hosted and local model providers behind adapters | proposed | task-level benchmark |
+| ADR-006 | Support hosted and local model providers behind adapters | superseded by ADR-015 | task-aware routing implementation |
 | ADR-007 | Use progressive autonomy with action-level policy gates | proposed | evaluation thresholds and UX prototype |
 | ADR-008 | Use MLflow as the leading evaluation/experiment platform | proposed | tracing and evaluation proof of concept |
 | ADR-009 | Preserve OpenTelemetry-compatible trace context | proposed | implementation spike |
@@ -18,6 +18,7 @@ Architecture decisions begin as candidates and become accepted only after eviden
 | ADR-012 | Default CAPTCHA handling to secure human handoff | proposed | site/terms review and remote-session prototype |
 | ADR-013 | Keep candidate runtime data outside Git | accepted | first vertical slice and private-data design |
 | ADR-014 | Support local mode and personal Cloudflare mode with secure remembered devices | accepted | prototype token UX, cost, portability, and ownership analysis |
+| ADR-015 | Route model work by task, provider/model, and execution mode | accepted | provider gateway, Claude subscription paths, and routing tests |
 
 ADR-003 is not a universal production mandate. PostgreSQL remains appropriate for generic hosted and advanced self-hosted deployments, while SQLite is the local default and D1 is the accepted Cloudflare data adapter.
 
