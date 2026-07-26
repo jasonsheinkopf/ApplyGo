@@ -1,0 +1,18 @@
+{
+  "name": "applygo-cloudflare",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "migrate:local": "wrangler d1 migrations apply applygo --local",
+    "migrate:remote": "wrangler d1 migrations apply applygo --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260725.0",
+    "typescript": "^5.8.0",
+    "wrangler": "^4.26.0"
+  }
+}
