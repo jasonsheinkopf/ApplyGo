@@ -1,34 +1,29 @@
 {% extends "base.html" %}
-{% block title %}ApplyGo Dashboard{% endblock %}
+{% block title %}ApplyGo{% endblock %}
 {% block content %}
-<section class="hero"><h1>First production vertical slice</h1><p>Create a private profile, upload a résumé or notes, verify evidence, then paste a job description for a grounded fit assessment.</p></section>
-<div class="grid">
-<section class="card">
-<h2>Create candidate profile</h2>
+<section class="hero hero-dashboard">
+  <div><span class="eyebrow">Your private career workspace</span><h1>Build a profile once. Use it everywhere.</h1><p>Connect a model, upload your source documents, approve factual evidence, and create résumé versions without changing the originals.</p></div>
+  <a class="button secondary" href="/setup">Configure ApplyGo</a>
+</section>
+<section class="steps">
+  <div><span>1</span><strong>Connect</strong><small>Choose local, subscription, or API models.</small></div>
+  <div><span>2</span><strong>Build profile</strong><small>Upload documents and describe your goals.</small></div>
+  <div><span>3</span><strong>Create</strong><small>Generate grounded résumé versions and job analysis.</small></div>
+</section>
+<div class="dashboard-grid">
+<section class="card accent-card">
+<h2>Create candidate profile</h2><p>Start with a separate workspace for each person.</p>
 <form method="post" action="/profiles">
-<label>Name<input name="display_name" required></label>
+<label>Name<input name="display_name" required placeholder="Your name"></label>
 <label>Profile label<input name="label" value="Primary profile"></label>
-<label>Summary<textarea name="summary" placeholder="Optional overview"></textarea></label>
 <button>Create profile</button>
 </form>
 </section>
-<section class="card">
-<h2>Profiles</h2>
-{% if profiles %}<ul>{% for profile in profiles %}<li><a href="/profiles/{{ profile.id }}">{{ profile.user.display_name }} — {{ profile.label }}</a></li>{% endfor %}</ul>{% else %}<p>No profiles yet.</p>{% endif %}
+<section class="card"><div class="section-heading"><div><span class="eyebrow">Workspaces</span><h2>Your profiles</h2></div></div>
+{% if profiles %}<div class="profile-list">{% for profile in profiles %}<a class="profile-row" href="/profiles/{{ profile.id }}"><span class="avatar">{{ profile.user.display_name[:1] }}</span><span><strong>{{ profile.user.display_name }}</strong><small>{{ profile.label }}</small></span><b>→</b></a>{% endfor %}</div>{% else %}<p class="empty">Create your first profile to begin.</p>{% endif %}
 </section>
 </div>
-<section class="card">
-<h2>Analyze a job</h2>
-{% if profiles %}
-<form method="post" action="/jobs">
-<label>Candidate<select name="profile_id">{% for profile in profiles %}<option value="{{ profile.id }}">{{ profile.user.display_name }} — {{ profile.label }}</option>{% endfor %}</select></label>
-<label>Job title<input name="title" required></label>
-<label>Company<input name="company" required></label>
-<label>Source URL<input name="source_url" type="url"></label>
-<label>Job description<textarea name="description" rows="14" required></textarea></label>
-<button>Save and assess</button>
-</form>
-{% else %}<p>Create a profile first.</p>{% endif %}
+<section class="card"><div class="section-heading"><div><span class="eyebrow">Later workflow</span><h2>Analyze a job</h2></div><small>Already functional</small></div>
+{% if profiles %}<form class="form-grid" method="post" action="/jobs"><label>Candidate<select name="profile_id">{% for profile in profiles %}<option value="{{ profile.id }}">{{ profile.user.display_name }} — {{ profile.label }}</option>{% endfor %}</select></label><label>Job title<input name="title" required></label><label>Company<input name="company" required></label><label>Source URL<input name="source_url" type="url"></label><label class="wide">Job description<textarea name="description" rows="8" required></textarea></label><button>Save and assess</button></form>{% else %}<p>Create a profile first.</p>{% endif %}
 </section>
-<section class="card"><h2>Recent jobs</h2>{% if jobs %}<ul>{% for job in jobs %}<li><a href="/jobs/{{ job.id }}">{{ job.title }} at {{ job.company }}</a></li>{% endfor %}</ul>{% else %}<p>No jobs yet.</p>{% endif %}</section>
 {% endblock %}
