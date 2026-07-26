@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -28,9 +29,21 @@ class Settings(BaseSettings):
         if self.database_url.startswith("sqlite"):
             Path("./data").mkdir(parents=True, exist_ok=True)
 
+    def expose_provider_environment(self) -> None:
+        values = {
+            "OPENAI_API_KEY": self.openai_api_key,
+            "ANTHROPIC_API_KEY": self.anthropic_api_key,
+            "OLLAMA_BASE_URL": self.ollama_base_url,
+            "OLLAMA_API_KEY": self.ollama_api_key,
+        }
+        for name, value in values.items():
+            if value:
+                os.environ.setdefault(name, value)
+
 
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
     settings.ensure_runtime_dirs()
+    settings.expose_provider_environment()
     return settings
