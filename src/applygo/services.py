@@ -1,21 +1,18 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import os
 import re
 import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from anthropic import Anthropic
-from openai import OpenAI
 from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from applygo.config import Settings, get_settings
+from applygo.model_router import ModelRouter, ModelTask
 from applygo.models import (
     CandidateEvidence,
     CandidateProfile,
@@ -24,7 +21,7 @@ from applygo.models import (
     SourceDocument,
 )
 
-PROMPT_VERSION = "fit-v1"
+PROMPT_VERSION = "fit-v2-routed"
 ALLOWED_UPLOAD_TYPES = {"application/pdf", "text/plain", "text/markdown"}
 
 
@@ -110,9 +107,8 @@ def normalize_job(description: str) -> dict[str, Any]:
         "kubernetes",
         "automotive",
     ]
-    skills = [skill for skill in vocabulary if skill in lowered]
     return {
-        "skills": skills,
+        "skills": [skill for skill in vocabulary if skill in lowered],
         "remote": "remote" in lowered,
         "hybrid": "hybrid" in lowered,
         "requires_work_authorization": any(
@@ -127,7 +123,7 @@ def deterministic_fit(
     evidence: list[CandidateEvidence],
     job: JobPosting,
 ) -> dict[str, Any]:
-    del profile  # Reserved for future deterministic preference checks.
+    del profile
     description = job.raw_description.lower()
     usable = [
         item
@@ -163,27 +159,22 @@ def deterministic_fit(
         "questions_for_user": [
             "Does this role satisfy your location, compensation, and work-authorization constraints?"
         ],
-        "grounding_notice": (
-            "Only verified or user-confirmed evidence marked usable was considered."
-        ),
+        "grounding_notice": "Only verified or user-confirmed evidence marked usable was considered.",
     }
 
 
 class ModelGateway:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
+        self.router = ModelRouter(self.settings)
 
     def assess(
         self,
         profile: CandidateProfile,
         evidence: list[CandidateEvidence],
         job: JobPosting,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], str, str]:
         baseline = deterministic_fit(profile, evidence, job)
-        provider = self.settings.model_provider.lower()
-        if provider == "mock":
-            return baseline, {}
-
         verified_evidence = [
             {"id": item.id, "claim": item.claim}
             for item in evidence
@@ -204,44 +195,14 @@ class ModelGateway:
             "Return JSON only. Evaluate fit using only verified_evidence. "
             "Never invent qualifications. Preserve every required_output_shape key."
         )
-
-        if provider in {"openai", "ollama"}:
-            base_url = (
-                None
-                if provider == "openai"
-                else os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-            )
-            key_name = "OPENAI_API_KEY" if provider == "openai" else "OLLAMA_API_KEY"
-            api_key = os.environ.get(key_name, "ollama")
-            client = OpenAI(api_key=api_key, base_url=base_url)
-            response = client.chat.completions.create(
-                model=self.settings.model_name,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": instruction},
-                    {"role": "user", "content": json.dumps(payload)},
-                ],
-            )
-            content = response.choices[0].message.content or "{}"
-            usage = {"total_tokens": response.usage.total_tokens if response.usage else None}
-            return json.loads(content), usage
-
-        if provider == "anthropic":
-            client = Anthropic()
-            response = client.messages.create(
-                model=self.settings.model_name,
-                max_tokens=2500,
-                system=instruction,
-                messages=[{"role": "user", "content": json.dumps(payload)}],
-            )
-            text = "".join(block.text for block in response.content if hasattr(block, "text"))
-            usage = {
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-            }
-            return json.loads(text), usage
-
-        raise ValueError(f"Unsupported model provider: {provider}")
+        result = self.router.invoke(
+            ModelTask.FIT_ASSESSMENT,
+            instruction,
+            payload,
+            mock_output=baseline,
+        )
+        usage = {**result.usage, "execution_mode": result.execution_mode.value}
+        return result.output, usage, result.provider, result.model
 
 
 def run_fit_assessment(
@@ -257,12 +218,12 @@ def run_fit_assessment(
         )
     )
     started = time.perf_counter()
-    result, usage = ModelGateway(settings).assess(profile, evidence, job)
+    result, usage, provider, model = ModelGateway(settings).assess(profile, evidence, job)
     assessment = FitAssessment(
         job_id=job.id,
         profile_id=profile.id,
-        provider=settings.model_provider,
-        model=settings.model_name,
+        provider=provider,
+        model=model,
         prompt_version=PROMPT_VERSION,
         result=result,
         evidence_ids=[

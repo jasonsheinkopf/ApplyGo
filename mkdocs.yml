@@ -55,6 +55,7 @@ nav:
       - Requirements: product/requirements.md
   - Architecture:
       - Local and Cloudflare Dual Mode: architecture/local-cloudflare-dual-mode.md
+      - Task-Aware Model Routing: architecture/model-provider-routing.md
   - Technology:
       - Technology Landscape: technology/index.md
       - Execution and Deployment: technology/execution-deployment.md
@@ -68,5 +69,6 @@ nav:
       - Initial Recommendations: decisions/initial-recommendations.md
       - ADR-013 Private Runtime Data: decisions/adr-013-private-runtime-data.md
       - ADR-014 Local and Cloudflare Modes: decisions/adr-014-dual-mode-cloudflare.md
+      - ADR-015 Task-Aware Model Routing: decisions/adr-015-task-aware-model-routing.md
   - Roadmap:
       - Phases and Exit Criteria: roadmap/phases.md
