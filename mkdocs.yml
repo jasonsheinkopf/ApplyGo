@@ -64,6 +64,7 @@ nav:
       - Evaluation and Observability: technology/evaluation-observability.md
   - Implementation Stages:
       - First Vertical Slice: stages/first-vertical-slice.md
+      - Candidate Profile Workspace: stages/profile-workspace.md
   - Decisions:
       - Decision Register: decisions/index.md
       - Initial Recommendations: decisions/initial-recommendations.md
