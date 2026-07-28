@@ -4,12 +4,16 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "check": "wrangler deploy --dry-run --outdir dist",
+    "check": "wrangler deploy --dry-run --outdir dist --env \"\"",
     "typecheck": "tsc --noEmit",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "migrate:local": "wrangler d1 migrations apply applygo --local",
-    "migrate:remote": "wrangler d1 migrations apply applygo --remote"
+    "migrate:remote": "wrangler d1 migrations apply applygo --remote",
+    "check:prod": "wrangler deploy --dry-run --outdir dist --env production",
+    "migrate:remote:prod": "wrangler d1 migrations apply applygo-prod-db --remote --env production",
+    "deploy:prod": "wrangler deploy --env production",
+    "release:prod": "npm run migrate:remote:prod && npm run deploy:prod"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "latest",

@@ -11,3 +11,6 @@ data/
 *.db
 *.sqlite*
 .DS_Store
+cloudflare/node_modules/
+cloudflare/dist/
+cloudflare/.wrangler/

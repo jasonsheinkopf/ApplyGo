@@ -21,6 +21,89 @@ function json(data: unknown, status = 200, headers: HeadersInit = {}): Response 
   });
 }
 
+function html(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    },
+  });
+}
+
+const ENROLL_PAGE = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ApplyGo Device Enrollment</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 24rem; margin: 3rem auto; padding: 0 1.25rem; }
+  h1 { font-size: 1.25rem; }
+  label { display: block; margin: 1rem 0 0.25rem; font-weight: 600; }
+  input { width: 100%; padding: 0.6rem; font-size: 1rem; box-sizing: border-box; }
+  button { margin-top: 1.25rem; width: 100%; padding: 0.7rem; font-size: 1rem; cursor: pointer; }
+  #status { margin-top: 1rem; font-weight: 600; min-height: 1.5rem; }
+  #status.success { color: #1a7f37; }
+  #status.error { color: #cf222e; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Enroll this device</h1>
+  <p>Enter the one-time code you were given and a name for this device.</p>
+  <form id="enroll-form" autocomplete="off">
+    <label for="code">One-time enrollment code</label>
+    <input id="code" name="code" inputmode="text" autocomplete="one-time-code" required />
+    <label for="device_name">Device name</label>
+    <input id="device_name" name="device_name" required placeholder="e.g. Jason's iPhone" />
+    <button type="submit">Enroll this device</button>
+  </form>
+  <p id="status" role="status" aria-live="polite"></p>
+</main>
+<script>
+(function () {
+  var form = document.getElementById("enroll-form");
+  var status = document.getElementById("status");
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    status.className = "";
+    status.textContent = "Enrolling…";
+    var code = document.getElementById("code").value.trim();
+    var deviceName = document.getElementById("device_name").value.trim();
+    fetch("/auth/enroll", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: code, device_name: deviceName }),
+    })
+      .then(function (response) {
+        if (!response.ok) {
+          return response.json().catch(function () { return {}; }).then(function (data) {
+            throw new Error(data.error || "enrollment_failed");
+          });
+        }
+        return fetch("/me", { credentials: "same-origin" });
+      })
+      .then(function (meResponse) {
+        if (!meResponse.ok) throw new Error("session_check_failed");
+        status.className = "success";
+        status.textContent = "This device is enrolled and signed in. You can close this page.";
+        form.reset();
+      })
+      .catch(function (error) {
+        status.className = "error";
+        status.textContent = "Enrollment failed: " + error.message;
+      });
+  });
+})();
+</script>
+</body>
+</html>`;
+
 function randomToken(bytes = 32): string {
   const value = new Uint8Array(bytes);
   crypto.getRandomValues(value);
@@ -172,6 +255,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") return json({ status: "ok", mode: "cloudflare" });
+    if (request.method === "GET" && url.pathname === "/enroll") return html(ENROLL_PAGE);
     if (request.method === "POST" && url.pathname === "/admin/enrollments") return createEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/enroll") return exchangeEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/logout") {
