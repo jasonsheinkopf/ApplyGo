@@ -19,5 +19,27 @@
   ],
   "vars": {
     "SESSION_DAYS": "90"
+  },
+  "env": {
+    "production": {
+      "name": "applygo-prod",
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "applygo-prod-db",
+          "database_id": "cfd20f38-862d-42b6-bf7a-9bfb7c0a6bdc",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "r2_buckets": [
+        {
+          "binding": "FILES",
+          "bucket_name": "applygo-prod-private"
+        }
+      ],
+      "vars": {
+        "SESSION_DAYS": "90"
+      }
+    }
   }
 }
