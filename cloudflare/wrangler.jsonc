@@ -19,5 +19,30 @@
   ],
   "vars": {
     "SESSION_DAYS": "90"
+  },
+  // Jason's production deployment. Deployed and managed via `--env production`
+  // (or Cloudflare Workers Builds, which is configured to use this env) so that
+  // local development config above stays untouched.
+  "env": {
+    "production": {
+      "name": "applygo-prod",
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "applygo-prod-db",
+          "database_id": "REPLACE_WITH_PROD_D1_DATABASE_ID",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "r2_buckets": [
+        {
+          "binding": "FILES",
+          "bucket_name": "applygo-prod-private"
+        }
+      ],
+      "vars": {
+        "SESSION_DAYS": "90"
+      }
+    }
   }
 }
