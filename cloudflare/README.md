@@ -30,7 +30,7 @@ npm install
 npx wrangler login
 ```
 
-Create the production data resources (skip if they already exist):
+Create the production data resources (skip if they already exist — see "Claude Code infrastructure access" below for how this can be done without Wrangler at all):
 
 ```bash
 npx wrangler d1 create applygo-prod-db
@@ -59,6 +59,22 @@ npm run release:production
 ```
 
 This is also the command Cloudflare Workers Builds runs on every push to `main` (see below), so migrations are never skipped before a deploy.
+
+## Claude Code infrastructure access
+
+Claude Code manages this account's Cloudflare resources through the **Cloudflare Developer Platform** MCP connector (OAuth-based, connected once via claude.ai connector settings). That connector's tool surface covers:
+
+- listing/creating/inspecting D1 databases, R2 buckets, and KV namespaces
+- running arbitrary D1 SQL (`d1_database_query`) — used to create/inspect tables directly, without needing `wrangler d1 migrations apply`
+- listing/inspecting Workers (name, bindings) and reading a Worker's deployed source
+- searching current Cloudflare documentation
+
+It does **not** cover: uploading/deploying a Worker, setting Worker secrets, or connecting Workers Builds to a Git repository. For those three, a session needs one of:
+
+1. **Wrangler CLI with `CLOUDFLARE_API_TOKEN`** — the practical option for a sandboxed/remote Claude Code session, since interactive `wrangler login` needs a browser on the same machine as the CLI. Ask Jason for a custom-scoped token (Account → Workers Scripts: Edit, Account → D1: Edit — nothing else) stored as an environment variable for the session, never pasted into chat, committed, or put in GitHub Actions secrets.
+2. **Jason running the command locally** — `wrangler login` works normally on his own machine, so `npm run release:production` or `wrangler secret put` can always be run by hand as a fallback.
+
+Connecting **Workers Builds** to the GitHub repository (below) is a one-time dashboard action with no API/MCP equivalent as of this writing — Cloudflare's Git integration is configured under a Worker's **Settings → Builds** page.
 
 ## Automatic GitHub deployment (Cloudflare Workers Builds)
 
