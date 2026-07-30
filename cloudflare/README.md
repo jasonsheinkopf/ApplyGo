@@ -108,6 +108,17 @@ A push to `main` that touches those paths automatically builds, applies pending 
 
 The enrollment code is single-use and expires (default 15 minutes, max 60). It cannot be exchanged again after use or after expiry.
 
+## Dashboard
+
+`GET /` is the phone-usable dashboard: profile edit, job posting list/add/remove, and device management, all gated by the same session cookie from enrollment. Visiting `/` without a valid session redirects to `/enroll`. It's a single self-contained HTML page (no build step, no external assets) that calls the JSON endpoints below with `credentials: 'same-origin'`.
+
+Authenticated data endpoints backing the dashboard:
+
+- `GET /profile` / `PUT /profile` — single-profile model (`label`, `summary`); the first `candidate_profiles` row is created on first save and updated in place after that
+- `GET /jobs` / `POST /jobs` / `DELETE /jobs/:id` — `job_postings` rows (`title`, `company`, `source_url`, `raw_description`)
+
+This is a first slice, not the full local-Python product surface (job-fit assessment, evidence, resume generation aren't ported). See "Current boundary" below.
+
 ## Device management
 
 Authenticated endpoints:
@@ -157,6 +168,7 @@ Hosted in Cloudflare today:
 - hashed session-token storage and remembered secure browser sessions
 - device listing and revocation
 - authenticated private artifact transfer (`/artifacts`)
+- a minimal phone-usable dashboard (`/`): profile edit, job posting list/add/remove
 
 Still local-Python-only (not ported to Cloudflare):
 
