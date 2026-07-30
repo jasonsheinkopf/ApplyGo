@@ -156,6 +156,79 @@ async function uploadArtifact(request: Request, env: Env): Promise<Response> {
   return json({ key, name: file.name, media_type: file.type, size: file.size }, 201);
 }
 
+const ENROLL_PAGE = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ApplyGo Device Enrollment</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 28rem; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.5; }
+  h1 { font-size: 1.35rem; }
+  label { display: block; margin: 1rem 0 0.25rem; font-weight: 600; }
+  input { width: 100%; padding: 0.6rem; font-size: 1rem; box-sizing: border-box; }
+  button { margin-top: 1.5rem; padding: 0.7rem 1.25rem; font-size: 1rem; width: 100%; cursor: pointer; }
+  #status { margin-top: 1rem; font-weight: 600; min-height: 1.25rem; }
+  #status.success { color: #16794e; }
+  #status.error { color: #b3261e; }
+</style>
+</head>
+<body>
+  <main>
+    <h1>Enroll this device</h1>
+    <p>Enter the one-time enrollment code and a name for this device. The code is single-use and expires quickly.</p>
+    <form id="enroll-form">
+      <label for="code">Enrollment code</label>
+      <input id="code" name="code" autocomplete="one-time-code" required>
+      <label for="device_name">Device name</label>
+      <input id="device_name" name="device_name" required placeholder="e.g. Jason's iPhone">
+      <button type="submit">Enroll device</button>
+    </form>
+    <p id="status" role="status" aria-live="polite"></p>
+  </main>
+  <script>
+    var form = document.getElementById('enroll-form');
+    var statusEl = document.getElementById('status');
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      statusEl.textContent = 'Enrolling…';
+      statusEl.className = '';
+      var code = document.getElementById('code').value.trim();
+      var deviceName = document.getElementById('device_name').value.trim();
+      fetch('/auth/enroll', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ code: code, device_name: deviceName }),
+      })
+        .then(function (res) {
+          if (!res.ok) {
+            return res.json().catch(function () { return {}; }).then(function (body) {
+              throw new Error(body.error || 'enrollment_failed');
+            });
+          }
+          return fetch('/me', { credentials: 'same-origin' });
+        })
+        .then(function (meRes) {
+          if (!meRes.ok) throw new Error('session_verification_failed');
+          statusEl.textContent = 'Device enrolled. Session verified — you can close this page.';
+          statusEl.className = 'success';
+          form.reset();
+        })
+        .catch(function (err) {
+          statusEl.textContent = 'Enrollment failed: ' + err.message;
+          statusEl.className = 'error';
+        });
+    });
+  </script>
+</body>
+</html>`;
+
+function enrollPage(): Response {
+  return new Response(ENROLL_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
 async function downloadArtifact(request: Request, env: Env, key: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -172,6 +245,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") return json({ status: "ok", mode: "cloudflare" });
+    if (request.method === "GET" && url.pathname === "/enroll") return enrollPage();
     if (request.method === "POST" && url.pathname === "/admin/enrollments") return createEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/enroll") return exchangeEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/logout") {
