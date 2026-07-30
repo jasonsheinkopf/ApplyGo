@@ -30,7 +30,7 @@
         {
           "binding": "DB",
           "database_name": "applygo-prod-db",
-          "database_id": "REPLACE_WITH_PROD_D1_DATABASE_ID",
+          "database_id": "cfd20f38-862d-42b6-bf7a-9bfb7c0a6bdc",
           "migrations_dir": "migrations"
         }
       ],
