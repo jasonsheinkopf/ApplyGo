@@ -16,6 +16,7 @@ Both configs bind the same names (`DB` for D1, `FILES` for R2) so `src/index.ts`
 ## Resources (production)
 
 - Worker: `applygo-prod`
+- Production URL: `https://applygo-prod.jasonsheinkopf.workers.dev`
 - D1 database: `applygo-prod-db`
 - private R2 bucket: `applygo-prod-private`
 - Worker secret: `SETUP_SECRET`
@@ -71,8 +72,10 @@ Claude Code manages this account's Cloudflare resources through the **Cloudflare
 
 It does **not** cover: uploading/deploying a Worker, setting Worker secrets, or connecting Workers Builds to a Git repository. For those three, a session needs one of:
 
-1. **Wrangler CLI with `CLOUDFLARE_API_TOKEN`** — the practical option for a sandboxed/remote Claude Code session, since interactive `wrangler login` needs a browser on the same machine as the CLI. Ask Jason for a custom-scoped token (Account → Workers Scripts: Edit, Account → D1: Edit — nothing else) stored as an environment variable for the session, never pasted into chat, committed, or put in GitHub Actions secrets.
+1. **Wrangler CLI with `CLOUDFLARE_API_TOKEN`** — the practical option for a sandboxed/remote Claude Code session, since interactive `wrangler login` needs a browser on the same machine as the CLI. Ask Jason for a custom-scoped token (Account → Workers Scripts: Edit, Account → D1: Edit — nothing else) and use it for a single command invocation only; never write it to a file, commit it, or put it in GitHub Actions secrets or a cloud environment's plain environment-variable field (that field has no dedicated secrets store and is readable by anyone using the environment).
 2. **Jason running the command locally** — `wrangler login` works normally on his own machine, so `npm run release:production` or `wrangler secret put` can always be run by hand as a fallback.
+
+**A Claude Code cloud session's default network policy blocks Wrangler entirely.** Wrangler talks to `api.cloudflare.com` directly (not through the MCP connector's Anthropic-routed traffic), and a cloud environment's default **Trusted** network access level doesn't include Cloudflare's API. To let a session run Wrangler commands, the environment's **Network access** must be set to **Custom** with `api.cloudflare.com` (and, to reach the deployed Worker itself for verification, `*.workers.dev`) added to **Allowed domains** — see [Configure cloud environments](https://code.claude.com/docs/en/cloud-environments#network-access). This takes effect for new sessions only, not one already running.
 
 Connecting **Workers Builds** to the GitHub repository (below) is a one-time dashboard action with no API/MCP equivalent as of this writing — Cloudflare's Git integration is configured under a Worker's **Settings → Builds** page.
 
@@ -95,13 +98,13 @@ A push to `main` that touches those paths automatically builds, applies pending 
 1. From a trusted terminal, create a short-lived one-time code (requires the `SETUP_SECRET` value, never exposed to the browser):
 
    ```bash
-   curl -X POST "https://YOUR-WORKER.workers.dev/admin/enrollments" \
+   curl -X POST "https://applygo-prod.jasonsheinkopf.workers.dev/admin/enrollments" \
      -H "content-type: application/json" \
      -H "x-applygo-setup-secret: YOUR_SETUP_SECRET" \
      -d '{"label":"Jason iPhone","minutes":15}'
    ```
 
-2. On the device itself, open `https://YOUR-WORKER.workers.dev/enroll` in the browser and enter the code and a device name. This minimal page posts directly to `/auth/enroll`, receives the `Secure`, `HttpOnly`, `SameSite=Strict` session cookie, and verifies the session via `/me` — the code and session are never written to `localStorage` or exposed to any script beyond that one POST.
+2. On the device itself, open `https://applygo-prod.jasonsheinkopf.workers.dev/enroll` in the browser and enter the code and a device name. This minimal page posts directly to `/auth/enroll`, receives the `Secure`, `HttpOnly`, `SameSite=Strict` session cookie, and verifies the session via `/me` — the code and session are never written to `localStorage` or exposed to any script beyond that one POST.
 
 The enrollment code is single-use and expires (default 15 minutes, max 60). It cannot be exchanged again after use or after expiry.
 
