@@ -85,13 +85,14 @@ Production deploys are connected through Cloudflare's native Workers Builds GitH
 
 - Repository: `jasonsheinkopf/ApplyGo`
 - Production branch: `main`
-- Root directory: `cloudflare`
+- **Root directory ("Path" in the dashboard): `cloudflare`** — required. Left at the default `/`, Cloudflare builds from the repo root, where there is no `package.json` (it's at `cloudflare/package.json`), and the build fails immediately with `npm error ... ENOENT ... package.json`.
 - Worker project: `applygo-prod`
 - Build command: `npm install && npm run typecheck && npm run check:production`
 - Deploy command: `npm run release:production`
+- **Non-production branch deploy command ("Version command" in the dashboard): `npx wrangler versions upload --env production`** — required, `--env production` included. Without it, Wrangler falls back to the top-level (local-dev) config on every PR build: wrong D1/R2 bindings, and a fatal `binding DB of type d1 must have a valid database_id` error, since the dev D1 entry is a placeholder.
 - Build watch paths: `cloudflare/**`, `.github/workflows/cloudflare.yml`
 
-A push to `main` that touches those paths automatically builds, applies pending D1 migrations, and deploys `applygo-prod`. Pushes that only touch unrelated paths (docs, the local Python app, résumé content, etc.) do not trigger a build. Pull requests run the same build/typecheck validation but do not deploy to production; Cloudflare preview builds (where available) are used instead of overwriting the live Worker.
+A push to `main` that touches those paths automatically builds, applies pending D1 migrations, and deploys `applygo-prod` live (the **Deploy command**). Pushes that only touch unrelated paths (docs, the local Python app, résumé content, etc.) do not trigger a build. Pull requests run the same build/typecheck validation and upload a new Worker Version (the **Non-production branch deploy command**), which does not receive live traffic — it validates the deploy path without affecting the running Worker.
 
 ## Enroll a phone or computer
 
