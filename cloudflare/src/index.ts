@@ -139,6 +139,99 @@ async function revokeDevice(request: Request, env: Env, deviceId: string): Promi
   return json({ revoked: result.meta.changes > 0 }, 200, headers);
 }
 
+type Profile = {
+  id: string;
+  label: string;
+  summary: string;
+  preferences_json: string;
+  created_at: string;
+  updated_at: string;
+};
+
+async function getProfile(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profile = await env.DB.prepare(
+    "SELECT id, label, summary, preferences_json, created_at, updated_at FROM candidate_profiles ORDER BY created_at ASC LIMIT 1",
+  ).first<Profile>();
+  return json({ profile: profile ?? null });
+}
+
+async function upsertProfile(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { label?: string; summary?: string };
+  const label = (body.label ?? "").trim();
+  const summary = (body.summary ?? "").trim();
+  if (!label) return json({ error: "label_required" }, 400);
+  const existing = await env.DB.prepare(
+    "SELECT id FROM candidate_profiles ORDER BY created_at ASC LIMIT 1",
+  ).first<{ id: string }>();
+  if (existing) {
+    await env.DB.prepare(
+      "UPDATE candidate_profiles SET label = ?, summary = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+      .bind(label, summary, existing.id)
+      .run();
+    return json({ id: existing.id, label, summary });
+  }
+  const id = crypto.randomUUID();
+  await env.DB.prepare("INSERT INTO candidate_profiles (id, label, summary) VALUES (?, ?, ?)")
+    .bind(id, label, summary)
+    .run();
+  return json({ id, label, summary }, 201);
+}
+
+type JobPosting = {
+  id: string;
+  title: string;
+  company: string;
+  source_url: string;
+  raw_description: string;
+  created_at: string;
+};
+
+async function listJobs(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const jobs = await env.DB.prepare(
+    "SELECT id, title, company, source_url, raw_description, created_at FROM job_postings ORDER BY created_at DESC LIMIT 100",
+  ).all<JobPosting>();
+  return json({ jobs: jobs.results });
+}
+
+async function createJob(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    title?: string;
+    company?: string;
+    source_url?: string;
+    raw_description?: string;
+  };
+  const title = (body.title ?? "").trim();
+  const company = (body.company ?? "").trim();
+  const raw_description = (body.raw_description ?? "").trim();
+  const source_url = (body.source_url ?? "").trim();
+  if (!title || !company || !raw_description) {
+    return json({ error: "title_company_and_raw_description_required" }, 400);
+  }
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO job_postings (id, title, company, source_url, raw_description) VALUES (?, ?, ?, ?, ?)",
+  )
+    .bind(id, title, company, source_url, raw_description)
+    .run();
+  return json({ id, title, company, source_url, raw_description }, 201);
+}
+
+async function deleteJob(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const result = await env.DB.prepare("DELETE FROM job_postings WHERE id = ?").bind(id).run();
+  return json({ deleted: result.meta.changes > 0 });
+}
+
 async function uploadArtifact(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -229,6 +322,228 @@ function enrollPage(): Response {
   return new Response(ENROLL_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
+const DASHBOARD_PAGE = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ApplyGo</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 34rem; margin: 0 auto 4rem; padding: 0 1.25rem; line-height: 1.5; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 1.25rem 0; }
+  h1 { font-size: 1.25rem; margin: 0; }
+  h2 { font-size: 1rem; margin: 0 0 0.75rem; }
+  section { margin: 1.75rem 0; padding: 1rem; border: 1px solid light-dark(#ddd, #333); border-radius: 0.6rem; }
+  label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 600; font-size: 0.9rem; }
+  input, textarea { width: 100%; padding: 0.55rem; font-size: 1rem; box-sizing: border-box; font-family: inherit; }
+  textarea { min-height: 5rem; resize: vertical; }
+  button { margin-top: 1rem; padding: 0.6rem 1.1rem; font-size: 0.95rem; cursor: pointer; }
+  button.secondary { background: none; border: 1px solid light-dark(#999, #666); }
+  #sign-out { margin-top: 0; padding: 0.4rem 0.8rem; font-size: 0.85rem; }
+  .status { margin-top: 0.6rem; font-weight: 600; font-size: 0.9rem; min-height: 1.1rem; }
+  .status.success { color: #16794e; }
+  .status.error { color: #b3261e; }
+  .job, .device { padding: 0.75rem 0; border-top: 1px solid light-dark(#eee, #2a2a2a); }
+  .job:first-child, .device:first-child { border-top: none; padding-top: 0; }
+  .job-title { font-weight: 600; }
+  .job-meta { font-size: 0.85rem; opacity: 0.75; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+  .empty { opacity: 0.6; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>ApplyGo</h1>
+    <button id="sign-out" class="secondary" type="button">Sign out</button>
+  </header>
+
+  <section id="profile-section">
+    <h2>Profile</h2>
+    <form id="profile-form">
+      <label for="profile-label">Name / label</label>
+      <input id="profile-label" required placeholder="e.g. Jason Sheinkopf">
+      <label for="profile-summary">Summary</label>
+      <textarea id="profile-summary" placeholder="Short professional summary"></textarea>
+      <button type="submit">Save profile</button>
+    </form>
+    <p id="profile-status" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section id="jobs-section">
+    <h2>Job postings</h2>
+    <div id="jobs-list"><p class="empty">Loading…</p></div>
+    <form id="job-form">
+      <label for="job-title">Title</label>
+      <input id="job-title" required placeholder="e.g. Senior Engineer">
+      <label for="job-company">Company</label>
+      <input id="job-company" required placeholder="e.g. Acme Corp">
+      <label for="job-url">Posting URL (optional)</label>
+      <input id="job-url" type="url" placeholder="https://...">
+      <label for="job-description">Description</label>
+      <textarea id="job-description" required placeholder="Paste the job description"></textarea>
+      <button type="submit">Add job</button>
+    </form>
+    <p id="job-status" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section id="devices-section">
+    <h2>Devices</h2>
+    <div id="devices-list"><p class="empty">Loading…</p></div>
+  </section>
+
+  <script>
+    function el(tag, props, children) {
+      var node = document.createElement(tag);
+      Object.keys(props || {}).forEach(function (key) { node[key] = props[key]; });
+      (children || []).forEach(function (child) { node.appendChild(child); });
+      return node;
+    }
+    function text(value) { return document.createTextNode(value); }
+
+    function goToEnroll() { window.location.href = '/enroll'; }
+
+    async function api(path, options) {
+      var res = await fetch(path, Object.assign({ credentials: 'same-origin' }, options || {}));
+      if (res.status === 401) { goToEnroll(); throw new Error('not_authenticated'); }
+      return res;
+    }
+
+    document.getElementById('sign-out').addEventListener('click', async function () {
+      await api('/auth/logout', { method: 'POST' });
+      goToEnroll();
+    });
+
+    async function loadProfile() {
+      var res = await api('/profile');
+      var data = await res.json();
+      if (data.profile) {
+        document.getElementById('profile-label').value = data.profile.label;
+        document.getElementById('profile-summary').value = data.profile.summary;
+      }
+    }
+
+    document.getElementById('profile-form').addEventListener('submit', async function (event) {
+      event.preventDefault();
+      var statusEl = document.getElementById('profile-status');
+      statusEl.textContent = 'Saving…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/profile', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            label: document.getElementById('profile-label').value,
+            summary: document.getElementById('profile-summary').value,
+          }),
+        });
+        if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
+        statusEl.textContent = 'Saved.';
+        statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    function renderJobs(jobs) {
+      var list = document.getElementById('jobs-list');
+      list.innerHTML = '';
+      if (!jobs.length) {
+        list.appendChild(el('p', { className: 'empty', textContent: 'No job postings yet.' }));
+        return;
+      }
+      jobs.forEach(function (job) {
+        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        del.addEventListener('click', async function () {
+          await api('/jobs/' + encodeURIComponent(job.id), { method: 'DELETE' });
+          loadJobs();
+        });
+        var row = el('div', { className: 'row' }, [
+          el('div', {}, [
+            el('div', { className: 'job-title', textContent: job.title + ' — ' + job.company }),
+            el('div', { className: 'job-meta', textContent: new Date(job.created_at).toLocaleDateString() }),
+          ]),
+          del,
+        ]);
+        list.appendChild(el('div', { className: 'job' }, [row]));
+      });
+    }
+
+    async function loadJobs() {
+      var res = await api('/jobs');
+      var data = await res.json();
+      renderJobs(data.jobs);
+    }
+
+    document.getElementById('job-form').addEventListener('submit', async function (event) {
+      event.preventDefault();
+      var statusEl = document.getElementById('job-status');
+      statusEl.textContent = 'Adding…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/jobs', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            title: document.getElementById('job-title').value,
+            company: document.getElementById('job-company').value,
+            source_url: document.getElementById('job-url').value,
+            raw_description: document.getElementById('job-description').value,
+          }),
+        });
+        if (!res.ok) throw new Error((await res.json()).error || 'add_failed');
+        statusEl.textContent = 'Added.';
+        statusEl.className = 'status success';
+        document.getElementById('job-form').reset();
+        loadJobs();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    function renderDevices(currentId, devices) {
+      var list = document.getElementById('devices-list');
+      list.innerHTML = '';
+      devices.forEach(function (device) {
+        var isCurrent = device.id === currentId;
+        var children = [
+          el('div', {}, [
+            el('div', { textContent: device.device_name + (isCurrent ? ' (this device)' : '') }),
+            el('div', { className: 'job-meta', textContent: 'Last seen ' + new Date(device.last_seen_at).toLocaleString() }),
+          ]),
+        ];
+        if (!device.revoked) {
+          var revoke = el('button', { className: 'secondary', type: 'button', textContent: 'Revoke' });
+          revoke.addEventListener('click', async function () {
+            await api('/devices/' + encodeURIComponent(device.id) + '/revoke', { method: 'POST' });
+            if (isCurrent) { goToEnroll(); return; }
+            loadDevices();
+          });
+          children.push(revoke);
+        }
+        list.appendChild(el('div', { className: 'device' }, [el('div', { className: 'row' }, children)]));
+      });
+    }
+
+    async function loadDevices() {
+      var res = await api('/devices');
+      var data = await res.json();
+      renderDevices(data.current_device_id, data.devices);
+    }
+
+    loadProfile();
+    loadJobs();
+    loadDevices();
+  </script>
+</body>
+</html>`;
+
+function dashboardPage(): Response {
+  return new Response(DASHBOARD_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
 async function downloadArtifact(request: Request, env: Env, key: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -246,6 +561,17 @@ export default {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") return json({ status: "ok", mode: "cloudflare" });
     if (request.method === "GET" && url.pathname === "/enroll") return enrollPage();
+    if (request.method === "GET" && url.pathname === "/") {
+      const auth = await requireSession(request, env);
+      if (auth instanceof Response) return Response.redirect(new URL("/enroll", request.url).toString(), 302);
+      return dashboardPage();
+    }
+    if (request.method === "GET" && url.pathname === "/profile") return getProfile(request, env);
+    if (request.method === "PUT" && url.pathname === "/profile") return upsertProfile(request, env);
+    if (request.method === "GET" && url.pathname === "/jobs") return listJobs(request, env);
+    if (request.method === "POST" && url.pathname === "/jobs") return createJob(request, env);
+    const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
+    if (request.method === "DELETE" && jobMatch) return deleteJob(request, env, jobMatch[1]);
     if (request.method === "POST" && url.pathname === "/admin/enrollments") return createEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/enroll") return exchangeEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/logout") {
