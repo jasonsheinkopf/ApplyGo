@@ -154,8 +154,17 @@ type Profile = {
   label: string;
   summary: string;
   preferences_json: string;
+  structured_json: string;
   created_at: string;
   updated_at: string;
+};
+
+type StructuredProfile = {
+  headline: string;
+  narrative_summary: string;
+  education: { school: string; degree: string; field: string; start_year: string; end_year: string }[];
+  experience: { company: string; title: string; start: string; end: string; highlights: string[] }[];
+  skills: string[];
 };
 
 function readDesiredRoles(preferencesJson: string): string {
@@ -166,16 +175,48 @@ function readDesiredRoles(preferencesJson: string): string {
   }
 }
 
+function readStructuredProfile(structuredJson: string): StructuredProfile | null {
+  try {
+    const parsed = JSON.parse(structuredJson || "{}");
+    return Object.keys(parsed).length > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 async function getProfile(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const profileId = await getOrCreateProfileId(env);
   const profile = await env.DB.prepare(
-    "SELECT id, label, summary, preferences_json, created_at, updated_at FROM candidate_profiles WHERE id = ?",
+    "SELECT id, label, summary, preferences_json, structured_json, created_at, updated_at FROM candidate_profiles WHERE id = ?",
   )
     .bind(profileId)
     .first<Profile>();
-  return json({ profile: { ...profile, desired_roles: readDesiredRoles(profile?.preferences_json ?? "{}") } });
+  return json({
+    profile: {
+      ...profile,
+      desired_roles: readDesiredRoles(profile?.preferences_json ?? "{}"),
+      structured: readStructuredProfile(profile?.structured_json ?? "{}"),
+    },
+  });
+}
+
+async function saveStructuredProfile(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { structured?: unknown };
+  if (!body.structured || typeof body.structured !== "object") {
+    return json({ error: "structured_required" }, 400);
+  }
+  const structured = body.structured as StructuredProfile;
+  const profileId = await getOrCreateProfileId(env);
+  await env.DB.prepare(
+    "UPDATE candidate_profiles SET structured_json = ?, summary = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+  )
+    .bind(JSON.stringify(structured), (structured.narrative_summary ?? "").slice(0, 4000), profileId)
+    .run();
+  return json({ structured });
 }
 
 async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
@@ -273,26 +314,14 @@ async function generateDesiredRoles(request: Request, env: Env): Promise<Respons
 async function upsertProfile(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { label?: string; summary?: string };
+  const body = (await request.json().catch(() => ({}))) as { label?: string };
   const label = (body.label ?? "").trim();
-  const summary = (body.summary ?? "").trim();
   if (!label) return json({ error: "label_required" }, 400);
-  const existing = await env.DB.prepare(
-    "SELECT id FROM candidate_profiles ORDER BY created_at ASC LIMIT 1",
-  ).first<{ id: string }>();
-  if (existing) {
-    await env.DB.prepare(
-      "UPDATE candidate_profiles SET label = ?, summary = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-    )
-      .bind(label, summary, existing.id)
-      .run();
-    return json({ id: existing.id, label, summary });
-  }
-  const id = crypto.randomUUID();
-  await env.DB.prepare("INSERT INTO candidate_profiles (id, label, summary) VALUES (?, ?, ?)")
-    .bind(id, label, summary)
+  const profileId = await getOrCreateProfileId(env);
+  await env.DB.prepare("UPDATE candidate_profiles SET label = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(label, profileId)
     .run();
-  return json({ id, label, summary }, 201);
+  return json({ id: profileId, label });
 }
 
 type JobPosting = {
@@ -509,6 +538,95 @@ async function callOpenAI(env: Env, prompt: string): Promise<string> {
   return (data.choices[0]?.message?.content ?? "").trim();
 }
 
+const STRUCTURED_PROFILE_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    headline: { type: "string", description: "A one-line professional headline, e.g. 'Senior AI Engineer'." },
+    narrative_summary: { type: "string", description: "A short prose summary, 3-6 sentences, useful for a cover letter." },
+    education: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          school: { type: "string" },
+          degree: { type: "string" },
+          field: { type: "string" },
+          start_year: { type: "string" },
+          end_year: { type: "string" },
+        },
+        required: ["school"],
+      },
+    },
+    experience: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          company: { type: "string" },
+          title: { type: "string" },
+          start: { type: "string" },
+          end: { type: "string" },
+          highlights: { type: "array", items: { type: "string" } },
+        },
+        required: ["company", "title"],
+      },
+    },
+    skills: { type: "array", items: { type: "string" } },
+  },
+  required: ["headline", "narrative_summary", "education", "experience", "skills"],
+} as const;
+
+async function callAnthropicStructured(env: Env, prompt: string): Promise<StructuredProfile> {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": env.ANTHROPIC_API_KEY!,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: env.ANTHROPIC_MODEL || "claude-sonnet-5",
+      max_tokens: 2000,
+      messages: [{ role: "user", content: prompt }],
+      tools: [{ name: "submit_structured_profile", input_schema: STRUCTURED_PROFILE_JSON_SCHEMA }],
+      tool_choice: { type: "tool", name: "submit_structured_profile" },
+    }),
+  });
+  if (!res.ok) throw new Error(`anthropic_error_${res.status}`);
+  const data = (await res.json()) as { content: { type: string; input?: StructuredProfile }[] };
+  const toolUse = data.content.find((block) => block.type === "tool_use");
+  if (!toolUse?.input) throw new Error("anthropic_no_structured_output");
+  return toolUse.input;
+}
+
+async function callOpenAIStructured(env: Env, prompt: string): Promise<StructuredProfile> {
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: env.OPENAI_MODEL || "gpt-4o",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Respond with a single JSON object only, matching this shape: " +
+            "{headline: string, narrative_summary: string, education: [{school, degree, field, start_year, end_year}], " +
+            "experience: [{company, title, start, end, highlights: string[]}], skills: string[]}. No prose outside the JSON.",
+        },
+        { role: "user", content: prompt },
+      ],
+    }),
+  });
+  if (!res.ok) throw new Error(`openai_error_${res.status}`);
+  const data = (await res.json()) as { choices: { message: { content: string } }[] };
+  const raw = data.choices[0]?.message?.content ?? "{}";
+  return JSON.parse(raw) as StructuredProfile;
+}
+
 async function generateProfile(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -518,9 +636,9 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
 
   const profileId = await getOrCreateProfileId(env);
-  const profile = await env.DB.prepare("SELECT summary FROM candidate_profiles WHERE id = ?")
+  const profile = await env.DB.prepare("SELECT structured_json FROM candidate_profiles WHERE id = ?")
     .bind(profileId)
-    .first<{ summary: string }>();
+    .first<{ structured_json: string }>();
   const notes = await env.DB.prepare(
     "SELECT claim FROM candidate_evidence WHERE profile_id = ? AND category = 'note' ORDER BY created_at ASC",
   )
@@ -534,24 +652,26 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
     .all<{ original_name: string; extracted_text: string }>();
 
   const sourceParts: string[] = [];
-  if (profile?.summary) sourceParts.push(`Existing summary:\n${profile.summary}`);
+  const existingStructured = readStructuredProfile(profile?.structured_json ?? "{}");
+  if (existingStructured) sourceParts.push(`Existing structured profile:\n${JSON.stringify(existingStructured)}`);
   for (const note of notes.results) sourceParts.push(`Note: ${note.claim}`);
   for (const doc of docs.results) sourceParts.push(`Document "${doc.original_name}":\n${doc.extracted_text.slice(0, 8000)}`);
 
   if (sourceParts.length === 0) return json({ error: "no_source_material" }, 400);
 
   const prompt = [
-    "You are helping a job candidate build an honest, long-form professional profile from their own source material.",
-    "Write a well-organized narrative profile (not just a resume rehash) covering background, skills, accomplishments, and goals,",
-    "based only on the material below. Do not invent facts that are not present in the source material.",
+    "You are helping a job candidate build a structured professional profile from their own source material:",
+    "education history, work experience with highlights, skills, a headline, and a short narrative summary.",
+    "Base this only on the material below. Do not invent schools, employers, dates, or accomplishments that are",
+    "not present in the source material. Leave a field empty rather than guessing.",
     "",
     "Source material:",
     ...sourceParts,
   ].join("\n\n");
 
   try {
-    const draft = provider === "openai" ? await callOpenAI(env, prompt) : await callAnthropic(env, prompt);
-    return json({ provider, draft_summary: draft });
+    const draft = provider === "openai" ? await callOpenAIStructured(env, prompt) : await callAnthropicStructured(env, prompt);
+    return json({ provider, draft_structured: draft });
   } catch (err) {
     return json({ error: "generation_failed", detail: (err as Error).message }, 502);
   }
@@ -687,7 +807,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     padding-bottom: 3rem;
     line-height: 1.5;
   }
-  .shell { max-width: 40rem; margin: 0 auto; padding: 0 1.1rem; }
+  .shell { max-width: 68rem; margin: 0 auto; padding: 0 1.1rem; }
   header {
     display: flex; align-items: center; justify-content: space-between;
     padding: 1.1rem 0; gap: 0.75rem;
@@ -734,6 +854,16 @@ const DASHBOARD_PAGE = `<!doctype html>
   .row-meta { font-size: 0.85rem; color: var(--text-muted); }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
   .empty { color: var(--text-muted); font-size: 0.9rem; }
+  .split { display: grid; grid-template-columns: 1fr; gap: 1.1rem; align-items: start; }
+  @media (min-width: 760px) {
+    .split { grid-template-columns: 1fr 1fr; }
+    .split-sticky { position: sticky; top: 1rem; }
+  }
+  .collapsible-text { cursor: pointer; }
+  h3.subhead { font-size: 0.85rem; margin: 1.1rem 0 0.4rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; }
+  .skills-list { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.3rem; }
+  .skill-pill { background: var(--bg); border: 1px solid var(--border); border-radius: 999px; padding: 0.2rem 0.65rem; font-size: 0.85rem; }
+  hr.divider { border: none; border-top: 1px solid var(--border); margin: 1.25rem 0; }
 </style>
 </head>
 <body>
@@ -757,86 +887,98 @@ const DASHBOARD_PAGE = `<!doctype html>
   </nav>
 
   <div id="panel-roles" class="panel active">
-    <section id="role-signals-section">
-      <h2>What are you looking for?</h2>
-      <p class="hint">Paste job links, or write loosely about what you want next. The more you add, the better the generated description.</p>
-      <div id="role-signals-list"><p class="empty">Loading…</p></div>
-      <form id="role-signal-form">
-        <label for="role-signal-text">Add a note or link</label>
-        <textarea id="role-signal-text" required placeholder="e.g. a link to a posting, or 'I want senior IC roles in applied AI, remote-friendly, not pure infra'"></textarea>
-        <button type="submit">Add</button>
-      </form>
-      <p id="role-signal-status" class="status" role="status" aria-live="polite"></p>
-    </section>
-
-    <section id="desired-roles-section">
-      <h2>Generated description</h2>
-      <label for="desired-roles-provider">Generate using</label>
-      <select id="desired-roles-provider">
-        <option value="anthropic">Anthropic (Claude)</option>
-        <option value="openai">OpenAI</option>
-      </select>
-      <button id="desired-roles-generate-button" class="secondary" type="button">Generate description</button>
-      <p id="desired-roles-generate-status" class="status" role="status" aria-live="polite"></p>
-      <div id="desired-roles-draft-block" style="display:none">
-        <label for="desired-roles-draft">Draft (review, then use or discard)</label>
-        <textarea id="desired-roles-draft" readonly style="min-height:8rem"></textarea>
-        <button id="desired-roles-use-draft" type="button">Use this draft</button>
+    <div class="split">
+      <div>
+        <section id="role-signals-section">
+          <h2>What are you looking for?</h2>
+          <p class="hint">Paste job links, or write loosely about what you want next. The more you add, the better the generated description.</p>
+          <div id="role-signals-list"><p class="empty">Loading…</p></div>
+          <form id="role-signal-form">
+            <label for="role-signal-text">Add a note or link</label>
+            <textarea id="role-signal-text" required placeholder="e.g. a link to a posting, or 'I want senior IC roles in applied AI, remote-friendly, not pure infra'"></textarea>
+            <button type="submit">Add</button>
+          </form>
+          <p id="role-signal-status" class="status" role="status" aria-live="polite"></p>
+        </section>
       </div>
-      <label for="desired-roles-description">Saved description</label>
-      <textarea id="desired-roles-description" style="min-height:8rem" placeholder="What roles are you targeting?"></textarea>
-      <button id="desired-roles-save-button" type="button">Save</button>
-      <p id="desired-roles-save-status" class="status" role="status" aria-live="polite"></p>
-    </section>
+      <div class="split-sticky">
+        <section id="desired-roles-section">
+          <h2>Generated description</h2>
+          <label for="desired-roles-provider">Generate using</label>
+          <select id="desired-roles-provider">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI</option>
+          </select>
+          <button id="desired-roles-generate-button" class="secondary" type="button">Generate description</button>
+          <p id="desired-roles-generate-status" class="status" role="status" aria-live="polite"></p>
+          <div id="desired-roles-draft-block" style="display:none">
+            <label for="desired-roles-draft">Draft (review, then use or discard)</label>
+            <textarea id="desired-roles-draft" readonly style="min-height:8rem"></textarea>
+            <button id="desired-roles-use-draft" type="button">Use this draft</button>
+          </div>
+          <label for="desired-roles-description">Saved description</label>
+          <textarea id="desired-roles-description" style="min-height:8rem" placeholder="What roles are you targeting?"></textarea>
+          <button id="desired-roles-save-button" type="button">Save</button>
+          <p id="desired-roles-save-status" class="status" role="status" aria-live="polite"></p>
+        </section>
+      </div>
+    </div>
   </div>
 
   <div id="panel-profile" class="panel">
-    <section id="profile-section">
-      <h2>Profile</h2>
-      <form id="profile-form">
-        <label for="profile-label">Name / label</label>
-        <input id="profile-label" required placeholder="e.g. Jason Sheinkopf">
-        <label for="profile-summary">Summary</label>
-        <textarea id="profile-summary" placeholder="Short professional summary"></textarea>
-        <button type="submit">Save profile</button>
-      </form>
-      <p id="profile-status" class="status" role="status" aria-live="polite"></p>
+    <div class="split">
+      <div>
+        <section id="material-section">
+          <h2>Your material</h2>
+          <p class="hint">Upload files or add notes — this feeds the structured profile on the right.</p>
+          <label for="profile-label">Name</label>
+          <input id="profile-label" required placeholder="e.g. Jason Sheinkopf">
+          <button id="save-name-button" class="secondary" type="button">Save name</button>
+          <p id="profile-status" class="status" role="status" aria-live="polite"></p>
 
-      <label for="generate-provider">Generate from documents &amp; notes using</label>
-      <select id="generate-provider">
-        <option value="anthropic">Anthropic (Claude)</option>
-        <option value="openai">OpenAI</option>
-      </select>
-      <button id="generate-button" class="secondary" type="button">Generate profile</button>
-      <p id="generate-status" class="status" role="status" aria-live="polite"></p>
-      <div id="draft-block" style="display:none">
-        <label for="draft-summary">Draft (review, then use or discard)</label>
-        <textarea id="draft-summary" readonly style="min-height:8rem"></textarea>
-        <button id="use-draft" type="button">Use this draft</button>
+          <hr class="divider">
+
+          <h3 class="subhead">Documents</h3>
+          <div id="documents-list"><p class="empty">Loading…</p></div>
+          <form id="document-form">
+            <label for="document-file">Upload resume or notes file (PDF, plain text, or Markdown)</label>
+            <input id="document-file" type="file" accept=".pdf,.txt,.md,application/pdf,text/plain,text/markdown" required>
+            <button type="submit">Upload</button>
+          </form>
+          <p id="document-status" class="status" role="status" aria-live="polite"></p>
+
+          <hr class="divider">
+
+          <h3 class="subhead">Notes about yourself</h3>
+          <div id="notes-list"><p class="empty">Loading…</p></div>
+          <form id="note-form">
+            <label for="note-text">Add unstructured text (accomplishments, goals, background — anything)</label>
+            <textarea id="note-text" required placeholder="Write freely; this feeds the profile generator"></textarea>
+            <button type="submit">Add note</button>
+          </form>
+          <p id="note-status" class="status" role="status" aria-live="polite"></p>
+        </section>
       </div>
-    </section>
-
-    <section id="documents-section">
-      <h2>Documents</h2>
-      <div id="documents-list"><p class="empty">Loading…</p></div>
-      <form id="document-form">
-        <label for="document-file">Upload resume or notes file (PDF, plain text, or Markdown)</label>
-        <input id="document-file" type="file" accept=".pdf,.txt,.md,application/pdf,text/plain,text/markdown" required>
-        <button type="submit">Upload</button>
-      </form>
-      <p id="document-status" class="status" role="status" aria-live="polite"></p>
-    </section>
-
-    <section id="notes-section">
-      <h2>Notes about yourself</h2>
-      <div id="notes-list"><p class="empty">Loading…</p></div>
-      <form id="note-form">
-        <label for="note-text">Add unstructured text (accomplishments, goals, background — anything)</label>
-        <textarea id="note-text" required placeholder="Write freely; this feeds the profile generator"></textarea>
-        <button type="submit">Add note</button>
-      </form>
-      <p id="note-status" class="status" role="status" aria-live="polite"></p>
-    </section>
+      <div class="split-sticky">
+        <section id="structured-profile-section">
+          <h2>Your structured profile</h2>
+          <label for="generate-provider">Generate from documents &amp; notes using</label>
+          <select id="generate-provider">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI</option>
+          </select>
+          <button id="generate-button" type="button">Generate structured profile</button>
+          <p id="generate-status" class="status" role="status" aria-live="polite"></p>
+          <div id="structured-draft-block" style="display:none">
+            <h3 class="subhead">Draft — review, then save or discard</h3>
+            <div id="structured-draft-view"></div>
+            <button id="use-structured-draft" type="button">Save this</button>
+            <button id="discard-structured-draft" class="secondary" type="button">Discard</button>
+          </div>
+          <div id="structured-profile-view"><p class="empty">No structured profile yet — add material on the left and generate.</p></div>
+        </section>
+      </div>
+    </div>
   </div>
 
   <div id="panel-jobs" class="panel">
@@ -902,36 +1044,91 @@ const DASHBOARD_PAGE = `<!doctype html>
       var data = await res.json();
       if (data.profile) {
         document.getElementById('profile-label').value = data.profile.label || '';
-        document.getElementById('profile-summary').value = data.profile.summary || '';
         document.getElementById('desired-roles-description').value = data.profile.desired_roles || '';
+        renderStructuredProfileView('structured-profile-view', data.profile.structured);
       }
     }
 
-    function renderRoleSignals(signals) {
-      var list = document.getElementById('role-signals-list');
+    // Renders a list where each item shows one line, click to expand/collapse the full text.
+    function renderCollapsibleList(listId, items, emptyText, getText, onDelete) {
+      var list = document.getElementById(listId);
       list.innerHTML = '';
-      if (!signals.length) {
-        list.appendChild(el('p', { className: 'empty', textContent: 'Nothing added yet.' }));
+      if (!items.length) {
+        list.appendChild(el('p', { className: 'empty', textContent: emptyText }));
         return;
       }
-      signals.forEach(function (signal) {
-        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
-        del.addEventListener('click', async function () {
-          await api('/role-signals/' + encodeURIComponent(signal.id), { method: 'DELETE' });
-          loadRoleSignals();
+      items.forEach(function (item) {
+        var full = getText(item);
+        var oneLine = full.length > 72 ? full.slice(0, 72) + '…' : full;
+        var expanded = false;
+        var textEl = el('div', { className: 'collapsible-text', textContent: oneLine });
+        textEl.addEventListener('click', function () {
+          expanded = !expanded;
+          textEl.textContent = expanded ? full : oneLine;
         });
-        var row = el('div', { className: 'row' }, [
-          el('div', { textContent: signal.claim }),
-          del,
-        ]);
+        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        del.addEventListener('click', async function (event) {
+          event.stopPropagation();
+          await onDelete(item);
+        });
+        var row = el('div', { className: 'row' }, [textEl, del]);
         list.appendChild(el('div', { className: 'row-item' }, [row]));
       });
+    }
+
+    function renderStructuredProfileView(containerId, structured) {
+      var container = document.getElementById(containerId);
+      container.innerHTML = '';
+      var hasContent = structured && (
+        structured.headline || structured.narrative_summary ||
+        (structured.education && structured.education.length) ||
+        (structured.experience && structured.experience.length) ||
+        (structured.skills && structured.skills.length)
+      );
+      if (!hasContent) {
+        container.appendChild(el('p', { className: 'empty', textContent: 'No structured profile yet — add material on the left and generate.' }));
+        return;
+      }
+      if (structured.headline) container.appendChild(el('div', { className: 'row-title', textContent: structured.headline }));
+      if (structured.narrative_summary) container.appendChild(el('p', { textContent: structured.narrative_summary }));
+      if (structured.education && structured.education.length) {
+        container.appendChild(el('h3', { className: 'subhead', textContent: 'Education' }));
+        structured.education.forEach(function (item) {
+          var line = [item.degree, item.field].filter(Boolean).join(' in ');
+          var years = [item.start_year, item.end_year].filter(Boolean).join('–');
+          container.appendChild(el('div', { className: 'row-item', textContent: [line, item.school, years].filter(Boolean).join(' · ') }));
+        });
+      }
+      if (structured.experience && structured.experience.length) {
+        container.appendChild(el('h3', { className: 'subhead', textContent: 'Experience' }));
+        structured.experience.forEach(function (item) {
+          var years = [item.start, item.end].filter(Boolean).join('–');
+          var block = el('div', { className: 'row-item' }, [
+            el('div', { className: 'row-title', textContent: [item.title, item.company].filter(Boolean).join(' — ') + (years ? ' (' + years + ')' : '') }),
+          ]);
+          (item.highlights || []).forEach(function (h) {
+            block.appendChild(el('div', { className: 'row-meta', textContent: '• ' + h }));
+          });
+          container.appendChild(block);
+        });
+      }
+      if (structured.skills && structured.skills.length) {
+        container.appendChild(el('h3', { className: 'subhead', textContent: 'Skills' }));
+        var pills = el('div', { className: 'skills-list' });
+        structured.skills.forEach(function (skill) {
+          pills.appendChild(el('span', { className: 'skill-pill', textContent: skill }));
+        });
+        container.appendChild(pills);
+      }
     }
 
     async function loadRoleSignals() {
       var res = await api('/role-signals');
       var data = await res.json();
-      renderRoleSignals(data.role_signals);
+      renderCollapsibleList('role-signals-list', data.role_signals, 'Nothing added yet.', function (s) { return s.claim; }, async function (s) {
+        await api('/role-signals/' + encodeURIComponent(s.id), { method: 'DELETE' });
+        loadRoleSignals();
+      });
     }
 
     document.getElementById('role-signal-form').addEventListener('submit', async function (event) {
@@ -1006,8 +1203,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
-    document.getElementById('profile-form').addEventListener('submit', async function (event) {
-      event.preventDefault();
+    document.getElementById('save-name-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('profile-status');
       statusEl.textContent = 'Saving…';
       statusEl.className = 'status';
@@ -1015,10 +1211,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         var res = await api('/profile', {
           method: 'PUT',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            label: document.getElementById('profile-label').value,
-            summary: document.getElementById('profile-summary').value,
-          }),
+          body: JSON.stringify({ label: document.getElementById('profile-label').value }),
         });
         if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
         statusEl.textContent = 'Saved.';
@@ -1029,9 +1222,11 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
+    var latestStructuredDraft = null;
+
     document.getElementById('generate-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('generate-status');
-      var draftBlock = document.getElementById('draft-block');
+      var draftBlock = document.getElementById('structured-draft-block');
       statusEl.textContent = 'Generating… this can take a little while.';
       statusEl.className = 'status';
       draftBlock.style.display = 'none';
@@ -1043,9 +1238,10 @@ const DASHBOARD_PAGE = `<!doctype html>
         });
         var data = await res.json();
         if (!res.ok) throw new Error(data.error || 'generation_failed');
-        document.getElementById('draft-summary').value = data.draft_summary;
+        latestStructuredDraft = data.draft_structured;
+        renderStructuredProfileView('structured-draft-view', latestStructuredDraft);
         draftBlock.style.display = 'block';
-        statusEl.textContent = 'Draft ready below. Review before using it.';
+        statusEl.textContent = 'Draft ready below. Review before saving it.';
         statusEl.className = 'status success';
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
@@ -1053,10 +1249,30 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
-    document.getElementById('use-draft').addEventListener('click', function () {
-      document.getElementById('profile-summary').value = document.getElementById('draft-summary').value;
-      document.getElementById('draft-block').style.display = 'none';
-      document.getElementById('generate-status').textContent = 'Draft copied into Summary above — click Save profile to keep it.';
+    document.getElementById('use-structured-draft').addEventListener('click', async function () {
+      var statusEl = document.getElementById('generate-status');
+      if (!latestStructuredDraft) return;
+      try {
+        var res = await api('/profile/structured', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ structured: latestStructuredDraft }),
+        });
+        if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
+        document.getElementById('structured-draft-block').style.display = 'none';
+        renderStructuredProfileView('structured-profile-view', latestStructuredDraft);
+        statusEl.textContent = 'Saved.';
+        statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    document.getElementById('discard-structured-draft').addEventListener('click', function () {
+      latestStructuredDraft = null;
+      document.getElementById('structured-draft-block').style.display = 'none';
+      document.getElementById('generate-status').textContent = 'Discarded.';
     });
 
     function renderDocuments(docs) {
@@ -1124,31 +1340,13 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
-    function renderNotes(notes) {
-      var list = document.getElementById('notes-list');
-      list.innerHTML = '';
-      if (!notes.length) {
-        list.appendChild(el('p', { className: 'empty', textContent: 'No notes yet.' }));
-        return;
-      }
-      notes.forEach(function (note) {
-        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
-        del.addEventListener('click', async function () {
-          await api('/notes/' + encodeURIComponent(note.id), { method: 'DELETE' });
-          loadNotes();
-        });
-        var row = el('div', { className: 'row' }, [
-          el('div', { textContent: note.claim }),
-          del,
-        ]);
-        list.appendChild(el('div', { className: 'row-item' }, [row]));
-      });
-    }
-
     async function loadNotes() {
       var res = await api('/notes');
       var data = await res.json();
-      renderNotes(data.notes);
+      renderCollapsibleList('notes-list', data.notes, 'No notes yet.', function (n) { return n.claim; }, async function (n) {
+        await api('/notes/' + encodeURIComponent(n.id), { method: 'DELETE' });
+        loadNotes();
+      });
     }
 
     document.getElementById('note-form').addEventListener('submit', async function (event) {
@@ -1299,6 +1497,7 @@ export default {
     }
     if (request.method === "GET" && url.pathname === "/profile") return getProfile(request, env);
     if (request.method === "PUT" && url.pathname === "/profile") return upsertProfile(request, env);
+    if (request.method === "PUT" && url.pathname === "/profile/structured") return saveStructuredProfile(request, env);
     if (request.method === "GET" && url.pathname === "/jobs") return listJobs(request, env);
     if (request.method === "POST" && url.pathname === "/jobs") return createJob(request, env);
     const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
