@@ -184,6 +184,37 @@ function readStructuredProfile(structuredJson: string): StructuredProfile | null
   }
 }
 
+// Deterministic safety net on top of prompting: even if the model doesn't perfectly follow
+// "don't drop entries," any old education/experience entry whose key doesn't reappear in the
+// new output is re-added, so regenerating can only add or correct, never silently lose data.
+function mergeStructuredProfiles(existing: StructuredProfile | null, incoming: StructuredProfile): StructuredProfile {
+  if (!existing) return incoming;
+  function mergeByKey<T>(oldList: T[], newList: T[], keyFn: (item: T) => string): T[] {
+    const newKeys = new Set((newList ?? []).map(keyFn));
+    const preserved = (oldList ?? []).filter((item) => !newKeys.has(keyFn(item)));
+    return [...(newList ?? []), ...preserved];
+  }
+  function mergeSkills(oldSkills: string[], newSkills: string[]): string[] {
+    const seen = new Set<string>();
+    const merged: string[] = [];
+    for (const skill of [...(newSkills ?? []), ...(oldSkills ?? [])]) {
+      const key = skill.trim().toLowerCase();
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        merged.push(skill.trim());
+      }
+    }
+    return merged;
+  }
+  return {
+    headline: incoming.headline || existing.headline,
+    narrative_summary: incoming.narrative_summary || existing.narrative_summary,
+    education: mergeByKey(existing.education, incoming.education, (e) => `${e.school}|${e.degree}`.toLowerCase()),
+    experience: mergeByKey(existing.experience, incoming.experience, (e) => `${e.company}|${e.title}`.toLowerCase()),
+    skills: mergeSkills(existing.skills, incoming.skills),
+  };
+}
+
 async function getProfile(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -449,6 +480,22 @@ async function renameDocument(request: Request, env: Env, id: string): Promise<R
   return json({ id, original_name: name });
 }
 
+async function getDocumentFile(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const doc = await env.DB.prepare("SELECT r2_key, media_type, original_name FROM source_documents WHERE id = ?")
+    .bind(id)
+    .first<{ r2_key: string; media_type: string; original_name: string }>();
+  if (!doc) return json({ error: "not_found" }, 404);
+  const object = await env.FILES.get(doc.r2_key);
+  if (!object) return json({ error: "not_found" }, 404);
+  const headers = new Headers();
+  headers.set("content-type", doc.media_type);
+  headers.set("content-disposition", `inline; filename="${doc.original_name.replace(/["\r\n]/g, "")}"`);
+  headers.set("cache-control", "private, no-store");
+  return new Response(object.body, { headers });
+}
+
 async function deleteDocument(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -652,25 +699,33 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
     .all<{ original_name: string; extracted_text: string }>();
 
   const sourceParts: string[] = [];
-  const existingStructured = readStructuredProfile(profile?.structured_json ?? "{}");
-  if (existingStructured) sourceParts.push(`Existing structured profile:\n${JSON.stringify(existingStructured)}`);
   for (const note of notes.results) sourceParts.push(`Note: ${note.claim}`);
   for (const doc of docs.results) sourceParts.push(`Document "${doc.original_name}":\n${doc.extracted_text.slice(0, 8000)}`);
 
   if (sourceParts.length === 0) return json({ error: "no_source_material" }, 400);
 
+  const existingStructured = readStructuredProfile(profile?.structured_json ?? "{}");
   const prompt = [
-    "You are helping a job candidate build a structured professional profile from their own source material:",
-    "education history, work experience with highlights, skills, a headline, and a short narrative summary.",
-    "Base this only on the material below. Do not invent schools, employers, dates, or accomplishments that are",
-    "not present in the source material. Leave a field empty rather than guessing.",
+    "You are updating a job candidate's structured professional profile: education history, work experience with",
+    "highlights, skills, a headline, and a short narrative summary.",
+    existingStructured
+      ? "This candidate already has a profile (given below as 'Current profile'). Treat it as the baseline: " +
+        "keep every education and experience entry from it that the new material below does not contradict, even " +
+        "if the new material doesn't happen to repeat it. Only change a specific field, or add a new entry, when " +
+        "the new material below adds information or directly conflicts with what's already there. Never silently " +
+        "drop an entry just because it isn't mentioned again."
+      : "Base this on the material below.",
+    "Do not invent schools, employers, dates, or accomplishments that are not present in the current profile or",
+    "the new material. Leave a field empty rather than guessing.",
     "",
-    "Source material:",
+    ...(existingStructured ? [`Current profile:\n${JSON.stringify(existingStructured)}`, ""] : []),
+    "New material:",
     ...sourceParts,
   ].join("\n\n");
 
   try {
-    const draft = provider === "openai" ? await callOpenAIStructured(env, prompt) : await callAnthropicStructured(env, prompt);
+    const raw = provider === "openai" ? await callOpenAIStructured(env, prompt) : await callAnthropicStructured(env, prompt);
+    const draft = mergeStructuredProfiles(existingStructured, raw);
     return json({ provider, draft_structured: draft });
   } catch (err) {
     return json({ error: "generation_failed", detail: (err as Error).message }, 502);
@@ -851,6 +906,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   .row-item { padding: 0.75rem 0; border-top: 1px solid var(--border); }
   .row-item:first-child { border-top: none; padding-top: 0; }
   .row-title { font-weight: 600; }
+  a.row-title { color: inherit; text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 0.15em; }
   .row-meta { font-size: 0.85rem; color: var(--text-muted); }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
   .empty { color: var(--text-muted); font-size: 0.9rem; }
@@ -1300,9 +1356,17 @@ const DASHBOARD_PAGE = `<!doctype html>
           loadDocuments();
         });
         var meta = doc.media_type + (doc.has_text ? '' : ' — text not extracted, paste content as a note instead');
+        var preview = el('a', {
+          className: 'row-title',
+          href: '/documents/' + encodeURIComponent(doc.id) + '/file',
+          target: '_blank',
+          rel: 'noopener',
+          textContent: doc.original_name,
+        });
+        preview.style.display = 'block';
         var row = el('div', { className: 'row' }, [
           el('div', {}, [
-            el('div', { className: 'row-title', textContent: doc.original_name }),
+            preview,
             el('div', { className: 'row-meta', textContent: meta }),
           ]),
           el('div', {}, [rename, del]),
@@ -1504,6 +1568,8 @@ export default {
     if (request.method === "DELETE" && jobMatch) return deleteJob(request, env, jobMatch[1]);
     if (request.method === "GET" && url.pathname === "/documents") return listDocuments(request, env);
     if (request.method === "POST" && url.pathname === "/documents") return uploadDocument(request, env);
+    const documentFileMatch = url.pathname.match(/^\/documents\/([^/]+)\/file$/);
+    if (request.method === "GET" && documentFileMatch) return getDocumentFile(request, env, documentFileMatch[1]);
     const documentMatch = url.pathname.match(/^\/documents\/([^/]+)$/);
     if (request.method === "PATCH" && documentMatch) return renameDocument(request, env, documentMatch[1]);
     if (request.method === "DELETE" && documentMatch) return deleteDocument(request, env, documentMatch[1]);
