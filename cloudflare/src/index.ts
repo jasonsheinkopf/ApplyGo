@@ -487,13 +487,22 @@ async function getDocumentFile(request: Request, env: Env, id: string): Promise<
     .bind(id)
     .first<{ r2_key: string; media_type: string; original_name: string }>();
   if (!doc) return json({ error: "not_found" }, 404);
-  const object = await env.FILES.get(doc.r2_key);
+  // PDF viewers (Adobe's plugin especially) fetch large files in chunks via Range requests;
+  // without honoring those and replying 206/Content-Range, some viewers fail to load entirely.
+  const object = await env.FILES.get(doc.r2_key, { range: request.headers });
   if (!object) return json({ error: "not_found" }, 404);
   const headers = new Headers();
+  object.writeHttpMetadata(headers);
   headers.set("content-type", doc.media_type);
   headers.set("content-disposition", `inline; filename="${doc.original_name.replace(/["\r\n]/g, "")}"`);
   headers.set("cache-control", "private, no-store");
-  return new Response(object.body, { headers });
+  headers.set("etag", object.httpEtag);
+  headers.set("accept-ranges", "bytes");
+  if (object.range && "offset" in object.range && "end" in object.range) {
+    headers.set("content-range", `bytes ${object.range.offset}-${object.range.end}/${object.size}`);
+  }
+  const status = request.headers.get("range") !== null ? 206 : 200;
+  return new Response(object.body, { headers, status });
 }
 
 async function deleteDocument(request: Request, env: Env, id: string): Promise<Response> {
@@ -1540,13 +1549,18 @@ function dashboardPage(): Response {
 async function downloadArtifact(request: Request, env: Env, key: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const object = await env.FILES.get(key);
+  const object = await env.FILES.get(key, { range: request.headers });
   if (!object) return json({ error: "not_found" }, 404);
   const headers = new Headers();
   object.writeHttpMetadata(headers);
   headers.set("etag", object.httpEtag);
   headers.set("cache-control", "private, no-store");
-  return new Response(object.body, { headers });
+  headers.set("accept-ranges", "bytes");
+  if (object.range && "offset" in object.range && "end" in object.range) {
+    headers.set("content-range", `bytes ${object.range.offset}-${object.range.end}/${object.size}`);
+  }
+  const status = request.headers.get("range") !== null ? 206 : 200;
+  return new Response(object.body, { headers, status });
 }
 
 export default {
