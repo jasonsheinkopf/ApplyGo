@@ -13,7 +13,8 @@
     "migrate:local": "wrangler d1 migrations apply applygo --local --env=\"\"",
     "migrate:remote": "wrangler d1 migrations apply applygo --remote --env=\"\"",
     "migrate:remote:production": "wrangler d1 migrations apply applygo-prod-db --remote --env production",
-    "release:production": "npm run migrate:remote:production && npm run deploy:production"
+    "release:production": "npm run migrate:remote:production && npm run deploy:production",
+    "enroll": "node scripts/create-enrollment.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "latest",

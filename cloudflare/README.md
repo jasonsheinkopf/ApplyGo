@@ -96,18 +96,27 @@ A push to `main` that touches those paths automatically builds, applies pending 
 
 ## Enroll a phone or computer
 
-1. From a trusted terminal, create a short-lived one-time code (requires the `SETUP_SECRET` value, never exposed to the browser):
+**From a machine with Wrangler logged in** (`npx wrangler login`, once per machine — real Cloudflare OAuth, no token needed): create a short-lived one-time code directly in D1, no `SETUP_SECRET` required:
 
-   ```bash
-   curl -X POST "https://applygo-prod.jasonsheinkopf.workers.dev/admin/enrollments" \
-     -H "content-type: application/json" \
-     -H "x-applygo-setup-secret: YOUR_SETUP_SECRET" \
-     -d '{"label":"Jason iPhone","minutes":15}'
-   ```
+```bash
+cd cloudflare
+npm run enroll -- "Jason's Laptop" 15
+```
 
-2. On the device itself, open `https://applygo-prod.jasonsheinkopf.workers.dev/enroll` in the browser and enter the code and a device name. This minimal page posts directly to `/auth/enroll`, receives the `Secure`, `HttpOnly`, `SameSite=Strict` session cookie, and verifies the session via `/me` — the code and session are never written to `localStorage` or exposed to any script beyond that one POST.
+This prints a one-time code. On the device you're enrolling, open `https://applygo-prod.jasonsheinkopf.workers.dev/enroll`, enter the code and a device name. The page posts directly to `/auth/enroll`, receives the `Secure`, `HttpOnly`, `SameSite=Strict` session cookie, and verifies the session via `/me` — the code and session are never written to `localStorage` or exposed to any script beyond that one POST.
 
-The enrollment code is single-use and expires (default 15 minutes, max 60). It cannot be exchanged again after use or after expiry.
+**Alternative, without a local dev environment**: the `POST /admin/enrollments` endpoint does the same thing over HTTP, gated by the `SETUP_SECRET` Worker secret instead of a Wrangler login:
+
+```bash
+curl -X POST "https://applygo-prod.jasonsheinkopf.workers.dev/admin/enrollments" \
+  -H "content-type: application/json" \
+  -H "x-applygo-setup-secret: YOUR_SETUP_SECRET" \
+  -d '{"label":"Jason iPhone","minutes":15}'
+```
+
+`SETUP_SECRET` was set with a randomly generated value that was never displayed or recorded anywhere (`openssl rand -base64 32 | wrangler secret put SETUP_SECRET --env production`), so this path isn't usable until you rotate it yourself (`wrangler secret put SETUP_SECRET --env production`, this time actually keeping the value somewhere safe if you want to use this endpoint).
+
+Either way, the enrollment code is single-use and expires (default/max above, 15 and 60 minutes respectively for `npm run enroll`). It cannot be exchanged again after use or after expiry.
 
 ## Dashboard
 
