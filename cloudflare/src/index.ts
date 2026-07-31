@@ -823,13 +823,13 @@ async function renderAndStoreResumePdf(env: Env, resumeId: string, html: string)
   try {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "networkidle0" });
-    const pdfStream = await page.createPDFStream({
+    const pdf = await page.pdf({
       format: "letter",
       printBackground: true,
       margin: { top: "0in", bottom: "0in", left: "0in", right: "0in" },
     });
     const key = `resumes/${resumeId}.pdf`;
-    await env.FILES.put(key, pdfStream, { httpMetadata: { contentType: "application/pdf" } });
+    await env.FILES.put(key, pdf, { httpMetadata: { contentType: "application/pdf" } });
     return key;
   } finally {
     await browser.close();
