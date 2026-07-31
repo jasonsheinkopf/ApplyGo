@@ -449,6 +449,22 @@ async function renameDocument(request: Request, env: Env, id: string): Promise<R
   return json({ id, original_name: name });
 }
 
+async function getDocumentFile(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const doc = await env.DB.prepare("SELECT r2_key, media_type, original_name FROM source_documents WHERE id = ?")
+    .bind(id)
+    .first<{ r2_key: string; media_type: string; original_name: string }>();
+  if (!doc) return json({ error: "not_found" }, 404);
+  const object = await env.FILES.get(doc.r2_key);
+  if (!object) return json({ error: "not_found" }, 404);
+  const headers = new Headers();
+  headers.set("content-type", doc.media_type);
+  headers.set("content-disposition", `inline; filename="${doc.original_name.replace(/["\r\n]/g, "")}"`);
+  headers.set("cache-control", "private, no-store");
+  return new Response(object.body, { headers });
+}
+
 async function deleteDocument(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -851,6 +867,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   .row-item { padding: 0.75rem 0; border-top: 1px solid var(--border); }
   .row-item:first-child { border-top: none; padding-top: 0; }
   .row-title { font-weight: 600; }
+  a.row-title { color: inherit; text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 0.15em; }
   .row-meta { font-size: 0.85rem; color: var(--text-muted); }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
   .empty { color: var(--text-muted); font-size: 0.9rem; }
@@ -1300,9 +1317,17 @@ const DASHBOARD_PAGE = `<!doctype html>
           loadDocuments();
         });
         var meta = doc.media_type + (doc.has_text ? '' : ' — text not extracted, paste content as a note instead');
+        var preview = el('a', {
+          className: 'row-title',
+          href: '/documents/' + encodeURIComponent(doc.id) + '/file',
+          target: '_blank',
+          rel: 'noopener',
+          textContent: doc.original_name,
+        });
+        preview.style.display = 'block';
         var row = el('div', { className: 'row' }, [
           el('div', {}, [
-            el('div', { className: 'row-title', textContent: doc.original_name }),
+            preview,
             el('div', { className: 'row-meta', textContent: meta }),
           ]),
           el('div', {}, [rename, del]),
@@ -1504,6 +1529,8 @@ export default {
     if (request.method === "DELETE" && jobMatch) return deleteJob(request, env, jobMatch[1]);
     if (request.method === "GET" && url.pathname === "/documents") return listDocuments(request, env);
     if (request.method === "POST" && url.pathname === "/documents") return uploadDocument(request, env);
+    const documentFileMatch = url.pathname.match(/^\/documents\/([^/]+)\/file$/);
+    if (request.method === "GET" && documentFileMatch) return getDocumentFile(request, env, documentFileMatch[1]);
     const documentMatch = url.pathname.match(/^\/documents\/([^/]+)$/);
     if (request.method === "PATCH" && documentMatch) return renameDocument(request, env, documentMatch[1]);
     if (request.method === "DELETE" && documentMatch) return deleteDocument(request, env, documentMatch[1]);
