@@ -124,10 +124,19 @@ Either way, the enrollment code is single-use and expires (default/max above, 15
 
 Authenticated data endpoints backing the dashboard:
 
-- `GET /profile` / `PUT /profile` — single-profile model (`label`, `summary`); the first `candidate_profiles` row is created on first save and updated in place after that
+- `GET /profile` / `PUT /profile` — single-profile model (`label`, `summary`); the first `candidate_profiles` row is created on first use and updated in place after that
 - `GET /jobs` / `POST /jobs` / `DELETE /jobs/:id` — `job_postings` rows (`title`, `company`, `source_url`, `raw_description`)
+- `GET /documents` / `POST /documents` / `PATCH /documents/:id` / `DELETE /documents/:id` — `source_documents` rows backed by private R2 storage. Uploads accept PDF, plain text, or Markdown (15 MB limit, same as `/artifacts`). Text is only extracted automatically for `text/plain`/`text/markdown` — PDFs are stored but not parsed yet, so PDF content doesn't feed profile generation until you also paste it as a note.
+- `GET /notes` / `POST /notes` / `DELETE /notes/:id` — freeform `candidate_evidence` rows (`category = 'note'`) for unstructured facts about yourself, no file needed
+- `POST /profile/generate` — synthesizes a long-form narrative profile from the existing summary + all notes + any extracted document text, using either Anthropic or OpenAI (`{"provider": "anthropic" | "openai"}`). Returns a draft only; it is never auto-saved. The dashboard shows it for review and only writes it into `summary` once you click "Use this draft" and then "Save profile" — consistent with this project's human-supervised design (see `docs/product/progressive-autonomy.md`).
 
-This is a first slice, not the full local-Python product surface (job-fit assessment, evidence, resume generation aren't ported). See "Current boundary" below.
+Model provider configuration:
+
+- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` — Worker secrets (`wrangler secret put ANTHROPIC_API_KEY --env production`), not vars, not committed. `/profile/generate` returns `501` for a provider whose key isn't set.
+- `ANTHROPIC_MODEL` / `OPENAI_MODEL` — plain (non-secret) vars in `wrangler.jsonc`, defaulting to `claude-sonnet-5` and `gpt-4o`. Bump these here if a model id is retired.
+- **Ollama is intentionally not wired into the Worker.** It runs on a local machine with no public address, so Cloudflare's servers cannot call it directly. Using it from the phone dashboard would need a separate local-worker/queued-job component (per `docs/architecture/local-cloudflare-dual-mode.md`'s "optional local worker" and ADR-015's "queued" execution mode) — that's a distinct, larger piece of future work, not a config setting.
+
+This is a first slice, not the full local-Python product surface (job-fit *assessment against a specific posting*, evidence verification workflow, resume generation/versioning aren't ported). See "Current boundary" below.
 
 ## Device management
 
@@ -178,7 +187,7 @@ Hosted in Cloudflare today:
 - hashed session-token storage and remembered secure browser sessions
 - device listing and revocation
 - authenticated private artifact transfer (`/artifacts`)
-- a minimal phone-usable dashboard (`/`): profile edit, job posting list/add/remove
+- a minimal phone-usable dashboard (`/`): profile edit, job posting list/add/remove, document upload/rename/remove, freeform notes, and AI-generated profile drafts (Anthropic or OpenAI)
 
 Still local-Python-only (not ported to Cloudflare):
 
