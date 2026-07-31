@@ -35,6 +35,86 @@ export type ScannedJob = {
   description: string;
 };
 
+// ---------------------------------------------------------------------------
+// Location constraints
+// ---------------------------------------------------------------------------
+
+const US_STATES: Record<string, string> = {
+  al: "alabama", ak: "alaska", az: "arizona", ar: "arkansas", ca: "california", co: "colorado",
+  ct: "connecticut", de: "delaware", fl: "florida", ga: "georgia", hi: "hawaii", id: "idaho",
+  il: "illinois", in: "indiana", ia: "iowa", ks: "kansas", ky: "kentucky", la: "louisiana",
+  me: "maine", md: "maryland", ma: "massachusetts", mi: "michigan", mn: "minnesota",
+  ms: "mississippi", mo: "missouri", mt: "montana", ne: "nebraska", nv: "nevada",
+  nh: "new hampshire", nj: "new jersey", nm: "new mexico", ny: "new york", nc: "north carolina",
+  nd: "north dakota", oh: "ohio", ok: "oklahoma", or: "oregon", pa: "pennsylvania",
+  ri: "rhode island", sc: "south carolina", sd: "south dakota", tn: "tennessee", tx: "texas",
+  ut: "utah", vt: "vermont", va: "virginia", wa: "washington", wv: "west virginia",
+  wi: "wisconsin", wy: "wyoming", dc: "district of columbia",
+};
+
+// Metro shorthand people actually type, mapped to the terms a company location would use.
+const METRO_ALIASES: Record<string, string[]> = {
+  "bay area": ["california", "san francisco", "san jose", "palo alto", "mountain view", "sunnyvale", "oakland", "berkeley", "santa clara", "menlo park", "cupertino", "redwood city", "san mateo"],
+  "sf bay area": ["california", "san francisco", "san jose", "palo alto", "mountain view", "sunnyvale", "oakland", "santa clara", "menlo park", "cupertino"],
+  "silicon valley": ["california", "san jose", "palo alto", "mountain view", "sunnyvale", "santa clara", "cupertino", "menlo park"],
+  sf: ["san francisco", "california"],
+  socal: ["california", "los angeles", "san diego", "irvine", "pasadena", "santa monica"],
+  la: ["los angeles", "california"],
+  nyc: ["new york"],
+  "new york city": ["new york"],
+  "the city": ["san francisco"],
+  seattle: ["washington", "seattle", "bellevue", "redmond"],
+  boston: ["massachusetts", "boston", "cambridge"],
+  austin: ["texas", "austin"],
+};
+
+function normalizeLocationText(value: string): string {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/** Splits a free-text location preference into individual acceptable places. */
+export function parseLocationFilter(text: string): string[] {
+  return String(text ?? "")
+    .split(/[,;\n]|\bor\b|\band\b|\//gi)
+    .map((part) => normalizeLocationText(part))
+    .filter((part) => part.length > 1);
+}
+
+/** Every spelling of a place we should accept: the term itself, plus state and metro expansions. */
+function expandLocationTerm(term: string): string[] {
+  const out = new Set<string>([term]);
+  if (US_STATES[term]) out.add(US_STATES[term]);
+  for (const [abbr, full] of Object.entries(US_STATES)) {
+    if (full === term) out.add(abbr);
+  }
+  for (const alias of METRO_ALIASES[term] ?? []) out.add(alias);
+  return Array.from(out);
+}
+
+/**
+ * True when a company or posting sits in one of the requested places. Unconstrained and
+ * unknown locations pass -- an empty location field should not silently drop a real result --
+ * but a location that is stated and clearly elsewhere is rejected.
+ */
+export function locationMatches(location: string, terms: string[]): boolean {
+  if (!terms.length) return true;
+  const haystack = normalizeLocationText(location);
+  if (!haystack) return true;
+  if (/\b(remote|anywhere|distributed|global|worldwide)\b/.test(haystack)) return true;
+
+  for (const term of terms) {
+    for (const variant of expandLocationTerm(term)) {
+      // Two-letter state codes must match as whole words, or "ca" hits "chicago".
+      const pattern =
+        variant.length <= 2
+          ? new RegExp(`\\b${variant}\\b`)
+          : new RegExp(variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      if (pattern.test(haystack)) return true;
+    }
+  }
+  return false;
+}
+
 /** Collapses punctuation and legal suffixes so the same company isn't added twice. */
 export function companyNameKey(name: string): string {
   return String(name ?? "")
@@ -107,11 +187,23 @@ export async function proposeCompanies(
   existingNames: string[],
   count: number,
   focus: string,
+  locations: string,
 ): Promise<CompanyProposal[]> {
   const prompt = [
     "You are helping a candidate build a target list of companies to watch for openings.",
     `Propose ${count} companies that genuinely fit the profile and target roles below.`,
     "",
+    locations
+      ? [
+          "LOCATION REQUIREMENT -- this is a hard constraint, not a preference:",
+          `The candidate will only consider work in: ${locations}.`,
+          "Every company you propose must be headquartered there, or have a substantial office there.",
+          "Set `location` to that qualifying office, not to a headquarters somewhere else.",
+          "A company that does not qualify must be left out entirely, even if it is otherwise a",
+          "perfect fit. Returning fewer companies is correct; returning out-of-area ones is not.",
+          "",
+        ].join("\n")
+      : "",
     "Rules:",
     "- Real, currently operating companies only. If you are not confident a company still exists",
     "  under that name, leave it out.",
@@ -126,7 +218,9 @@ export async function proposeCompanies(
       ? `ALREADY ON THE LIST -- do not propose any of these again:\n${existingNames.join(", ")}`
       : "The list is currently empty.",
     "",
-    desiredRoles ? `TARGET ROLES:\n${desiredRoles}` : "TARGET ROLES: not specified; infer from the profile.",
+    desiredRoles
+      ? `TARGET ROLES (if these state a location or work arrangement, treat it as binding):\n${desiredRoles}`
+      : "TARGET ROLES: not specified; infer from the profile.",
     "",
     `CANDIDATE PROFILE:\n${profileJson}`,
   ]

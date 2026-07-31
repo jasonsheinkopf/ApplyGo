@@ -6,6 +6,8 @@ import {
   companyNameKey,
   fetchBoardJobs,
   filterJobsByRoles,
+  locationMatches,
+  parseLocationFilter,
   proposeCompanies,
   resolveBoard,
   verifyWebsite,
@@ -187,6 +189,14 @@ type Profile = {
   updated_at: string;
 };
 
+function readDesiredLocations(preferencesJson: string): string {
+  try {
+    return (JSON.parse(preferencesJson || "{}") as { desired_locations?: string }).desired_locations ?? "";
+  } catch {
+    return "";
+  }
+}
+
 function readDesiredRoles(preferencesJson: string): string {
   try {
     return (JSON.parse(preferencesJson || "{}") as { desired_roles?: string }).desired_roles ?? "";
@@ -248,6 +258,7 @@ async function getProfile(request: Request, env: Env): Promise<Response> {
     profile: {
       ...profile,
       desired_roles: readDesiredRoles(profile?.preferences_json ?? "{}"),
+      desired_locations: readDesiredLocations(profile?.preferences_json ?? "{}"),
       structured: readStructuredProfile(profile?.structured_json ?? "{}"),
     },
   });
@@ -273,8 +284,9 @@ async function saveStructuredProfile(request: Request, env: Env): Promise<Respon
 async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { desired_roles?: string };
+  const body = (await request.json().catch(() => ({}))) as { desired_roles?: string; desired_locations?: string };
   const desiredRoles = (body.desired_roles ?? "").trim();
+  const desiredLocations = (body.desired_locations ?? "").trim();
   const profileId = await getOrCreateProfileId(env);
   const existing = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
     .bind(profileId)
@@ -286,10 +298,11 @@ async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
     prefs = {};
   }
   prefs.desired_roles = desiredRoles;
+  prefs.desired_locations = desiredLocations;
   await env.DB.prepare("UPDATE candidate_profiles SET preferences_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
     .bind(JSON.stringify(prefs), profileId)
     .run();
-  return json({ desired_roles: desiredRoles });
+  return json({ desired_roles: desiredRoles, desired_locations: desiredLocations });
 }
 
 async function listRoleSignals(request: Request, env: Env): Promise<Response> {
@@ -417,7 +430,25 @@ async function listCompanies(request: Request, env: Env): Promise<Response> {
   )
     .bind(profileId)
     .first<{ n: number }>();
-  return json({ companies: rows.results, unscanned: pending?.n ?? 0 });
+
+  // Companies added before a location was set (or under a different one) get flagged rather than
+  // deleted, so tightening the filter never silently discards work.
+  const prefsRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  const desiredLocations = readDesiredLocations(prefsRow?.preferences_json ?? "{}");
+  const locationTerms = parseLocationFilter(desiredLocations);
+  const companies = (rows.results as Record<string, unknown>[]).map((row) => ({
+    ...row,
+    off_target: !locationMatches(String(row.location ?? ""), locationTerms),
+  }));
+
+  return json({
+    companies,
+    unscanned: pending?.n ?? 0,
+    desired_locations: desiredLocations,
+    off_target: companies.filter((c) => c.off_target).length,
+  });
 }
 
 async function addCompanyRow(
@@ -514,6 +545,9 @@ async function discoverCompanies(request: Request, env: Env): Promise<Response> 
     .all<{ name: string }>();
   const existingNames = (existing.results ?? []).map((r) => r.name);
 
+  const desiredLocations = readDesiredLocations(profileRow?.preferences_json ?? "{}");
+  const locationTerms = parseLocationFilter(desiredLocations);
+
   const count = Math.min(Math.max(Number(body.count) || 10, 1), 20);
   let proposals;
   try {
@@ -525,18 +559,24 @@ async function discoverCompanies(request: Request, env: Env): Promise<Response> 
       existingNames,
       count,
       (body.focus ?? "").trim(),
+      desiredLocations,
     );
   } catch (err) {
     return json({ error: "discovery_failed", detail: (err as Error).message }, 502);
   }
 
   const known = new Set(existingNames.map(companyNameKey));
-  const fresh = proposals.filter((p) => {
+  const deduped = proposals.filter((p) => {
     const key = companyNameKey(p.name);
     if (!key || known.has(key)) return false;
     known.add(key);
     return true;
   });
+
+  // The prompt states the location requirement, but a model treats it as guidance often enough
+  // that it has to be enforced here too rather than trusted.
+  const fresh = deduped.filter((p) => locationMatches(p.location, locationTerms));
+  const offTarget = deduped.length - fresh.length;
 
   let added = 0;
   let unreachable = 0;
@@ -554,8 +594,10 @@ async function discoverCompanies(request: Request, env: Env): Promise<Response> 
   return json({
     added,
     proposed: proposals.length,
-    duplicates: proposals.length - fresh.length,
+    duplicates: proposals.length - deduped.length,
+    off_target: offTarget,
     unreachable,
+    locations: desiredLocations,
   });
 }
 
@@ -574,6 +616,7 @@ async function scanCompanies(request: Request, env: Env): Promise<Response> {
     .bind(profileId)
     .first<{ preferences_json: string }>();
   const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
+  const locationTerms = parseLocationFilter(readDesiredLocations(profileRow?.preferences_json ?? "{}"));
 
   const limit = Math.min(Math.max(Number(body.limit) || 6, 1), 12);
   const targets = body.company_id
@@ -596,7 +639,7 @@ async function scanCompanies(request: Request, env: Env): Promise<Response> {
   const results: { company: string; jobs: number; note: string }[] = [];
 
   for (const company of targets.results ?? []) {
-    const outcome = await scanOneCompany(env, company, desiredRoles, budget);
+    const outcome = await scanOneCompany(env, company, desiredRoles, locationTerms, budget);
     results.push({ company: company.name, jobs: outcome.jobs, note: outcome.note });
     if (budget.remaining <= 2) break;
   }
@@ -623,6 +666,7 @@ async function scanOneCompany(
   env: Env,
   company: CompanyScanRow,
   desiredRoles: string,
+  locationTerms: string[],
   budget: { remaining: number },
 ): Promise<{ jobs: number; note: string }> {
   let provider = company.ats_provider as AtsProvider | "" | "none";
@@ -657,7 +701,10 @@ async function scanOneCompany(
     return { jobs: 0, note: "board read failed" };
   }
 
-  const relevant = filterJobsByRoles(scanned, desiredRoles);
+  // A company can qualify on location while most of its postings don't, so each posting is
+  // checked on its own rather than inherited from the company.
+  const inArea = scanned.filter((job) => locationMatches(job.location, locationTerms));
+  const relevant = filterJobsByRoles(inArea, desiredRoles);
   for (const job of relevant) {
     if (!job.title || !job.external_id) continue;
     await env.DB.prepare(
@@ -687,7 +734,7 @@ async function scanOneCompany(
   const note =
     relevant.length === scanned.length
       ? `${scanned.length} open role${scanned.length === 1 ? "" : "s"} on their board.`
-      : `${relevant.length} of ${scanned.length} open roles match your target roles.`;
+      : `${relevant.length} of ${scanned.length} open roles match your target roles and locations.`;
 
   await env.DB.prepare(
     `UPDATE companies SET ats_provider = ?, ats_token = ?, open_jobs = ?, scan_note = ?,
@@ -1546,6 +1593,9 @@ const DASHBOARD_PAGE = `<!doctype html>
           </div>
           <label for="desired-roles-description">Saved description</label>
           <textarea id="desired-roles-description" style="min-height:8rem" placeholder="What roles are you targeting?"></textarea>
+          <label for="desired-locations">Locations you'll work in</label>
+          <input id="desired-locations" placeholder="e.g. California, or Bay Area, Seattle, Remote">
+          <p class="hint">Enforced as a hard filter: company discovery won't add employers outside these, and board scans skip postings elsewhere. Leave blank for no location limit.</p>
           <button id="desired-roles-save-button" type="button">Save</button>
           <p id="desired-roles-save-status" class="status" role="status" aria-live="polite"></p>
         </section>
@@ -1786,6 +1836,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       if (data.profile) {
         document.getElementById('profile-label').value = data.profile.label || '';
         document.getElementById('desired-roles-description').value = data.profile.desired_roles || '';
+        document.getElementById('desired-locations').value = data.profile.desired_locations || '';
         renderStructuredProfileView('structured-profile-view', data.profile.structured);
         renderStructuredProfileView('resume-profile-view', data.profile.structured);
       }
@@ -2099,7 +2150,10 @@ const DASHBOARD_PAGE = `<!doctype html>
         var res = await api('/desired-roles', {
           method: 'PUT',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ desired_roles: document.getElementById('desired-roles-description').value }),
+          body: JSON.stringify({
+            desired_roles: document.getElementById('desired-roles-description').value,
+            desired_locations: document.getElementById('desired-locations').value,
+          }),
         });
         if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
         statusEl.textContent = 'Saved.';
@@ -2328,6 +2382,9 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (company.status === 'dismissed') {
           titleChildren.push(el('span', { className: 'badge', textContent: 'dismissed' }));
         }
+        if (company.off_target) {
+          titleChildren.push(el('span', { className: 'badge warn', textContent: 'outside your locations' }));
+        }
 
         var meta = [company.location, company.last_scanned_at ? 'scanned ' + new Date(company.last_scanned_at).toLocaleDateString() : 'not scanned yet']
           .filter(Boolean).join(' · ');
@@ -2413,7 +2470,9 @@ const DASHBOARD_PAGE = `<!doctype html>
         el('span', {}, [
           el('strong', { textContent: String(allCompanies.length) }),
           el('span', { textContent: ' compan' + (allCompanies.length === 1 ? 'y' : 'ies') +
-            ' · ' + withJobs + ' with open roles · ' + (data.unscanned || 0) + ' not scanned yet' }),
+            ' · ' + withJobs + ' with open roles · ' + (data.unscanned || 0) + ' not scanned yet' +
+            (data.off_target ? ' · ' + data.off_target + ' outside your locations' : '') +
+            (data.desired_locations ? ' · limited to ' + data.desired_locations : ' · no location limit set') }),
         ]),
       );
       renderCompanyLocations();
@@ -2440,6 +2499,9 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (!res.ok) throw new Error(errorMessage(data, 'discovery_failed'));
         var parts = ['Added ' + data.added + ' new.'];
         if (data.duplicates) parts.push(data.duplicates + ' already on your list.');
+        if (data.off_target) {
+          parts.push(data.off_target + ' rejected as outside ' + (data.locations || 'your locations') + '.');
+        }
         if (data.unreachable) parts.push(data.unreachable + " couldn't be reached — flagged for you to check.");
         statusEl.textContent = parts.join(' ');
         statusEl.className = 'status success';
