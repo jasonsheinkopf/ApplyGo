@@ -120,23 +120,24 @@ Either way, the enrollment code is single-use and expires (default/max above, 15
 
 ## Dashboard
 
-`GET /` is the phone-usable dashboard, gated by the same session cookie from enrollment (redirects to `/enroll` without a valid session). It's a single self-contained HTML page (no build step, no external assets, no frontend framework) with four tabs, calling the JSON endpoints below with `credentials: 'same-origin'`:
+`GET /` is the phone-and-desktop-usable dashboard, gated by the same session cookie from enrollment (redirects to `/enroll` without a valid session). It's a single self-contained HTML page (no build step, no external assets, no frontend framework) with four tabs, calling the JSON endpoints below with `credentials: 'same-origin'`. Wide viewports (laptop/desktop, ≥760px) get a left/right split — inputs on the left, AI-generated output on the right, sticky so it stays in view while you scroll the left column; narrow viewports (phone) stack to one column. Long list items (notes, role signals) render as a single truncated line and expand on click, rather than dumping full text inline.
 
-- **Desired Roles** — paste job links or write loosely about what you want next (`role_signal`-category `candidate_evidence` rows); generate a structured description of the roles you're targeting (Anthropic or OpenAI), stored in `candidate_profiles.preferences_json.desired_roles`
-- **Profile** — name/summary, document upload, freeform notes, and AI profile generation
+- **Desired Roles** — paste job links or write loosely about what you want next (left, `role_signal`-category `candidate_evidence` rows); generate a structured description of the roles you're targeting (right, Anthropic or OpenAI), stored in `candidate_profiles.preferences_json.desired_roles`
+- **Profile** — your material (name, document upload, freeform notes) on the left; your AI-generated **structured** profile on the right
 - **Jobs** — job posting list/add/remove
 - **Devices** — device list/revoke
 
 Authenticated data endpoints:
 
-- `GET /profile` / `PUT /profile` — single-profile model (`label`, `summary`); returns `desired_roles` too (read from `preferences_json`). The first `candidate_profiles` row is created on first use (by any tab) and updated in place after that.
+- `GET /profile` / `PUT /profile` — `PUT` only updates `label` (name) now. Response includes `desired_roles` (from `preferences_json`) and `structured` (parsed `structured_json`, or `null` if nothing generated yet). The first `candidate_profiles` row is created on first use (by any tab) and updated in place after that.
+- `PUT /profile/structured` — saves an approved structured-profile draft (`{"structured": {...}}`) into `structured_json`, and mirrors `narrative_summary` into the legacy `summary` column.
 - `GET /role-signals` / `POST /role-signals` / `DELETE /role-signals/:id` — freeform `candidate_evidence` rows (`category = 'role_signal'`)
 - `PUT /desired-roles` — saves the reviewed description into `preferences_json.desired_roles`
-- `POST /desired-roles/generate` — synthesizes a structured "roles you're looking for" description from all role-signal notes, via Anthropic or OpenAI. Draft only, not auto-saved.
+- `POST /desired-roles/generate` — synthesizes a structured "roles you're looking for" description (still prose) from all role-signal notes, via Anthropic or OpenAI. Draft only, not auto-saved.
 - `GET /jobs` / `POST /jobs` / `DELETE /jobs/:id` — `job_postings` rows (`title`, `company`, `source_url`, `raw_description`)
 - `GET /documents` / `POST /documents` / `PATCH /documents/:id` / `DELETE /documents/:id` — `source_documents` rows backed by private R2 storage. Uploads accept PDF, plain text, or Markdown (15 MB limit, same as `/artifacts`). Text is extracted automatically for all three types: `text/plain`/`text/markdown` read directly, PDFs parsed with [`unpdf`](https://github.com/unjs/unpdf) (Cloudflare's own recommended edge-compatible PDF.js build — see [R2's PDF summarization tutorial](https://developers.cloudflare.com/r2/tutorials/summarize-pdf/)).
 - `GET /notes` / `POST /notes` / `DELETE /notes/:id` — freeform `candidate_evidence` rows (`category = 'note'`) for unstructured facts about yourself, no file needed
-- `POST /profile/generate` — synthesizes a long-form narrative profile from the existing summary + all notes + all extracted document text (including parsed PDFs), using either Anthropic or OpenAI (`{"provider": "anthropic" | "openai"}`). Returns a draft only; it is never auto-saved. The dashboard shows it for review and only writes it into `summary` once you click "Use this draft" and then "Save profile" — consistent with this project's human-supervised design (see `docs/product/progressive-autonomy.md`).
+- `POST /profile/generate` — synthesizes a **structured** profile — `headline`, `narrative_summary`, `education[]`, `experience[]` (with `highlights[]`), `skills[]` — from the existing structured profile + all notes + all extracted document text (including parsed PDFs), using either Anthropic or OpenAI (`{"provider": "anthropic" | "openai"}`). Reliable JSON is enforced per-provider: Anthropic via forced tool-use with a JSON Schema, OpenAI via `response_format: {"type": "json_object"}`. Returns a draft only; it is never auto-saved. The dashboard shows it for review and only writes it via `PUT /profile/structured` once you click "Save this" — consistent with this project's human-supervised design (see `docs/product/progressive-autonomy.md`). The intent: this structured record is what later features (auto-filling applications, per-job tailoring) read from, instead of re-parsing unstructured text on every use.
 
 Model provider configuration:
 
@@ -176,7 +177,7 @@ Uploads are limited to 15 MB and PDF, plain text, or Markdown in this initial sl
 
 ## Migrations
 
-Migrations in `migrations/` are forward-only, idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`), and applied with `wrangler d1 migrations apply`, which tracks already-applied migrations per database and never drops or recreates tables. Production migrations always run before deploy (`npm run release:production`), whether invoked manually or by Workers Builds.
+Migrations in `migrations/` are forward-only and applied with `wrangler d1 migrations apply`, which tracks already-applied migrations per database (in its own ledger table) so each migration file only ever runs once, and never drops or recreates tables. The initial migration uses `CREATE TABLE IF NOT EXISTS`/`CREATE INDEX IF NOT EXISTS` for extra safety; later migrations that add columns (e.g. `0002_structured_profile.sql`'s `ALTER TABLE ... ADD COLUMN`) don't need that — SQLite has no `ADD COLUMN IF NOT EXISTS`, and Wrangler's per-migration tracking already prevents re-running it. Production migrations always run before deploy (`npm run release:production`), whether invoked manually or by Workers Builds.
 
 ## Rollback
 
