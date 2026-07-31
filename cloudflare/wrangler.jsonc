@@ -41,7 +41,12 @@
         }
       ],
       "vars": {
-        "SESSION_DAYS": "90"
+        "SESSION_DAYS": "90",
+        // Non-secret model identifiers. ANTHROPIC_API_KEY / OPENAI_API_KEY are
+        // set separately as Worker secrets (`wrangler secret put ... --env production`),
+        // never here. Bump these if a model id is retired.
+        "ANTHROPIC_MODEL": "claude-sonnet-5",
+        "OPENAI_MODEL": "gpt-4o"
       }
     }
   }

@@ -3,6 +3,10 @@ interface Env {
   FILES: R2Bucket;
   SETUP_SECRET: string;
   SESSION_DAYS: string;
+  ANTHROPIC_API_KEY?: string;
+  OPENAI_API_KEY?: string;
+  ANTHROPIC_MODEL?: string;
+  OPENAI_MODEL?: string;
 }
 
 type Session = {
@@ -30,9 +34,13 @@ function randomToken(bytes = 32): string {
     .replaceAll("=", "");
 }
 
-async function sha256(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(value));
+async function digestHex(data: BufferSource): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", data);
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256(value: string): Promise<string> {
+  return digestHex(encoder.encode(value));
 }
 
 function cookieValue(request: Request, name: string): string | null {
@@ -232,6 +240,207 @@ async function deleteJob(request: Request, env: Env, id: string): Promise<Respon
   return json({ deleted: result.meta.changes > 0 });
 }
 
+async function getOrCreateProfileId(env: Env): Promise<string> {
+  const existing = await env.DB.prepare(
+    "SELECT id FROM candidate_profiles ORDER BY created_at ASC LIMIT 1",
+  ).first<{ id: string }>();
+  if (existing) return existing.id;
+  const id = crypto.randomUUID();
+  await env.DB.prepare("INSERT INTO candidate_profiles (id, label, summary) VALUES (?, '', '')").bind(id).run();
+  return id;
+}
+
+const DOCUMENT_TYPES = new Set(["application/pdf", "text/plain", "text/markdown"]);
+
+async function listDocuments(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const docs = await env.DB.prepare(
+    `SELECT id, original_name, media_type, created_at, LENGTH(extracted_text) > 0 AS has_text
+     FROM source_documents WHERE profile_id = ? ORDER BY created_at DESC`,
+  )
+    .bind(profileId)
+    .all();
+  return json({ documents: docs.results });
+}
+
+async function uploadDocument(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const form = await request.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return json({ error: "file_required" }, 400);
+  if (file.size > 15 * 1024 * 1024) return json({ error: "file_too_large" }, 413);
+  if (!DOCUMENT_TYPES.has(file.type)) return json({ error: "unsupported_media_type" }, 415);
+
+  const bytes = await file.arrayBuffer();
+  const sha = await digestHex(bytes);
+  const extractedText = file.type === "text/plain" || file.type === "text/markdown" ? new TextDecoder().decode(bytes) : "";
+  const key = `documents/${crypto.randomUUID()}`;
+  await env.FILES.put(key, bytes, {
+    httpMetadata: { contentType: file.type },
+    customMetadata: { originalName: file.name, uploadedByDevice: auth.id },
+  });
+
+  const profileId = await getOrCreateProfileId(env);
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO source_documents (id, profile_id, original_name, r2_key, media_type, sha256, extracted_text)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(id, profileId, file.name, key, file.type, sha, extractedText)
+    .run();
+  return json({ id, original_name: file.name, media_type: file.type, has_text: extractedText.length > 0 }, 201);
+}
+
+async function renameDocument(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { original_name?: string };
+  const name = (body.original_name ?? "").trim();
+  if (!name) return json({ error: "original_name_required" }, 400);
+  await env.DB.prepare("UPDATE source_documents SET original_name = ? WHERE id = ?").bind(name, id).run();
+  return json({ id, original_name: name });
+}
+
+async function deleteDocument(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const doc = await env.DB.prepare("SELECT r2_key FROM source_documents WHERE id = ?")
+    .bind(id)
+    .first<{ r2_key: string }>();
+  if (!doc) return json({ error: "not_found" }, 404);
+  await env.FILES.delete(doc.r2_key);
+  await env.DB.prepare("DELETE FROM source_documents WHERE id = ?").bind(id).run();
+  return json({ deleted: true });
+}
+
+async function listNotes(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const notes = await env.DB.prepare(
+    "SELECT id, claim, created_at FROM candidate_evidence WHERE profile_id = ? AND category = 'note' ORDER BY created_at DESC",
+  )
+    .bind(profileId)
+    .all();
+  return json({ notes: notes.results });
+}
+
+async function createNote(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { text?: string };
+  const claim = (body.text ?? "").trim();
+  if (!claim) return json({ error: "text_required" }, 400);
+  const profileId = await getOrCreateProfileId(env);
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO candidate_evidence (id, profile_id, category, claim, usable_in_applications) VALUES (?, ?, 'note', ?, 1)",
+  )
+    .bind(id, profileId, claim)
+    .run();
+  return json({ id, claim }, 201);
+}
+
+async function deleteNote(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const result = await env.DB.prepare("DELETE FROM candidate_evidence WHERE id = ? AND category = 'note'")
+    .bind(id)
+    .run();
+  return json({ deleted: result.meta.changes > 0 });
+}
+
+async function callAnthropic(env: Env, prompt: string): Promise<string> {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": env.ANTHROPIC_API_KEY!,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: env.ANTHROPIC_MODEL || "claude-sonnet-5",
+      max_tokens: 1500,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  if (!res.ok) throw new Error(`anthropic_error_${res.status}`);
+  const data = (await res.json()) as { content: { type: string; text?: string }[] };
+  return data.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
+    .join("\n")
+    .trim();
+}
+
+async function callOpenAI(env: Env, prompt: string): Promise<string> {
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: env.OPENAI_MODEL || "gpt-4o",
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  if (!res.ok) throw new Error(`openai_error_${res.status}`);
+  const data = (await res.json()) as { choices: { message: { content: string } }[] };
+  return (data.choices[0]?.message?.content ?? "").trim();
+}
+
+async function generateProfile(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string };
+  const provider = body.provider === "openai" ? "openai" : "anthropic";
+  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
+  if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
+
+  const profileId = await getOrCreateProfileId(env);
+  const profile = await env.DB.prepare("SELECT summary FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ summary: string }>();
+  const notes = await env.DB.prepare(
+    "SELECT claim FROM candidate_evidence WHERE profile_id = ? AND category = 'note' ORDER BY created_at ASC",
+  )
+    .bind(profileId)
+    .all<{ claim: string }>();
+  const docs = await env.DB.prepare(
+    `SELECT original_name, extracted_text FROM source_documents
+     WHERE profile_id = ? AND LENGTH(extracted_text) > 0 ORDER BY created_at ASC`,
+  )
+    .bind(profileId)
+    .all<{ original_name: string; extracted_text: string }>();
+
+  const sourceParts: string[] = [];
+  if (profile?.summary) sourceParts.push(`Existing summary:\n${profile.summary}`);
+  for (const note of notes.results) sourceParts.push(`Note: ${note.claim}`);
+  for (const doc of docs.results) sourceParts.push(`Document "${doc.original_name}":\n${doc.extracted_text.slice(0, 8000)}`);
+
+  if (sourceParts.length === 0) return json({ error: "no_source_material" }, 400);
+
+  const prompt = [
+    "You are helping a job candidate build an honest, long-form professional profile from their own source material.",
+    "Write a well-organized narrative profile (not just a resume rehash) covering background, skills, accomplishments, and goals,",
+    "based only on the material below. Do not invent facts that are not present in the source material.",
+    "",
+    "Source material:",
+    ...sourceParts,
+  ].join("\n\n");
+
+  try {
+    const draft = provider === "openai" ? await callOpenAI(env, prompt) : await callAnthropic(env, prompt);
+    return json({ provider, draft_summary: draft });
+  } catch (err) {
+    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+  }
+}
+
 async function uploadArtifact(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -368,6 +577,41 @@ const DASHBOARD_PAGE = `<!doctype html>
       <button type="submit">Save profile</button>
     </form>
     <p id="profile-status" class="status" role="status" aria-live="polite"></p>
+
+    <label for="generate-provider">Generate from documents &amp; notes using</label>
+    <select id="generate-provider">
+      <option value="anthropic">Anthropic (Claude)</option>
+      <option value="openai">OpenAI</option>
+    </select>
+    <button id="generate-button" class="secondary" type="button">Generate profile</button>
+    <p id="generate-status" class="status" role="status" aria-live="polite"></p>
+    <div id="draft-block" style="display:none">
+      <label for="draft-summary">Draft (review, then use or discard)</label>
+      <textarea id="draft-summary" readonly style="min-height:8rem"></textarea>
+      <button id="use-draft" type="button">Use this draft</button>
+    </div>
+  </section>
+
+  <section id="documents-section">
+    <h2>Documents</h2>
+    <div id="documents-list"><p class="empty">Loading…</p></div>
+    <form id="document-form">
+      <label for="document-file">Upload resume or notes file (PDF, plain text, or Markdown)</label>
+      <input id="document-file" type="file" accept=".pdf,.txt,.md,application/pdf,text/plain,text/markdown" required>
+      <button type="submit">Upload</button>
+    </form>
+    <p id="document-status" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section id="notes-section">
+    <h2>Notes about yourself</h2>
+    <div id="notes-list"><p class="empty">Loading…</p></div>
+    <form id="note-form">
+      <label for="note-text">Add unstructured text (accomplishments, goals, background — anything)</label>
+      <textarea id="note-text" required placeholder="Write freely; this feeds the profile generator"></textarea>
+      <button type="submit">Add note</button>
+    </form>
+    <p id="note-status" class="status" role="status" aria-live="polite"></p>
   </section>
 
   <section id="jobs-section">
@@ -440,6 +684,151 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
         statusEl.textContent = 'Saved.';
         statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    document.getElementById('generate-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('generate-status');
+      var draftBlock = document.getElementById('draft-block');
+      statusEl.textContent = 'Generating… this can take a little while.';
+      statusEl.className = 'status';
+      draftBlock.style.display = 'none';
+      try {
+        var res = await api('/profile/generate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ provider: document.getElementById('generate-provider').value }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'generation_failed');
+        document.getElementById('draft-summary').value = data.draft_summary;
+        draftBlock.style.display = 'block';
+        statusEl.textContent = 'Draft ready below. Review before using it.';
+        statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    document.getElementById('use-draft').addEventListener('click', function () {
+      document.getElementById('profile-summary').value = document.getElementById('draft-summary').value;
+      document.getElementById('draft-block').style.display = 'none';
+      document.getElementById('generate-status').textContent = 'Draft copied into Summary above — click Save profile to keep it.';
+    });
+
+    function renderDocuments(docs) {
+      var list = document.getElementById('documents-list');
+      list.innerHTML = '';
+      if (!docs.length) {
+        list.appendChild(el('p', { className: 'empty', textContent: 'No documents yet.' }));
+        return;
+      }
+      docs.forEach(function (doc) {
+        var rename = el('button', { className: 'secondary', type: 'button', textContent: 'Rename' });
+        rename.addEventListener('click', async function () {
+          var name = window.prompt('New name for this document:', doc.original_name);
+          if (!name) return;
+          await api('/documents/' + encodeURIComponent(doc.id), {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ original_name: name }),
+          });
+          loadDocuments();
+        });
+        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        del.addEventListener('click', async function () {
+          await api('/documents/' + encodeURIComponent(doc.id), { method: 'DELETE' });
+          loadDocuments();
+        });
+        var meta = doc.media_type + (doc.has_text ? '' : ' — text not extracted, paste content as a note instead');
+        var row = el('div', { className: 'row' }, [
+          el('div', {}, [
+            el('div', { className: 'job-title', textContent: doc.original_name }),
+            el('div', { className: 'job-meta', textContent: meta }),
+          ]),
+          el('div', {}, [rename, del]),
+        ]);
+        list.appendChild(el('div', { className: 'job' }, [row]));
+      });
+    }
+
+    async function loadDocuments() {
+      var res = await api('/documents');
+      var data = await res.json();
+      renderDocuments(data.documents);
+    }
+
+    document.getElementById('document-form').addEventListener('submit', async function (event) {
+      event.preventDefault();
+      var statusEl = document.getElementById('document-status');
+      var fileInput = document.getElementById('document-file');
+      if (!fileInput.files.length) return;
+      statusEl.textContent = 'Uploading…';
+      statusEl.className = 'status';
+      try {
+        var formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+        var res = await api('/documents', { method: 'POST', body: formData });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'upload_failed');
+        statusEl.textContent = 'Uploaded.';
+        statusEl.className = 'status success';
+        document.getElementById('document-form').reset();
+        loadDocuments();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    function renderNotes(notes) {
+      var list = document.getElementById('notes-list');
+      list.innerHTML = '';
+      if (!notes.length) {
+        list.appendChild(el('p', { className: 'empty', textContent: 'No notes yet.' }));
+        return;
+      }
+      notes.forEach(function (note) {
+        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        del.addEventListener('click', async function () {
+          await api('/notes/' + encodeURIComponent(note.id), { method: 'DELETE' });
+          loadNotes();
+        });
+        var row = el('div', { className: 'row' }, [
+          el('div', { textContent: note.claim }),
+          del,
+        ]);
+        list.appendChild(el('div', { className: 'job' }, [row]));
+      });
+    }
+
+    async function loadNotes() {
+      var res = await api('/notes');
+      var data = await res.json();
+      renderNotes(data.notes);
+    }
+
+    document.getElementById('note-form').addEventListener('submit', async function (event) {
+      event.preventDefault();
+      var statusEl = document.getElementById('note-status');
+      statusEl.textContent = 'Adding…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/notes', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text: document.getElementById('note-text').value }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'add_failed');
+        statusEl.textContent = 'Added.';
+        statusEl.className = 'status success';
+        document.getElementById('note-form').reset();
+        loadNotes();
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
@@ -534,6 +923,8 @@ const DASHBOARD_PAGE = `<!doctype html>
     }
 
     loadProfile();
+    loadDocuments();
+    loadNotes();
     loadJobs();
     loadDevices();
   </script>
@@ -572,6 +963,16 @@ export default {
     if (request.method === "POST" && url.pathname === "/jobs") return createJob(request, env);
     const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
     if (request.method === "DELETE" && jobMatch) return deleteJob(request, env, jobMatch[1]);
+    if (request.method === "GET" && url.pathname === "/documents") return listDocuments(request, env);
+    if (request.method === "POST" && url.pathname === "/documents") return uploadDocument(request, env);
+    const documentMatch = url.pathname.match(/^\/documents\/([^/]+)$/);
+    if (request.method === "PATCH" && documentMatch) return renameDocument(request, env, documentMatch[1]);
+    if (request.method === "DELETE" && documentMatch) return deleteDocument(request, env, documentMatch[1]);
+    if (request.method === "GET" && url.pathname === "/notes") return listNotes(request, env);
+    if (request.method === "POST" && url.pathname === "/notes") return createNote(request, env);
+    const noteMatch = url.pathname.match(/^\/notes\/([^/]+)$/);
+    if (request.method === "DELETE" && noteMatch) return deleteNote(request, env, noteMatch[1]);
+    if (request.method === "POST" && url.pathname === "/profile/generate") return generateProfile(request, env);
     if (request.method === "POST" && url.pathname === "/admin/enrollments") return createEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/enroll") return exchangeEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/logout") {
