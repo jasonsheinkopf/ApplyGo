@@ -1,8 +1,10 @@
 import { extractText, getDocumentProxy } from "unpdf";
+import puppeteer, { type BrowserWorker } from "@cloudflare/puppeteer";
 
 interface Env {
   DB: D1Database;
   FILES: R2Bucket;
+  BROWSER: BrowserWorker;
   SETUP_SECRET: string;
   SESSION_DAYS: string;
   ANTHROPIC_API_KEY?: string;
@@ -741,6 +743,218 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   }
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function renderResumeHtml(name: string, content: StructuredProfile): string {
+  const educationHtml = (content.education ?? [])
+    .map((e) => {
+      const line = [e.degree, e.field].filter(Boolean).join(" in ");
+      const years = [e.start_year, e.end_year].filter(Boolean).join(" – ");
+      return `<div class="entry">
+        <div class="entry-row"><span class="entry-title">${escapeHtml(line || e.school)}</span><span class="entry-dates">${escapeHtml(years)}</span></div>
+        ${line ? `<div class="entry-sub">${escapeHtml(e.school)}</div>` : ""}
+      </div>`;
+    })
+    .join("");
+
+  const experienceHtml = (content.experience ?? [])
+    .map((e) => {
+      const years = [e.start, e.end].filter(Boolean).join(" – ");
+      const highlights = (e.highlights ?? []).map((h) => `<li>${escapeHtml(h)}</li>`).join("");
+      return `<div class="entry">
+        <div class="entry-row"><span class="entry-title">${escapeHtml(e.title)} — ${escapeHtml(e.company)}</span><span class="entry-dates">${escapeHtml(years)}</span></div>
+        ${highlights ? `<ul class="bullets">${highlights}</ul>` : ""}
+      </div>`;
+    })
+    .join("");
+
+  const skillsHtml = (content.skills ?? []).map((s) => escapeHtml(s)).join(" &nbsp;·&nbsp; ");
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: Georgia, 'Times New Roman', serif;
+    color: #1a1a1a;
+    margin: 0;
+    padding: 0.35in 0.55in;
+    font-size: 10.5pt;
+    line-height: 1.42;
+  }
+  h1 { font-size: 19pt; margin: 0 0 2pt; font-weight: 700; }
+  .headline { font-size: 10.5pt; color: #444; margin: 0 0 10pt; }
+  .summary { margin: 0 0 12pt; font-size: 10pt; color: #222; }
+  h2 {
+    font-size: 10.5pt; text-transform: uppercase; letter-spacing: 0.06em;
+    border-bottom: 1px solid #999; padding-bottom: 2pt; margin: 12pt 0 7pt;
+  }
+  .entry { margin-bottom: 8pt; }
+  .entry-row { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5em; }
+  .entry-title { font-weight: 700; font-size: 10.5pt; }
+  .entry-dates { font-size: 9.5pt; color: #555; white-space: nowrap; }
+  .entry-sub { font-size: 9.5pt; color: #444; font-style: italic; }
+  .bullets { margin: 3pt 0 0; padding-left: 15pt; }
+  .bullets li { margin-bottom: 2pt; }
+  .skills { font-size: 10pt; }
+</style>
+</head>
+<body>
+  <h1>${escapeHtml(name || "Resume")}</h1>
+  ${content.headline ? `<div class="headline">${escapeHtml(content.headline)}</div>` : ""}
+  ${content.narrative_summary ? `<p class="summary">${escapeHtml(content.narrative_summary)}</p>` : ""}
+  ${experienceHtml ? `<h2>Experience</h2>${experienceHtml}` : ""}
+  ${educationHtml ? `<h2>Education</h2>${educationHtml}` : ""}
+  ${skillsHtml ? `<h2>Skills</h2><div class="skills">${skillsHtml}</div>` : ""}
+</body>
+</html>`;
+}
+
+async function renderAndStoreResumePdf(env: Env, resumeId: string, html: string): Promise<string> {
+  const browser = await puppeteer.launch(env.BROWSER);
+  try {
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: "networkidle0" });
+    const pdfStream = await page.createPDFStream({
+      format: "letter",
+      printBackground: true,
+      margin: { top: "0in", bottom: "0in", left: "0in", right: "0in" },
+    });
+    const key = `resumes/${resumeId}.pdf`;
+    await env.FILES.put(key, pdfStream, { httpMetadata: { contentType: "application/pdf" } });
+    return key;
+  } finally {
+    await browser.close();
+  }
+}
+
+async function generateResumeContent(
+  env: Env,
+  structured: StructuredProfile,
+  instructions: string,
+  provider: string,
+): Promise<StructuredProfile> {
+  const prompt = [
+    "You are producing content for one tailored resume version, built from a candidate's full structured profile.",
+    "You may reorder, select, and trim entries and highlights for relevance and concision (for example, keeping only",
+    "the most relevant few bullets per role), but never invent facts, employers, dates, or accomplishments that are",
+    "not present in the profile below.",
+    instructions
+      ? `Instructions for this specific resume version: ${instructions}`
+      : "No special instructions were given -- produce a strong, concise, general-purpose resume.",
+    "",
+    `Full profile:\n${JSON.stringify(structured)}`,
+  ].join("\n\n");
+  return provider === "openai" ? await callOpenAIStructured(env, prompt) : await callAnthropicStructured(env, prompt);
+}
+
+async function listResumes(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const rows = await env.DB.prepare(
+    "SELECT id, name, instructions, created_at FROM resumes WHERE profile_id = ? ORDER BY created_at DESC",
+  )
+    .bind(profileId)
+    .all();
+  return json({ resumes: rows.results });
+}
+
+async function createResume(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { instructions?: string; provider?: string };
+  const instructions = (body.instructions ?? "").trim();
+  const provider = body.provider === "openai" ? "openai" : "anthropic";
+  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
+  if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
+
+  const profileId = await getOrCreateProfileId(env);
+  const profileRow = await env.DB.prepare("SELECT label, structured_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ label: string; structured_json: string }>();
+  const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
+  if (!structured) return json({ error: "no_profile_yet" }, 400);
+
+  let content: StructuredProfile;
+  try {
+    content = await generateResumeContent(env, structured, instructions, provider);
+  } catch (err) {
+    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+  }
+
+  const html = renderResumeHtml(profileRow?.label ?? "", content);
+  const id = crypto.randomUUID();
+  let pdfKey: string;
+  try {
+    pdfKey = await renderAndStoreResumePdf(env, id, html);
+  } catch (err) {
+    return json({ error: "pdf_render_failed", detail: (err as Error).message }, 502);
+  }
+
+  const name = instructions ? instructions.slice(0, 60) : `Resume ${new Date().toISOString().slice(0, 10)}`;
+  await env.DB.prepare(
+    "INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key) VALUES (?, ?, ?, ?, ?, ?)",
+  )
+    .bind(id, profileId, name, instructions, JSON.stringify(content), pdfKey)
+    .run();
+
+  return json({ id, name }, 201);
+}
+
+async function renameResume(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { name?: string };
+  const name = (body.name ?? "").trim();
+  if (!name) return json({ error: "name_required" }, 400);
+  await env.DB.prepare("UPDATE resumes SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(name, id).run();
+  return json({ id, name });
+}
+
+async function deleteResume(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const row = await env.DB.prepare("SELECT pdf_r2_key FROM resumes WHERE id = ?")
+    .bind(id)
+    .first<{ pdf_r2_key: string | null }>();
+  if (!row) return json({ error: "not_found" }, 404);
+  if (row.pdf_r2_key) await env.FILES.delete(row.pdf_r2_key);
+  await env.DB.prepare("DELETE FROM resumes WHERE id = ?").bind(id).run();
+  return json({ deleted: true });
+}
+
+async function getResumeFile(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const row = await env.DB.prepare("SELECT pdf_r2_key, name FROM resumes WHERE id = ?")
+    .bind(id)
+    .first<{ pdf_r2_key: string | null; name: string }>();
+  if (!row?.pdf_r2_key) return json({ error: "not_found" }, 404);
+  const object = await env.FILES.get(row.pdf_r2_key, { range: request.headers });
+  if (!object) return json({ error: "not_found" }, 404);
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("content-type", "application/pdf");
+  headers.set("content-disposition", `inline; filename="${row.name.replace(/["\r\n]/g, "")}.pdf"`);
+  headers.set("cache-control", "private, no-store");
+  headers.set("etag", object.httpEtag);
+  headers.set("accept-ranges", "bytes");
+  if (object.range && "offset" in object.range && "end" in object.range) {
+    headers.set("content-range", `bytes ${object.range.offset}-${object.range.end}/${object.size}`);
+  }
+  const status = request.headers.get("range") !== null ? 206 : 200;
+  return new Response(object.body, { headers, status });
+}
+
 async function uploadArtifact(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -947,6 +1161,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   <nav>
     <button class="tab active" data-tab="roles" type="button">Desired Roles</button>
     <button class="tab" data-tab="profile" type="button">Profile</button>
+    <button class="tab" data-tab="resume" type="button">Resume</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
     <button class="tab" data-tab="devices" type="button">Devices</button>
   </nav>
@@ -1046,6 +1261,41 @@ const DASHBOARD_PAGE = `<!doctype html>
     </div>
   </div>
 
+  <div id="panel-resume" class="panel">
+    <div class="split">
+      <div class="split-sticky">
+        <section id="resume-reference-section">
+          <h2>Your profile</h2>
+          <p class="hint">Read-only — edit this on the Profile tab. Every resume version is built from it.</p>
+          <div id="resume-profile-view"><p class="empty">No structured profile yet — build one on the Profile tab first.</p></div>
+        </section>
+      </div>
+      <div>
+        <section id="resume-generate-section">
+          <h2>Resume versions</h2>
+          <label for="resume-instructions">Instructions for this version (optional)</label>
+          <textarea id="resume-instructions" placeholder="e.g. keep it to one page, emphasize leadership, target a backend-heavy role"></textarea>
+          <label for="resume-provider">Generate using</label>
+          <select id="resume-provider">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI</option>
+          </select>
+          <button id="resume-generate-button" type="button">Generate new version</button>
+          <p id="resume-generate-status" class="status" role="status" aria-live="polite"></p>
+        </section>
+
+        <section id="resume-list-section">
+          <div id="resumes-list"><p class="empty">Loading…</p></div>
+        </section>
+
+        <section id="resume-preview-section" style="display:none">
+          <h2>Preview</h2>
+          <iframe id="resume-preview-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+        </section>
+      </div>
+    </div>
+  </div>
+
   <div id="panel-jobs" class="panel">
     <section id="jobs-section">
       <h2>Job postings</h2>
@@ -1111,8 +1361,88 @@ const DASHBOARD_PAGE = `<!doctype html>
         document.getElementById('profile-label').value = data.profile.label || '';
         document.getElementById('desired-roles-description').value = data.profile.desired_roles || '';
         renderStructuredProfileView('structured-profile-view', data.profile.structured);
+        renderStructuredProfileView('resume-profile-view', data.profile.structured);
       }
     }
+
+    function showResumePreview(id) {
+      var section = document.getElementById('resume-preview-section');
+      section.style.display = 'block';
+      document.getElementById('resume-preview-frame').src = '/resumes/' + encodeURIComponent(id) + '/file';
+      section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    async function loadResumes() {
+      var res = await api('/resumes');
+      var data = await res.json();
+      var list = document.getElementById('resumes-list');
+      list.innerHTML = '';
+      if (!data.resumes.length) {
+        list.appendChild(el('p', { className: 'empty', textContent: 'No resume versions yet — generate one above.' }));
+        return;
+      }
+      data.resumes.forEach(function (resume) {
+        var preview = el('a', {
+          className: 'row-title',
+          href: '/resumes/' + encodeURIComponent(resume.id) + '/file',
+          target: '_blank',
+          rel: 'noopener',
+          textContent: resume.name,
+        });
+        var previewInline = el('button', { className: 'secondary', type: 'button', textContent: 'Preview here' });
+        previewInline.addEventListener('click', function () { showResumePreview(resume.id); });
+        var rename = el('button', { className: 'secondary', type: 'button', textContent: 'Rename' });
+        rename.addEventListener('click', async function () {
+          var name = window.prompt('New name for this resume version:', resume.name);
+          if (!name) return;
+          await api('/resumes/' + encodeURIComponent(resume.id), {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name: name }),
+          });
+          loadResumes();
+        });
+        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        del.addEventListener('click', async function () {
+          await api('/resumes/' + encodeURIComponent(resume.id), { method: 'DELETE' });
+          loadResumes();
+        });
+        var row = el('div', { className: 'row' }, [
+          el('div', {}, [
+            preview,
+            el('div', { className: 'row-meta', textContent: new Date(resume.created_at).toLocaleString() }),
+          ]),
+          el('div', {}, [previewInline, rename, del]),
+        ]);
+        list.appendChild(el('div', { className: 'row-item' }, [row]));
+      });
+    }
+
+    document.getElementById('resume-generate-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('resume-generate-status');
+      statusEl.textContent = 'Generating and rendering a PDF… this can take a little while.';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/resumes', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            instructions: document.getElementById('resume-instructions').value,
+            provider: document.getElementById('resume-provider').value,
+          }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'generation_failed');
+        statusEl.textContent = 'Created "' + data.name + '".';
+        statusEl.className = 'status success';
+        document.getElementById('resume-instructions').value = '';
+        await loadResumes();
+        showResumePreview(data.id);
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
 
     // Renders a list where each item shows one line, click to expand/collapse the full text.
     function renderCollapsibleList(listId, items, emptyText, getText, onDelete) {
@@ -1536,6 +1866,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     loadRoleSignals();
     loadDocuments();
     loadNotes();
+    loadResumes();
     loadJobs();
     loadDevices();
   </script>
@@ -1598,6 +1929,13 @@ export default {
     if (request.method === "DELETE" && roleSignalMatch) return deleteRoleSignal(request, env, roleSignalMatch[1]);
     if (request.method === "PUT" && url.pathname === "/desired-roles") return saveDesiredRoles(request, env);
     if (request.method === "POST" && url.pathname === "/desired-roles/generate") return generateDesiredRoles(request, env);
+    if (request.method === "GET" && url.pathname === "/resumes") return listResumes(request, env);
+    if (request.method === "POST" && url.pathname === "/resumes") return createResume(request, env);
+    const resumeFileMatch = url.pathname.match(/^\/resumes\/([^/]+)\/file$/);
+    if (request.method === "GET" && resumeFileMatch) return getResumeFile(request, env, resumeFileMatch[1]);
+    const resumeMatch = url.pathname.match(/^\/resumes\/([^/]+)$/);
+    if (request.method === "PATCH" && resumeMatch) return renameResume(request, env, resumeMatch[1]);
+    if (request.method === "DELETE" && resumeMatch) return deleteResume(request, env, resumeMatch[1]);
     if (request.method === "POST" && url.pathname === "/admin/enrollments") return createEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/enroll") return exchangeEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/logout") {

@@ -3,6 +3,7 @@
   "name": "applygo-personal",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-26",
+  "compatibility_flags": ["nodejs_compat"],
   "d1_databases": [
     {
       "binding": "DB",
@@ -17,6 +18,9 @@
       "bucket_name": "applygo-private"
     }
   ],
+  "browser": {
+    "binding": "BROWSER"
+  },
   "vars": {
     "SESSION_DAYS": "90"
   },
@@ -40,6 +44,9 @@
           "bucket_name": "applygo-prod-private"
         }
       ],
+      "browser": {
+        "binding": "BROWSER"
+      },
       "vars": {
         "SESSION_DAYS": "90",
         // Non-secret model identifiers. ANTHROPIC_API_KEY / OPENAI_API_KEY are
