@@ -79,6 +79,27 @@ It does **not** cover: uploading/deploying a Worker, setting Worker secrets, or 
 
 Connecting **Workers Builds** to the GitHub repository (below) is a one-time dashboard action with no API/MCP equivalent as of this writing — Cloudflare's Git integration is configured under a Worker's **Settings → Builds** page.
 
+### Reading production logs directly
+
+`wrangler tail` (live log streaming) cannot work from a sandboxed/remote Claude Code session — it requires a WebSocket upgrade, which the session's outbound proxy does not support, regardless of credentials.
+
+Instead, this Worker has `observability.enabled: true` set in `wrangler.jsonc`, and a session can query recent logs/exceptions directly over plain HTTPS via Cloudflare's Workers Logs REST API:
+
+```
+POST https://api.cloudflare.com/client/v4/accounts/{account_id}/workers/observability/telemetry/query
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "queryId": "any-string",
+  "timeframe": { "from": <epoch_ms>, "to": <epoch_ms> },
+  "view": "events",
+  "parameters": { "datasets": ["cloudflare-workers"], "filters": [], "limit": 20 }
+}
+```
+
+This needs a token scoped to **Account → Workers Tail: Read** and **Account → Workers Observability: Edit** (Observability has no read-only permission tier). Ask Jason for a token with exactly those two permissions if one isn't already available; as with all tokens, use it inline for the request only, never write it to a file or commit it.
+
 ## Automatic GitHub deployment (Cloudflare Workers Builds)
 
 Production deploys are connected through Cloudflare's native Workers Builds GitHub integration, not a stored API token:

@@ -21,6 +21,9 @@
   "browser": {
     "binding": "BROWSER"
   },
+  "observability": {
+    "enabled": true
+  },
   "vars": {
     "SESSION_DAYS": "90"
   },
@@ -46,6 +49,9 @@
       ],
       "browser": {
         "binding": "BROWSER"
+      },
+      "observability": {
+        "enabled": true
       },
       "vars": {
         "SESSION_DAYS": "90",

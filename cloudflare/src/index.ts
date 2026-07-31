@@ -1349,6 +1349,12 @@ const DASHBOARD_PAGE = `<!doctype html>
       return res;
     }
 
+    function errorMessage(data, fallback) {
+      var msg = (data && data.error) || fallback;
+      if (data && data.detail) msg += ': ' + data.detail;
+      return msg;
+    }
+
     document.getElementById('sign-out').addEventListener('click', async function () {
       await api('/auth/logout', { method: 'POST' });
       goToEnroll();
@@ -1432,7 +1438,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           }),
         });
         var data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'generation_failed');
+        if (!res.ok) throw new Error(errorMessage(data, 'generation_failed'));
         statusEl.textContent = 'Created "' + data.name + '".';
         statusEl.className = 'status success';
         document.getElementById('resume-instructions').value = '';
@@ -1538,7 +1544,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           body: JSON.stringify({ text: document.getElementById('role-signal-text').value }),
         });
         var data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'add_failed');
+        if (!res.ok) throw new Error(errorMessage(data, 'add_failed'));
         statusEl.textContent = 'Added.';
         statusEl.className = 'status success';
         document.getElementById('role-signal-form').reset();
@@ -1562,7 +1568,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           body: JSON.stringify({ provider: document.getElementById('desired-roles-provider').value }),
         });
         var data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'generation_failed');
+        if (!res.ok) throw new Error(errorMessage(data, 'generation_failed'));
         document.getElementById('desired-roles-draft').value = data.draft_description;
         draftBlock.style.display = 'block';
         statusEl.textContent = 'Draft ready below. Review before using it.';
@@ -1632,7 +1638,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           body: JSON.stringify({ provider: document.getElementById('generate-provider').value }),
         });
         var data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'generation_failed');
+        if (!res.ok) throw new Error(errorMessage(data, 'generation_failed'));
         latestStructuredDraft = data.draft_structured;
         renderStructuredProfileView('structured-draft-view', latestStructuredDraft);
         draftBlock.style.display = 'block';
@@ -1732,7 +1738,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         formData.append('file', fileInput.files[0]);
         var res = await api('/documents', { method: 'POST', body: formData });
         var data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'upload_failed');
+        if (!res.ok) throw new Error(errorMessage(data, 'upload_failed'));
         statusEl.textContent = 'Uploaded.';
         statusEl.className = 'status success';
         document.getElementById('document-form').reset();
@@ -1764,7 +1770,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           body: JSON.stringify({ text: document.getElementById('note-text').value }),
         });
         var data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'add_failed');
+        if (!res.ok) throw new Error(errorMessage(data, 'add_failed'));
         statusEl.textContent = 'Added.';
         statusEl.className = 'status success';
         document.getElementById('note-form').reset();
