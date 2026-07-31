@@ -1,5 +1,22 @@
 import { extractText, getDocumentProxy } from "unpdf";
-import puppeteer, { type BrowserWorker } from "@cloudflare/puppeteer";
+import { type BrowserWorker } from "@cloudflare/puppeteer";
+import { type Provider, callStructured, callText, normalizeProvider, providerKeyMissing } from "./llm";
+import {
+  type LayoutSpec,
+  type ResumeCheck,
+  type ResumeDoc,
+  type StructuredProfile,
+  TEMPLATES,
+  applyLayoutAdjustments,
+  composeResumeDoc,
+  defaultLayout,
+  normalizeLayout,
+  normalizeTemplate,
+  renderResumeArtifacts,
+  renderResumeHtml,
+  reviewResumeDesign,
+  runAllChecks,
+} from "./resume";
 
 interface Env {
   DB: D1Database;
@@ -161,14 +178,6 @@ type Profile = {
   updated_at: string;
 };
 
-type StructuredProfile = {
-  headline: string;
-  narrative_summary: string;
-  education: { school: string; degree: string; field: string; start_year: string; end_year: string }[];
-  experience: { company: string; title: string; start: string; end: string; highlights: string[] }[];
-  skills: string[];
-};
-
 function readDesiredRoles(preferencesJson: string): string {
   try {
     return (JSON.parse(preferencesJson || "{}") as { desired_roles?: string }).desired_roles ?? "";
@@ -315,7 +324,7 @@ async function generateDesiredRoles(request: Request, env: Env): Promise<Respons
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as { provider?: string };
-  const provider = body.provider === "openai" ? "openai" : "anthropic";
+  const provider = normalizeProvider(body.provider);
   if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
   if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
 
@@ -337,7 +346,7 @@ async function generateDesiredRoles(request: Request, env: Env): Promise<Respons
   ].join("\n\n");
 
   try {
-    const draft = provider === "openai" ? await callOpenAI(env, prompt) : await callAnthropic(env, prompt);
+    const draft = await callText(env, provider, prompt);
     return json({ provider, draft_description: draft });
   } catch (err) {
     return json({ error: "generation_failed", detail: (err as Error).message }, 502);
@@ -556,45 +565,6 @@ async function deleteNote(request: Request, env: Env, id: string): Promise<Respo
   return json({ deleted: result.meta.changes > 0 });
 }
 
-async function callAnthropic(env: Env, prompt: string): Promise<string> {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": env.ANTHROPIC_API_KEY!,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: env.ANTHROPIC_MODEL || "claude-sonnet-5",
-      max_tokens: 1500,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-  if (!res.ok) throw new Error(`anthropic_error_${res.status}`);
-  const data = (await res.json()) as { content: { type: string; text?: string }[] };
-  return data.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text ?? "")
-    .join("\n")
-    .trim();
-}
-
-async function callOpenAI(env: Env, prompt: string): Promise<string> {
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: env.OPENAI_MODEL || "gpt-4o",
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-  if (!res.ok) throw new Error(`openai_error_${res.status}`);
-  const data = (await res.json()) as { choices: { message: { content: string } }[] };
-  return (data.choices[0]?.message?.content ?? "").trim();
-}
 
 const STRUCTURED_PROFILE_JSON_SCHEMA = {
   type: "object",
@@ -634,62 +604,12 @@ const STRUCTURED_PROFILE_JSON_SCHEMA = {
   required: ["headline", "narrative_summary", "education", "experience", "skills"],
 } as const;
 
-async function callAnthropicStructured(env: Env, prompt: string): Promise<StructuredProfile> {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": env.ANTHROPIC_API_KEY!,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: env.ANTHROPIC_MODEL || "claude-sonnet-5",
-      max_tokens: 2000,
-      messages: [{ role: "user", content: prompt }],
-      tools: [{ name: "submit_structured_profile", input_schema: STRUCTURED_PROFILE_JSON_SCHEMA }],
-      tool_choice: { type: "tool", name: "submit_structured_profile" },
-    }),
-  });
-  if (!res.ok) throw new Error(`anthropic_error_${res.status}`);
-  const data = (await res.json()) as { content: { type: string; input?: StructuredProfile }[] };
-  const toolUse = data.content.find((block) => block.type === "tool_use");
-  if (!toolUse?.input) throw new Error("anthropic_no_structured_output");
-  return toolUse.input;
-}
-
-async function callOpenAIStructured(env: Env, prompt: string): Promise<StructuredProfile> {
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: env.OPENAI_MODEL || "gpt-4o",
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "Respond with a single JSON object only, matching this shape: " +
-            "{headline: string, narrative_summary: string, education: [{school, degree, field, start_year, end_year}], " +
-            "experience: [{company, title, start, end, highlights: string[]}], skills: string[]}. No prose outside the JSON.",
-        },
-        { role: "user", content: prompt },
-      ],
-    }),
-  });
-  if (!res.ok) throw new Error(`openai_error_${res.status}`);
-  const data = (await res.json()) as { choices: { message: { content: string } }[] };
-  const raw = data.choices[0]?.message?.content ?? "{}";
-  return JSON.parse(raw) as StructuredProfile;
-}
 
 async function generateProfile(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as { provider?: string };
-  const provider = body.provider === "openai" ? "openai" : "anthropic";
+  const provider = normalizeProvider(body.provider);
   if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
   if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
 
@@ -735,7 +655,14 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   ].join("\n\n");
 
   try {
-    const raw = provider === "openai" ? await callOpenAIStructured(env, prompt) : await callAnthropicStructured(env, prompt);
+    const raw = await callStructured<StructuredProfile>(
+      env,
+      provider,
+      prompt,
+      STRUCTURED_PROFILE_JSON_SCHEMA,
+      "submit_structured_profile",
+      2000,
+    );
     const draft = mergeStructuredProfiles(existingStructured, raw);
     return json({ provider, draft_structured: draft });
   } catch (err) {
@@ -743,171 +670,220 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   }
 }
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function renderResumeHtml(name: string, content: StructuredProfile): string {
-  const educationHtml = (content.education ?? [])
-    .map((e) => {
-      const line = [e.degree, e.field].filter(Boolean).join(" in ");
-      const years = [e.start_year, e.end_year].filter(Boolean).join(" – ");
-      return `<div class="entry">
-        <div class="entry-row"><span class="entry-title">${escapeHtml(line || e.school)}</span><span class="entry-dates">${escapeHtml(years)}</span></div>
-        ${line ? `<div class="entry-sub">${escapeHtml(e.school)}</div>` : ""}
-      </div>`;
-    })
-    .join("");
-
-  const experienceHtml = (content.experience ?? [])
-    .map((e) => {
-      const years = [e.start, e.end].filter(Boolean).join(" – ");
-      const highlights = (e.highlights ?? []).map((h) => `<li>${escapeHtml(h)}</li>`).join("");
-      return `<div class="entry">
-        <div class="entry-row"><span class="entry-title">${escapeHtml(e.title)} — ${escapeHtml(e.company)}</span><span class="entry-dates">${escapeHtml(years)}</span></div>
-        ${highlights ? `<ul class="bullets">${highlights}</ul>` : ""}
-      </div>`;
-    })
-    .join("");
-
-  const skillsHtml = (content.skills ?? []).map((s) => escapeHtml(s)).join(" &nbsp;·&nbsp; ");
-
-  return `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  * { box-sizing: border-box; }
-  body {
-    font-family: Georgia, 'Times New Roman', serif;
-    color: #1a1a1a;
-    margin: 0;
-    padding: 0.35in 0.55in;
-    font-size: 10.5pt;
-    line-height: 1.42;
-  }
-  h1 { font-size: 19pt; margin: 0 0 2pt; font-weight: 700; }
-  .headline { font-size: 10.5pt; color: #444; margin: 0 0 10pt; }
-  .summary { margin: 0 0 12pt; font-size: 10pt; color: #222; }
-  h2 {
-    font-size: 10.5pt; text-transform: uppercase; letter-spacing: 0.06em;
-    border-bottom: 1px solid #999; padding-bottom: 2pt; margin: 12pt 0 7pt;
-  }
-  .entry { margin-bottom: 8pt; }
-  .entry-row { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5em; }
-  .entry-title { font-weight: 700; font-size: 10.5pt; }
-  .entry-dates { font-size: 9.5pt; color: #555; white-space: nowrap; }
-  .entry-sub { font-size: 9.5pt; color: #444; font-style: italic; }
-  .bullets { margin: 3pt 0 0; padding-left: 15pt; }
-  .bullets li { margin-bottom: 2pt; }
-  .skills { font-size: 10pt; }
-</style>
-</head>
-<body>
-  <h1>${escapeHtml(name || "Resume")}</h1>
-  ${content.headline ? `<div class="headline">${escapeHtml(content.headline)}</div>` : ""}
-  ${content.narrative_summary ? `<p class="summary">${escapeHtml(content.narrative_summary)}</p>` : ""}
-  ${experienceHtml ? `<h2>Experience</h2>${experienceHtml}` : ""}
-  ${educationHtml ? `<h2>Education</h2>${educationHtml}` : ""}
-  ${skillsHtml ? `<h2>Skills</h2><div class="skills">${skillsHtml}</div>` : ""}
-</body>
-</html>`;
-}
-
-async function renderAndStoreResumePdf(env: Env, resumeId: string, html: string): Promise<string> {
-  const browser = await puppeteer.launch(env.BROWSER);
-  try {
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: "networkidle0" });
-    const pdf = await page.pdf({
-      format: "letter",
-      printBackground: true,
-      margin: { top: "0in", bottom: "0in", left: "0in", right: "0in" },
-    });
-    const key = `resumes/${resumeId}.pdf`;
-    await env.FILES.put(key, pdf, { httpMetadata: { contentType: "application/pdf" } });
-    return key;
-  } finally {
-    await browser.close();
-  }
-}
-
-async function generateResumeContent(
-  env: Env,
-  structured: StructuredProfile,
-  instructions: string,
-  provider: string,
-): Promise<StructuredProfile> {
-  const prompt = [
-    "You are producing content for one tailored resume version, built from a candidate's full structured profile.",
-    "You may reorder, select, and trim entries and highlights for relevance and concision (for example, keeping only",
-    "the most relevant few bullets per role), but never invent facts, employers, dates, or accomplishments that are",
-    "not present in the profile below.",
-    instructions
-      ? `Instructions for this specific resume version: ${instructions}`
-      : "No special instructions were given -- produce a strong, concise, general-purpose resume.",
-    "",
-    `Full profile:\n${JSON.stringify(structured)}`,
-  ].join("\n\n");
-  return provider === "openai" ? await callOpenAIStructured(env, prompt) : await callAnthropicStructured(env, prompt);
-}
-
 async function listResumes(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const profileId = await getOrCreateProfileId(env);
   const rows = await env.DB.prepare(
-    "SELECT id, name, instructions, created_at FROM resumes WHERE profile_id = ? ORDER BY created_at DESC",
+    `SELECT id, name, instructions, template, revision, checks_json, critique, created_at
+     FROM resumes WHERE profile_id = ? ORDER BY created_at DESC`,
   )
     .bind(profileId)
     .all();
-  return json({ resumes: rows.results });
+  return json({ resumes: rows.results, templates: TEMPLATES });
+}
+
+/** Loads the evidence every resume is built from, or the error response explaining why it can't. */
+async function loadProfileForResume(
+  env: Env,
+): Promise<{ profileId: string; structured: StructuredProfile; desiredRoles: string } | Response> {
+  const profileId = await getOrCreateProfileId(env);
+  const row = await env.DB.prepare(
+    "SELECT preferences_json, structured_json FROM candidate_profiles WHERE id = ?",
+  )
+    .bind(profileId)
+    .first<{ preferences_json: string; structured_json: string }>();
+  const structured = readStructuredProfile(row?.structured_json ?? "{}");
+  if (!structured) return json({ error: "no_profile_yet" }, 400);
+  return { profileId, structured, desiredRoles: readDesiredRoles(row?.preferences_json ?? "{}") };
+}
+
+/**
+ * compose -> render -> check, shared by first generation and by every revision so a revised
+ * resume is validated exactly as strictly as a fresh one.
+ */
+async function buildResumeVersion(
+  env: Env,
+  resumeId: string,
+  provider: Provider,
+  structured: StructuredProfile,
+  desiredRoles: string,
+  instructions: string,
+  layout: LayoutSpec,
+  feedback: string,
+): Promise<{ doc: ResumeDoc; pdfKey: string; screenshotBase64: string; checks: ResumeCheck[] }> {
+  const doc = await composeResumeDoc(env, provider, structured, desiredRoles, instructions, layout, feedback);
+  const html = renderResumeHtml(doc, layout);
+  const { pdfKey, pdfBytes, screenshotBase64 } = await renderResumeArtifacts(env, resumeId, html);
+  const checks = await runAllChecks(pdfBytes, doc, structured, layout);
+  return { doc, pdfKey, screenshotBase64, checks };
 }
 
 async function createResume(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { instructions?: string; provider?: string };
+  const body = (await request.json().catch(() => ({}))) as {
+    instructions?: string;
+    provider?: string;
+    template?: string;
+    max_pages?: number;
+  };
   const instructions = (body.instructions ?? "").trim();
-  const provider = body.provider === "openai" ? "openai" : "anthropic";
-  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
-  if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
 
-  const profileId = await getOrCreateProfileId(env);
-  const profileRow = await env.DB.prepare("SELECT label, structured_json FROM candidate_profiles WHERE id = ?")
-    .bind(profileId)
-    .first<{ label: string; structured_json: string }>();
-  const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
-  if (!structured) return json({ error: "no_profile_yet" }, 400);
+  const profile = await loadProfileForResume(env);
+  if (profile instanceof Response) return profile;
 
-  let content: StructuredProfile;
+  const layout = normalizeLayout({
+    ...defaultLayout(normalizeTemplate(body.template)),
+    max_pages: body.max_pages ?? 1,
+  });
+
+  const id = crypto.randomUUID();
+  let built;
   try {
-    content = await generateResumeContent(env, structured, instructions, provider);
+    built = await buildResumeVersion(
+      env,
+      id,
+      provider,
+      profile.structured,
+      profile.desiredRoles,
+      instructions,
+      layout,
+      "",
+    );
   } catch (err) {
     return json({ error: "generation_failed", detail: (err as Error).message }, 502);
   }
 
-  const html = renderResumeHtml(profileRow?.label ?? "", content);
-  const id = crypto.randomUUID();
-  let pdfKey: string;
-  try {
-    pdfKey = await renderAndStoreResumePdf(env, id, html);
-  } catch (err) {
-    return json({ error: "pdf_render_failed", detail: (err as Error).message }, 502);
-  }
-
   const name = instructions ? instructions.slice(0, 60) : `Resume ${new Date().toISOString().slice(0, 10)}`;
   await env.DB.prepare(
-    "INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key) VALUES (?, ?, ?, ?, ?, ?)",
+    `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(id, profileId, name, instructions, JSON.stringify(content), pdfKey)
+    .bind(
+      id,
+      profile.profileId,
+      name,
+      instructions,
+      JSON.stringify(built.doc),
+      built.pdfKey,
+      layout.template,
+      JSON.stringify(layout),
+      JSON.stringify(built.checks),
+    )
     .run();
 
-  return json({ id, name }, 201);
+  return json({ id, name, template: layout.template, revision: 1, checks: built.checks }, 201);
+}
+
+/**
+ * The design-review loop: screenshot what we rendered, have a vision model critique it as a
+ * designer would, then apply its (clamped) layout changes and, when it says the writing itself
+ * is the problem, re-compose from verified evidence with its guidance. The user's own comment,
+ * when given, outranks the model's opinion.
+ */
+async function reviewResume(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { comment?: string; provider?: string };
+  const comment = (body.comment ?? "").trim();
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const profile = await loadProfileForResume(env);
+  if (profile instanceof Response) return profile;
+
+  const row = await env.DB.prepare(
+    "SELECT instructions, content_json, layout_json, checks_json, revision FROM resumes WHERE id = ? AND profile_id = ?",
+  )
+    .bind(id, profile.profileId)
+    .first<{
+      instructions: string;
+      content_json: string;
+      layout_json: string;
+      checks_json: string;
+      revision: number;
+    }>();
+  if (!row) return json({ error: "not_found" }, 404);
+
+  const layout = normalizeLayout(JSON.parse(row.layout_json || "{}"));
+  const doc = JSON.parse(row.content_json || "{}") as ResumeDoc;
+  const previousChecks = JSON.parse(row.checks_json || "[]") as ResumeCheck[];
+
+  try {
+    // Re-render the current version so the reviewer sees exactly what is stored.
+    const current = await renderResumeArtifacts(env, id, renderResumeHtml(doc, layout));
+    const review = await reviewResumeDesign(
+      env,
+      provider,
+      current.screenshotBase64,
+      layout,
+      previousChecks,
+      comment,
+    );
+
+    const nextLayout = applyLayoutAdjustments(layout, review.layout_adjustments);
+    const feedback = [review.needs_content_revision ? review.content_guidance : "", comment]
+      .filter(Boolean)
+      .join("\n");
+
+    let built;
+    if (feedback) {
+      built = await buildResumeVersion(
+        env,
+        id,
+        provider,
+        profile.structured,
+        profile.desiredRoles,
+        row.instructions ?? "",
+        nextLayout,
+        feedback,
+      );
+    } else {
+      // Layout-only fix: keep the approved wording, just re-render it.
+      const html = renderResumeHtml(doc, nextLayout);
+      const rendered = await renderResumeArtifacts(env, id, html);
+      built = {
+        doc,
+        pdfKey: rendered.pdfKey,
+        screenshotBase64: rendered.screenshotBase64,
+        checks: await runAllChecks(rendered.pdfBytes, doc, profile.structured, nextLayout),
+      };
+    }
+
+    const revision = (row.revision ?? 1) + 1;
+    await env.DB.prepare(
+      `UPDATE resumes SET content_json = ?, pdf_r2_key = ?, layout_json = ?, checks_json = ?, critique = ?,
+       revision = ?, template = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    )
+      .bind(
+        JSON.stringify(built.doc),
+        built.pdfKey,
+        JSON.stringify(nextLayout),
+        JSON.stringify(built.checks),
+        review.critique,
+        revision,
+        nextLayout.template,
+        id,
+      )
+      .run();
+
+    return json({
+      id,
+      revision,
+      verdict: review.verdict,
+      critique: review.critique,
+      layout: nextLayout,
+      content_revised: Boolean(feedback),
+      checks: built.checks,
+    });
+  } catch (err) {
+    return json({ error: "review_failed", detail: (err as Error).message }, 502);
+  }
 }
 
 async function renameResume(request: Request, env: Env, id: string): Promise<Response> {
@@ -1133,6 +1109,25 @@ const DASHBOARD_PAGE = `<!doctype html>
   .row-meta { font-size: 0.85rem; color: var(--text-muted); }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
   .empty { color: var(--text-muted); font-size: 0.9rem; }
+  .template-choices { display: grid; gap: 0.5rem; margin-bottom: 0.9rem; }
+  @media (min-width: 560px) { .template-choices { grid-template-columns: repeat(3, 1fr); } }
+  .template-card {
+    text-align: left; padding: 0.65rem 0.7rem; border: 1px solid var(--border);
+    border-radius: 0.55rem; background: transparent; color: inherit; cursor: pointer;
+  }
+  .template-card[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .template-card strong { display: block; font-size: 0.95rem; margin-bottom: 0.15rem; }
+  .template-card span { font-size: 0.8rem; color: var(--text-muted); line-height: 1.35; }
+  .checks { list-style: none; padding: 0; margin: 0.75rem 0 0; display: grid; gap: 0.35rem; }
+  .checks li { font-size: 0.85rem; display: flex; gap: 0.5rem; align-items: baseline; }
+  .checks .mark { font-weight: 700; }
+  .checks .error .mark { color: var(--error); }
+  .checks .warning .mark { color: #b8860b; }
+  .checks .ok .mark { color: var(--success); }
+  .critique {
+    font-size: 0.9rem; border-left: 3px solid var(--accent); padding: 0.5rem 0.75rem;
+    background: var(--surface-2, rgba(127,127,127,0.08)); border-radius: 0 0.4rem 0.4rem 0;
+  }
   .split { display: grid; grid-template-columns: 1fr; gap: 1.1rem; align-items: start; }
   @media (min-width: 760px) {
     .split { grid-template-columns: 1fr 1fr; }
@@ -1273,8 +1268,15 @@ const DASHBOARD_PAGE = `<!doctype html>
       <div>
         <section id="resume-generate-section">
           <h2>Resume versions</h2>
+          <label for="resume-template">Template</label>
+          <div id="resume-template-choices" class="template-choices"></div>
           <label for="resume-instructions">Instructions for this version (optional)</label>
           <textarea id="resume-instructions" placeholder="e.g. keep it to one page, emphasize leadership, target a backend-heavy role"></textarea>
+          <label for="resume-pages">Length</label>
+          <select id="resume-pages">
+            <option value="1">One page</option>
+            <option value="2">Up to two pages</option>
+          </select>
           <label for="resume-provider">Generate using</label>
           <select id="resume-provider">
             <option value="anthropic">Anthropic (Claude)</option>
@@ -1291,6 +1293,15 @@ const DASHBOARD_PAGE = `<!doctype html>
         <section id="resume-preview-section" style="display:none">
           <h2>Preview</h2>
           <iframe id="resume-preview-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+
+          <div id="resume-checks"></div>
+
+          <h3>Design review</h3>
+          <p class="hint">A vision model looks at the rendered page the way a designer would, then adjusts the layout — and rewrites the wording from your verified profile if that's the real problem. Add a comment to steer it, or leave it blank and just hit revise.</p>
+          <p id="resume-critique" class="critique" style="display:none"></p>
+          <textarea id="resume-review-comment" placeholder="Optional — e.g. too much white space at the bottom, make the skills section smaller"></textarea>
+          <button id="resume-review-button" type="button">Revise this version</button>
+          <p id="resume-review-status" class="status" role="status" aria-live="polite"></p>
         </section>
       </div>
     </div>
@@ -1371,16 +1382,61 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     }
 
-    function showResumePreview(id) {
+    var activeResumeId = null;
+    var selectedTemplate = 'classic';
+
+    function renderTemplateChoices(templates) {
+      var host = document.getElementById('resume-template-choices');
+      host.innerHTML = '';
+      templates.forEach(function (tpl) {
+        var card = el('button', { className: 'template-card', type: 'button' }, [
+          el('strong', { textContent: tpl.name }),
+          el('span', { textContent: tpl.blurb }),
+        ]);
+        card.setAttribute('aria-pressed', String(tpl.id === selectedTemplate));
+        card.addEventListener('click', function () {
+          selectedTemplate = tpl.id;
+          Array.prototype.forEach.call(host.children, function (child) {
+            child.setAttribute('aria-pressed', String(child === card));
+          });
+        });
+        host.appendChild(card);
+      });
+    }
+
+    function renderChecks(checks) {
+      var host = document.getElementById('resume-checks');
+      host.innerHTML = '';
+      if (!checks || !checks.length) return;
+      var list = el('ul', { className: 'checks' });
+      checks.forEach(function (check) {
+        var mark = check.severity === 'ok' ? '✓' : check.severity === 'warning' ? '!' : '✕';
+        list.appendChild(el('li', { className: check.severity }, [
+          el('span', { className: 'mark', textContent: mark }),
+          el('span', { textContent: check.message }),
+        ]));
+      });
+      host.appendChild(list);
+    }
+
+    // Cache-bust so a revised PDF at the same URL actually reloads in the iframe.
+    function showResumePreview(id, checks, critique) {
+      activeResumeId = id;
       var section = document.getElementById('resume-preview-section');
       section.style.display = 'block';
-      document.getElementById('resume-preview-frame').src = '/resumes/' + encodeURIComponent(id) + '/file';
+      document.getElementById('resume-preview-frame').src =
+        '/resumes/' + encodeURIComponent(id) + '/file?v=' + Date.now();
+      renderChecks(checks);
+      var critiqueEl = document.getElementById('resume-critique');
+      critiqueEl.textContent = critique || '';
+      critiqueEl.style.display = critique ? 'block' : 'none';
       section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
     async function loadResumes() {
       var res = await api('/resumes');
       var data = await res.json();
+      if (data.templates) renderTemplateChoices(data.templates);
       var list = document.getElementById('resumes-list');
       list.innerHTML = '';
       if (!data.resumes.length) {
@@ -1396,7 +1452,11 @@ const DASHBOARD_PAGE = `<!doctype html>
           textContent: resume.name,
         });
         var previewInline = el('button', { className: 'secondary', type: 'button', textContent: 'Preview here' });
-        previewInline.addEventListener('click', function () { showResumePreview(resume.id); });
+        previewInline.addEventListener('click', function () {
+          var checks = [];
+          try { checks = JSON.parse(resume.checks_json || '[]'); } catch (e) { checks = []; }
+          showResumePreview(resume.id, checks, resume.critique);
+        });
         var rename = el('button', { className: 'secondary', type: 'button', textContent: 'Rename' });
         rename.addEventListener('click', async function () {
           var name = window.prompt('New name for this resume version:', resume.name);
@@ -1413,11 +1473,13 @@ const DASHBOARD_PAGE = `<!doctype html>
           await api('/resumes/' + encodeURIComponent(resume.id), { method: 'DELETE' });
           loadResumes();
         });
+        var meta = [
+          resume.template || 'classic',
+          'rev ' + (resume.revision || 1),
+          new Date(resume.created_at).toLocaleString(),
+        ].join(' · ');
         var row = el('div', { className: 'row' }, [
-          el('div', {}, [
-            preview,
-            el('div', { className: 'row-meta', textContent: new Date(resume.created_at).toLocaleString() }),
-          ]),
+          el('div', {}, [preview, el('div', { className: 'row-meta', textContent: meta })]),
           el('div', {}, [previewInline, rename, del]),
         ]);
         list.appendChild(el('div', { className: 'row-item' }, [row]));
@@ -1435,6 +1497,8 @@ const DASHBOARD_PAGE = `<!doctype html>
           body: JSON.stringify({
             instructions: document.getElementById('resume-instructions').value,
             provider: document.getElementById('resume-provider').value,
+            template: selectedTemplate,
+            max_pages: Number(document.getElementById('resume-pages').value),
           }),
         });
         var data = await res.json();
@@ -1443,7 +1507,40 @@ const DASHBOARD_PAGE = `<!doctype html>
         statusEl.className = 'status success';
         document.getElementById('resume-instructions').value = '';
         await loadResumes();
-        showResumePreview(data.id);
+        showResumePreview(data.id, data.checks, '');
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    document.getElementById('resume-review-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('resume-review-status');
+      if (!activeResumeId) {
+        statusEl.textContent = 'Preview a resume version first.';
+        statusEl.className = 'status error';
+        return;
+      }
+      statusEl.textContent = 'Reviewing the rendered page and revising… this takes a bit longer than generating.';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/resumes/' + encodeURIComponent(activeResumeId) + '/review', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            comment: document.getElementById('resume-review-comment').value,
+            provider: document.getElementById('resume-provider').value,
+          }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(errorMessage(data, 'review_failed'));
+        document.getElementById('resume-review-comment').value = '';
+        await loadResumes();
+        showResumePreview(data.id, data.checks, data.critique);
+        statusEl.textContent =
+          'Revision ' + data.revision + ' ready — ' +
+          (data.content_revised ? 'wording and layout updated.' : 'layout updated.');
+        statusEl.className = 'status success';
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
@@ -1939,6 +2036,8 @@ export default {
     if (request.method === "POST" && url.pathname === "/resumes") return createResume(request, env);
     const resumeFileMatch = url.pathname.match(/^\/resumes\/([^/]+)\/file$/);
     if (request.method === "GET" && resumeFileMatch) return getResumeFile(request, env, resumeFileMatch[1]);
+    const resumeReviewMatch = url.pathname.match(/^\/resumes\/([^/]+)\/review$/);
+    if (request.method === "POST" && resumeReviewMatch) return reviewResume(request, env, resumeReviewMatch[1]);
     const resumeMatch = url.pathname.match(/^\/resumes\/([^/]+)$/);
     if (request.method === "PATCH" && resumeMatch) return renameResume(request, env, resumeMatch[1]);
     if (request.method === "DELETE" && resumeMatch) return deleteResume(request, env, resumeMatch[1]);
