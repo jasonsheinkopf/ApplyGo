@@ -120,23 +120,31 @@ Either way, the enrollment code is single-use and expires (default/max above, 15
 
 ## Dashboard
 
-`GET /` is the phone-usable dashboard: profile edit, job posting list/add/remove, and device management, all gated by the same session cookie from enrollment. Visiting `/` without a valid session redirects to `/enroll`. It's a single self-contained HTML page (no build step, no external assets) that calls the JSON endpoints below with `credentials: 'same-origin'`.
+`GET /` is the phone-usable dashboard, gated by the same session cookie from enrollment (redirects to `/enroll` without a valid session). It's a single self-contained HTML page (no build step, no external assets, no frontend framework) with four tabs, calling the JSON endpoints below with `credentials: 'same-origin'`:
 
-Authenticated data endpoints backing the dashboard:
+- **Desired Roles** — paste job links or write loosely about what you want next (`role_signal`-category `candidate_evidence` rows); generate a structured description of the roles you're targeting (Anthropic or OpenAI), stored in `candidate_profiles.preferences_json.desired_roles`
+- **Profile** — name/summary, document upload, freeform notes, and AI profile generation
+- **Jobs** — job posting list/add/remove
+- **Devices** — device list/revoke
 
-- `GET /profile` / `PUT /profile` — single-profile model (`label`, `summary`); the first `candidate_profiles` row is created on first use and updated in place after that
+Authenticated data endpoints:
+
+- `GET /profile` / `PUT /profile` — single-profile model (`label`, `summary`); returns `desired_roles` too (read from `preferences_json`). The first `candidate_profiles` row is created on first use (by any tab) and updated in place after that.
+- `GET /role-signals` / `POST /role-signals` / `DELETE /role-signals/:id` — freeform `candidate_evidence` rows (`category = 'role_signal'`)
+- `PUT /desired-roles` — saves the reviewed description into `preferences_json.desired_roles`
+- `POST /desired-roles/generate` — synthesizes a structured "roles you're looking for" description from all role-signal notes, via Anthropic or OpenAI. Draft only, not auto-saved.
 - `GET /jobs` / `POST /jobs` / `DELETE /jobs/:id` — `job_postings` rows (`title`, `company`, `source_url`, `raw_description`)
-- `GET /documents` / `POST /documents` / `PATCH /documents/:id` / `DELETE /documents/:id` — `source_documents` rows backed by private R2 storage. Uploads accept PDF, plain text, or Markdown (15 MB limit, same as `/artifacts`). Text is only extracted automatically for `text/plain`/`text/markdown` — PDFs are stored but not parsed yet, so PDF content doesn't feed profile generation until you also paste it as a note.
+- `GET /documents` / `POST /documents` / `PATCH /documents/:id` / `DELETE /documents/:id` — `source_documents` rows backed by private R2 storage. Uploads accept PDF, plain text, or Markdown (15 MB limit, same as `/artifacts`). Text is extracted automatically for all three types: `text/plain`/`text/markdown` read directly, PDFs parsed with [`unpdf`](https://github.com/unjs/unpdf) (Cloudflare's own recommended edge-compatible PDF.js build — see [R2's PDF summarization tutorial](https://developers.cloudflare.com/r2/tutorials/summarize-pdf/)).
 - `GET /notes` / `POST /notes` / `DELETE /notes/:id` — freeform `candidate_evidence` rows (`category = 'note'`) for unstructured facts about yourself, no file needed
-- `POST /profile/generate` — synthesizes a long-form narrative profile from the existing summary + all notes + any extracted document text, using either Anthropic or OpenAI (`{"provider": "anthropic" | "openai"}`). Returns a draft only; it is never auto-saved. The dashboard shows it for review and only writes it into `summary` once you click "Use this draft" and then "Save profile" — consistent with this project's human-supervised design (see `docs/product/progressive-autonomy.md`).
+- `POST /profile/generate` — synthesizes a long-form narrative profile from the existing summary + all notes + all extracted document text (including parsed PDFs), using either Anthropic or OpenAI (`{"provider": "anthropic" | "openai"}`). Returns a draft only; it is never auto-saved. The dashboard shows it for review and only writes it into `summary` once you click "Use this draft" and then "Save profile" — consistent with this project's human-supervised design (see `docs/product/progressive-autonomy.md`).
 
 Model provider configuration:
 
-- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` — Worker secrets (`wrangler secret put ANTHROPIC_API_KEY --env production`), not vars, not committed. `/profile/generate` returns `501` for a provider whose key isn't set.
+- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` — Worker secrets (`wrangler secret put ANTHROPIC_API_KEY --env production`), not vars, not committed. Both `/profile/generate` and `/desired-roles/generate` return `501` for a provider whose key isn't set.
 - `ANTHROPIC_MODEL` / `OPENAI_MODEL` — plain (non-secret) vars in `wrangler.jsonc`, defaulting to `claude-sonnet-5` and `gpt-4o`. Bump these here if a model id is retired.
 - **Ollama is intentionally not wired into the Worker.** It runs on a local machine with no public address, so Cloudflare's servers cannot call it directly. Using it from the phone dashboard would need a separate local-worker/queued-job component (per `docs/architecture/local-cloudflare-dual-mode.md`'s "optional local worker" and ADR-015's "queued" execution mode) — that's a distinct, larger piece of future work, not a config setting.
 
-This is a first slice, not the full local-Python product surface (job-fit *assessment against a specific posting*, evidence verification workflow, resume generation/versioning aren't ported). See "Current boundary" below.
+This is a first slice, not the full local-Python product surface — nor the full evidence-vault/job-matcher/verifier/reviewer resume-tailoring pipeline described in issue tracking for future work. Job-fit *assessment against a specific posting*, per-job tailored resume generation, formatted resume rendering, and evidence verification workflows aren't ported. See "Current boundary" below.
 
 ## Device management
 
@@ -187,7 +195,7 @@ Hosted in Cloudflare today:
 - hashed session-token storage and remembered secure browser sessions
 - device listing and revocation
 - authenticated private artifact transfer (`/artifacts`)
-- a minimal phone-usable dashboard (`/`): profile edit, job posting list/add/remove, document upload/rename/remove, freeform notes, and AI-generated profile drafts (Anthropic or OpenAI)
+- a tabbed, phone-usable dashboard (`/`): desired-roles description generation, profile edit, PDF/text/markdown document upload with real text extraction, freeform notes, AI-generated profile drafts (Anthropic or OpenAI), job posting list/add/remove, and device management
 
 Still local-Python-only (not ported to Cloudflare):
 

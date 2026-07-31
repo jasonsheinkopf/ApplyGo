@@ -1,3 +1,5 @@
+import { extractText, getDocumentProxy } from "unpdf";
+
 interface Env {
   DB: D1Database;
   FILES: R2Bucket;
@@ -156,13 +158,116 @@ type Profile = {
   updated_at: string;
 };
 
+function readDesiredRoles(preferencesJson: string): string {
+  try {
+    return (JSON.parse(preferencesJson || "{}") as { desired_roles?: string }).desired_roles ?? "";
+  } catch {
+    return "";
+  }
+}
+
 async function getProfile(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
   const profile = await env.DB.prepare(
-    "SELECT id, label, summary, preferences_json, created_at, updated_at FROM candidate_profiles ORDER BY created_at ASC LIMIT 1",
-  ).first<Profile>();
-  return json({ profile: profile ?? null });
+    "SELECT id, label, summary, preferences_json, created_at, updated_at FROM candidate_profiles WHERE id = ?",
+  )
+    .bind(profileId)
+    .first<Profile>();
+  return json({ profile: { ...profile, desired_roles: readDesiredRoles(profile?.preferences_json ?? "{}") } });
+}
+
+async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { desired_roles?: string };
+  const desiredRoles = (body.desired_roles ?? "").trim();
+  const profileId = await getOrCreateProfileId(env);
+  const existing = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  let prefs: Record<string, unknown> = {};
+  try {
+    prefs = JSON.parse(existing?.preferences_json || "{}");
+  } catch {
+    prefs = {};
+  }
+  prefs.desired_roles = desiredRoles;
+  await env.DB.prepare("UPDATE candidate_profiles SET preferences_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(JSON.stringify(prefs), profileId)
+    .run();
+  return json({ desired_roles: desiredRoles });
+}
+
+async function listRoleSignals(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const rows = await env.DB.prepare(
+    "SELECT id, claim, created_at FROM candidate_evidence WHERE profile_id = ? AND category = 'role_signal' ORDER BY created_at DESC",
+  )
+    .bind(profileId)
+    .all();
+  return json({ role_signals: rows.results });
+}
+
+async function createRoleSignal(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { text?: string };
+  const claim = (body.text ?? "").trim();
+  if (!claim) return json({ error: "text_required" }, 400);
+  const profileId = await getOrCreateProfileId(env);
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO candidate_evidence (id, profile_id, category, claim, usable_in_applications) VALUES (?, ?, 'role_signal', ?, 1)",
+  )
+    .bind(id, profileId, claim)
+    .run();
+  return json({ id, claim }, 201);
+}
+
+async function deleteRoleSignal(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const result = await env.DB.prepare("DELETE FROM candidate_evidence WHERE id = ? AND category = 'role_signal'")
+    .bind(id)
+    .run();
+  return json({ deleted: result.meta.changes > 0 });
+}
+
+async function generateDesiredRoles(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string };
+  const provider = body.provider === "openai" ? "openai" : "anthropic";
+  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
+  if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
+
+  const profileId = await getOrCreateProfileId(env);
+  const signals = await env.DB.prepare(
+    "SELECT claim FROM candidate_evidence WHERE profile_id = ? AND category = 'role_signal' ORDER BY created_at ASC",
+  )
+    .bind(profileId)
+    .all<{ claim: string }>();
+  if (signals.results.length === 0) return json({ error: "no_source_material" }, 400);
+
+  const prompt = [
+    "A job candidate has given you loose notes, job links, and preferences about the kind of roles they want next.",
+    "Write a clear, structured description of the roles they are looking for: role families/titles, seniority, domain,",
+    "must-have vs nice-to-have aspects, and anything they explicitly ruled out. Base this only on the notes below.",
+    "",
+    "Notes:",
+    ...signals.results.map((s) => `- ${s.claim}`),
+  ].join("\n\n");
+
+  try {
+    const draft = provider === "openai" ? await callOpenAI(env, prompt) : await callAnthropic(env, prompt);
+    return json({ provider, draft_description: draft });
+  } catch (err) {
+    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+  }
 }
 
 async function upsertProfile(request: Request, env: Env): Promise<Response> {
@@ -276,7 +381,18 @@ async function uploadDocument(request: Request, env: Env): Promise<Response> {
 
   const bytes = await file.arrayBuffer();
   const sha = await digestHex(bytes);
-  const extractedText = file.type === "text/plain" || file.type === "text/markdown" ? new TextDecoder().decode(bytes) : "";
+  let extractedText = "";
+  if (file.type === "text/plain" || file.type === "text/markdown") {
+    extractedText = new TextDecoder().decode(bytes);
+  } else if (file.type === "application/pdf") {
+    try {
+      const pdf = await getDocumentProxy(new Uint8Array(bytes));
+      const { text } = await extractText(pdf, { mergePages: true });
+      extractedText = text;
+    } catch {
+      extractedText = "";
+    }
+  }
   const key = `documents/${crypto.randomUUID()}`;
   await env.FILES.put(key, bytes, {
     httpMetadata: { contentType: file.type },
@@ -538,105 +654,228 @@ const DASHBOARD_PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ApplyGo</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, sans-serif; max-width: 34rem; margin: 0 auto 4rem; padding: 0 1.25rem; line-height: 1.5; }
-  header { display: flex; align-items: center; justify-content: space-between; padding: 1.25rem 0; }
-  h1 { font-size: 1.25rem; margin: 0; }
-  h2 { font-size: 1rem; margin: 0 0 0.75rem; }
-  section { margin: 1.75rem 0; padding: 1rem; border: 1px solid light-dark(#ddd, #333); border-radius: 0.6rem; }
-  label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 600; font-size: 0.9rem; }
-  input, textarea { width: 100%; padding: 0.55rem; font-size: 1rem; box-sizing: border-box; font-family: inherit; }
-  textarea { min-height: 5rem; resize: vertical; }
-  button { margin-top: 1rem; padding: 0.6rem 1.1rem; font-size: 0.95rem; cursor: pointer; }
-  button.secondary { background: none; border: 1px solid light-dark(#999, #666); }
-  #sign-out { margin-top: 0; padding: 0.4rem 0.8rem; font-size: 0.85rem; }
+  :root {
+    color-scheme: light dark;
+    --accent: #4f46e5;
+    --accent-contrast: #ffffff;
+    --bg: #f6f6f9;
+    --surface: #ffffff;
+    --border: #e3e3ea;
+    --text: #1a1a1f;
+    --text-muted: #6b6b76;
+    --success: #16794e;
+    --error: #b3261e;
+    --radius: 0.85rem;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101012;
+      --surface: #1b1b1f;
+      --border: #2d2d33;
+      --text: #f1f1f3;
+      --text-muted: #9c9ca6;
+      --accent: #818cf8;
+      --accent-contrast: #101012;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding-bottom: 3rem;
+    line-height: 1.5;
+  }
+  .shell { max-width: 40rem; margin: 0 auto; padding: 0 1.1rem; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 1.1rem 0; gap: 0.75rem;
+  }
+  .brand { display: flex; align-items: center; gap: 0.5rem; font-weight: 700; font-size: 1.15rem; }
+  .brand svg { flex: none; }
+  .brand .go { color: var(--accent); }
+  nav {
+    display: flex; gap: 0.35rem; overflow-x: auto; padding-bottom: 0.5rem;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  nav::-webkit-scrollbar { display: none; }
+  nav button {
+    flex: none; margin: 0; padding: 0.5rem 0.9rem; font-size: 0.9rem; font-weight: 600;
+    background: none; border: none; border-radius: 999px; color: var(--text-muted); cursor: pointer;
+  }
+  nav button.active { background: var(--accent); color: var(--accent-contrast); }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  section {
+    margin: 1.1rem 0; padding: 1.1rem; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius);
+  }
+  h2 { font-size: 1.05rem; margin: 0 0 0.75rem; }
+  p.hint { color: var(--text-muted); font-size: 0.88rem; margin: -0.25rem 0 0.75rem; }
+  label { display: block; margin: 0.75rem 0 0.3rem; font-weight: 600; font-size: 0.88rem; }
+  input, textarea, select {
+    width: 100%; padding: 0.6rem 0.7rem; font-size: 1rem; box-sizing: border-box; font-family: inherit;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 0.5rem;
+  }
+  textarea { min-height: 5.5rem; resize: vertical; }
+  button {
+    margin-top: 1rem; padding: 0.65rem 1.15rem; font-size: 0.95rem; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: var(--accent-contrast); border: none; border-radius: 0.5rem;
+  }
+  button.secondary { background: none; border: 1px solid var(--border); color: var(--text); }
+  #sign-out { margin-top: 0; padding: 0.4rem 0.85rem; font-size: 0.85rem; }
   .status { margin-top: 0.6rem; font-weight: 600; font-size: 0.9rem; min-height: 1.1rem; }
-  .status.success { color: #16794e; }
-  .status.error { color: #b3261e; }
-  .job, .device { padding: 0.75rem 0; border-top: 1px solid light-dark(#eee, #2a2a2a); }
-  .job:first-child, .device:first-child { border-top: none; padding-top: 0; }
-  .job-title { font-weight: 600; }
-  .job-meta { font-size: 0.85rem; opacity: 0.75; }
+  .status.success { color: var(--success); }
+  .status.error { color: var(--error); }
+  .row-item { padding: 0.75rem 0; border-top: 1px solid var(--border); }
+  .row-item:first-child { border-top: none; padding-top: 0; }
+  .row-title { font-weight: 600; }
+  .row-meta { font-size: 0.85rem; color: var(--text-muted); }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
-  .empty { opacity: 0.6; font-size: 0.9rem; }
+  .empty { color: var(--text-muted); font-size: 0.9rem; }
 </style>
 </head>
 <body>
+  <div class="shell">
   <header>
-    <h1>ApplyGo</h1>
+    <div class="brand">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+        <rect width="28" height="28" rx="8" fill="var(--accent)"/>
+        <path d="M8 15L13 20L21 9" stroke="var(--accent-contrast)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span>Apply<span class="go">Go</span></span>
+    </div>
     <button id="sign-out" class="secondary" type="button">Sign out</button>
   </header>
 
-  <section id="profile-section">
-    <h2>Profile</h2>
-    <form id="profile-form">
-      <label for="profile-label">Name / label</label>
-      <input id="profile-label" required placeholder="e.g. Jason Sheinkopf">
-      <label for="profile-summary">Summary</label>
-      <textarea id="profile-summary" placeholder="Short professional summary"></textarea>
-      <button type="submit">Save profile</button>
-    </form>
-    <p id="profile-status" class="status" role="status" aria-live="polite"></p>
+  <nav>
+    <button class="tab active" data-tab="roles" type="button">Desired Roles</button>
+    <button class="tab" data-tab="profile" type="button">Profile</button>
+    <button class="tab" data-tab="jobs" type="button">Jobs</button>
+    <button class="tab" data-tab="devices" type="button">Devices</button>
+  </nav>
 
-    <label for="generate-provider">Generate from documents &amp; notes using</label>
-    <select id="generate-provider">
-      <option value="anthropic">Anthropic (Claude)</option>
-      <option value="openai">OpenAI</option>
-    </select>
-    <button id="generate-button" class="secondary" type="button">Generate profile</button>
-    <p id="generate-status" class="status" role="status" aria-live="polite"></p>
-    <div id="draft-block" style="display:none">
-      <label for="draft-summary">Draft (review, then use or discard)</label>
-      <textarea id="draft-summary" readonly style="min-height:8rem"></textarea>
-      <button id="use-draft" type="button">Use this draft</button>
-    </div>
-  </section>
+  <div id="panel-roles" class="panel active">
+    <section id="role-signals-section">
+      <h2>What are you looking for?</h2>
+      <p class="hint">Paste job links, or write loosely about what you want next. The more you add, the better the generated description.</p>
+      <div id="role-signals-list"><p class="empty">Loading…</p></div>
+      <form id="role-signal-form">
+        <label for="role-signal-text">Add a note or link</label>
+        <textarea id="role-signal-text" required placeholder="e.g. a link to a posting, or 'I want senior IC roles in applied AI, remote-friendly, not pure infra'"></textarea>
+        <button type="submit">Add</button>
+      </form>
+      <p id="role-signal-status" class="status" role="status" aria-live="polite"></p>
+    </section>
 
-  <section id="documents-section">
-    <h2>Documents</h2>
-    <div id="documents-list"><p class="empty">Loading…</p></div>
-    <form id="document-form">
-      <label for="document-file">Upload resume or notes file (PDF, plain text, or Markdown)</label>
-      <input id="document-file" type="file" accept=".pdf,.txt,.md,application/pdf,text/plain,text/markdown" required>
-      <button type="submit">Upload</button>
-    </form>
-    <p id="document-status" class="status" role="status" aria-live="polite"></p>
-  </section>
+    <section id="desired-roles-section">
+      <h2>Generated description</h2>
+      <label for="desired-roles-provider">Generate using</label>
+      <select id="desired-roles-provider">
+        <option value="anthropic">Anthropic (Claude)</option>
+        <option value="openai">OpenAI</option>
+      </select>
+      <button id="desired-roles-generate-button" class="secondary" type="button">Generate description</button>
+      <p id="desired-roles-generate-status" class="status" role="status" aria-live="polite"></p>
+      <div id="desired-roles-draft-block" style="display:none">
+        <label for="desired-roles-draft">Draft (review, then use or discard)</label>
+        <textarea id="desired-roles-draft" readonly style="min-height:8rem"></textarea>
+        <button id="desired-roles-use-draft" type="button">Use this draft</button>
+      </div>
+      <label for="desired-roles-description">Saved description</label>
+      <textarea id="desired-roles-description" style="min-height:8rem" placeholder="What roles are you targeting?"></textarea>
+      <button id="desired-roles-save-button" type="button">Save</button>
+      <p id="desired-roles-save-status" class="status" role="status" aria-live="polite"></p>
+    </section>
+  </div>
 
-  <section id="notes-section">
-    <h2>Notes about yourself</h2>
-    <div id="notes-list"><p class="empty">Loading…</p></div>
-    <form id="note-form">
-      <label for="note-text">Add unstructured text (accomplishments, goals, background — anything)</label>
-      <textarea id="note-text" required placeholder="Write freely; this feeds the profile generator"></textarea>
-      <button type="submit">Add note</button>
-    </form>
-    <p id="note-status" class="status" role="status" aria-live="polite"></p>
-  </section>
+  <div id="panel-profile" class="panel">
+    <section id="profile-section">
+      <h2>Profile</h2>
+      <form id="profile-form">
+        <label for="profile-label">Name / label</label>
+        <input id="profile-label" required placeholder="e.g. Jason Sheinkopf">
+        <label for="profile-summary">Summary</label>
+        <textarea id="profile-summary" placeholder="Short professional summary"></textarea>
+        <button type="submit">Save profile</button>
+      </form>
+      <p id="profile-status" class="status" role="status" aria-live="polite"></p>
 
-  <section id="jobs-section">
-    <h2>Job postings</h2>
-    <div id="jobs-list"><p class="empty">Loading…</p></div>
-    <form id="job-form">
-      <label for="job-title">Title</label>
-      <input id="job-title" required placeholder="e.g. Senior Engineer">
-      <label for="job-company">Company</label>
-      <input id="job-company" required placeholder="e.g. Acme Corp">
-      <label for="job-url">Posting URL (optional)</label>
-      <input id="job-url" type="url" placeholder="https://...">
-      <label for="job-description">Description</label>
-      <textarea id="job-description" required placeholder="Paste the job description"></textarea>
-      <button type="submit">Add job</button>
-    </form>
-    <p id="job-status" class="status" role="status" aria-live="polite"></p>
-  </section>
+      <label for="generate-provider">Generate from documents &amp; notes using</label>
+      <select id="generate-provider">
+        <option value="anthropic">Anthropic (Claude)</option>
+        <option value="openai">OpenAI</option>
+      </select>
+      <button id="generate-button" class="secondary" type="button">Generate profile</button>
+      <p id="generate-status" class="status" role="status" aria-live="polite"></p>
+      <div id="draft-block" style="display:none">
+        <label for="draft-summary">Draft (review, then use or discard)</label>
+        <textarea id="draft-summary" readonly style="min-height:8rem"></textarea>
+        <button id="use-draft" type="button">Use this draft</button>
+      </div>
+    </section>
 
-  <section id="devices-section">
-    <h2>Devices</h2>
-    <div id="devices-list"><p class="empty">Loading…</p></div>
-  </section>
+    <section id="documents-section">
+      <h2>Documents</h2>
+      <div id="documents-list"><p class="empty">Loading…</p></div>
+      <form id="document-form">
+        <label for="document-file">Upload resume or notes file (PDF, plain text, or Markdown)</label>
+        <input id="document-file" type="file" accept=".pdf,.txt,.md,application/pdf,text/plain,text/markdown" required>
+        <button type="submit">Upload</button>
+      </form>
+      <p id="document-status" class="status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="notes-section">
+      <h2>Notes about yourself</h2>
+      <div id="notes-list"><p class="empty">Loading…</p></div>
+      <form id="note-form">
+        <label for="note-text">Add unstructured text (accomplishments, goals, background — anything)</label>
+        <textarea id="note-text" required placeholder="Write freely; this feeds the profile generator"></textarea>
+        <button type="submit">Add note</button>
+      </form>
+      <p id="note-status" class="status" role="status" aria-live="polite"></p>
+    </section>
+  </div>
+
+  <div id="panel-jobs" class="panel">
+    <section id="jobs-section">
+      <h2>Job postings</h2>
+      <div id="jobs-list"><p class="empty">Loading…</p></div>
+      <form id="job-form">
+        <label for="job-title">Title</label>
+        <input id="job-title" required placeholder="e.g. Senior Engineer">
+        <label for="job-company">Company</label>
+        <input id="job-company" required placeholder="e.g. Acme Corp">
+        <label for="job-url">Posting URL (optional)</label>
+        <input id="job-url" type="url" placeholder="https://...">
+        <label for="job-description">Description</label>
+        <textarea id="job-description" required placeholder="Paste the job description"></textarea>
+        <button type="submit">Add job</button>
+      </form>
+      <p id="job-status" class="status" role="status" aria-live="polite"></p>
+    </section>
+  </div>
+
+  <div id="panel-devices" class="panel">
+    <section id="devices-section">
+      <h2>Devices</h2>
+      <div id="devices-list"><p class="empty">Loading…</p></div>
+    </section>
+  </div>
+  </div>
 
   <script>
+    document.querySelectorAll('nav .tab').forEach(function (tabButton) {
+      tabButton.addEventListener('click', function () {
+        document.querySelectorAll('nav .tab').forEach(function (b) { b.classList.remove('active'); });
+        document.querySelectorAll('.panel').forEach(function (p) { p.classList.remove('active'); });
+        tabButton.classList.add('active');
+        document.getElementById('panel-' + tabButton.dataset.tab).classList.add('active');
+      });
+    });
+
     function el(tag, props, children) {
       var node = document.createElement(tag);
       Object.keys(props || {}).forEach(function (key) { node[key] = props[key]; });
@@ -662,10 +901,110 @@ const DASHBOARD_PAGE = `<!doctype html>
       var res = await api('/profile');
       var data = await res.json();
       if (data.profile) {
-        document.getElementById('profile-label').value = data.profile.label;
-        document.getElementById('profile-summary').value = data.profile.summary;
+        document.getElementById('profile-label').value = data.profile.label || '';
+        document.getElementById('profile-summary').value = data.profile.summary || '';
+        document.getElementById('desired-roles-description').value = data.profile.desired_roles || '';
       }
     }
+
+    function renderRoleSignals(signals) {
+      var list = document.getElementById('role-signals-list');
+      list.innerHTML = '';
+      if (!signals.length) {
+        list.appendChild(el('p', { className: 'empty', textContent: 'Nothing added yet.' }));
+        return;
+      }
+      signals.forEach(function (signal) {
+        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        del.addEventListener('click', async function () {
+          await api('/role-signals/' + encodeURIComponent(signal.id), { method: 'DELETE' });
+          loadRoleSignals();
+        });
+        var row = el('div', { className: 'row' }, [
+          el('div', { textContent: signal.claim }),
+          del,
+        ]);
+        list.appendChild(el('div', { className: 'row-item' }, [row]));
+      });
+    }
+
+    async function loadRoleSignals() {
+      var res = await api('/role-signals');
+      var data = await res.json();
+      renderRoleSignals(data.role_signals);
+    }
+
+    document.getElementById('role-signal-form').addEventListener('submit', async function (event) {
+      event.preventDefault();
+      var statusEl = document.getElementById('role-signal-status');
+      statusEl.textContent = 'Adding…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/role-signals', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text: document.getElementById('role-signal-text').value }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'add_failed');
+        statusEl.textContent = 'Added.';
+        statusEl.className = 'status success';
+        document.getElementById('role-signal-form').reset();
+        loadRoleSignals();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    document.getElementById('desired-roles-generate-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('desired-roles-generate-status');
+      var draftBlock = document.getElementById('desired-roles-draft-block');
+      statusEl.textContent = 'Generating…';
+      statusEl.className = 'status';
+      draftBlock.style.display = 'none';
+      try {
+        var res = await api('/desired-roles/generate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ provider: document.getElementById('desired-roles-provider').value }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'generation_failed');
+        document.getElementById('desired-roles-draft').value = data.draft_description;
+        draftBlock.style.display = 'block';
+        statusEl.textContent = 'Draft ready below. Review before using it.';
+        statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    document.getElementById('desired-roles-use-draft').addEventListener('click', function () {
+      document.getElementById('desired-roles-description').value = document.getElementById('desired-roles-draft').value;
+      document.getElementById('desired-roles-draft-block').style.display = 'none';
+      document.getElementById('desired-roles-generate-status').textContent = 'Draft copied below — click Save to keep it.';
+    });
+
+    document.getElementById('desired-roles-save-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('desired-roles-save-status');
+      statusEl.textContent = 'Saving…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/desired-roles', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ desired_roles: document.getElementById('desired-roles-description').value }),
+        });
+        if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
+        statusEl.textContent = 'Saved.';
+        statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
 
     document.getElementById('profile-form').addEventListener('submit', async function (event) {
       event.preventDefault();
@@ -747,12 +1086,12 @@ const DASHBOARD_PAGE = `<!doctype html>
         var meta = doc.media_type + (doc.has_text ? '' : ' — text not extracted, paste content as a note instead');
         var row = el('div', { className: 'row' }, [
           el('div', {}, [
-            el('div', { className: 'job-title', textContent: doc.original_name }),
-            el('div', { className: 'job-meta', textContent: meta }),
+            el('div', { className: 'row-title', textContent: doc.original_name }),
+            el('div', { className: 'row-meta', textContent: meta }),
           ]),
           el('div', {}, [rename, del]),
         ]);
-        list.appendChild(el('div', { className: 'job' }, [row]));
+        list.appendChild(el('div', { className: 'row-item' }, [row]));
       });
     }
 
@@ -802,7 +1141,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           el('div', { textContent: note.claim }),
           del,
         ]);
-        list.appendChild(el('div', { className: 'job' }, [row]));
+        list.appendChild(el('div', { className: 'row-item' }, [row]));
       });
     }
 
@@ -850,12 +1189,12 @@ const DASHBOARD_PAGE = `<!doctype html>
         });
         var row = el('div', { className: 'row' }, [
           el('div', {}, [
-            el('div', { className: 'job-title', textContent: job.title + ' — ' + job.company }),
-            el('div', { className: 'job-meta', textContent: new Date(job.created_at).toLocaleDateString() }),
+            el('div', { className: 'row-title', textContent: job.title + ' — ' + job.company }),
+            el('div', { className: 'row-meta', textContent: new Date(job.created_at).toLocaleDateString() }),
           ]),
           del,
         ]);
-        list.appendChild(el('div', { className: 'job' }, [row]));
+        list.appendChild(el('div', { className: 'row-item' }, [row]));
       });
     }
 
@@ -900,7 +1239,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         var children = [
           el('div', {}, [
             el('div', { textContent: device.device_name + (isCurrent ? ' (this device)' : '') }),
-            el('div', { className: 'job-meta', textContent: 'Last seen ' + new Date(device.last_seen_at).toLocaleString() }),
+            el('div', { className: 'row-meta', textContent: 'Last seen ' + new Date(device.last_seen_at).toLocaleString() }),
           ]),
         ];
         if (!device.revoked) {
@@ -912,7 +1251,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           });
           children.push(revoke);
         }
-        list.appendChild(el('div', { className: 'device' }, [el('div', { className: 'row' }, children)]));
+        list.appendChild(el('div', { className: 'row-item' }, [el('div', { className: 'row' }, children)]));
       });
     }
 
@@ -923,6 +1262,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     }
 
     loadProfile();
+    loadRoleSignals();
     loadDocuments();
     loadNotes();
     loadJobs();
@@ -973,6 +1313,12 @@ export default {
     const noteMatch = url.pathname.match(/^\/notes\/([^/]+)$/);
     if (request.method === "DELETE" && noteMatch) return deleteNote(request, env, noteMatch[1]);
     if (request.method === "POST" && url.pathname === "/profile/generate") return generateProfile(request, env);
+    if (request.method === "GET" && url.pathname === "/role-signals") return listRoleSignals(request, env);
+    if (request.method === "POST" && url.pathname === "/role-signals") return createRoleSignal(request, env);
+    const roleSignalMatch = url.pathname.match(/^\/role-signals\/([^/]+)$/);
+    if (request.method === "DELETE" && roleSignalMatch) return deleteRoleSignal(request, env, roleSignalMatch[1]);
+    if (request.method === "PUT" && url.pathname === "/desired-roles") return saveDesiredRoles(request, env);
+    if (request.method === "POST" && url.pathname === "/desired-roles/generate") return generateDesiredRoles(request, env);
     if (request.method === "POST" && url.pathname === "/admin/enrollments") return createEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/enroll") return exchangeEnrollment(request, env);
     if (request.method === "POST" && url.pathname === "/auth/logout") {
