@@ -17,7 +17,8 @@
     "enroll": "node scripts/create-enrollment.mjs"
   },
   "dependencies": {
-    "unpdf": "latest"
+    "unpdf": "latest",
+    "@cloudflare/puppeteer": "latest"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "latest",

@@ -124,6 +124,7 @@ Either way, the enrollment code is single-use and expires (default/max above, 15
 
 - **Desired Roles** — paste job links or write loosely about what you want next (left, `role_signal`-category `candidate_evidence` rows); generate a structured description of the roles you're targeting (right, Anthropic or OpenAI), stored in `candidate_profiles.preferences_json.desired_roles`
 - **Profile** — your material (name, document upload, freeform notes) on the left; your AI-generated **structured** profile on the right
+- **Resume** — your structured profile shown read-only on the left (sticky, for reference while the list on the right grows); on the right, named resume versions rendered as real PDFs. Type optional instructions ("keep it to one page", "emphasize leadership"), generate a new version, preview it inline or in a new tab, rename or remove it. Every generate creates a **new** version — nothing is overwritten, so past versions stay available.
 - **Jobs** — job posting list/add/remove
 - **Devices** — device list/revoke
 
@@ -140,14 +141,16 @@ Authenticated data endpoints:
 - `GET /notes` / `POST /notes` / `DELETE /notes/:id` — freeform `candidate_evidence` rows (`category = 'note'`) for unstructured facts about yourself, no file needed
 - `POST /profile/generate` — synthesizes a **structured** profile — `headline`, `narrative_summary`, `education[]`, `experience[]` (with `highlights[]`), `skills[]` — from all notes and extracted document text (including parsed PDFs), using either Anthropic or OpenAI (`{"provider": "anthropic" | "openai"}`). Reliable JSON is enforced per-provider: Anthropic via forced tool-use with a JSON Schema, OpenAI via `response_format: {"type": "json_object"}`. Returns a draft only; it is never auto-saved. The dashboard shows it for review and only writes it via `PUT /profile/structured` once you click "Save this" — consistent with this project's human-supervised design (see `docs/product/progressive-autonomy.md`). The intent: this structured record is what later features (auto-filling applications, per-job tailoring) read from, instead of re-parsing unstructured text on every use.
   - **Regenerating is additive, not destructive.** The profile is meant to accumulate over time as you add material, not get overwritten from scratch on every regeneration. The prompt is given the current saved profile as an explicit baseline ("keep every entry the new material doesn't contradict") rather than as just one more source among equals, and a deterministic merge step (`mergeStructuredProfiles`) runs on the model's output regardless: any existing education/experience entry whose key (school+degree, or company+title) doesn't reappear in the new output is re-added automatically. This means a regeneration can only add or correct entries, never silently drop one just because the model didn't happen to re-mention it.
+- `GET /resumes` / `POST /resumes` / `PATCH /resumes/:id` / `DELETE /resumes/:id` — named `resumes` rows, each an independent, never-overwritten version. `POST /resumes` (`{"instructions"?: string, "provider"?: "anthropic" | "openai"}`) does the whole pipeline in one call: an LLM tailors resume content from the current structured profile (reordering/trimming for relevance per `instructions`, never inventing facts) into the same `StructuredProfile` shape, an HTML resume template is rendered from that content, and [Cloudflare Browser Rendering](https://developers.cloudflare.com/browser-rendering/) (`@cloudflare/puppeteer`, the `BROWSER` binding) turns that HTML into an actual PDF stored in R2 — a real headless-browser layout engine rather than manually positioning text, which is what makes it plausible for the output to actually look professionally typeset. Auto-named from the instructions (or a date) at creation; rename afterward via `PATCH`.
+- `GET /resumes/:id/file` — the rendered PDF, same Range-aware inline-preview treatment as `/documents/:id/file`.
 
 Model provider configuration:
 
-- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` — Worker secrets (`wrangler secret put ANTHROPIC_API_KEY --env production`), not vars, not committed. Both `/profile/generate` and `/desired-roles/generate` return `501` for a provider whose key isn't set.
+- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` — Worker secrets (`wrangler secret put ANTHROPIC_API_KEY --env production`), not vars, not committed. `/profile/generate`, `/desired-roles/generate`, and `/resumes` (`POST`) all return `501` for a provider whose key isn't set.
 - `ANTHROPIC_MODEL` / `OPENAI_MODEL` — plain (non-secret) vars in `wrangler.jsonc`, defaulting to `claude-sonnet-5` and `gpt-4o`. Bump these here if a model id is retired.
 - **Ollama is intentionally not wired into the Worker.** It runs on a local machine with no public address, so Cloudflare's servers cannot call it directly. Using it from the phone dashboard would need a separate local-worker/queued-job component (per `docs/architecture/local-cloudflare-dual-mode.md`'s "optional local worker" and ADR-015's "queued" execution mode) — that's a distinct, larger piece of future work, not a config setting.
 
-This is a first slice, not the full local-Python product surface — nor the full evidence-vault/job-matcher/verifier/reviewer resume-tailoring pipeline described in issue tracking for future work. Job-fit *assessment against a specific posting*, per-job tailored resume generation, formatted resume rendering, and evidence verification workflows aren't ported. See "Current boundary" below.
+This is a first slice, not the full local-Python product surface — nor the full evidence-vault/job-matcher/verifier/reviewer resume-tailoring pipeline described in issue tracking for future work. Job-fit *assessment against a specific posting*, per-job tailored resume generation targeting one posting, and evidence verification workflows aren't ported yet. Resume PDF rendering exists now, but automated visual QA (render → screenshot → vision-model layout critique → auto-adjust) is tracked as a fast-follow, not built yet — see "Current boundary" below.
 
 ## Device management
 
@@ -198,13 +201,14 @@ Hosted in Cloudflare today:
 - hashed session-token storage and remembered secure browser sessions
 - device listing and revocation
 - authenticated private artifact transfer (`/artifacts`)
-- a tabbed, phone-usable dashboard (`/`): desired-roles description generation, profile edit, PDF/text/markdown document upload with real text extraction, freeform notes, AI-generated profile drafts (Anthropic or OpenAI), job posting list/add/remove, and device management
+- a tabbed, phone-usable dashboard (`/`): desired-roles description generation, profile edit, PDF/text/markdown document upload with real text extraction, freeform notes, AI-generated profile drafts (Anthropic or OpenAI), named resume versions rendered as real PDFs via Browser Rendering, job posting list/add/remove, and device management
 
-Still local-Python-only (not ported to Cloudflare):
+Still local-Python-only, or not built anywhere yet (not ported to Cloudflare):
 
-- the full candidate-profile Jinja/Python frontend and dashboard UI
-- job-fit assessment generation and model-provider orchestration
+- job-fit assessment generation *against a specific posting* (the `fit_assessments` table exists; nothing writes to it yet)
+- automated visual QA on generated resume PDFs (render → screenshot → vision-model layout critique → auto-adjust) — tracked as a fast-follow to resume generation, not built
+- the fuller evidence-vault / requirement-extraction / matching / verification / reviewer pipeline for per-job tailored resumes — see the tracked design issue for this
 - Playwright-based browser automation for applications
-- profile/job/evidence CRUD APIs beyond the raw data model
+- export/import between local and Cloudflare mode
 
-This directory is a control-plane foundation, not the completed Cloudflare product UI. The next Cloudflare slice will add the responsive PWA, profile/job APIs, export/import, local-worker registration, and deployment automation beyond what is described here.
+This directory is a control-plane foundation, not the completed Cloudflare product UI, but the phone-usable dashboard now covers the bulk of the personal-data-management surface (profile, documents, notes, desired roles, resumes, jobs, devices).
