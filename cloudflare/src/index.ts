@@ -2,6 +2,15 @@ import { extractText, getDocumentProxy } from "unpdf";
 import { type BrowserWorker } from "@cloudflare/puppeteer";
 import { type Provider, callStructured, callText, normalizeProvider, providerKeyMissing } from "./llm";
 import {
+  type AtsProvider,
+  companyNameKey,
+  fetchBoardJobs,
+  filterJobsByRoles,
+  proposeCompanies,
+  resolveBoard,
+  verifyWebsite,
+} from "./companies";
+import {
   type LayoutSpec,
   type ResumeCheck,
   type ResumeDoc,
@@ -379,9 +388,335 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const jobs = await env.DB.prepare(
-    "SELECT id, title, company, source_url, raw_description, created_at FROM job_postings ORDER BY created_at DESC LIMIT 100",
-  ).all<JobPosting>();
+    `SELECT id, title, company, source_url, raw_description, location, posted_at, ats_provider,
+            company_id, created_at
+     FROM job_postings
+     ORDER BY COALESCE(posted_at, created_at) DESC
+     LIMIT 300`,
+  ).all();
   return json({ jobs: jobs.results });
+}
+
+// ---------------------------------------------------------------------------
+// Companies
+// ---------------------------------------------------------------------------
+
+async function listCompanies(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const rows = await env.DB.prepare(
+    `SELECT id, name, website, careers_url, bio, location, why_fit, ats_provider, status, source,
+            scan_note, last_scanned_at, open_jobs, created_at
+     FROM companies WHERE profile_id = ? ORDER BY name COLLATE NOCASE ASC`,
+  )
+    .bind(profileId)
+    .all();
+  const pending = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status != 'dismissed' AND last_scanned_at IS NULL",
+  )
+    .bind(profileId)
+    .first<{ n: number }>();
+  return json({ companies: rows.results, unscanned: pending?.n ?? 0 });
+}
+
+async function addCompanyRow(
+  env: Env,
+  profileId: string,
+  company: {
+    name: string;
+    website: string;
+    careers_url: string;
+    bio: string;
+    location: string;
+    why_fit: string;
+    status: string;
+    source: string;
+  },
+): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `INSERT OR IGNORE INTO companies
+       (id, profile_id, name, name_key, website, careers_url, bio, location, why_fit, status, source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      crypto.randomUUID(),
+      profileId,
+      company.name,
+      companyNameKey(company.name),
+      company.website,
+      company.careers_url,
+      company.bio,
+      company.location,
+      company.why_fit,
+      company.status,
+      company.source,
+    )
+    .run();
+  return result.meta.changes > 0;
+}
+
+async function createCompany(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    name?: string;
+    website?: string;
+    careers_url?: string;
+    bio?: string;
+    location?: string;
+  };
+  const name = (body.name ?? "").trim();
+  if (!name) return json({ error: "name_required" }, 400);
+  const profileId = await getOrCreateProfileId(env);
+  const added = await addCompanyRow(env, profileId, {
+    name,
+    website: (body.website ?? "").trim(),
+    careers_url: (body.careers_url ?? "").trim(),
+    bio: (body.bio ?? "").trim(),
+    location: (body.location ?? "").trim(),
+    why_fit: "",
+    status: "reachable",
+    source: "manual",
+  });
+  return json({ added }, added ? 201 : 200);
+}
+
+/**
+ * Proposes companies from the candidate's own profile, then checks each proposed site actually
+ * resolves before trusting it. A model listing employers will occasionally invent or misremember
+ * one, so nothing here is taken on faith.
+ */
+async function discoverCompanies(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    provider?: string;
+    count?: number;
+    focus?: string;
+  };
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const profileId = await getOrCreateProfileId(env);
+  const profileRow = await env.DB.prepare(
+    "SELECT preferences_json, structured_json FROM candidate_profiles WHERE id = ?",
+  )
+    .bind(profileId)
+    .first<{ preferences_json: string; structured_json: string }>();
+  const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
+  if (!structured) return json({ error: "no_profile_yet" }, 400);
+  const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
+
+  const existing = await env.DB.prepare("SELECT name FROM companies WHERE profile_id = ?")
+    .bind(profileId)
+    .all<{ name: string }>();
+  const existingNames = (existing.results ?? []).map((r) => r.name);
+
+  const count = Math.min(Math.max(Number(body.count) || 10, 1), 20);
+  let proposals;
+  try {
+    proposals = await proposeCompanies(
+      env,
+      provider,
+      JSON.stringify(structured),
+      desiredRoles,
+      existingNames,
+      count,
+      (body.focus ?? "").trim(),
+    );
+  } catch (err) {
+    return json({ error: "discovery_failed", detail: (err as Error).message }, 502);
+  }
+
+  const known = new Set(existingNames.map(companyNameKey));
+  const fresh = proposals.filter((p) => {
+    const key = companyNameKey(p.name);
+    if (!key || known.has(key)) return false;
+    known.add(key);
+    return true;
+  });
+
+  let added = 0;
+  let unreachable = 0;
+  for (const proposal of fresh) {
+    const reachable = await verifyWebsite(proposal.website);
+    if (!reachable) unreachable += 1;
+    const inserted = await addCompanyRow(env, profileId, {
+      ...proposal,
+      status: reachable ? "reachable" : "unreachable",
+      source: "ai",
+    });
+    if (inserted) added += 1;
+  }
+
+  return json({
+    added,
+    proposed: proposals.length,
+    duplicates: proposals.length - fresh.length,
+    unreachable,
+  });
+}
+
+/**
+ * Reads job boards for companies that need it. Each company costs several outbound requests, so
+ * this works in bounded batches against a shared subrequest budget and reports what is left --
+ * the dashboard just calls it again rather than risking a single oversized request.
+ */
+async function scanCompanies(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { limit?: number; company_id?: string };
+  const profileId = await getOrCreateProfileId(env);
+
+  const profileRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
+
+  const limit = Math.min(Math.max(Number(body.limit) || 6, 1), 12);
+  const targets = body.company_id
+    ? await env.DB.prepare(
+        "SELECT id, name, website, careers_url, ats_provider, ats_token FROM companies WHERE id = ? AND profile_id = ?",
+      )
+        .bind(body.company_id, profileId)
+        .all<CompanyScanRow>()
+    : await env.DB.prepare(
+        `SELECT id, name, website, careers_url, ats_provider, ats_token
+         FROM companies
+         WHERE profile_id = ? AND status != 'dismissed'
+         ORDER BY last_scanned_at IS NOT NULL, last_scanned_at ASC
+         LIMIT ?`,
+      )
+        .bind(profileId, limit)
+        .all<CompanyScanRow>();
+
+  const budget = { remaining: 40 };
+  const results: { company: string; jobs: number; note: string }[] = [];
+
+  for (const company of targets.results ?? []) {
+    const outcome = await scanOneCompany(env, company, desiredRoles, budget);
+    results.push({ company: company.name, jobs: outcome.jobs, note: outcome.note });
+    if (budget.remaining <= 2) break;
+  }
+
+  const remaining = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status != 'dismissed' AND last_scanned_at IS NULL",
+  )
+    .bind(profileId)
+    .first<{ n: number }>();
+
+  return json({ scanned: results.length, results, unscanned: remaining?.n ?? 0 });
+}
+
+type CompanyScanRow = {
+  id: string;
+  name: string;
+  website: string;
+  careers_url: string;
+  ats_provider: string;
+  ats_token: string;
+};
+
+async function scanOneCompany(
+  env: Env,
+  company: CompanyScanRow,
+  desiredRoles: string,
+  budget: { remaining: number },
+): Promise<{ jobs: number; note: string }> {
+  let provider = company.ats_provider as AtsProvider | "" | "none";
+  let token = company.ats_token;
+
+  if (!provider || provider === "none") {
+    const resolved = await resolveBoard(company.website, company.careers_url, budget);
+    if (!resolved) {
+      await env.DB.prepare(
+        `UPDATE companies SET ats_provider = 'none', scan_note = ?, last_scanned_at = CURRENT_TIMESTAMP,
+         updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      )
+        .bind("No supported job board found on their site.", company.id)
+        .run();
+      return { jobs: 0, note: "no supported board found" };
+    }
+    provider = resolved.provider;
+    token = resolved.token;
+  }
+
+  let scanned;
+  try {
+    budget.remaining -= 1;
+    scanned = await fetchBoardJobs(provider as AtsProvider, token);
+  } catch (err) {
+    await env.DB.prepare(
+      `UPDATE companies SET scan_note = ?, last_scanned_at = CURRENT_TIMESTAMP,
+       updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    )
+      .bind(`Board read failed: ${(err as Error).message}`, company.id)
+      .run();
+    return { jobs: 0, note: "board read failed" };
+  }
+
+  const relevant = filterJobsByRoles(scanned, desiredRoles);
+  for (const job of relevant) {
+    if (!job.title || !job.external_id) continue;
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO job_postings
+         (id, title, company, source_url, raw_description, location, posted_at, ats_provider, company_id, external_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        crypto.randomUUID(),
+        job.title,
+        company.name,
+        job.url,
+        job.description,
+        job.location,
+        job.posted_at || null,
+        provider,
+        company.id,
+        job.external_id,
+      )
+      .run();
+  }
+
+  const total = await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE company_id = ?")
+    .bind(company.id)
+    .first<{ n: number }>();
+
+  const note =
+    relevant.length === scanned.length
+      ? `${scanned.length} open role${scanned.length === 1 ? "" : "s"} on their board.`
+      : `${relevant.length} of ${scanned.length} open roles match your target roles.`;
+
+  await env.DB.prepare(
+    `UPDATE companies SET ats_provider = ?, ats_token = ?, open_jobs = ?, scan_note = ?,
+     last_scanned_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+  )
+    .bind(provider, token, total?.n ?? 0, note, company.id)
+    .run();
+
+  return { jobs: relevant.length, note };
+}
+
+async function updateCompany(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { status?: string };
+  const status = body.status === "dismissed" ? "dismissed" : "reachable";
+  const result = await env.DB.prepare(
+    "UPDATE companies SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+  )
+    .bind(status, id)
+    .run();
+  return json({ updated: result.meta.changes > 0, status });
+}
+
+async function deleteCompany(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const result = await env.DB.prepare("DELETE FROM companies WHERE id = ?").bind(id).run();
+  return json({ deleted: result.meta.changes > 0 });
 }
 
 async function createJob(request: Request, env: Env): Promise<Response> {
@@ -1128,6 +1463,23 @@ const DASHBOARD_PAGE = `<!doctype html>
     font-size: 0.9rem; border-left: 3px solid var(--accent); padding: 0.5rem 0.75rem;
     background: var(--surface-2, rgba(127,127,127,0.08)); border-radius: 0 0.4rem 0.4rem 0;
   }
+  .summary-line { font-size: 0.95rem; margin: 0 0 0.9rem; }
+  .summary-line strong { font-size: 1.35rem; }
+  .badge {
+    display: inline-block; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em;
+    text-transform: uppercase; padding: 0.12rem 0.4rem; border-radius: 0.3rem;
+    border: 1px solid var(--border); color: var(--text-muted); white-space: nowrap;
+  }
+  .badge.jobs { border-color: var(--success); color: var(--success); }
+  .badge.warn { border-color: var(--error); color: var(--error); }
+  .row-title-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+  .company-bio { font-size: 0.88rem; margin: 0.3rem 0 0; }
+  .company-why { font-size: 0.85rem; color: var(--text-muted); margin: 0.25rem 0 0; font-style: italic; }
+  .location-list { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+  .location-chip {
+    font-size: 0.8rem; padding: 0.2rem 0.5rem; border: 1px solid var(--border);
+    border-radius: 999px; background: transparent; color: inherit; cursor: pointer;
+  }
   .split { display: grid; grid-template-columns: 1fr; gap: 1.1rem; align-items: start; }
   @media (min-width: 760px) {
     .split { grid-template-columns: 1fr 1fr; }
@@ -1157,6 +1509,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     <button class="tab active" data-tab="roles" type="button">Desired Roles</button>
     <button class="tab" data-tab="profile" type="button">Profile</button>
     <button class="tab" data-tab="resume" type="button">Resume</button>
+    <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
     <button class="tab" data-tab="devices" type="button">Devices</button>
   </nav>
@@ -1307,9 +1660,65 @@ const DASHBOARD_PAGE = `<!doctype html>
     </div>
   </div>
 
+  <div id="panel-companies" class="panel">
+    <div class="split">
+      <div class="split-sticky">
+        <section id="companies-controls-section">
+          <h2>Target companies</h2>
+          <p class="hint">Built from your profile and desired roles. Jobs are read from each company's own board — no aggregators.</p>
+          <p id="companies-summary" class="summary-line">Loading…</p>
+
+          <label for="company-focus">Focus this search (optional)</label>
+          <input id="company-focus" placeholder="e.g. automotive, robotics, Bay Area startups">
+          <label for="company-count">How many to look for</label>
+          <select id="company-count">
+            <option value="10">10</option>
+            <option value="15">15</option>
+            <option value="20">20</option>
+          </select>
+          <label for="company-provider">Search using</label>
+          <select id="company-provider">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI</option>
+          </select>
+          <button id="companies-discover-button" type="button">Find more companies</button>
+          <p id="companies-discover-status" class="status" role="status" aria-live="polite"></p>
+
+          <h3>Check for openings</h3>
+          <p class="hint">Reads the job boards of companies already on your list. Runs in batches, so click again if there are more left.</p>
+          <button id="companies-scan-button" type="button">Scan boards for jobs</button>
+          <p id="companies-scan-status" class="status" role="status" aria-live="polite"></p>
+
+          <h3>Where they are</h3>
+          <div id="companies-locations"><p class="empty">No companies yet.</p></div>
+
+          <h3>Add one yourself</h3>
+          <form id="company-form">
+            <label for="company-name">Name</label>
+            <input id="company-name" required placeholder="e.g. Acme Robotics">
+            <label for="company-website">Website</label>
+            <input id="company-website" type="url" placeholder="https://acme.com">
+            <button type="submit">Add company</button>
+          </form>
+          <p id="company-add-status" class="status" role="status" aria-live="polite"></p>
+        </section>
+      </div>
+      <div>
+        <section id="companies-list-section">
+          <label for="companies-filter">Filter</label>
+          <input id="companies-filter" placeholder="Search by name, location, or description">
+          <div id="companies-list"><p class="empty">Loading…</p></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
   <div id="panel-jobs" class="panel">
     <section id="jobs-section">
       <h2>Job postings</h2>
+      <p class="hint">Openings found by scanning your target companies' boards, plus anything you added by hand.</p>
+      <label for="jobs-filter">Filter</label>
+      <input id="jobs-filter" placeholder="Search by title, company, or location">
       <div id="jobs-list"><p class="empty">Loading…</p></div>
       <form id="job-form">
         <label for="job-title">Title</label>
@@ -1878,34 +2287,277 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
-    function renderJobs(jobs) {
-      var list = document.getElementById('jobs-list');
+    var allCompanies = [];
+    var allJobs = [];
+
+    function matchesFilter(haystack, needle) {
+      if (!needle) return true;
+      return haystack.toLowerCase().indexOf(needle.toLowerCase()) !== -1;
+    }
+
+    function renderCompanies() {
+      var needle = document.getElementById('companies-filter').value.trim();
+      var list = document.getElementById('companies-list');
       list.innerHTML = '';
-      if (!jobs.length) {
-        list.appendChild(el('p', { className: 'empty', textContent: 'No job postings yet.' }));
+      var shown = allCompanies.filter(function (c) {
+        return matchesFilter([c.name, c.location, c.bio, c.why_fit].join(' '), needle);
+      });
+      if (!shown.length) {
+        list.appendChild(el('p', {
+          className: 'empty',
+          textContent: allCompanies.length ? 'No companies match that filter.' : 'No companies yet — run a search on the left.',
+        }));
         return;
       }
-      jobs.forEach(function (job) {
+      shown.forEach(function (company) {
+        var titleChildren = [];
+        if (company.website) {
+          titleChildren.push(el('a', {
+            className: 'row-title', href: company.website, target: '_blank', rel: 'noopener',
+            textContent: company.name,
+          }));
+        } else {
+          titleChildren.push(el('span', { className: 'row-title', textContent: company.name }));
+        }
+        if (company.open_jobs > 0) {
+          titleChildren.push(el('span', { className: 'badge jobs', textContent: company.open_jobs + ' open' }));
+        }
+        if (company.status === 'unreachable') {
+          titleChildren.push(el('span', { className: 'badge warn', textContent: 'site unreachable' }));
+        }
+        if (company.status === 'dismissed') {
+          titleChildren.push(el('span', { className: 'badge', textContent: 'dismissed' }));
+        }
+
+        var meta = [company.location, company.last_scanned_at ? 'scanned ' + new Date(company.last_scanned_at).toLocaleDateString() : 'not scanned yet']
+          .filter(Boolean).join(' · ');
+
+        var body = [
+          el('div', { className: 'row-title-line' }, titleChildren),
+          el('div', { className: 'row-meta', textContent: meta }),
+        ];
+        if (company.bio) body.push(el('p', { className: 'company-bio', textContent: company.bio }));
+        if (company.why_fit) body.push(el('p', { className: 'company-why', textContent: company.why_fit }));
+        if (company.scan_note) body.push(el('div', { className: 'row-meta', textContent: company.scan_note }));
+
+        var scanOne = el('button', { className: 'secondary', type: 'button', textContent: 'Scan' });
+        scanOne.addEventListener('click', async function () {
+          scanOne.disabled = true;
+          scanOne.textContent = 'Scanning…';
+          await api('/companies/scan', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ company_id: company.id }),
+          });
+          await loadCompanies();
+          await loadJobs();
+        });
+        var dismiss = el('button', {
+          className: 'secondary', type: 'button',
+          textContent: company.status === 'dismissed' ? 'Restore' : 'Dismiss',
+        });
+        dismiss.addEventListener('click', async function () {
+          await api('/companies/' + encodeURIComponent(company.id), {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ status: company.status === 'dismissed' ? 'reachable' : 'dismissed' }),
+          });
+          loadCompanies();
+        });
+        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        del.addEventListener('click', async function () {
+          await api('/companies/' + encodeURIComponent(company.id), { method: 'DELETE' });
+          loadCompanies();
+        });
+
+        list.appendChild(el('div', { className: 'row-item' }, [
+          el('div', { className: 'row' }, [el('div', {}, body), el('div', {}, [scanOne, dismiss, del])]),
+        ]));
+      });
+    }
+
+    function renderCompanyLocations() {
+      var host = document.getElementById('companies-locations');
+      host.innerHTML = '';
+      var counts = {};
+      allCompanies.forEach(function (c) {
+        var key = (c.location || 'Unknown').trim() || 'Unknown';
+        counts[key] = (counts[key] || 0) + 1;
+      });
+      var keys = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; });
+      if (!keys.length) {
+        host.appendChild(el('p', { className: 'empty', textContent: 'No companies yet.' }));
+        return;
+      }
+      var wrap = el('div', { className: 'location-list' });
+      keys.forEach(function (key) {
+        var chip = el('button', {
+          className: 'location-chip', type: 'button', textContent: key + ' (' + counts[key] + ')',
+        });
+        chip.addEventListener('click', function () {
+          document.getElementById('companies-filter').value = key === 'Unknown' ? '' : key;
+          renderCompanies();
+        });
+        wrap.appendChild(chip);
+      });
+      host.appendChild(wrap);
+    }
+
+    async function loadCompanies() {
+      var res = await api('/companies');
+      var data = await res.json();
+      allCompanies = data.companies || [];
+      var withJobs = allCompanies.filter(function (c) { return c.open_jobs > 0; }).length;
+      document.getElementById('companies-summary').innerHTML = '';
+      document.getElementById('companies-summary').appendChild(
+        el('span', {}, [
+          el('strong', { textContent: String(allCompanies.length) }),
+          el('span', { textContent: ' compan' + (allCompanies.length === 1 ? 'y' : 'ies') +
+            ' · ' + withJobs + ' with open roles · ' + (data.unscanned || 0) + ' not scanned yet' }),
+        ]),
+      );
+      renderCompanyLocations();
+      renderCompanies();
+    }
+
+    document.getElementById('companies-filter').addEventListener('input', renderCompanies);
+
+    document.getElementById('companies-discover-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('companies-discover-status');
+      statusEl.textContent = 'Searching and checking each site resolves… this takes a moment.';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/companies/discover', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            provider: document.getElementById('company-provider').value,
+            count: Number(document.getElementById('company-count').value),
+            focus: document.getElementById('company-focus').value,
+          }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(errorMessage(data, 'discovery_failed'));
+        var parts = ['Added ' + data.added + ' new.'];
+        if (data.duplicates) parts.push(data.duplicates + ' already on your list.');
+        if (data.unreachable) parts.push(data.unreachable + " couldn't be reached — flagged for you to check.");
+        statusEl.textContent = parts.join(' ');
+        statusEl.className = 'status success';
+        loadCompanies();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    document.getElementById('companies-scan-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('companies-scan-status');
+      var button = this;
+      button.disabled = true;
+      statusEl.textContent = 'Reading job boards…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/companies/scan', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ limit: 6 }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(errorMessage(data, 'scan_failed'));
+        var found = (data.results || []).reduce(function (sum, r) { return sum + r.jobs; }, 0);
+        statusEl.textContent =
+          'Scanned ' + data.scanned + ' — found ' + found + ' matching role' + (found === 1 ? '' : 's') + '. ' +
+          (data.unscanned ? data.unscanned + ' still unscanned, click again to continue.' : 'All companies scanned.');
+        statusEl.className = 'status success';
+        await loadCompanies();
+        await loadJobs();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    document.getElementById('company-form').addEventListener('submit', async function (event) {
+      event.preventDefault();
+      var statusEl = document.getElementById('company-add-status');
+      statusEl.textContent = 'Adding…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/companies', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            name: document.getElementById('company-name').value,
+            website: document.getElementById('company-website').value,
+          }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(errorMessage(data, 'add_failed'));
+        statusEl.textContent = data.added ? 'Added.' : 'Already on your list.';
+        statusEl.className = 'status success';
+        document.getElementById('company-form').reset();
+        loadCompanies();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    function renderJobs() {
+      var needle = document.getElementById('jobs-filter').value.trim();
+      var list = document.getElementById('jobs-list');
+      list.innerHTML = '';
+      var shown = allJobs.filter(function (job) {
+        return matchesFilter([job.title, job.company, job.location].join(' '), needle);
+      });
+      if (!shown.length) {
+        list.appendChild(el('p', {
+          className: 'empty',
+          textContent: allJobs.length
+            ? 'No postings match that filter.'
+            : 'No job postings yet — add target companies and scan their boards.',
+        }));
+        return;
+      }
+      shown.forEach(function (job) {
         var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
         del.addEventListener('click', async function () {
           await api('/jobs/' + encodeURIComponent(job.id), { method: 'DELETE' });
           loadJobs();
         });
-        var row = el('div', { className: 'row' }, [
-          el('div', {}, [
-            el('div', { className: 'row-title', textContent: job.title + ' — ' + job.company }),
-            el('div', { className: 'row-meta', textContent: new Date(job.created_at).toLocaleDateString() }),
+        var titleNode = job.source_url
+          ? el('a', {
+              className: 'row-title', href: job.source_url, target: '_blank', rel: 'noopener',
+              textContent: job.title,
+            })
+          : el('span', { className: 'row-title', textContent: job.title });
+        var meta = [
+          job.company,
+          job.location,
+          job.posted_at ? 'posted ' + new Date(job.posted_at).toLocaleDateString() : '',
+          job.ats_provider || 'added by hand',
+        ].filter(Boolean).join(' · ');
+        list.appendChild(el('div', { className: 'row-item' }, [
+          el('div', { className: 'row' }, [
+            el('div', {}, [
+              el('div', { className: 'row-title-line' }, [titleNode]),
+              el('div', { className: 'row-meta', textContent: meta }),
+            ]),
+            del,
           ]),
-          del,
-        ]);
-        list.appendChild(el('div', { className: 'row-item' }, [row]));
+        ]));
       });
     }
+
+    document.getElementById('jobs-filter').addEventListener('input', renderJobs);
 
     async function loadJobs() {
       var res = await api('/jobs');
       var data = await res.json();
-      renderJobs(data.jobs);
+      allJobs = data.jobs || [];
+      renderJobs();
     }
 
     document.getElementById('job-form').addEventListener('submit', async function (event) {
@@ -1970,6 +2622,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     loadDocuments();
     loadNotes();
     loadResumes();
+    loadCompanies();
     loadJobs();
     loadDevices();
   </script>
@@ -2010,6 +2663,13 @@ export default {
     if (request.method === "GET" && url.pathname === "/profile") return getProfile(request, env);
     if (request.method === "PUT" && url.pathname === "/profile") return upsertProfile(request, env);
     if (request.method === "PUT" && url.pathname === "/profile/structured") return saveStructuredProfile(request, env);
+    if (request.method === "GET" && url.pathname === "/companies") return listCompanies(request, env);
+    if (request.method === "POST" && url.pathname === "/companies") return createCompany(request, env);
+    if (request.method === "POST" && url.pathname === "/companies/discover") return discoverCompanies(request, env);
+    if (request.method === "POST" && url.pathname === "/companies/scan") return scanCompanies(request, env);
+    const companyMatch = url.pathname.match(/^\/companies\/([^/]+)$/);
+    if (request.method === "PATCH" && companyMatch) return updateCompany(request, env, companyMatch[1]);
+    if (request.method === "DELETE" && companyMatch) return deleteCompany(request, env, companyMatch[1]);
     if (request.method === "GET" && url.pathname === "/jobs") return listJobs(request, env);
     if (request.method === "POST" && url.pathname === "/jobs") return createJob(request, env);
     const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);

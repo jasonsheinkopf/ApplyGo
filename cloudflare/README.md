@@ -146,7 +146,8 @@ Either way, the enrollment code is single-use and expires (default/max above, 15
 - **Desired Roles** — paste job links or write loosely about what you want next (left, `role_signal`-category `candidate_evidence` rows); generate a structured description of the roles you're targeting (right, Anthropic or OpenAI), stored in `candidate_profiles.preferences_json.desired_roles`
 - **Profile** — your material (name, document upload, freeform notes) on the left; your AI-generated **structured** profile on the right
 - **Resume** — your structured profile shown read-only on the left (sticky, for reference while the list on the right grows); on the right, named resume versions rendered as real PDFs. Pick a template, set a page target, type optional instructions ("emphasize leadership", "target a backend-heavy role"), and generate. Each version previews inline, shows its automated check results, and can be revised through a vision design review (with an optional comment to steer it). Every generate creates a **new** version — nothing is overwritten, so past versions stay available. See "Resume pipeline" below for how a version is actually produced.
-- **Jobs** — job posting list/add/remove
+- **Companies** — your target-company list. Controls on the left (search, scan, location breakdown, manual add); the alphabetical list on the right with a filter box, each company showing its bio, site link, location, open-role count, and scan status. See "Company discovery and job scanning" below.
+- **Jobs** — openings found by scanning your target companies' boards, plus anything added by hand. Filterable by title, company, or location; each posting links straight to the company's own listing.
 - **Devices** — device list/revoke
 
 Authenticated data endpoints:
@@ -165,6 +166,20 @@ Authenticated data endpoints:
 - `GET /resumes` / `POST /resumes` / `PATCH /resumes/:id` / `DELETE /resumes/:id` — named `resumes` rows, each an independent, never-overwritten version. `POST /resumes` (`{"instructions"?, "provider"?, "template"?: "classic" | "modern" | "compact", "max_pages"?: 1 | 2}`) runs the full pipeline described below. Auto-named from the instructions (or a date) at creation; rename afterward via `PATCH`.
 - `POST /resumes/:id/review` (`{"comment"?: string, "provider"?}`) — the design-review loop. Re-renders the version, screenshots it, and has a vision model critique it; applies the resulting layout changes and, when the reviewer says the *writing* is the problem, re-composes the content from verified evidence with its guidance. A user `comment` outranks the model's own opinion. Bumps `revision` in place rather than creating a new named version.
 - `GET /resumes/:id/file` — the rendered PDF, same Range-aware inline-preview treatment as `/documents/:id/file`.
+
+### Company discovery and job scanning
+
+- `GET /companies` / `POST /companies` / `PATCH /companies/:id` / `DELETE /companies/:id` — the target-company list. `PATCH` toggles `status` between `reachable` and `dismissed`, so a company can be set aside without losing it.
+- `POST /companies/discover` (`{"provider"?, "count"?: 1-20, "focus"?: string}`) — proposes companies from the structured profile and Desired Roles, then **verifies each proposed site actually resolves** before trusting it. Reachable and unreachable entries are both stored, the latter flagged in the UI, because a model listing employers will occasionally invent or misremember one. Companies already on the list are passed into the prompt as exclusions *and* deduped on insert by a normalized name key, so `Acme, Inc.` and `Acme Inc` can't both land.
+- `POST /companies/scan` (`{"limit"?: 1-12, "company_id"?: string}`) — reads job boards for companies that need it and writes the results into `job_postings`.
+
+**No aggregators, by design.** Jobs come from each company's own board. Nearly every company runs that board on one of a handful of applicant tracking systems, and those publish plain public JSON APIs — Greenhouse (`boards-api.greenhouse.io`), Lever (`api.lever.co`), Ashby (`api.ashbyhq.com`), SmartRecruiters (`api.smartrecruiters.com`). So "check their site directly" is implemented by resolving *which* ATS a company uses and reading that board's API, which is structured and stable, rather than scraping a JavaScript-rendered careers page.
+
+Board resolution runs in two steps: fetch the company's careers page and look for an outbound ATS link (the only thing scraped — job content always comes from the API), and if that finds nothing, try the company's own domain slug as a board token against each provider. The slug guess is cheap and correct surprisingly often, since most companies register their own name on their ATS. A company where neither works is marked `ats_provider = 'none'` with a note, so it isn't retried blindly.
+
+Scanning is **batched against a shared subrequest budget** (each company costs a few outbound requests, and Workers cap subrequests per invocation). The endpoint reports how many companies remain unscanned and the dashboard simply calls it again, rather than risking one oversized request. Re-scanning is safe: a partial unique index on `(company_id, external_id)` makes posting inserts idempotent, and it's partial so manually added jobs — which have neither — are never caught by it. Scanned postings are filtered against your Desired Roles by title keyword, a deterministic pass that needs no model call.
+
+Known limitation: discovery draws on the model's own knowledge, so it favors companies it knows and can be stale. The reachability check filters out names that don't resolve, but it can't tell you a company is currently hiring or still independent — that's what the scan step establishes. Wiring in a web-search API would improve recall and freshness; it isn't wired up, and would need another key and budget. Manual add is first-class for anything the model won't surface.
 
 ### Resume pipeline
 
@@ -241,7 +256,9 @@ Hosted in Cloudflare today:
 
 Still local-Python-only, or not built anywhere yet (not ported to Cloudflare):
 
-- job-fit assessment generation *against a specific posting* (the `fit_assessments` table exists; nothing writes to it yet)
+- job-fit assessment generation *against a specific posting* (the `fit_assessments` table exists; nothing writes to it yet) — the Companies/Jobs tabs now supply the postings this would score
+- geocoded map of company locations — the Companies tab groups and filters by location text instead, which covers the actual use (seeing where the list clusters) without a geocoding dependency and external tile provider
+- Workday-hosted job boards — per-tenant POST endpoints rather than a public GET API, so they need separate handling from the four supported ATS platforms
 - per-job tailored resumes: requirement extraction from a posting, requirement→evidence matching, and the verification/reviewer stages — see the tracked design issue. The resume pipeline above is built to be reused for this; only the target input changes.
 - outcome learning — recording which resume characteristics correlate with recruiter responses and interviews, and calibrating defaults from that. Needs application-outcome data the product doesn't collect yet, and needs enough volume for the correlation to mean anything.
 - Playwright-based browser automation for applications
