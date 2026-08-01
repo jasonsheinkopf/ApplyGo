@@ -1602,25 +1602,44 @@ const DASHBOARD_PAGE = `<!doctype html>
   :root {
     color-scheme: light dark;
     --accent: #4f46e5;
+    --accent-soft: rgba(79, 70, 229, 0.1);
     --accent-contrast: #ffffff;
-    --bg: #f6f6f9;
+    --bg: #f4f4f7;
     --surface: #ffffff;
-    --border: #e3e3ea;
-    --text: #1a1a1f;
-    --text-muted: #6b6b76;
-    --success: #16794e;
+    --surface-2: #fafafb;
+    --border: #e4e4ea;
+    --border-strong: #d3d3dc;
+    --text: #17171c;
+    --text-muted: #6b6b78;
+    --success: #15734a;
+    --success-soft: rgba(21, 115, 74, 0.1);
+    --warning: #92610a;
+    --warning-soft: rgba(146, 97, 10, 0.1);
     --error: #b3261e;
-    --radius: 0.85rem;
+    --error-soft: rgba(179, 38, 30, 0.1);
+    --radius: 0.8rem;
+    --radius-sm: 0.5rem;
+    --shadow: 0 1px 2px rgba(16, 16, 24, 0.04), 0 1px 3px rgba(16, 16, 24, 0.03);
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #101012;
-      --surface: #1b1b1f;
-      --border: #2d2d33;
-      --text: #f1f1f3;
-      --text-muted: #9c9ca6;
-      --accent: #818cf8;
-      --accent-contrast: #101012;
+      --bg: #0d0d10;
+      --surface: #17171b;
+      --surface-2: #1e1e24;
+      --border: #2a2a32;
+      --border-strong: #3a3a44;
+      --text: #f0f0f3;
+      --text-muted: #9a9aa6;
+      --accent: #8b93f8;
+      --accent-soft: rgba(139, 147, 248, 0.14);
+      --accent-contrast: #0d0d10;
+      --success: #4ade9b;
+      --success-soft: rgba(74, 222, 155, 0.13);
+      --warning: #e0b155;
+      --warning-soft: rgba(224, 177, 85, 0.13);
+      --error: #f2837c;
+      --error-soft: rgba(242, 131, 124, 0.13);
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
     }
   }
   * { box-sizing: border-box; }
@@ -1632,54 +1651,102 @@ const DASHBOARD_PAGE = `<!doctype html>
     padding-bottom: 3rem;
     line-height: 1.5;
   }
-  .shell { max-width: 68rem; margin: 0 auto; padding: 0 1.1rem; }
+  .shell { max-width: 72rem; margin: 0 auto; padding: 0 1.1rem; }
   header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 1.1rem 0; gap: 0.75rem;
+    padding: 1.1rem 0 0.9rem; gap: 0.75rem;
   }
-  .brand { display: flex; align-items: center; gap: 0.5rem; font-weight: 700; font-size: 1.15rem; }
+  .brand { display: flex; align-items: center; gap: 0.5rem; font-weight: 700; font-size: 1.15rem; letter-spacing: -0.01em; }
   .brand svg { flex: none; }
   .brand .go { color: var(--accent); }
   nav {
-    display: flex; gap: 0.35rem; overflow-x: auto; padding-bottom: 0.5rem;
+    display: flex; gap: 0.2rem; overflow-x: auto; padding: 0.25rem; margin-bottom: 1.1rem;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
     -webkit-overflow-scrolling: touch; scrollbar-width: none;
   }
   nav::-webkit-scrollbar { display: none; }
   nav button {
-    flex: none; margin: 0; padding: 0.5rem 0.9rem; font-size: 0.9rem; font-weight: 600;
+    flex: none; margin: 0; padding: 0.45rem 0.95rem; font-size: 0.875rem; font-weight: 600;
     background: none; border: none; border-radius: 999px; color: var(--text-muted); cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
   }
+  nav button:hover { color: var(--text); }
   nav button.active { background: var(--accent); color: var(--accent-contrast); }
   .panel { display: none; }
   .panel.active { display: block; }
   section {
-    margin: 1.1rem 0; padding: 1.1rem; background: var(--surface);
-    border: 1px solid var(--border); border-radius: var(--radius);
+    margin: 0 0 1.1rem; padding: 1.15rem 1.25rem; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
   }
-  h2 { font-size: 1.05rem; margin: 0 0 0.75rem; }
-  p.hint { color: var(--text-muted); font-size: 0.88rem; margin: -0.25rem 0 0.75rem; }
-  label { display: block; margin: 0.75rem 0 0.3rem; font-weight: 600; font-size: 0.88rem; }
+  h2 { font-size: 1.0rem; font-weight: 650; margin: 0 0 0.7rem; letter-spacing: -0.01em; }
+  h3 { font-size: 0.92rem; font-weight: 650; margin: 1.4rem 0 0.5rem; }
+  p.hint { color: var(--text-muted); font-size: 0.85rem; line-height: 1.45; margin: -0.35rem 0 0.85rem; }
+  label { display: block; margin: 0.7rem 0 0.3rem; font-weight: 600; font-size: 0.82rem; color: var(--text-muted); }
   input, textarea, select {
-    width: 100%; padding: 0.6rem 0.7rem; font-size: 1rem; box-sizing: border-box; font-family: inherit;
-    background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 0.5rem;
+    width: 100%; padding: 0.55rem 0.7rem; font-size: 0.95rem; box-sizing: border-box; font-family: inherit;
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
   }
-  textarea { min-height: 5.5rem; resize: vertical; }
+  input:focus, textarea:focus, select:focus {
+    outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  textarea { min-height: 5.5rem; resize: vertical; line-height: 1.5; }
   button {
-    margin-top: 1rem; padding: 0.65rem 1.15rem; font-size: 0.95rem; font-weight: 600; cursor: pointer;
-    background: var(--accent); color: var(--accent-contrast); border: none; border-radius: 0.5rem;
+    margin-top: 0.85rem; padding: 0.55rem 1rem; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: var(--accent-contrast); border: 1px solid transparent;
+    border-radius: var(--radius-sm); transition: opacity 0.12s ease, background 0.12s ease;
   }
-  button.secondary { background: none; border: 1px solid var(--border); color: var(--text); }
-  #sign-out { margin-top: 0; padding: 0.4rem 0.85rem; font-size: 0.85rem; }
+  button:hover:not(:disabled) { opacity: 0.9; }
+  button:disabled { opacity: 0.55; cursor: default; }
+  button.secondary { background: var(--surface); border-color: var(--border-strong); color: var(--text); }
+  button.secondary:hover:not(:disabled) { background: var(--surface-2); opacity: 1; }
+  /* Compact actions that sit inside a list row rather than ending a form. */
+  .row-actions { display: flex; flex: none; gap: 0.35rem; align-items: center; }
+  .row-actions button {
+    margin-top: 0; padding: 0.3rem 0.6rem; font-size: 0.8rem; font-weight: 600; white-space: nowrap;
+    background: var(--surface); border: 1px solid var(--border); color: var(--text-muted);
+  }
+  .row-actions button:hover:not(:disabled) { background: var(--surface-2); color: var(--text); border-color: var(--border-strong); }
+  .row-actions button.danger:hover:not(:disabled) { color: var(--error); border-color: var(--error); }
+  /* Control clusters: small inputs sized to their content instead of stretching full width. */
+  .controls { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: flex-end; margin-bottom: 0.4rem; }
+  .controls > div { display: flex; flex-direction: column; }
+  .controls label { margin-top: 0; }
+  .controls select, .controls input { width: auto; min-width: 9rem; }
+  .controls button { margin-top: 0; }
+  details.disclosure {
+    margin-top: 1.1rem; border-top: 1px solid var(--border); padding-top: 0.9rem;
+  }
+  details.disclosure > summary {
+    cursor: pointer; font-size: 0.85rem; font-weight: 600; color: var(--text-muted);
+    list-style: none; display: flex; align-items: center; gap: 0.4rem;
+  }
+  details.disclosure > summary::-webkit-details-marker { display: none; }
+  details.disclosure > summary::before { content: "+"; font-size: 1rem; line-height: 1; }
+  details.disclosure[open] > summary::before { content: "\\2013"; }
+  details.disclosure > summary:hover { color: var(--text); }
+  #sign-out { margin-top: 0; padding: 0.35rem 0.8rem; font-size: 0.82rem; }
   .status { margin-top: 0.6rem; font-weight: 600; font-size: 0.9rem; min-height: 1.1rem; }
   .status.success { color: var(--success); }
   .status.error { color: var(--error); }
-  .row-item { padding: 0.75rem 0; border-top: 1px solid var(--border); }
-  .row-item:first-child { border-top: none; padding-top: 0; }
-  .row-title { font-weight: 600; }
-  a.row-title { color: inherit; text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 0.15em; }
-  .row-meta { font-size: 0.85rem; color: var(--text-muted); }
-  .row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
-  .empty { color: var(--text-muted); font-size: 0.9rem; }
+  .row-item { padding: 0.7rem 0; border-top: 1px solid var(--border); }
+  .row-item:first-child { border-top: none; padding-top: 0.15rem; }
+  .row-item:last-child { padding-bottom: 0.15rem; }
+  .row-title { font-weight: 600; font-size: 0.95rem; }
+  a.row-title { color: inherit; text-decoration: none; }
+  a.row-title:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 0.15em; }
+  .row-meta { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.1rem; }
+  /* min-width:0 lets the text column shrink; without it a long unbreakable URL
+     forces the whole grid wider than the viewport on phones. */
+  .row { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; }
+  .row > div:first-child { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+  /* On a phone there isn't room for text and a button cluster side by side -- squeezing the
+     text into ~150px makes rows several times taller than stacking the actions underneath. */
+  @media (max-width: 599px) {
+    .row { flex-direction: column; align-items: stretch; gap: 0.5rem; }
+    .row-actions { justify-content: flex-start; flex-wrap: wrap; }
+  }
+  .empty { color: var(--text-muted); font-size: 0.88rem; margin: 0.35rem 0; }
   .template-choices { display: grid; gap: 0.5rem; margin-bottom: 0.9rem; }
   @media (min-width: 560px) { .template-choices { grid-template-columns: repeat(3, 1fr); } }
   .template-card {
@@ -1699,35 +1766,51 @@ const DASHBOARD_PAGE = `<!doctype html>
     font-size: 0.9rem; border-left: 3px solid var(--accent); padding: 0.5rem 0.75rem;
     background: var(--surface-2, rgba(127,127,127,0.08)); border-radius: 0 0.4rem 0.4rem 0;
   }
-  .summary-line { font-size: 0.95rem; margin: 0 0 0.9rem; }
-  .summary-line strong { font-size: 1.35rem; }
-  .badge {
-    display: inline-block; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em;
-    text-transform: uppercase; padding: 0.12rem 0.4rem; border-radius: 0.3rem;
-    border: 1px solid var(--border); color: var(--text-muted); white-space: nowrap;
+  .summary-line {
+    font-size: 0.85rem; color: var(--text-muted); margin: 0 0 1rem; padding: 0.6rem 0.75rem;
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    line-height: 1.5;
   }
-  .badge.jobs { border-color: var(--success); color: var(--success); }
-  .badge.warn { border-color: var(--error); color: var(--error); }
+  .summary-line strong { font-size: 1.25rem; color: var(--text); margin-right: 0.15rem; }
+  .badge {
+    display: inline-block; font-size: 0.68rem; font-weight: 700; letter-spacing: 0.03em;
+    text-transform: uppercase; padding: 0.15rem 0.45rem; border-radius: 999px;
+    border: 1px solid transparent; background: var(--surface-2); color: var(--text-muted); white-space: nowrap;
+  }
+  .badge.jobs, .badge.strong { background: var(--success-soft); color: var(--success); }
+  .badge.warn { background: var(--error-soft); color: var(--error); }
+  .badge.possible { background: var(--accent-soft); color: var(--accent); }
   .row-title-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
-  .company-bio { font-size: 0.88rem; margin: 0.3rem 0 0; }
-  .company-why { font-size: 0.85rem; color: var(--text-muted); margin: 0.25rem 0 0; font-style: italic; }
+  .company-bio { font-size: 0.85rem; margin: 0.35rem 0 0; line-height: 1.5; }
+  .company-why { font-size: 0.82rem; color: var(--text-muted); margin: 0.3rem 0 0; padding-left: 0.55rem; border-left: 2px solid var(--border-strong); }
   .location-list { display: flex; flex-wrap: wrap; gap: 0.35rem; }
   .location-chip {
     font-size: 0.8rem; padding: 0.2rem 0.5rem; border: 1px solid var(--border);
     border-radius: 999px; background: transparent; color: inherit; cursor: pointer;
   }
-  .checkbox-label { display: flex; align-items: center; gap: 0.4rem; font-size: 0.9rem; margin: 0.5rem 0 0.75rem; cursor: pointer; }
-  .checkbox-label input { width: auto; margin: 0; }
-  .badge.strong { border-color: var(--success); color: var(--success); }
-  .badge.possible { border-color: var(--accent); color: var(--accent); }
-  .job-reason { font-size: 0.85rem; margin: 0.3rem 0 0; }
-  .job-missing { font-size: 0.82rem; color: var(--text-muted); margin: 0.15rem 0 0; }
+  .checkbox-label {
+    display: flex; align-items: center; gap: 0.45rem; font-size: 0.85rem; color: var(--text-muted);
+    margin: 0.6rem 0 0.2rem; cursor: pointer; font-weight: 500;
+  }
+  .checkbox-label:hover { color: var(--text); }
+  .checkbox-label input { width: auto; margin: 0; accent-color: var(--accent); }
+  .job-reason { font-size: 0.85rem; margin: 0.35rem 0 0; line-height: 1.5; }
+  .job-missing {
+    font-size: 0.8rem; color: var(--text-muted); margin: 0.3rem 0 0;
+    padding-left: 0.55rem; border-left: 2px solid var(--border-strong);
+  }
+  .row-item.is-muted .row-title, .row-item.is-muted .job-reason { opacity: 0.62; }
   .split { display: grid; grid-template-columns: 1fr; gap: 1.1rem; align-items: start; }
-  @media (min-width: 760px) {
-    .split { grid-template-columns: 1fr 1fr; }
+  /* Grid items default to min-width:auto, which refuses to shrink below their widest
+     unbreakable content. Long pasted URLs then push the whole page wider than the phone
+     viewport, so every grid child is explicitly allowed to shrink. */
+  .split > * { min-width: 0; }
+  @media (min-width: 860px) {
+    .split { grid-template-columns: minmax(0, 22rem) minmax(0, 1fr); }
     .split-sticky { position: sticky; top: 1rem; }
   }
-  .collapsible-text { cursor: pointer; }
+  .collapsible-text { cursor: pointer; overflow-wrap: anywhere; }
+  .collapsible-text:hover { color: var(--accent); }
   h3.subhead { font-size: 0.85rem; margin: 1.1rem 0 0.4rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; }
   .skills-list { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.3rem; }
   .skill-pill { background: var(--bg); border: 1px solid var(--border); border-radius: 999px; padding: 0.2rem 0.65rem; font-size: 0.85rem; }
@@ -1915,17 +1998,23 @@ const DASHBOARD_PAGE = `<!doctype html>
 
           <label for="company-focus">Focus this search (optional)</label>
           <input id="company-focus" placeholder="e.g. automotive, robotics, Bay Area startups">
-          <label for="company-count">How many to look for</label>
-          <select id="company-count">
-            <option value="10">10</option>
-            <option value="15">15</option>
-            <option value="20">20</option>
-          </select>
-          <label for="company-provider">Search using</label>
-          <select id="company-provider">
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI</option>
-          </select>
+          <div class="controls">
+            <div>
+              <label for="company-count">How many</label>
+              <select id="company-count">
+                <option value="10">10</option>
+                <option value="15">15</option>
+                <option value="20">20</option>
+              </select>
+            </div>
+            <div>
+              <label for="company-provider">Search using</label>
+              <select id="company-provider">
+                <option value="anthropic">Anthropic (Claude)</option>
+                <option value="openai">OpenAI</option>
+              </select>
+            </div>
+          </div>
           <button id="companies-discover-button" type="button">Find more companies</button>
           <p id="companies-discover-status" class="status" role="status" aria-live="polite"></p>
 
@@ -1937,15 +2026,17 @@ const DASHBOARD_PAGE = `<!doctype html>
           <h3>Where they are</h3>
           <div id="companies-locations"><p class="empty">No companies yet.</p></div>
 
-          <h3>Add one yourself</h3>
-          <form id="company-form">
-            <label for="company-name">Name</label>
-            <input id="company-name" required placeholder="e.g. Acme Robotics">
-            <label for="company-website">Website</label>
-            <input id="company-website" type="url" placeholder="https://acme.com">
-            <button type="submit">Add company</button>
-          </form>
-          <p id="company-add-status" class="status" role="status" aria-live="polite"></p>
+          <details class="disclosure">
+            <summary>Add a company yourself</summary>
+            <form id="company-form">
+              <label for="company-name">Name</label>
+              <input id="company-name" required placeholder="e.g. Acme Robotics">
+              <label for="company-website">Website</label>
+              <input id="company-website" type="url" placeholder="https://acme.com">
+              <button type="submit">Add company</button>
+            </form>
+            <p id="company-add-status" class="status" role="status" aria-live="polite"></p>
+          </details>
         </section>
       </div>
       <div>
@@ -1963,32 +2054,39 @@ const DASHBOARD_PAGE = `<!doctype html>
       <h2>Job postings</h2>
       <p class="hint">Openings found by scanning your target companies' boards, plus anything you added by hand. Each posting is judged against your profile, not just keyword-matched — postings you'd clearly be turned down for are hidden by default.</p>
 
-      <label for="jobs-provider">Check fit using</label>
-      <select id="jobs-provider">
-        <option value="anthropic">Anthropic (Claude)</option>
-        <option value="openai">OpenAI</option>
-      </select>
-      <button id="jobs-assess-button" type="button">Check fit on new postings</button>
+      <div class="controls">
+        <div>
+          <label for="jobs-provider">Check fit using</label>
+          <select id="jobs-provider">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI</option>
+          </select>
+        </div>
+        <button id="jobs-assess-button" type="button">Check fit on new postings</button>
+      </div>
       <p id="jobs-assess-status" class="status" role="status" aria-live="polite"></p>
 
       <label for="jobs-filter">Filter</label>
       <input id="jobs-filter" placeholder="Search by title, company, or location">
       <label class="checkbox-label">
-        <input id="jobs-show-rejected" type="checkbox"> Show postings marked not a fit
+        <input id="jobs-show-rejected" type="checkbox"><span id="jobs-rejected-count">Show postings marked not a fit</span>
       </label>
       <div id="jobs-list"><p class="empty">Loading…</p></div>
-      <form id="job-form">
-        <label for="job-title">Title</label>
-        <input id="job-title" required placeholder="e.g. Senior Engineer">
-        <label for="job-company">Company</label>
-        <input id="job-company" required placeholder="e.g. Acme Corp">
-        <label for="job-url">Posting URL (optional)</label>
-        <input id="job-url" type="url" placeholder="https://...">
-        <label for="job-description">Description</label>
-        <textarea id="job-description" required placeholder="Paste the job description"></textarea>
-        <button type="submit">Add job</button>
-      </form>
-      <p id="job-status" class="status" role="status" aria-live="polite"></p>
+      <details class="disclosure">
+        <summary>Add a posting by hand</summary>
+        <form id="job-form">
+          <label for="job-title">Title</label>
+          <input id="job-title" required placeholder="e.g. Senior Engineer">
+          <label for="job-company">Company</label>
+          <input id="job-company" required placeholder="e.g. Acme Corp">
+          <label for="job-url">Posting URL (optional)</label>
+          <input id="job-url" type="url" placeholder="https://...">
+          <label for="job-description">Description</label>
+          <textarea id="job-description" required placeholder="Paste the job description"></textarea>
+          <button type="submit">Add job</button>
+        </form>
+        <p id="job-status" class="status" role="status" aria-live="polite"></p>
+      </details>
     </section>
   </div>
 
@@ -2118,13 +2216,13 @@ const DASHBOARD_PAGE = `<!doctype html>
           rel: 'noopener',
           textContent: resume.name,
         });
-        var previewInline = el('button', { className: 'secondary', type: 'button', textContent: 'Preview here' });
+        var previewInline = el('button', { type: 'button', textContent: 'Preview' });
         previewInline.addEventListener('click', function () {
           var checks = [];
           try { checks = JSON.parse(resume.checks_json || '[]'); } catch (e) { checks = []; }
           showResumePreview(resume.id, checks, resume.critique);
         });
-        var rename = el('button', { className: 'secondary', type: 'button', textContent: 'Rename' });
+        var rename = el('button', { type: 'button', textContent: 'Rename' });
         rename.addEventListener('click', async function () {
           var name = window.prompt('New name for this resume version:', resume.name);
           if (!name) return;
@@ -2135,7 +2233,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           });
           loadResumes();
         });
-        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        var del = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
         del.addEventListener('click', async function () {
           await api('/resumes/' + encodeURIComponent(resume.id), { method: 'DELETE' });
           loadResumes();
@@ -2147,7 +2245,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         ].join(' · ');
         var row = el('div', { className: 'row' }, [
           el('div', {}, [preview, el('div', { className: 'row-meta', textContent: meta })]),
-          el('div', {}, [previewInline, rename, del]),
+          el('div', { className: 'row-actions' }, [previewInline, rename, del]),
         ]);
         list.appendChild(el('div', { className: 'row-item' }, [row]));
       });
@@ -2218,12 +2316,13 @@ const DASHBOARD_PAGE = `<!doctype html>
     function renderCollapsibleList(listId, items, emptyText, getText, onDelete) {
       var list = document.getElementById(listId);
       list.innerHTML = '';
-      if (!items.length) {
+      if (!items || !items.length) {
         list.appendChild(el('p', { className: 'empty', textContent: emptyText }));
         return;
       }
       items.forEach(function (item) {
-        var full = getText(item);
+        // One row missing its text must not take the whole list down with it.
+        var full = String(getText(item) == null ? '' : getText(item));
         var oneLine = full.length > 72 ? full.slice(0, 72) + '…' : full;
         var expanded = false;
         var textEl = el('div', { className: 'collapsible-text', textContent: oneLine });
@@ -2231,12 +2330,12 @@ const DASHBOARD_PAGE = `<!doctype html>
           expanded = !expanded;
           textEl.textContent = expanded ? full : oneLine;
         });
-        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        var del = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
         del.addEventListener('click', async function (event) {
           event.stopPropagation();
           await onDelete(item);
         });
-        var row = el('div', { className: 'row' }, [textEl, del]);
+        var row = el('div', { className: 'row' }, [el('div', {}, [textEl]), el('div', { className: 'row-actions' }, [del])]);
         list.appendChild(el('div', { className: 'row-item' }, [row]));
       });
     }
@@ -2451,7 +2550,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         return;
       }
       docs.forEach(function (doc) {
-        var rename = el('button', { className: 'secondary', type: 'button', textContent: 'Rename' });
+        var rename = el('button', { type: 'button', textContent: 'Rename' });
         rename.addEventListener('click', async function () {
           var name = window.prompt('New name for this document:', doc.original_name);
           if (!name) return;
@@ -2462,7 +2561,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           });
           loadDocuments();
         });
-        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        var del = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
         del.addEventListener('click', async function () {
           await api('/documents/' + encodeURIComponent(doc.id), { method: 'DELETE' });
           loadDocuments();
@@ -2481,7 +2580,7 @@ const DASHBOARD_PAGE = `<!doctype html>
             preview,
             el('div', { className: 'row-meta', textContent: meta }),
           ]),
-          el('div', {}, [rename, del]),
+          el('div', { className: 'row-actions' }, [rename, del]),
         ]);
         list.appendChild(el('div', { className: 'row-item' }, [row]));
       });
@@ -2604,7 +2703,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (company.why_fit) body.push(el('p', { className: 'company-why', textContent: company.why_fit }));
         if (company.scan_note) body.push(el('div', { className: 'row-meta', textContent: company.scan_note }));
 
-        var scanOne = el('button', { className: 'secondary', type: 'button', textContent: 'Scan' });
+        var scanOne = el('button', { type: 'button', textContent: 'Scan' });
         scanOne.addEventListener('click', async function () {
           scanOne.disabled = true;
           scanOne.textContent = 'Scanning…';
@@ -2617,7 +2716,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           await loadJobs();
         });
         var dismiss = el('button', {
-          className: 'secondary', type: 'button',
+          type: 'button',
           textContent: company.status === 'dismissed' ? 'Restore' : 'Dismiss',
         });
         dismiss.addEventListener('click', async function () {
@@ -2628,14 +2727,17 @@ const DASHBOARD_PAGE = `<!doctype html>
           });
           loadCompanies();
         });
-        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        var del = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
         del.addEventListener('click', async function () {
           await api('/companies/' + encodeURIComponent(company.id), { method: 'DELETE' });
           loadCompanies();
         });
 
-        list.appendChild(el('div', { className: 'row-item' }, [
-          el('div', { className: 'row' }, [el('div', {}, body), el('div', {}, [scanOne, dismiss, del])]),
+        list.appendChild(el('div', { className: 'row-item' + (company.status === 'dismissed' ? ' is-muted' : '') }, [
+          el('div', { className: 'row' }, [
+            el('div', {}, body),
+            el('div', { className: 'row-actions' }, [scanOne, dismiss, del]),
+          ]),
         ]));
       });
     }
@@ -2806,13 +2908,10 @@ const DASHBOARD_PAGE = `<!doctype html>
       var order = { strong: 0, unassessed: 1, possible: 2, reject: 3 };
       shown.sort(function (a, b) { return (order[a.fit_status] ?? 1) - (order[b.fit_status] ?? 1); });
 
-      if (!rejectedCount) {
-        document.getElementById('jobs-show-rejected').parentElement.style.display = 'none';
-      } else {
-        document.getElementById('jobs-show-rejected').parentElement.style.display = 'flex';
-        document.getElementById('jobs-show-rejected').parentElement.lastChild.textContent =
-          ' Show postings marked not a fit (' + rejectedCount + ')';
-      }
+      var rejectedToggle = document.getElementById('jobs-show-rejected');
+      rejectedToggle.parentElement.style.display = rejectedCount ? 'flex' : 'none';
+      document.getElementById('jobs-rejected-count').textContent =
+        'Show ' + rejectedCount + ' posting' + (rejectedCount === 1 ? '' : 's') + ' marked not a fit';
 
       if (!shown.length) {
         list.appendChild(el('p', {
@@ -2849,11 +2948,11 @@ const DASHBOARD_PAGE = `<!doctype html>
 
         var actions = [];
         if (job.fit_status === 'reject') {
-          var restore = el('button', { className: 'secondary', type: 'button', textContent: 'Restore' });
+          var restore = el('button', { type: 'button', textContent: 'Restore' });
           restore.addEventListener('click', function () { submitJobFit(job.id, 'restore'); });
           actions.push(restore);
         } else {
-          var reject = el('button', { className: 'secondary', type: 'button', textContent: 'Not for me' });
+          var reject = el('button', { type: 'button', textContent: 'Not for me' });
           reject.addEventListener('click', function () {
             var reason = window.prompt(
               'Optional — why isn\\'t this a fit? (helps avoid similar postings later)',
@@ -2864,15 +2963,18 @@ const DASHBOARD_PAGE = `<!doctype html>
           });
           actions.push(reject);
         }
-        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        var del = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
         del.addEventListener('click', async function () {
           await api('/jobs/' + encodeURIComponent(job.id), { method: 'DELETE' });
           loadJobs();
         });
         actions.push(del);
 
-        list.appendChild(el('div', { className: 'row-item' }, [
-          el('div', { className: 'row' }, [el('div', {}, body), el('div', {}, actions)]),
+        list.appendChild(el('div', { className: 'row-item' + (job.fit_status === 'reject' ? ' is-muted' : '') }, [
+          el('div', { className: 'row' }, [
+            el('div', {}, body),
+            el('div', { className: 'row-actions' }, actions),
+          ]),
         ]));
       });
     }
@@ -2951,20 +3053,23 @@ const DASHBOARD_PAGE = `<!doctype html>
       list.innerHTML = '';
       devices.forEach(function (device) {
         var isCurrent = device.id === currentId;
+        var titleLine = [el('span', { className: 'row-title', textContent: device.device_name })];
+        if (isCurrent) titleLine.push(el('span', { className: 'badge possible', textContent: 'this device' }));
+        if (device.revoked) titleLine.push(el('span', { className: 'badge warn', textContent: 'revoked' }));
         var children = [
           el('div', {}, [
-            el('div', { textContent: device.device_name + (isCurrent ? ' (this device)' : '') }),
+            el('div', { className: 'row-title-line' }, titleLine),
             el('div', { className: 'row-meta', textContent: 'Last seen ' + new Date(device.last_seen_at).toLocaleString() }),
           ]),
         ];
         if (!device.revoked) {
-          var revoke = el('button', { className: 'secondary', type: 'button', textContent: 'Revoke' });
+          var revoke = el('button', { className: 'danger', type: 'button', textContent: 'Revoke' });
           revoke.addEventListener('click', async function () {
             await api('/devices/' + encodeURIComponent(device.id) + '/revoke', { method: 'POST' });
             if (isCurrent) { goToEnroll(); return; }
             loadDevices();
           });
-          children.push(revoke);
+          children.push(el('div', { className: 'row-actions' }, [revoke]));
         }
         list.appendChild(el('div', { className: 'row-item' }, [el('div', { className: 'row' }, children)]));
       });
