@@ -12,6 +12,7 @@ import {
   resolveBoard,
   verifyWebsite,
 } from "./companies";
+import { FIT_BATCH_SIZE, type FitResult, assessJobFitBatch, chunk } from "./fit";
 import {
   type LayoutSpec,
   type ResumeCheck,
@@ -402,12 +403,145 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
   const jobs = await env.DB.prepare(
     `SELECT id, title, company, source_url, raw_description, location, posted_at, ats_provider,
-            company_id, created_at
+            company_id, fit_status, fit_reason, fit_missing_json, created_at
      FROM job_postings
      ORDER BY COALESCE(posted_at, created_at) DESC
      LIMIT 300`,
   ).all();
-  return json({ jobs: jobs.results });
+  const unassessed = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'unassessed'",
+  ).first<{ n: number }>();
+  return json({ jobs: jobs.results, unassessed: unassessed?.n ?? 0 });
+}
+
+/** Recent user-confirmed disqualifier reasons, most recent first, deduped case-insensitively. */
+async function loadDisqualifiers(env: Env, profileId: string, limit = 25): Promise<string[]> {
+  const rows = await env.DB.prepare(
+    "SELECT reason FROM job_feedback WHERE profile_id = ? ORDER BY created_at DESC LIMIT 100",
+  )
+    .bind(profileId)
+    .all<{ reason: string }>();
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const row of rows.results ?? []) {
+    const key = row.reason.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(row.reason.trim());
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+async function assessJobs(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { limit?: number; provider?: string };
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const profileId = await getOrCreateProfileId(env);
+  const profileRow = await env.DB.prepare(
+    "SELECT preferences_json, structured_json FROM candidate_profiles WHERE id = ?",
+  )
+    .bind(profileId)
+    .first<{ preferences_json: string; structured_json: string }>();
+  const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
+  if (!structured) return json({ error: "no_profile_yet" }, 400);
+  const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
+  const disqualifiers = await loadDisqualifiers(env, profileId);
+
+  const limit = Math.min(Math.max(Number(body.limit) || 24, 1), 40);
+  const rows = await env.DB.prepare(
+    `SELECT id, title, company, location, raw_description FROM job_postings
+     WHERE fit_status = 'unassessed' ORDER BY created_at ASC LIMIT ?`,
+  )
+    .bind(limit)
+    .all<{ id: string; title: string; company: string; location: string; raw_description: string }>();
+
+  const jobs = (rows.results ?? []).map((r) => ({
+    id: r.id,
+    title: r.title,
+    company: r.company,
+    location: r.location,
+    description: r.raw_description,
+  }));
+
+  let assessed = 0;
+  const errors: string[] = [];
+  for (const batch of chunk(jobs, FIT_BATCH_SIZE)) {
+    try {
+      const results = await assessJobFitBatch(
+        env,
+        provider,
+        JSON.stringify(structured),
+        desiredRoles,
+        disqualifiers,
+        batch,
+      );
+      await storeFitResults(env, results);
+      assessed += results.length;
+    } catch (err) {
+      errors.push((err as Error).message);
+    }
+  }
+
+  const remaining = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'unassessed'",
+  ).first<{ n: number }>();
+
+  return json({ assessed, remaining: remaining?.n ?? 0, errors });
+}
+
+async function storeFitResults(env: Env, results: FitResult[]): Promise<void> {
+  for (const result of results) {
+    await env.DB.prepare(
+      `UPDATE job_postings SET fit_status = ?, fit_reason = ?, fit_missing_json = ?, assessed_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+    )
+      .bind(result.verdict, result.reason, JSON.stringify(result.missing), result.id)
+      .run();
+  }
+}
+
+async function setJobFit(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { action?: string; reason?: string };
+  const job = await env.DB.prepare("SELECT title, company FROM job_postings WHERE id = ?")
+    .bind(id)
+    .first<{ title: string; company: string }>();
+  if (!job) return json({ error: "not_found" }, 404);
+
+  if (body.action === "restore") {
+    await env.DB.prepare(
+      "UPDATE job_postings SET fit_status = 'unassessed', fit_reason = '', assessed_at = NULL WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+    return json({ id, fit_status: "unassessed" });
+  }
+
+  const reason = (body.reason ?? "").trim();
+  await env.DB.prepare(
+    "UPDATE job_postings SET fit_status = 'reject', fit_reason = ?, assessed_at = CURRENT_TIMESTAMP WHERE id = ?",
+  )
+    .bind(reason || "Not a fit.", id)
+    .run();
+
+  // Only an explicit, user-typed reason becomes a durable disqualifier -- a bare "not for me"
+  // click with nothing typed teaches the system nothing, which is the right default.
+  if (reason) {
+    const profileId = await getOrCreateProfileId(env);
+    await env.DB.prepare(
+      "INSERT INTO job_feedback (id, profile_id, job_id, title, company, reason) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+      .bind(crypto.randomUUID(), profileId, id, job.title, job.company, reason)
+      .run();
+  }
+
+  return json({ id, fit_status: "reject", reason });
 }
 
 // ---------------------------------------------------------------------------
@@ -609,14 +743,32 @@ async function discoverCompanies(request: Request, env: Env): Promise<Response> 
 async function scanCompanies(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { limit?: number; company_id?: string };
+  const body = (await request.json().catch(() => ({}))) as {
+    limit?: number;
+    company_id?: string;
+    provider?: string;
+  };
   const profileId = await getOrCreateProfileId(env);
 
-  const profileRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+  const profileRow = await env.DB.prepare("SELECT preferences_json, structured_json FROM candidate_profiles WHERE id = ?")
     .bind(profileId)
-    .first<{ preferences_json: string }>();
+    .first<{ preferences_json: string; structured_json: string }>();
   const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
   const locationTerms = parseLocationFilter(readDesiredLocations(profileRow?.preferences_json ?? "{}"));
+
+  // Fit assessment during a scan is opt-in and silent about it when unavailable: no configured
+  // key just means newly found postings land as 'unassessed', same as before this feature existed.
+  const fitProvider = normalizeProvider(body.provider);
+  const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
+  const fitContext =
+    structured && !providerKeyMissing(env, fitProvider)
+      ? {
+          provider: fitProvider,
+          profileJson: JSON.stringify(structured),
+          desiredRoles,
+          disqualifiers: await loadDisqualifiers(env, profileId),
+        }
+      : null;
 
   const limit = Math.min(Math.max(Number(body.limit) || 6, 1), 12);
   const targets = body.company_id
@@ -639,7 +791,7 @@ async function scanCompanies(request: Request, env: Env): Promise<Response> {
   const results: { company: string; jobs: number; note: string }[] = [];
 
   for (const company of targets.results ?? []) {
-    const outcome = await scanOneCompany(env, company, desiredRoles, locationTerms, budget);
+    const outcome = await scanOneCompany(env, company, desiredRoles, locationTerms, fitContext, budget);
     results.push({ company: company.name, jobs: outcome.jobs, note: outcome.note });
     if (budget.remaining <= 2) break;
   }
@@ -662,11 +814,19 @@ type CompanyScanRow = {
   ats_token: string;
 };
 
+type FitContext = {
+  provider: Provider;
+  profileJson: string;
+  desiredRoles: string;
+  disqualifiers: string[];
+};
+
 async function scanOneCompany(
   env: Env,
   company: CompanyScanRow,
   desiredRoles: string,
   locationTerms: string[],
+  fitContext: FitContext | null,
   budget: { remaining: number },
 ): Promise<{ jobs: number; note: string }> {
   let provider = company.ats_provider as AtsProvider | "" | "none";
@@ -704,16 +864,41 @@ async function scanOneCompany(
   // A company can qualify on location while most of its postings don't, so each posting is
   // checked on its own rather than inherited from the company.
   const inArea = scanned.filter((job) => locationMatches(job.location, locationTerms));
-  const relevant = filterJobsByRoles(inArea, desiredRoles);
+  const relevant = filterJobsByRoles(inArea, desiredRoles)
+    .filter((job) => job.title && job.external_id)
+    .map((job) => ({ ...job, id: crypto.randomUUID() }));
+
+  const fitById = new Map<string, FitResult>();
+  if (fitContext && relevant.length) {
+    for (const jobBatch of chunk(relevant, FIT_BATCH_SIZE)) {
+      if (budget.remaining <= 1) break;
+      budget.remaining -= 1;
+      try {
+        const results = await assessJobFitBatch(
+          env,
+          fitContext.provider,
+          fitContext.profileJson,
+          fitContext.desiredRoles,
+          fitContext.disqualifiers,
+          jobBatch.map((j) => ({ id: j.id, title: j.title, company: company.name, location: j.location, description: j.description })),
+        );
+        for (const result of results) fitById.set(result.id, result);
+      } catch {
+        // A batch failing leaves those jobs 'unassessed' -- visible by default, never hidden by an error.
+      }
+    }
+  }
+
   for (const job of relevant) {
-    if (!job.title || !job.external_id) continue;
+    const fit = fitById.get(job.id);
     await env.DB.prepare(
       `INSERT OR IGNORE INTO job_postings
-         (id, title, company, source_url, raw_description, location, posted_at, ats_provider, company_id, external_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, title, company, source_url, raw_description, location, posted_at, ats_provider, company_id,
+          external_id, fit_status, fit_reason, fit_missing_json, assessed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
-        crypto.randomUUID(),
+        job.id,
         job.title,
         company.name,
         job.url,
@@ -723,6 +908,10 @@ async function scanOneCompany(
         provider,
         company.id,
         job.external_id,
+        fit?.verdict ?? "unassessed",
+        fit?.reason ?? "",
+        JSON.stringify(fit?.missing ?? []),
+        fit ? new Date().toISOString() : null,
       )
       .run();
   }
@@ -1527,6 +1716,12 @@ const DASHBOARD_PAGE = `<!doctype html>
     font-size: 0.8rem; padding: 0.2rem 0.5rem; border: 1px solid var(--border);
     border-radius: 999px; background: transparent; color: inherit; cursor: pointer;
   }
+  .checkbox-label { display: flex; align-items: center; gap: 0.4rem; font-size: 0.9rem; margin: 0.5rem 0 0.75rem; cursor: pointer; }
+  .checkbox-label input { width: auto; margin: 0; }
+  .badge.strong { border-color: var(--success); color: var(--success); }
+  .badge.possible { border-color: var(--accent); color: var(--accent); }
+  .job-reason { font-size: 0.85rem; margin: 0.3rem 0 0; }
+  .job-missing { font-size: 0.82rem; color: var(--text-muted); margin: 0.15rem 0 0; }
   .split { display: grid; grid-template-columns: 1fr; gap: 1.1rem; align-items: start; }
   @media (min-width: 760px) {
     .split { grid-template-columns: 1fr 1fr; }
@@ -1735,7 +1930,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           <p id="companies-discover-status" class="status" role="status" aria-live="polite"></p>
 
           <h3>Check for openings</h3>
-          <p class="hint">Reads the job boards of companies already on your list. Runs in batches, so click again if there are more left.</p>
+          <p class="hint">Reads the job boards of companies already on your list and judges each posting against your profile — not just a keyword match. Runs in batches, so click again if there are more left.</p>
           <button id="companies-scan-button" type="button">Scan boards for jobs</button>
           <p id="companies-scan-status" class="status" role="status" aria-live="polite"></p>
 
@@ -1766,9 +1961,21 @@ const DASHBOARD_PAGE = `<!doctype html>
   <div id="panel-jobs" class="panel">
     <section id="jobs-section">
       <h2>Job postings</h2>
-      <p class="hint">Openings found by scanning your target companies' boards, plus anything you added by hand.</p>
+      <p class="hint">Openings found by scanning your target companies' boards, plus anything you added by hand. Each posting is judged against your profile, not just keyword-matched — postings you'd clearly be turned down for are hidden by default.</p>
+
+      <label for="jobs-provider">Check fit using</label>
+      <select id="jobs-provider">
+        <option value="anthropic">Anthropic (Claude)</option>
+        <option value="openai">OpenAI</option>
+      </select>
+      <button id="jobs-assess-button" type="button">Check fit on new postings</button>
+      <p id="jobs-assess-status" class="status" role="status" aria-live="polite"></p>
+
       <label for="jobs-filter">Filter</label>
       <input id="jobs-filter" placeholder="Search by title, company, or location">
+      <label class="checkbox-label">
+        <input id="jobs-show-rejected" type="checkbox"> Show postings marked not a fit
+      </label>
       <div id="jobs-list"><p class="empty">Loading…</p></div>
       <form id="job-form">
         <label for="job-title">Title</label>
@@ -2522,13 +2729,14 @@ const DASHBOARD_PAGE = `<!doctype html>
         var res = await api('/companies/scan', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ limit: 6 }),
+          body: JSON.stringify({ limit: 6, provider: document.getElementById('company-provider').value }),
         });
         var data = await res.json();
         if (!res.ok) throw new Error(errorMessage(data, 'scan_failed'));
         var found = (data.results || []).reduce(function (sum, r) { return sum + r.jobs; }, 0);
         statusEl.textContent =
-          'Scanned ' + data.scanned + ' — found ' + found + ' matching role' + (found === 1 ? '' : 's') + '. ' +
+          'Scanned ' + data.scanned + ' — found ' + found + ' matching role' + (found === 1 ? '' : 's') +
+          ' and location. ' +
           (data.unscanned ? data.unscanned + ' still unscanned, click again to continue.' : 'All companies scanned.');
         statusEl.className = 'status success';
         await loadCompanies();
@@ -2567,13 +2775,45 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
+    var FIT_LABELS = {
+      strong: { text: 'Strong match', cls: 'strong' },
+      possible: { text: 'Possible match', cls: 'possible' },
+      reject: { text: 'Not a fit', cls: 'warn' },
+      unassessed: { text: 'Not checked yet', cls: '' },
+    };
+
+    async function submitJobFit(jobId, action, reason) {
+      await api('/jobs/' + encodeURIComponent(jobId) + '/fit', {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: action, reason: reason || '' }),
+      });
+      await loadJobs();
+    }
+
     function renderJobs() {
       var needle = document.getElementById('jobs-filter').value.trim();
+      var showRejected = document.getElementById('jobs-show-rejected').checked;
       var list = document.getElementById('jobs-list');
       list.innerHTML = '';
-      var shown = allJobs.filter(function (job) {
+
+      var rejectedCount = allJobs.filter(function (j) { return j.fit_status === 'reject'; }).length;
+      var visible = showRejected ? allJobs : allJobs.filter(function (j) { return j.fit_status !== 'reject'; });
+      var shown = visible.filter(function (job) {
         return matchesFilter([job.title, job.company, job.location].join(' '), needle);
       });
+      // Best fits first; postings not yet checked stay near the top too, since they haven't been ruled out.
+      var order = { strong: 0, unassessed: 1, possible: 2, reject: 3 };
+      shown.sort(function (a, b) { return (order[a.fit_status] ?? 1) - (order[b.fit_status] ?? 1); });
+
+      if (!rejectedCount) {
+        document.getElementById('jobs-show-rejected').parentElement.style.display = 'none';
+      } else {
+        document.getElementById('jobs-show-rejected').parentElement.style.display = 'flex';
+        document.getElementById('jobs-show-rejected').parentElement.lastChild.textContent =
+          ' Show postings marked not a fit (' + rejectedCount + ')';
+      }
+
       if (!shown.length) {
         list.appendChild(el('p', {
           className: 'empty',
@@ -2584,41 +2824,98 @@ const DASHBOARD_PAGE = `<!doctype html>
         return;
       }
       shown.forEach(function (job) {
-        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
-        del.addEventListener('click', async function () {
-          await api('/jobs/' + encodeURIComponent(job.id), { method: 'DELETE' });
-          loadJobs();
-        });
+        var fitInfo = FIT_LABELS[job.fit_status] || FIT_LABELS.unassessed;
+        var missing = [];
+        try { missing = JSON.parse(job.fit_missing_json || '[]'); } catch (e) { missing = []; }
+
         var titleNode = job.source_url
           ? el('a', {
               className: 'row-title', href: job.source_url, target: '_blank', rel: 'noopener',
               textContent: job.title,
             })
           : el('span', { className: 'row-title', textContent: job.title });
+        var titleLine = [titleNode, el('span', { className: ('badge ' + fitInfo.cls).trim(), textContent: fitInfo.text })];
+
         var meta = [
           job.company,
           job.location,
           job.posted_at ? 'posted ' + new Date(job.posted_at).toLocaleDateString() : '',
           job.ats_provider || 'added by hand',
         ].filter(Boolean).join(' · ');
+
+        var body = [el('div', { className: 'row-title-line' }, titleLine), el('div', { className: 'row-meta', textContent: meta })];
+        if (job.fit_reason) body.push(el('p', { className: 'job-reason', textContent: job.fit_reason }));
+        if (missing.length) body.push(el('p', { className: 'job-missing', textContent: 'Gaps: ' + missing.join('; ') }));
+
+        var actions = [];
+        if (job.fit_status === 'reject') {
+          var restore = el('button', { className: 'secondary', type: 'button', textContent: 'Restore' });
+          restore.addEventListener('click', function () { submitJobFit(job.id, 'restore'); });
+          actions.push(restore);
+        } else {
+          var reject = el('button', { className: 'secondary', type: 'button', textContent: 'Not for me' });
+          reject.addEventListener('click', function () {
+            var reason = window.prompt(
+              'Optional — why isn\\'t this a fit? (helps avoid similar postings later)',
+              job.fit_reason && job.fit_status !== 'unassessed' ? job.fit_reason : '',
+            );
+            if (reason === null) return;
+            submitJobFit(job.id, 'reject', reason);
+          });
+          actions.push(reject);
+        }
+        var del = el('button', { className: 'secondary', type: 'button', textContent: 'Remove' });
+        del.addEventListener('click', async function () {
+          await api('/jobs/' + encodeURIComponent(job.id), { method: 'DELETE' });
+          loadJobs();
+        });
+        actions.push(del);
+
         list.appendChild(el('div', { className: 'row-item' }, [
-          el('div', { className: 'row' }, [
-            el('div', {}, [
-              el('div', { className: 'row-title-line' }, [titleNode]),
-              el('div', { className: 'row-meta', textContent: meta }),
-            ]),
-            del,
-          ]),
+          el('div', { className: 'row' }, [el('div', {}, body), el('div', {}, actions)]),
         ]));
       });
     }
 
     document.getElementById('jobs-filter').addEventListener('input', renderJobs);
+    document.getElementById('jobs-show-rejected').addEventListener('change', renderJobs);
+
+    document.getElementById('jobs-assess-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('jobs-assess-status');
+      var button = this;
+      button.disabled = true;
+      statusEl.textContent = 'Comparing postings against your profile…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/jobs/assess', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ provider: document.getElementById('jobs-provider').value, limit: 24 }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(errorMessage(data, 'assess_failed'));
+        statusEl.textContent =
+          'Checked ' + data.assessed + '. ' +
+          (data.remaining ? data.remaining + ' still unchecked, click again to continue.' : 'All caught up.');
+        statusEl.className = 'status success';
+        await loadJobs();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
+      }
+    });
 
     async function loadJobs() {
       var res = await api('/jobs');
       var data = await res.json();
       allJobs = data.jobs || [];
+      var statusEl = document.getElementById('jobs-assess-status');
+      if (data.unassessed && !statusEl.textContent) {
+        statusEl.textContent = data.unassessed + ' posting' + (data.unassessed === 1 ? '' : 's') + ' not checked for fit yet.';
+        statusEl.className = 'status';
+      }
       renderJobs();
     }
 
@@ -2734,6 +3031,9 @@ export default {
     if (request.method === "DELETE" && companyMatch) return deleteCompany(request, env, companyMatch[1]);
     if (request.method === "GET" && url.pathname === "/jobs") return listJobs(request, env);
     if (request.method === "POST" && url.pathname === "/jobs") return createJob(request, env);
+    if (request.method === "POST" && url.pathname === "/jobs/assess") return assessJobs(request, env);
+    const jobFitMatch = url.pathname.match(/^\/jobs\/([^/]+)\/fit$/);
+    if (request.method === "PATCH" && jobFitMatch) return setJobFit(request, env, jobFitMatch[1]);
     const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
     if (request.method === "DELETE" && jobMatch) return deleteJob(request, env, jobMatch[1]);
     if (request.method === "GET" && url.pathname === "/documents") return listDocuments(request, env);
