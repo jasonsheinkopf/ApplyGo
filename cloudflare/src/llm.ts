@@ -6,9 +6,26 @@ export interface LlmEnv {
   OPENAI_API_KEY?: string;
   ANTHROPIC_MODEL?: string;
   OPENAI_MODEL?: string;
+  ANTHROPIC_SCREEN_MODEL?: string;
+  OPENAI_SCREEN_MODEL?: string;
 }
 
 export type Provider = "anthropic" | "openai";
+
+/**
+ * Which class of model to use. "screen" is the cheap, high-volume tier used for bulk yes/no
+ * passes; "reason" is the strong tier used where the answer actually has to be right.
+ */
+export type Tier = "reason" | "screen";
+
+function modelFor(env: LlmEnv, provider: Provider, tier: Tier): string {
+  if (provider === "openai") {
+    return tier === "screen" ? env.OPENAI_SCREEN_MODEL || "gpt-4o-mini" : env.OPENAI_MODEL || "gpt-4o";
+  }
+  return tier === "screen"
+    ? env.ANTHROPIC_SCREEN_MODEL || "claude-haiku-4-5-20251001"
+    : env.ANTHROPIC_MODEL || "claude-sonnet-5";
+}
 
 export function normalizeProvider(value: unknown): Provider {
   return value === "openai" ? "openai" : "anthropic";
@@ -87,13 +104,14 @@ export async function callStructured<T>(
   schema: unknown,
   toolName: string,
   maxTokens = 4000,
+  tier: Tier = "reason",
 ): Promise<T> {
   if (provider === "openai") {
     const res = await fetch(OPENAI_URL, {
       method: "POST",
       headers: openaiHeaders(env),
       body: JSON.stringify({
-        model: env.OPENAI_MODEL || "gpt-4o",
+        model: modelFor(env, provider, tier),
         response_format: { type: "json_object" },
         messages: [
           {
@@ -115,7 +133,7 @@ export async function callStructured<T>(
     method: "POST",
     headers: anthropicHeaders(env),
     body: JSON.stringify({
-      model: env.ANTHROPIC_MODEL || "claude-sonnet-5",
+      model: modelFor(env, provider, tier),
       max_tokens: maxTokens,
       messages: [{ role: "user", content: prompt }],
       tools: [{ name: toolName, input_schema: schema }],
