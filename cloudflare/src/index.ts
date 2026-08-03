@@ -1930,9 +1930,11 @@ const DASHBOARD_PAGE = `<!doctype html>
     text-transform: uppercase; padding: 0.15rem 0.45rem; border-radius: 999px;
     border: 1px solid transparent; background: var(--surface-2); color: var(--text-muted); white-space: nowrap;
   }
-  .badge.jobs, .badge.strong { background: var(--success-soft); color: var(--success); }
+  /* Green = already judged and worth your attention (strong/possible). Yellow = not filtered
+     yet -- don't waste time on it until it's been screened. Red = ruled out. */
+  .badge.jobs, .badge.strong, .badge.possible { background: var(--success-soft); color: var(--success); }
   .badge.warn { background: var(--error-soft); color: var(--error); }
-  .badge.possible { background: var(--accent-soft); color: var(--accent); }
+  .badge.queued { background: var(--warning-soft); color: var(--warning); }
   .row-title-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
   .company-bio { font-size: 0.85rem; margin: 0.35rem 0 0; line-height: 1.5; }
   .company-why { font-size: 0.82rem; color: var(--text-muted); margin: 0.3rem 0 0; padding-left: 0.55rem; border-left: 2px solid var(--border-strong); }
@@ -2229,6 +2231,9 @@ const DASHBOARD_PAGE = `<!doctype html>
       <h2>Job postings</h2>
       <label for="jobs-filter">Filter</label>
       <input id="jobs-filter" placeholder="Search by title, company, or location">
+      <label class="checkbox-label">
+        <input id="jobs-show-unfiltered" type="checkbox"><span id="jobs-unfiltered-count">Show postings not filtered yet</span>
+      </label>
       <label class="checkbox-label">
         <input id="jobs-show-rejected" type="checkbox"><span id="jobs-rejected-count">Show postings marked not a fit</span>
       </label>
@@ -3085,12 +3090,16 @@ const DASHBOARD_PAGE = `<!doctype html>
       possible: { text: 'Possible match', cls: 'possible' },
       reject: { text: 'Not a fit', cls: 'warn' },
       screened_out: { text: 'Screened out', cls: 'warn' },
-      screened_in: { text: 'Awaiting review', cls: '' },
-      unassessed: { text: 'Not filtered yet', cls: '' },
+      screened_in: { text: 'Awaiting review', cls: 'queued' },
+      unassessed: { text: 'Not filtered yet', cls: 'queued' },
     };
-    // Postings the filters ruled out. Everything else -- matches and anything still queued --
-    // stays visible, so a posting is never hidden before something has actually judged it.
-    var HIDDEN_STATUSES = { reject: true, screened_out: true };
+    // Three buckets, kept visually and structurally separate so a fresh scan's unfiltered
+    // postings never get mixed in with results you've already reviewed:
+    //   judged matches (green)      -- shown by default
+    //   not filtered yet (yellow)   -- hidden by default, own toggle
+    //   ruled out (red)             -- hidden by default, own toggle
+    var QUEUED_STATUSES = { unassessed: true, screened_in: true };
+    var RULED_OUT_STATUSES = { reject: true, screened_out: true };
 
     async function submitJobFit(jobId, action, reason) {
       await api('/jobs/' + encodeURIComponent(jobId) + '/fit', {
@@ -3101,36 +3110,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       await loadJobs();
     }
 
-    function renderJobs() {
-      var needle = document.getElementById('jobs-filter').value.trim();
-      var showRejected = document.getElementById('jobs-show-rejected').checked;
-      var list = document.getElementById('jobs-list');
-      list.innerHTML = '';
-
-      var rejectedCount = allJobs.filter(function (j) { return HIDDEN_STATUSES[j.fit_status]; }).length;
-      var visible = showRejected ? allJobs : allJobs.filter(function (j) { return !HIDDEN_STATUSES[j.fit_status]; });
-      var shown = visible.filter(function (job) {
-        return matchesFilter([job.title, job.company, job.location].join(' '), needle);
-      });
-      // Judged matches first, then anything still queued, then what was ruled out.
-      var order = { strong: 0, possible: 1, screened_in: 2, unassessed: 3, screened_out: 4, reject: 5 };
-      shown.sort(function (a, b) { return (order[a.fit_status] ?? 3) - (order[b.fit_status] ?? 3); });
-
-      var rejectedToggle = document.getElementById('jobs-show-rejected');
-      rejectedToggle.parentElement.style.display = rejectedCount ? 'flex' : 'none';
-      document.getElementById('jobs-rejected-count').textContent =
-        'Show ' + rejectedCount + ' filtered-out posting' + (rejectedCount === 1 ? '' : 's');
-
-      if (!shown.length) {
-        list.appendChild(el('p', {
-          className: 'empty',
-          textContent: allJobs.length
-            ? 'No postings match that filter.'
-            : 'No job postings yet — add target companies and scan their boards.',
-        }));
-        return;
-      }
-      shown.forEach(function (job) {
+    function renderJobRows(list, jobs) {
+      jobs.forEach(function (job) {
         var fitInfo = FIT_LABELS[job.fit_status] || FIT_LABELS.unassessed;
         var missing = [];
         try { missing = JSON.parse(job.fit_missing_json || '[]'); } catch (e) { missing = []; }
@@ -3178,7 +3159,8 @@ const DASHBOARD_PAGE = `<!doctype html>
         });
         actions.push(del);
 
-        list.appendChild(el('div', { className: 'row-item' + (HIDDEN_STATUSES[job.fit_status] ? ' is-muted' : '') }, [
+        var muted = RULED_OUT_STATUSES[job.fit_status] || QUEUED_STATUSES[job.fit_status];
+        list.appendChild(el('div', { className: 'row-item' + (muted ? ' is-muted' : '') }, [
           el('div', { className: 'row' }, [
             el('div', {}, body),
             el('div', { className: 'row-actions' }, actions),
@@ -3187,7 +3169,59 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
     }
 
+    function renderJobs() {
+      var needle = document.getElementById('jobs-filter').value.trim();
+      var showQueued = document.getElementById('jobs-show-unfiltered').checked;
+      var showRejected = document.getElementById('jobs-show-rejected').checked;
+      var list = document.getElementById('jobs-list');
+      list.innerHTML = '';
+
+      var matching = allJobs.filter(function (job) {
+        return matchesFilter([job.title, job.company, job.location].join(' '), needle);
+      });
+      // Kept as three separate groups rather than one filtered-and-sorted list, so a fresh
+      // scan's unreviewed postings can never end up sitting among ones you've already judged --
+      // each group only ever appears in its own block, gated by its own toggle.
+      var matches = matching.filter(function (j) { return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status]; });
+      var queued = matching.filter(function (j) { return QUEUED_STATUSES[j.fit_status]; });
+      var ruledOut = matching.filter(function (j) { return RULED_OUT_STATUSES[j.fit_status]; });
+      var order = { strong: 0, possible: 1 };
+      matches.sort(function (a, b) { return (order[a.fit_status] ?? 2) - (order[b.fit_status] ?? 2); });
+
+      var queuedToggle = document.getElementById('jobs-show-unfiltered');
+      queuedToggle.parentElement.style.display = queued.length ? 'flex' : 'none';
+      document.getElementById('jobs-unfiltered-count').textContent =
+        'Show ' + queued.length + ' posting' + (queued.length === 1 ? '' : 's') + ' not filtered yet';
+
+      var rejectedToggle = document.getElementById('jobs-show-rejected');
+      rejectedToggle.parentElement.style.display = ruledOut.length ? 'flex' : 'none';
+      document.getElementById('jobs-rejected-count').textContent =
+        'Show ' + ruledOut.length + ' posting' + (ruledOut.length === 1 ? '' : 's') + ' marked not a fit';
+
+      if (!matches.length && !(showQueued && queued.length) && !(showRejected && ruledOut.length)) {
+        list.appendChild(el('p', {
+          className: 'empty',
+          textContent: allJobs.length
+            ? (matching.length ? 'Nothing to show — try the checkboxes above to reveal filtered-out postings.' : 'No postings match that filter.')
+            : 'No job postings yet — add target companies and scan their boards.',
+        }));
+        return;
+      }
+
+      renderJobRows(list, matches);
+
+      if (showQueued && queued.length) {
+        list.appendChild(el('h3', { className: 'subhead', textContent: 'Not filtered yet' }));
+        renderJobRows(list, queued);
+      }
+      if (showRejected && ruledOut.length) {
+        list.appendChild(el('h3', { className: 'subhead', textContent: 'Marked not a fit' }));
+        renderJobRows(list, ruledOut);
+      }
+    }
+
     document.getElementById('jobs-filter').addEventListener('input', renderJobs);
+    document.getElementById('jobs-show-unfiltered').addEventListener('change', renderJobs);
     document.getElementById('jobs-show-rejected').addEventListener('change', renderJobs);
 
     document.getElementById('jobs-assess-button').addEventListener('click', async function () {
