@@ -109,6 +109,25 @@ const FIT_BATCH_SCHEMA = {
   required: ["results"],
 } as const;
 
+/**
+ * A years-of-experience gap is one of the few requirements precise enough to reason about
+ * numerically, so it gets a concrete rule rather than being left to "far beyond" judgment calls
+ * -- which in practice let postings needing roughly double the candidate's actual experience
+ * through as a "stretch". Calibrated to what actually reads as fine vs. not: needing 5 when you
+ * have 3 is a normal reach; needing 7 when you have 3 is a different job level entirely.
+ */
+function experienceGapRule(currentYear: number): string {
+  return [
+    "Years-of-experience requirements get a concrete rule, since they're precise enough to reason",
+    "about numerically rather than qualitatively: when a posting states a minimum (e.g. '7+ years'),",
+    `estimate the candidate's actual total years of relevant professional experience from their work`,
+    `history's start/end years (treat "Present" as ${currentYear}). A gap of up to 2 years is a normal,`,
+    "fine stretch -- do not reject for it alone (needing 5 years when they have 3 is fine). A gap of",
+    "more than 2 years is a genuine mismatch and should be rejected, citing the specific gap (needing",
+    "7+ years when they have about 3 is a different seniority level, not a stretch).",
+  ].join("\n");
+}
+
 function fitPrompt(
   profileJson: string,
   desiredRoles: string,
@@ -126,6 +145,8 @@ function fitPrompt(
     "-- the candidate would rather see a long-shot than miss it. Only reject on requirements the",
     "posting actually states (a specific language or tool, a degree, a minimum years of experience),",
     "not on assumptions about culture fit, company size, or anything the posting doesn't say.",
+    "",
+    experienceGapRule(new Date().getUTCFullYear()),
     "",
     disqualifiers.length
       ? [
@@ -239,6 +260,8 @@ export async function screenJobsBatch(
     "Keep anything plausible. Drop only clear mismatches: a different profession entirely, a",
     "seniority far outside their range, or a stated hard requirement they obviously lack.",
     "When unsure, keep it -- a later, more careful pass will make the real call.",
+    "",
+    experienceGapRule(new Date().getUTCFullYear()),
     "",
     disqualifiers.length
       ? `The candidate has already rejected roles for these reasons:\n${disqualifiers.map((d) => `- ${d}`).join("\n")}\n`
