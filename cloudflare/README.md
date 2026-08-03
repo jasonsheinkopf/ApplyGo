@@ -183,16 +183,41 @@ Scanning is **batched against a shared subrequest budget** (each company costs a
 
 Known limitation: discovery draws on the model's own knowledge, so it favors companies it knows and can be stale. The reachability check filters out names that don't resolve, but it can't tell you a company is currently hiring or still independent — that's what the scan step establishes. Wiring in a web-search API would improve recall and freshness; it isn't wired up, and would need another key and budget. Manual add is first-class for anything the model won't surface.
 
-### Job fit assessment
+### Job filtering pipeline
 
-A title and location match tells you a posting is in the right category. It says nothing about whether the requirements actually rule the candidate out — a title match survives "PhD required" or "10+ years of C++" sitting three lines into the description just as easily as a real fit does. This stage reads the actual posting against the actual profile and says so, rather than leaving every keyword-matched result for the user to triage by hand (`src/fit.ts`).
+Finding listings is cheap; judging them is not. The naive version — send every scraped posting to a strong model alongside the full profile — is the expensive way to do this, so the work is split into tiers that get progressively more costly and progressively fewer inputs:
 
-- Runs automatically during `POST /companies/scan` for newly found postings (pass `{"provider": "anthropic" | "openai"}`; scanning still works without it, postings just stay `unassessed`), and on demand via `POST /jobs/assess` (`{"limit"?: 1-40, "provider"?}`) for postings already in the database — this is how the existing, already-noisy job list gets cleaned up retroactively, not just new scans.
-- Verdict is `strong`, `possible`, or `reject`, with a one-sentence reason grounded in the specific requirement and the specific profile (mis)match, plus a list of concrete gaps (e.g. "no evidence of C++"). Prompted to be decisive about `reject` — a stated, unmet requirement — but to default to `possible` on genuine ambiguity, because a long-shot the candidate never sees is worse than one they skim past.
-- Assessment runs in batches of 8 postings per model call (`FIT_BATCH_SIZE`) against the same shared subrequest budget as board scanning, and **fails open**: a batch that errors, or a posting the model doesn't return a result for, stays `unassessed` — visible in the Jobs tab by default — rather than silently disappearing. An assessment gap is never treated as a rejection.
-- The Jobs tab hides `reject`-status postings by default (toggle to reveal them, with their reason shown) and sorts `strong` first.
+| tier | what runs | cost | input per posting |
+|---|---|---|---|
+| 0 | location match + title keyword, in code | free | — |
+| 1 | cheap model, binary keep/drop, 25 postings per call | low | title, location, first 500 chars |
+| 2 | strong model, verdict + reason + gaps, 8 per call | high | full stored description |
 
-**Rejections learn, but only from the user, on purpose.** `PATCH /jobs/:id/fit` (`{"action": "reject", "reason"?}` or `{"action": "restore"}`) is what the "Not for me" / "Restore" buttons call. A reason typed here is stored in `job_feedback` and fed into every future fit assessment as a confirmed disqualifier ("the candidate has previously confirmed X was not a fit"). The AI's own `reject` verdict on a posting is **not** added to `job_feedback` by itself — only a reason the user explicitly submits becomes a durable signal. That split matters: if the AI's own mistakes could reinforce themselves into permanent rules, one bad verdict could compound into a pattern of wrongly hidden postings with no way back. Restoring a posting clears its status back to `unassessed` without touching anything already learned.
+Two things make this work. **Scanning no longer judges anything** — `POST /companies/scan` only collects listings, so it stays fast and covers more companies per request. **`POST /jobs/process`** then runs tier 1 and tier 2 in that order against a shared call budget, reporting what remains at each stage so the dashboard just asks again. One "Find my matches" button drives the whole thing.
+
+The cheap tier is deliberately **biased toward keeping**: it exists to remove obvious misses, and a wrong drop there is invisible to the user, so anything ambiguous survives to tier 2. Postings the model doesn't return a result for are also kept. Screened-out postings stay in the database rather than being deleted, so a re-scan never re-pays to reject them.
+
+`fit_status` is the pipeline's state machine: `unassessed` → `screened_out` | `screened_in` → `strong` | `possible` | `reject`. The Jobs tab shows matches and anything still queued, and hides only what a filter actually ruled out.
+
+**The compact match profile.** `candidate_profiles.match_profile` is a short rendering of the profile — headline, summary, roles, degrees, skills — capped at 2000 characters, and it is the candidate half of every screening call. It's built **deterministically** from `structured_json` rather than generated by a model: it costs nothing, is identical on every run, and cannot drift out of sync with the profile it describes the way a cached LLM summary would. The full structured profile runs several thousand characters and would otherwise be re-sent with every batch, which is exactly the input worth shrinking.
+
+Model tiers are configured per provider — `ANTHROPIC_SCREEN_MODEL` (default `claude-haiku-4-5-20251001`) and `OPENAI_SCREEN_MODEL` (default `gpt-4o-mini`) for tier 1, `ANTHROPIC_MODEL` / `OPENAI_MODEL` for tier 2.
+
+Storage is bounded on the way in: scraped descriptions are capped at 1500 characters, which is more than tier 1 reads and enough for tier 2 to judge against. Descriptions are the largest column in the database, and the Data tab reports exactly how much space they take.
+
+### Stored data and stage resets
+
+The **Data** tab shows what's actually stored — row counts per collection, and byte totals for the two bulky text columns — and lets a developer reset the pipeline at any stage.
+
+Stages are ordered, and resetting one clears **everything downstream of it**, because those results were derived from what's being removed: companies → listings → descriptions → screening/assessment. Resetting job descriptions, for example, also clears every fit verdict, since those verdicts were computed against descriptions that no longer exist. Each button states its downstream effect before confirming.
+
+Hand-added postings are deliberately exempt from the listings reset (they have no `company_id` and are the user's own work), and are deletable separately alongside other standalone collections — rejection reasons, resumes, notes, role signals.
+
+### Job fit assessment (tier 2)
+
+The strong-model pass, run only on postings that survive screening (`src/fit.ts`). Verdict is `strong`, `possible`, or `reject`, with a one-sentence reason grounded in the specific requirement and the specific profile (mis)match, plus a list of concrete gaps. Prompted to be decisive about `reject` — a stated, unmet requirement — but to default to `possible` on genuine ambiguity, because a long-shot the candidate never sees is worse than one they skim past. **Fails open**: a batch that errors, or a posting the model doesn't return, keeps its previous status and stays visible rather than silently disappearing.
+
+**Rejections learn, but only from the user, on purpose.** `PATCH /jobs/:id/fit` (`{"action": "reject", "reason"?}` or `{"action": "restore"}`) is what the "Not for me" / "Restore" buttons call. A reason typed here is stored in `job_feedback` and fed into **both** filter tiers as a confirmed disqualifier. The AI's own `reject` verdict is **not** added to `job_feedback` by itself — only a reason the user explicitly submits becomes a durable signal. That split matters: if the AI's own mistakes could reinforce themselves into permanent rules, one bad verdict could compound into a pattern of wrongly hidden postings with no way back. Restoring a posting clears its status without touching anything already learned.
 
 ### Resume pipeline
 
@@ -265,7 +290,7 @@ Hosted in Cloudflare today:
 - hashed session-token storage and remembered secure browser sessions
 - device listing and revocation
 - authenticated private artifact transfer (`/artifacts`)
-- a tabbed, phone-usable dashboard (`/`): desired-roles description generation, profile edit, PDF/text/markdown document upload with real text extraction, freeform notes, AI-generated profile drafts (Anthropic or OpenAI), named resume versions across three templates with grounding/ATS/layout checks and a vision design-review loop, target-company discovery with direct job-board scanning, per-posting AI fit assessment with user-taught disqualifiers, and device management
+- a tabbed, phone-usable dashboard (`/`): desired-roles description generation, profile edit, PDF/text/markdown document upload with real text extraction, freeform notes, AI-generated profile drafts (Anthropic or OpenAI), named resume versions across three templates with grounding/ATS/layout checks and a vision design-review loop, target-company discovery with direct job-board scanning, a two-tier job filtering pipeline (cheap bulk screen then strong-model assessment) with user-taught disqualifiers, a Data tab for inspecting stored data and resetting any pipeline stage, and device management
 
 Still local-Python-only, or not built anywhere yet (not ported to Cloudflare):
 

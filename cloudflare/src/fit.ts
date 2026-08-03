@@ -12,6 +12,48 @@
 
 import { type LlmEnv, type Provider, callStructured } from "./llm";
 
+/** The subset of the profile that matters for judging a job. Structurally compatible with StructuredProfile. */
+type ProfileForMatching = {
+  headline?: string;
+  narrative_summary?: string;
+  skills?: string[];
+  experience?: { company: string; title: string; start: string; end: string }[];
+  education?: { school: string; degree: string; field: string; end_year: string }[];
+};
+
+/**
+ * A short rendering of the profile, used as the candidate half of every match call.
+ *
+ * Built deterministically rather than generated: it costs nothing, it is identical on every run,
+ * and it cannot drift out of sync with the profile it describes the way a cached LLM summary
+ * would. The full structured profile runs several thousand characters and gets re-sent with
+ * every screening batch, which is exactly the input worth shrinking.
+ */
+export function buildMatchProfile(profile: ProfileForMatching): string {
+  const lines: string[] = [];
+  if (profile.headline) lines.push(profile.headline);
+
+  const summary = (profile.narrative_summary ?? "").trim();
+  if (summary) lines.push(summary.length > 400 ? summary.slice(0, 400).trimEnd() + "…" : summary);
+
+  const roles = (profile.experience ?? []).slice(0, 6).map((e) => {
+    const span = [e.start, e.end].filter(Boolean).join("–");
+    return `${e.title} at ${e.company}${span ? ` (${span})` : ""}`;
+  });
+  if (roles.length) lines.push(`Experience: ${roles.join("; ")}`);
+
+  const degrees = (profile.education ?? []).slice(0, 3).map((e) => {
+    const what = [e.degree, e.field].filter(Boolean).join(" in ");
+    return `${what || "Study"}, ${e.school}${e.end_year ? ` ${e.end_year}` : ""}`;
+  });
+  if (degrees.length) lines.push(`Education: ${degrees.join("; ")}`);
+
+  const skills = (profile.skills ?? []).slice(0, 40);
+  if (skills.length) lines.push(`Skills: ${skills.join(", ")}`);
+
+  return lines.join("\n").slice(0, 2000);
+}
+
 export type FitVerdict = "strong" | "possible" | "reject";
 
 export type JobToAssess = {
@@ -145,6 +187,93 @@ export async function assessJobFitBatch(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Tier 1 -- cheap bulk screen
+// ---------------------------------------------------------------------------
+
+export type ScreenResult = { id: string; keep: boolean; note: string };
+
+const SCREEN_BATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    results: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Must exactly match the posting's id as given." },
+          keep: {
+            type: "boolean",
+            description:
+              "true if this candidate could plausibly be considered for the role. false only when the " +
+              "posting is clearly wrong for them -- a different profession, a seniority far outside their " +
+              "range, or a stated hard requirement they obviously lack.",
+          },
+          note: { type: "string", description: "At most 8 words on why, only when keep is false." },
+        },
+        required: ["id", "keep", "note"],
+      },
+    },
+  },
+  required: ["results"],
+} as const;
+
+/**
+ * The cheap pass. Runs a small model over many postings at once with only a title, location and
+ * the opening of each description, and asks a single yes/no question. Deliberately biased toward
+ * keeping: this tier exists to remove the obvious misses before the expensive tier runs, and a
+ * wrong "drop" here is invisible to the user, so ambiguity must survive to the next stage.
+ */
+export async function screenJobsBatch(
+  env: LlmEnv,
+  provider: Provider,
+  matchProfile: string,
+  desiredRoles: string,
+  disqualifiers: string[],
+  jobs: JobToAssess[],
+): Promise<ScreenResult[]> {
+  if (!jobs.length) return [];
+  const prompt = [
+    "Decide which of these job postings are worth a closer look for this candidate.",
+    "",
+    "Keep anything plausible. Drop only clear mismatches: a different profession entirely, a",
+    "seniority far outside their range, or a stated hard requirement they obviously lack.",
+    "When unsure, keep it -- a later, more careful pass will make the real call.",
+    "",
+    disqualifiers.length
+      ? `The candidate has already rejected roles for these reasons:\n${disqualifiers.map((d) => `- ${d}`).join("\n")}\n`
+      : "",
+    desiredRoles ? `WANTS: ${desiredRoles.slice(0, 600)}\n` : "",
+    `CANDIDATE:\n${matchProfile}`,
+    "",
+    `POSTINGS:\n${JSON.stringify(
+      jobs.map((j) => ({ id: j.id, title: j.title, location: j.location, snippet: j.description.slice(0, 500) })),
+    )}`,
+    "",
+    "Return one result per posting.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const { results } = await callStructured<{ results: ScreenResult[] }>(
+    env,
+    provider,
+    prompt,
+    SCREEN_BATCH_SCHEMA,
+    "submit_screen",
+    2000,
+    "screen",
+  );
+  const byId = new Map((results ?? []).map((r) => [r.id, r]));
+  // Anything the model didn't return survives to the next tier rather than being dropped silently.
+  return jobs.map((job) => {
+    const found = byId.get(job.id);
+    if (!found) return { id: job.id, keep: true, note: "" };
+    return { id: job.id, keep: found.keep !== false, note: found.note ?? "" };
+  });
+}
+
+export const SCREEN_BATCH_SIZE = 25;
 export const FIT_BATCH_SIZE = 8;
 
 export function chunk<T>(items: T[], size: number): T[][] {

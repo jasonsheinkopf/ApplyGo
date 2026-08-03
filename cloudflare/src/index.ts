@@ -12,7 +12,14 @@ import {
   resolveBoard,
   verifyWebsite,
 } from "./companies";
-import { FIT_BATCH_SIZE, type FitResult, assessJobFitBatch, chunk } from "./fit";
+import {
+  FIT_BATCH_SIZE,
+  type FitResult,
+  SCREEN_BATCH_SIZE,
+  assessJobFitBatch,
+  buildMatchProfile,
+  screenJobsBatch,
+} from "./fit";
 import {
   type LayoutSpec,
   type ResumeCheck,
@@ -40,6 +47,8 @@ interface Env {
   OPENAI_API_KEY?: string;
   ANTHROPIC_MODEL?: string;
   OPENAI_MODEL?: string;
+  ANTHROPIC_SCREEN_MODEL?: string;
+  OPENAI_SCREEN_MODEL?: string;
 }
 
 type Session = {
@@ -274,12 +283,19 @@ async function saveStructuredProfile(request: Request, env: Env): Promise<Respon
   }
   const structured = body.structured as StructuredProfile;
   const profileId = await getOrCreateProfileId(env);
+  // Recomputed on every save so the compact matching profile can never lag the real one.
   await env.DB.prepare(
-    "UPDATE candidate_profiles SET structured_json = ?, summary = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    `UPDATE candidate_profiles SET structured_json = ?, summary = ?, match_profile = ?,
+     updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
   )
-    .bind(JSON.stringify(structured), (structured.narrative_summary ?? "").slice(0, 4000), profileId)
+    .bind(
+      JSON.stringify(structured),
+      (structured.narrative_summary ?? "").slice(0, 4000),
+      buildMatchProfile(structured),
+      profileId,
+    )
     .run();
-  return json({ structured });
+  return json({ structured, match_profile: buildMatchProfile(structured) });
 }
 
 async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
@@ -408,10 +424,7 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
      ORDER BY COALESCE(posted_at, created_at) DESC
      LIMIT 300`,
   ).all();
-  const unassessed = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'unassessed'",
-  ).first<{ n: number }>();
-  return json({ jobs: jobs.results, unassessed: unassessed?.n ?? 0 });
+  return json({ jobs: jobs.results, counts: await jobPipelineCounts(env) });
 }
 
 /** Recent user-confirmed disqualifier reasons, most recent first, deduped case-insensitively. */
@@ -433,44 +446,92 @@ async function loadDisqualifiers(env: Env, profileId: string, limit = 25): Promi
   return out;
 }
 
-async function assessJobs(request: Request, env: Env): Promise<Response> {
+type JobRow = { id: string; title: string; company: string; location: string; raw_description: string };
+
+function toAssessable(rows: JobRow[]) {
+  return rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    company: r.company,
+    location: r.location,
+    description: r.raw_description ?? "",
+  }));
+}
+
+/**
+ * Runs the filtering pipeline: cheap screen first, strong assessment only on what survives.
+ *
+ * Both tiers run in one request, bounded by a shared call budget, and the response reports what
+ * is left at each stage so the dashboard can simply ask again. Doing the cheap pass first is the
+ * whole point -- most scraped postings are obvious misses, and paying strong-model rates to
+ * discover that is the expensive way to run this.
+ */
+async function processJobs(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { limit?: number; provider?: string };
+  const body = (await request.json().catch(() => ({}))) as { provider?: string; calls?: number };
   const provider = normalizeProvider(body.provider);
   const keyError = providerKeyMissing(env, provider);
   if (keyError) return json({ error: keyError }, 501);
 
   const profileId = await getOrCreateProfileId(env);
   const profileRow = await env.DB.prepare(
-    "SELECT preferences_json, structured_json FROM candidate_profiles WHERE id = ?",
+    "SELECT preferences_json, structured_json, match_profile FROM candidate_profiles WHERE id = ?",
   )
     .bind(profileId)
-    .first<{ preferences_json: string; structured_json: string }>();
+    .first<{ preferences_json: string; structured_json: string; match_profile: string }>();
   const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
   if (!structured) return json({ error: "no_profile_yet" }, 400);
+  // Backfills for profiles saved before match_profile existed.
+  const matchProfile = profileRow?.match_profile?.trim() || buildMatchProfile(structured);
   const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
   const disqualifiers = await loadDisqualifiers(env, profileId);
 
-  const limit = Math.min(Math.max(Number(body.limit) || 24, 1), 40);
-  const rows = await env.DB.prepare(
-    `SELECT id, title, company, location, raw_description FROM job_postings
-     WHERE fit_status = 'unassessed' ORDER BY created_at ASC LIMIT ?`,
-  )
-    .bind(limit)
-    .all<{ id: string; title: string; company: string; location: string; raw_description: string }>();
-
-  const jobs = (rows.results ?? []).map((r) => ({
-    id: r.id,
-    title: r.title,
-    company: r.company,
-    location: r.location,
-    description: r.raw_description,
-  }));
-
-  let assessed = 0;
+  const budget = { remaining: Math.min(Math.max(Number(body.calls) || 6, 1), 12) };
   const errors: string[] = [];
-  for (const batch of chunk(jobs, FIT_BATCH_SIZE)) {
+  let screened = 0;
+  let screenedOut = 0;
+  let assessed = 0;
+
+  // Tier 1: cheap bulk screen over everything untouched.
+  while (budget.remaining > 0) {
+    const rows = await env.DB.prepare(
+      `SELECT id, title, company, location, raw_description FROM job_postings
+       WHERE fit_status = 'unassessed' ORDER BY created_at ASC LIMIT ?`,
+    )
+      .bind(SCREEN_BATCH_SIZE)
+      .all<JobRow>();
+    const batch = toAssessable(rows.results ?? []);
+    if (!batch.length) break;
+    budget.remaining -= 1;
+    try {
+      const results = await screenJobsBatch(env, provider, matchProfile, desiredRoles, disqualifiers, batch);
+      for (const result of results) {
+        await env.DB.prepare(
+          "UPDATE job_postings SET fit_status = ?, fit_reason = ?, screened_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+          .bind(result.keep ? "screened_in" : "screened_out", result.keep ? "" : result.note, result.id)
+          .run();
+        if (!result.keep) screenedOut += 1;
+      }
+      screened += results.length;
+    } catch (err) {
+      errors.push(`screen: ${(err as Error).message}`);
+      break;
+    }
+  }
+
+  // Tier 2: strong model, only on survivors.
+  while (budget.remaining > 0) {
+    const rows = await env.DB.prepare(
+      `SELECT id, title, company, location, raw_description FROM job_postings
+       WHERE fit_status = 'screened_in' ORDER BY created_at ASC LIMIT ?`,
+    )
+      .bind(FIT_BATCH_SIZE)
+      .all<JobRow>();
+    const batch = toAssessable(rows.results ?? []);
+    if (!batch.length) break;
+    budget.remaining -= 1;
     try {
       const results = await assessJobFitBatch(
         env,
@@ -483,15 +544,149 @@ async function assessJobs(request: Request, env: Env): Promise<Response> {
       await storeFitResults(env, results);
       assessed += results.length;
     } catch (err) {
-      errors.push((err as Error).message);
+      errors.push(`assess: ${(err as Error).message}`);
+      break;
     }
   }
 
-  const remaining = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'unassessed'",
-  ).first<{ n: number }>();
+  const counts = await jobPipelineCounts(env);
+  return json({ screened, screened_out: screenedOut, assessed, errors, counts });
+}
 
-  return json({ assessed, remaining: remaining?.n ?? 0, errors });
+/** Row counts per pipeline stage, used for both the Jobs status line and the Data tab. */
+async function jobPipelineCounts(env: Env): Promise<Record<string, number>> {
+  const rows = await env.DB.prepare(
+    "SELECT fit_status, COUNT(*) AS n FROM job_postings GROUP BY fit_status",
+  ).all<{ fit_status: string; n: number }>();
+  const counts: Record<string, number> = {
+    unassessed: 0,
+    screened_in: 0,
+    screened_out: 0,
+    strong: 0,
+    possible: 0,
+    reject: 0,
+  };
+  for (const row of rows.results ?? []) counts[row.fit_status] = row.n;
+  counts.total = Object.values(counts).reduce((a, b) => a + b, 0);
+  return counts;
+}
+
+// ---------------------------------------------------------------------------
+// Stored data: inspection and stage-scoped resets
+// ---------------------------------------------------------------------------
+
+/**
+ * The pipeline, as an ordered list. Each stage produces data that the stages after it depend on,
+ * so resetting one has to clear everything downstream -- otherwise you get postings pointing at
+ * companies that no longer exist, or fit verdicts computed against descriptions that are gone.
+ */
+const PIPELINE_STAGES = [
+  {
+    id: "companies",
+    name: "Target companies",
+    detail: "The company list itself. Clearing it also removes every posting scanned from those companies.",
+  },
+  {
+    id: "listings",
+    name: "Job listings",
+    detail: "Postings scraped from company boards, with their titles, links, locations and dates.",
+  },
+  {
+    id: "descriptions",
+    name: "Job descriptions",
+    detail: "The description text on each posting. This is the largest thing stored; clearing it keeps the listings but forces a re-scan before screening can run again.",
+  },
+  {
+    id: "screening",
+    name: "Screening + assessment",
+    detail: "Every fit verdict, reason and gap list. Clearing it returns all postings to unscreened so the pipeline can run from scratch.",
+  },
+] as const;
+
+async function dataSummary(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+
+  const count = async (sql: string): Promise<number> =>
+    (await env.DB.prepare(sql).first<{ n: number }>())?.n ?? 0;
+
+  const [companies, jobs, documents, notes, roleSignals, resumes, feedback, descBytes, docBytes] = await Promise.all([
+    count("SELECT COUNT(*) AS n FROM companies"),
+    count("SELECT COUNT(*) AS n FROM job_postings"),
+    count("SELECT COUNT(*) AS n FROM source_documents"),
+    count("SELECT COUNT(*) AS n FROM candidate_evidence WHERE category = 'note'"),
+    count("SELECT COUNT(*) AS n FROM candidate_evidence WHERE category = 'role_signal'"),
+    count("SELECT COUNT(*) AS n FROM resumes"),
+    count("SELECT COUNT(*) AS n FROM job_feedback"),
+    count("SELECT COALESCE(SUM(LENGTH(raw_description)), 0) AS n FROM job_postings"),
+    count("SELECT COALESCE(SUM(LENGTH(extracted_text)), 0) AS n FROM source_documents"),
+  ]);
+
+  return json({
+    stages: PIPELINE_STAGES,
+    counts: {
+      companies,
+      jobs,
+      documents,
+      notes,
+      role_signals: roleSignals,
+      resumes,
+      feedback,
+    },
+    pipeline: await jobPipelineCounts(env),
+    bytes: { job_descriptions: descBytes, document_text: docBytes },
+  });
+}
+
+/** Clears one pipeline stage and everything downstream of it. */
+async function purgeStage(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { stage?: string };
+  const index = PIPELINE_STAGES.findIndex((s) => s.id === body.stage);
+  if (index < 0) return json({ error: "unknown_stage" }, 400);
+
+  const cleared: string[] = [];
+  // Walk from the requested stage forward so downstream data always goes with it.
+  for (const stage of PIPELINE_STAGES.slice(index)) {
+    if (stage.id === "companies") {
+      // Postings cascade via the companies foreign key, but manually added jobs have no
+      // company_id and are the user's own work, so they are deliberately left alone.
+      await env.DB.prepare("DELETE FROM companies").run();
+      cleared.push("companies");
+    } else if (stage.id === "listings") {
+      await env.DB.prepare("DELETE FROM job_postings WHERE company_id IS NOT NULL").run();
+      cleared.push("listings");
+    } else if (stage.id === "descriptions") {
+      await env.DB.prepare("UPDATE job_postings SET raw_description = ''").run();
+      cleared.push("descriptions");
+    } else if (stage.id === "screening") {
+      await env.DB.prepare(
+        `UPDATE job_postings SET fit_status = 'unassessed', fit_reason = '', fit_missing_json = '[]',
+         screened_at = NULL, assessed_at = NULL`,
+      ).run();
+      cleared.push("screening");
+    }
+  }
+  return json({ cleared, pipeline: await jobPipelineCounts(env) });
+}
+
+/** Deletes one standalone collection that isn't part of the job pipeline. */
+async function purgeCollection(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { collection?: string };
+  const statements: Record<string, string> = {
+    feedback: "DELETE FROM job_feedback",
+    resumes: "DELETE FROM resumes",
+    notes: "DELETE FROM candidate_evidence WHERE category = 'note'",
+    role_signals: "DELETE FROM candidate_evidence WHERE category = 'role_signal'",
+    manual_jobs: "DELETE FROM job_postings WHERE company_id IS NULL",
+  };
+  const sql = statements[body.collection ?? ""];
+  if (!sql) return json({ error: "unknown_collection" }, 400);
+  const result = await env.DB.prepare(sql).run();
+  return json({ deleted: result.meta.changes ?? 0 });
 }
 
 async function storeFitResults(env: Env, results: FitResult[]): Promise<void> {
@@ -750,25 +945,11 @@ async function scanCompanies(request: Request, env: Env): Promise<Response> {
   };
   const profileId = await getOrCreateProfileId(env);
 
-  const profileRow = await env.DB.prepare("SELECT preferences_json, structured_json FROM candidate_profiles WHERE id = ?")
+  const profileRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
     .bind(profileId)
-    .first<{ preferences_json: string; structured_json: string }>();
+    .first<{ preferences_json: string }>();
   const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
   const locationTerms = parseLocationFilter(readDesiredLocations(profileRow?.preferences_json ?? "{}"));
-
-  // Fit assessment during a scan is opt-in and silent about it when unavailable: no configured
-  // key just means newly found postings land as 'unassessed', same as before this feature existed.
-  const fitProvider = normalizeProvider(body.provider);
-  const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
-  const fitContext =
-    structured && !providerKeyMissing(env, fitProvider)
-      ? {
-          provider: fitProvider,
-          profileJson: JSON.stringify(structured),
-          desiredRoles,
-          disqualifiers: await loadDisqualifiers(env, profileId),
-        }
-      : null;
 
   const limit = Math.min(Math.max(Number(body.limit) || 6, 1), 12);
   const targets = body.company_id
@@ -791,7 +972,7 @@ async function scanCompanies(request: Request, env: Env): Promise<Response> {
   const results: { company: string; jobs: number; note: string }[] = [];
 
   for (const company of targets.results ?? []) {
-    const outcome = await scanOneCompany(env, company, desiredRoles, locationTerms, fitContext, budget);
+    const outcome = await scanOneCompany(env, company, desiredRoles, locationTerms, budget);
     results.push({ company: company.name, jobs: outcome.jobs, note: outcome.note });
     if (budget.remaining <= 2) break;
   }
@@ -814,19 +995,11 @@ type CompanyScanRow = {
   ats_token: string;
 };
 
-type FitContext = {
-  provider: Provider;
-  profileJson: string;
-  desiredRoles: string;
-  disqualifiers: string[];
-};
-
 async function scanOneCompany(
   env: Env,
   company: CompanyScanRow,
   desiredRoles: string,
   locationTerms: string[],
-  fitContext: FitContext | null,
   budget: { remaining: number },
 ): Promise<{ jobs: number; note: string }> {
   let provider = company.ats_provider as AtsProvider | "" | "none";
@@ -868,50 +1041,28 @@ async function scanOneCompany(
     .filter((job) => job.title && job.external_id)
     .map((job) => ({ ...job, id: crypto.randomUUID() }));
 
-  const fitById = new Map<string, FitResult>();
-  if (fitContext && relevant.length) {
-    for (const jobBatch of chunk(relevant, FIT_BATCH_SIZE)) {
-      if (budget.remaining <= 1) break;
-      budget.remaining -= 1;
-      try {
-        const results = await assessJobFitBatch(
-          env,
-          fitContext.provider,
-          fitContext.profileJson,
-          fitContext.desiredRoles,
-          fitContext.disqualifiers,
-          jobBatch.map((j) => ({ id: j.id, title: j.title, company: company.name, location: j.location, description: j.description })),
-        );
-        for (const result of results) fitById.set(result.id, result);
-      } catch {
-        // A batch failing leaves those jobs 'unassessed' -- visible by default, never hidden by an error.
-      }
-    }
-  }
-
+  // Scanning only collects listings. Judging them is a separate, explicitly triggered stage, so
+  // a scan stays cheap and fast and can cover far more companies per request.
   for (const job of relevant) {
-    const fit = fitById.get(job.id);
     await env.DB.prepare(
       `INSERT OR IGNORE INTO job_postings
          (id, title, company, source_url, raw_description, location, posted_at, ats_provider, company_id,
-          external_id, fit_status, fit_reason, fit_missing_json, assessed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          external_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         job.id,
         job.title,
         company.name,
         job.url,
-        job.description,
+        // Only the opening of a description is ever needed for screening, and this is the single
+        // biggest column in the database, so it is capped on the way in.
+        (job.description ?? "").slice(0, 1500),
         job.location,
         job.posted_at || null,
         provider,
         company.id,
         job.external_id,
-        fit?.verdict ?? "unassessed",
-        fit?.reason ?? "",
-        JSON.stringify(fit?.missing ?? []),
-        fit ? new Date().toISOString() : null,
       )
       .run();
   }
@@ -1837,6 +1988,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
     <button class="tab" data-tab="devices" type="button">Devices</button>
+    <button class="tab" data-tab="data" type="button">Data</button>
   </nav>
 
   <div id="panel-roles" class="panel active">
@@ -2054,15 +2206,16 @@ const DASHBOARD_PAGE = `<!doctype html>
       <h2>Job postings</h2>
       <p class="hint">Openings found by scanning your target companies' boards, plus anything you added by hand. Each posting is judged against your profile, not just keyword-matched — postings you'd clearly be turned down for are hidden by default.</p>
 
+      <p id="jobs-pipeline" class="summary-line">Loading…</p>
       <div class="controls">
         <div>
-          <label for="jobs-provider">Check fit using</label>
+          <label for="jobs-provider">Filter using</label>
           <select id="jobs-provider">
             <option value="anthropic">Anthropic (Claude)</option>
             <option value="openai">OpenAI</option>
           </select>
         </div>
-        <button id="jobs-assess-button" type="button">Check fit on new postings</button>
+        <button id="jobs-assess-button" type="button">Find my matches</button>
       </div>
       <p id="jobs-assess-status" class="status" role="status" aria-live="polite"></p>
 
@@ -2094,6 +2247,27 @@ const DASHBOARD_PAGE = `<!doctype html>
     <section id="devices-section">
       <h2>Devices</h2>
       <div id="devices-list"><p class="empty">Loading…</p></div>
+    </section>
+  </div>
+
+  <div id="panel-data" class="panel">
+    <section id="data-stored-section">
+      <h2>What's stored</h2>
+      <p class="hint">Everything ApplyGo keeps about you and your search, and how much space the bulky parts take.</p>
+      <div id="data-counts"><p class="empty">Loading…</p></div>
+    </section>
+
+    <section id="data-pipeline-section">
+      <h2>Pipeline</h2>
+      <p class="hint">Each stage feeds the next. Resetting one also clears everything downstream of it, because those results were derived from what you're removing.</p>
+      <div id="data-stages"><p class="empty">Loading…</p></div>
+    </section>
+
+    <section id="data-collections-section">
+      <h2>Other collections</h2>
+      <p class="hint">Standalone data that isn't part of the job pipeline.</p>
+      <div id="data-collections"></div>
+      <p id="data-status" class="status" role="status" aria-live="polite"></p>
     </section>
   </div>
   </div>
@@ -2881,8 +3055,13 @@ const DASHBOARD_PAGE = `<!doctype html>
       strong: { text: 'Strong match', cls: 'strong' },
       possible: { text: 'Possible match', cls: 'possible' },
       reject: { text: 'Not a fit', cls: 'warn' },
-      unassessed: { text: 'Not checked yet', cls: '' },
+      screened_out: { text: 'Screened out', cls: 'warn' },
+      screened_in: { text: 'Awaiting review', cls: '' },
+      unassessed: { text: 'Not filtered yet', cls: '' },
     };
+    // Postings the filters ruled out. Everything else -- matches and anything still queued --
+    // stays visible, so a posting is never hidden before something has actually judged it.
+    var HIDDEN_STATUSES = { reject: true, screened_out: true };
 
     async function submitJobFit(jobId, action, reason) {
       await api('/jobs/' + encodeURIComponent(jobId) + '/fit', {
@@ -2899,19 +3078,19 @@ const DASHBOARD_PAGE = `<!doctype html>
       var list = document.getElementById('jobs-list');
       list.innerHTML = '';
 
-      var rejectedCount = allJobs.filter(function (j) { return j.fit_status === 'reject'; }).length;
-      var visible = showRejected ? allJobs : allJobs.filter(function (j) { return j.fit_status !== 'reject'; });
+      var rejectedCount = allJobs.filter(function (j) { return HIDDEN_STATUSES[j.fit_status]; }).length;
+      var visible = showRejected ? allJobs : allJobs.filter(function (j) { return !HIDDEN_STATUSES[j.fit_status]; });
       var shown = visible.filter(function (job) {
         return matchesFilter([job.title, job.company, job.location].join(' '), needle);
       });
-      // Best fits first; postings not yet checked stay near the top too, since they haven't been ruled out.
-      var order = { strong: 0, unassessed: 1, possible: 2, reject: 3 };
-      shown.sort(function (a, b) { return (order[a.fit_status] ?? 1) - (order[b.fit_status] ?? 1); });
+      // Judged matches first, then anything still queued, then what was ruled out.
+      var order = { strong: 0, possible: 1, screened_in: 2, unassessed: 3, screened_out: 4, reject: 5 };
+      shown.sort(function (a, b) { return (order[a.fit_status] ?? 3) - (order[b.fit_status] ?? 3); });
 
       var rejectedToggle = document.getElementById('jobs-show-rejected');
       rejectedToggle.parentElement.style.display = rejectedCount ? 'flex' : 'none';
       document.getElementById('jobs-rejected-count').textContent =
-        'Show ' + rejectedCount + ' posting' + (rejectedCount === 1 ? '' : 's') + ' marked not a fit';
+        'Show ' + rejectedCount + ' filtered-out posting' + (rejectedCount === 1 ? '' : 's');
 
       if (!shown.length) {
         list.appendChild(el('p', {
@@ -2970,7 +3149,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         });
         actions.push(del);
 
-        list.appendChild(el('div', { className: 'row-item' + (job.fit_status === 'reject' ? ' is-muted' : '') }, [
+        list.appendChild(el('div', { className: 'row-item' + (HIDDEN_STATUSES[job.fit_status] ? ' is-muted' : '') }, [
           el('div', { className: 'row' }, [
             el('div', {}, body),
             el('div', { className: 'row-actions' }, actions),
@@ -2986,20 +3165,26 @@ const DASHBOARD_PAGE = `<!doctype html>
       var statusEl = document.getElementById('jobs-assess-status');
       var button = this;
       button.disabled = true;
-      statusEl.textContent = 'Comparing postings against your profile…';
+      statusEl.textContent = 'Screening listings, then assessing the ones worth a closer look…';
       statusEl.className = 'status';
       try {
-        var res = await api('/jobs/assess', {
+        var res = await api('/jobs/process', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ provider: document.getElementById('jobs-provider').value, limit: 24 }),
+          body: JSON.stringify({ provider: document.getElementById('jobs-provider').value }),
         });
         var data = await res.json();
-        if (!res.ok) throw new Error(errorMessage(data, 'assess_failed'));
-        statusEl.textContent =
-          'Checked ' + data.assessed + '. ' +
-          (data.remaining ? data.remaining + ' still unchecked, click again to continue.' : 'All caught up.');
-        statusEl.className = 'status success';
+        if (!res.ok) throw new Error(errorMessage(data, 'process_failed'));
+        var counts = data.counts || {};
+        var left = (counts.unassessed || 0) + (counts.screened_in || 0);
+        var parts = [];
+        if (data.screened) parts.push('Screened ' + data.screened + ', dropped ' + data.screened_out + ' as clear misses.');
+        if (data.assessed) parts.push('Assessed ' + data.assessed + ' in detail.');
+        if (!parts.length) parts.push('Nothing left to process.');
+        parts.push(left ? left + ' still queued — click again to continue.' : 'All caught up.');
+        if ((data.errors || []).length) parts.push('Some batches failed: ' + data.errors.join('; '));
+        statusEl.textContent = parts.join(' ');
+        statusEl.className = (data.errors || []).length ? 'status error' : 'status success';
         await loadJobs();
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
@@ -3009,15 +3194,25 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
+    function renderJobPipeline(counts) {
+      var host = document.getElementById('jobs-pipeline');
+      host.innerHTML = '';
+      var matches = (counts.strong || 0) + (counts.possible || 0);
+      var queued = (counts.unassessed || 0) + (counts.screened_in || 0);
+      host.appendChild(el('span', {}, [
+        el('strong', { textContent: String(matches) }),
+        el('span', { textContent: ' match' + (matches === 1 ? '' : 'es') +
+          ' · ' + queued + ' waiting to be filtered' +
+          ' · ' + (counts.screened_out || 0) + ' dropped in screening' +
+          ' · ' + (counts.reject || 0) + ' ruled out' }),
+      ]));
+    }
+
     async function loadJobs() {
       var res = await api('/jobs');
       var data = await res.json();
       allJobs = data.jobs || [];
-      var statusEl = document.getElementById('jobs-assess-status');
-      if (data.unassessed && !statusEl.textContent) {
-        statusEl.textContent = data.unassessed + ' posting' + (data.unassessed === 1 ? '' : 's') + ' not checked for fit yet.';
-        statusEl.className = 'status';
-      }
+      renderJobPipeline(data.counts || {});
       renderJobs();
     }
 
@@ -3075,6 +3270,119 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
     }
 
+    function formatBytes(n) {
+      if (!n) return '0 KB';
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    function dataRow(label, value, note) {
+      var body = [el('div', { className: 'row-title', textContent: label })];
+      if (note) body.push(el('div', { className: 'row-meta', textContent: note }));
+      return el('div', { className: 'row-item' }, [
+        el('div', { className: 'row' }, [
+          el('div', {}, body),
+          el('div', { className: 'row-actions' }, [el('span', { className: 'badge', textContent: value })]),
+        ]),
+      ]);
+    }
+
+    async function loadData() {
+      var res = await api('/data');
+      var data = await res.json();
+      var counts = data.counts || {};
+      var pipeline = data.pipeline || {};
+      var bytes = data.bytes || {};
+
+      var countsHost = document.getElementById('data-counts');
+      countsHost.innerHTML = '';
+      countsHost.appendChild(dataRow('Target companies', String(counts.companies || 0)));
+      countsHost.appendChild(dataRow(
+        'Job listings', String(counts.jobs || 0),
+        (pipeline.strong || 0) + ' strong · ' + (pipeline.possible || 0) + ' possible · ' +
+        ((pipeline.unassessed || 0) + (pipeline.screened_in || 0)) + ' queued · ' +
+        (pipeline.screened_out || 0) + ' screened out · ' + (pipeline.reject || 0) + ' ruled out',
+      ));
+      countsHost.appendChild(dataRow('Job description text', formatBytes(bytes.job_descriptions), 'Largest thing stored'));
+      countsHost.appendChild(dataRow('Uploaded documents', String(counts.documents || 0), 'Extracted text: ' + formatBytes(bytes.document_text)));
+      countsHost.appendChild(dataRow('Notes', String(counts.notes || 0)));
+      countsHost.appendChild(dataRow('Desired-role signals', String(counts.role_signals || 0)));
+      countsHost.appendChild(dataRow('Resume versions', String(counts.resumes || 0)));
+      countsHost.appendChild(dataRow('Rejection reasons you taught it', String(counts.feedback || 0)));
+
+      var stagesHost = document.getElementById('data-stages');
+      stagesHost.innerHTML = '';
+      (data.stages || []).forEach(function (stage, index) {
+        var downstream = (data.stages || []).slice(index + 1).map(function (s) { return s.name.toLowerCase(); });
+        var body = [
+          el('div', { className: 'row-title', textContent: (index + 1) + '. ' + stage.name }),
+          el('div', { className: 'row-meta', textContent: stage.detail }),
+        ];
+        if (downstream.length) {
+          body.push(el('div', { className: 'row-meta', textContent: 'Also clears: ' + downstream.join(', ') }));
+        }
+        var reset = el('button', { className: 'danger', type: 'button', textContent: 'Reset' });
+        reset.addEventListener('click', async function () {
+          var warning = downstream.length
+            ? 'Reset "' + stage.name + '" and also clear ' + downstream.join(', ') + '?'
+            : 'Reset "' + stage.name + '"?';
+          if (!window.confirm(warning)) return;
+          var statusEl = document.getElementById('data-status');
+          statusEl.textContent = 'Clearing…';
+          statusEl.className = 'status';
+          var r = await api('/data/purge-stage', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ stage: stage.id }),
+          });
+          var d = await r.json();
+          statusEl.textContent = r.ok ? 'Cleared: ' + (d.cleared || []).join(', ') + '.' : errorMessage(d, 'purge_failed');
+          statusEl.className = r.ok ? 'status success' : 'status error';
+          await loadData();
+          await loadCompanies();
+          await loadJobs();
+        });
+        stagesHost.appendChild(el('div', { className: 'row-item' }, [
+          el('div', { className: 'row' }, [el('div', {}, body), el('div', { className: 'row-actions' }, [reset])]),
+        ]));
+      });
+
+      var collectionsHost = document.getElementById('data-collections');
+      collectionsHost.innerHTML = '';
+      [
+        { id: 'manual_jobs', name: 'Hand-added job postings', note: 'Postings you typed in yourself, which company scans never touch.' },
+        { id: 'feedback', name: 'Rejection reasons', note: 'What you taught the filter by rejecting postings with a reason.' },
+        { id: 'resumes', name: 'Resume versions', note: 'Generated resumes and their PDFs.' },
+        { id: 'notes', name: 'Notes', note: 'Freeform notes on the Profile tab.' },
+        { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Desired Roles tab.' },
+      ].forEach(function (collection) {
+        var del = el('button', { className: 'danger', type: 'button', textContent: 'Delete' });
+        del.addEventListener('click', async function () {
+          if (!window.confirm('Delete all ' + collection.name.toLowerCase() + '?')) return;
+          var statusEl = document.getElementById('data-status');
+          var r = await api('/data/purge-collection', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ collection: collection.id }),
+          });
+          var d = await r.json();
+          statusEl.textContent = r.ok ? 'Deleted ' + d.deleted + ' row' + (d.deleted === 1 ? '' : 's') + '.' : errorMessage(d, 'purge_failed');
+          statusEl.className = r.ok ? 'status success' : 'status error';
+          await loadData();
+        });
+        collectionsHost.appendChild(el('div', { className: 'row-item' }, [
+          el('div', { className: 'row' }, [
+            el('div', {}, [
+              el('div', { className: 'row-title', textContent: collection.name }),
+              el('div', { className: 'row-meta', textContent: collection.note }),
+            ]),
+            el('div', { className: 'row-actions' }, [del]),
+          ]),
+        ]));
+      });
+    }
+
     async function loadDevices() {
       var res = await api('/devices');
       var data = await res.json();
@@ -3089,6 +3397,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     loadCompanies();
     loadJobs();
     loadDevices();
+    loadData();
   </script>
 </body>
 </html>`;
@@ -3136,7 +3445,10 @@ export default {
     if (request.method === "DELETE" && companyMatch) return deleteCompany(request, env, companyMatch[1]);
     if (request.method === "GET" && url.pathname === "/jobs") return listJobs(request, env);
     if (request.method === "POST" && url.pathname === "/jobs") return createJob(request, env);
-    if (request.method === "POST" && url.pathname === "/jobs/assess") return assessJobs(request, env);
+    if (request.method === "POST" && url.pathname === "/jobs/process") return processJobs(request, env);
+    if (request.method === "GET" && url.pathname === "/data") return dataSummary(request, env);
+    if (request.method === "POST" && url.pathname === "/data/purge-stage") return purgeStage(request, env);
+    if (request.method === "POST" && url.pathname === "/data/purge-collection") return purgeCollection(request, env);
     const jobFitMatch = url.pathname.match(/^\/jobs\/([^/]+)\/fit$/);
     if (request.method === "PATCH" && jobFitMatch) return setJobFit(request, env, jobFitMatch[1]);
     const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
