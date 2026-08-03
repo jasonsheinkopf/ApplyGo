@@ -938,11 +938,7 @@ async function discoverCompanies(request: Request, env: Env): Promise<Response> 
 async function scanCompanies(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as {
-    limit?: number;
-    company_id?: string;
-    provider?: string;
-  };
+  const body = (await request.json().catch(() => ({}))) as { limit?: number; company_id?: string };
   const profileId = await getOrCreateProfileId(env);
 
   const profileRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
@@ -969,11 +965,13 @@ async function scanCompanies(request: Request, env: Env): Promise<Response> {
         .all<CompanyScanRow>();
 
   const budget = { remaining: 40 };
-  const results: { company: string; jobs: number; note: string }[] = [];
+  const results: { company: string; jobs: number; new_jobs: number; note: string }[] = [];
+  let newListings = 0;
 
   for (const company of targets.results ?? []) {
     const outcome = await scanOneCompany(env, company, desiredRoles, locationTerms, budget);
-    results.push({ company: company.name, jobs: outcome.jobs, note: outcome.note });
+    results.push({ company: company.name, jobs: outcome.jobs, new_jobs: outcome.newJobs, note: outcome.note });
+    newListings += outcome.newJobs;
     if (budget.remaining <= 2) break;
   }
 
@@ -983,7 +981,7 @@ async function scanCompanies(request: Request, env: Env): Promise<Response> {
     .bind(profileId)
     .first<{ n: number }>();
 
-  return json({ scanned: results.length, results, unscanned: remaining?.n ?? 0 });
+  return json({ scanned: results.length, results, new_listings: newListings, unscanned: remaining?.n ?? 0 });
 }
 
 type CompanyScanRow = {
@@ -1001,7 +999,7 @@ async function scanOneCompany(
   desiredRoles: string,
   locationTerms: string[],
   budget: { remaining: number },
-): Promise<{ jobs: number; note: string }> {
+): Promise<{ jobs: number; newJobs: number; note: string }> {
   let provider = company.ats_provider as AtsProvider | "" | "none";
   let token = company.ats_token;
 
@@ -1014,7 +1012,7 @@ async function scanOneCompany(
       )
         .bind("No supported job board found on their site.", company.id)
         .run();
-      return { jobs: 0, note: "no supported board found" };
+      return { jobs: 0, newJobs: 0, note: "no supported board found" };
     }
     provider = resolved.provider;
     token = resolved.token;
@@ -1031,7 +1029,7 @@ async function scanOneCompany(
     )
       .bind(`Board read failed: ${(err as Error).message}`, company.id)
       .run();
-    return { jobs: 0, note: "board read failed" };
+    return { jobs: 0, newJobs: 0, note: "board read failed" };
   }
 
   // A company can qualify on location while most of its postings don't, so each posting is
@@ -1043,8 +1041,9 @@ async function scanOneCompany(
 
   // Scanning only collects listings. Judging them is a separate, explicitly triggered stage, so
   // a scan stays cheap and fast and can cover far more companies per request.
+  let newJobs = 0;
   for (const job of relevant) {
-    await env.DB.prepare(
+    const inserted = await env.DB.prepare(
       `INSERT OR IGNORE INTO job_postings
          (id, title, company, source_url, raw_description, location, posted_at, ats_provider, company_id,
           external_id)
@@ -1065,6 +1064,9 @@ async function scanOneCompany(
         job.external_id,
       )
       .run();
+    // relevant.length also counts postings the board already showed on a previous scan;
+    // meta.changes is the only reliable signal for "actually new this time".
+    if (inserted.meta.changes > 0) newJobs += 1;
   }
 
   const total = await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE company_id = ?")
@@ -1083,7 +1085,7 @@ async function scanOneCompany(
     .bind(provider, token, total?.n ?? 0, note, company.id)
     .run();
 
-  return { jobs: relevant.length, note };
+  return { jobs: relevant.length, newJobs, note };
 }
 
 async function updateCompany(request: Request, env: Env, id: string): Promise<Response> {
@@ -2169,11 +2171,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           </div>
           <button id="companies-discover-button" type="button">Find more companies</button>
           <p id="companies-discover-status" class="status" role="status" aria-live="polite"></p>
-
-          <h3>Check for openings</h3>
-          <p class="hint">Reads the job boards of companies already on your list and judges each posting against your profile — not just a keyword match. Runs in batches, so click again if there are more left.</p>
-          <button id="companies-scan-button" type="button">Scan boards for jobs</button>
-          <p id="companies-scan-status" class="status" role="status" aria-live="polite"></p>
+          <p class="hint">Once companies are on your list, scan their boards for openings from the Jobs tab.</p>
 
           <h3>Where they are</h3>
           <div id="companies-locations"><p class="empty">No companies yet.</p></div>
@@ -2202,10 +2200,17 @@ const DASHBOARD_PAGE = `<!doctype html>
   </div>
 
   <div id="panel-jobs" class="panel">
-    <section id="jobs-section">
-      <h2>Job postings</h2>
-      <p class="hint">Openings found by scanning your target companies' boards, plus anything you added by hand. Each posting is judged against your profile, not just keyword-matched — postings you'd clearly be turned down for are hidden by default.</p>
+    <section id="jobs-scan-section">
+      <h2>1. Scan for new listings</h2>
+      <p class="hint">Reads the job boards of every company on your list. Runs in batches, so click again if there are more companies left to scan.</p>
+      <p id="jobs-scan-summary" class="summary-line">Loading…</p>
+      <button id="jobs-scan-button" type="button">Scan company boards</button>
+      <p id="jobs-scan-status" class="status" role="status" aria-live="polite"></p>
+    </section>
 
+    <section id="jobs-filter-section">
+      <h2>2. Filter for your best matches</h2>
+      <p class="hint">Screens new listings against your profile in two passes — a quick check, then a closer look at anything that survives it — so you only spend real attention on postings worth reading.</p>
       <p id="jobs-pipeline" class="summary-line">Loading…</p>
       <div class="controls">
         <div>
@@ -2218,7 +2223,10 @@ const DASHBOARD_PAGE = `<!doctype html>
         <button id="jobs-assess-button" type="button">Find my matches</button>
       </div>
       <p id="jobs-assess-status" class="status" role="status" aria-live="polite"></p>
+    </section>
 
+    <section id="jobs-section">
+      <h2>Job postings</h2>
       <label for="jobs-filter">Filter</label>
       <input id="jobs-filter" placeholder="Search by title, company, or location">
       <label class="checkbox-label">
@@ -2960,6 +2968,27 @@ const DASHBOARD_PAGE = `<!doctype html>
       );
       renderCompanyLocations();
       renderCompanies();
+      renderScanSummary();
+    }
+
+    function renderScanSummary() {
+      var host = document.getElementById('jobs-scan-summary');
+      if (!host) return;
+      var scannedAt = allCompanies
+        .map(function (c) { return c.last_scanned_at; })
+        .filter(Boolean)
+        .sort()
+        .pop();
+      var eligible = allCompanies.filter(function (c) { return c.status !== 'dismissed'; }).length;
+      var unscanned = allCompanies.filter(function (c) { return c.status !== 'dismissed' && !c.last_scanned_at; }).length;
+      host.innerHTML = '';
+      host.appendChild(el('span', {}, [
+        el('span', {
+          textContent: (scannedAt ? 'Last scanned ' + new Date(scannedAt).toLocaleString() : 'Never scanned yet') +
+            ' · ' + eligible + ' compan' + (eligible === 1 ? 'y' : 'ies') + ' on your list' +
+            (unscanned ? ' · ' + unscanned + ' not scanned yet' : ''),
+        }),
+      ]));
     }
 
     document.getElementById('companies-filter').addEventListener('input', renderCompanies);
@@ -2995,8 +3024,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
-    document.getElementById('companies-scan-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('companies-scan-status');
+    document.getElementById('jobs-scan-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('jobs-scan-status');
       var button = this;
       button.disabled = true;
       statusEl.textContent = 'Reading job boards…';
@@ -3005,15 +3034,15 @@ const DASHBOARD_PAGE = `<!doctype html>
         var res = await api('/companies/scan', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ limit: 6, provider: document.getElementById('company-provider').value }),
+          body: JSON.stringify({ limit: 6 }),
         });
         var data = await res.json();
         if (!res.ok) throw new Error(errorMessage(data, 'scan_failed'));
-        var found = (data.results || []).reduce(function (sum, r) { return sum + r.jobs; }, 0);
         statusEl.textContent =
-          'Scanned ' + data.scanned + ' — found ' + found + ' matching role' + (found === 1 ? '' : 's') +
-          ' and location. ' +
-          (data.unscanned ? data.unscanned + ' still unscanned, click again to continue.' : 'All companies scanned.');
+          'Scanned ' + data.scanned + ' compan' + (data.scanned === 1 ? 'y' : 'ies') + ' — found ' +
+          data.new_listings + ' new listing' + (data.new_listings === 1 ? '' : 's') + '. ' +
+          (data.unscanned ? data.unscanned + ' compan' + (data.unscanned === 1 ? 'y' : 'ies') +
+            ' still unscanned, click again to continue.' : 'All companies scanned.');
         statusEl.className = 'status success';
         await loadCompanies();
         await loadJobs();
