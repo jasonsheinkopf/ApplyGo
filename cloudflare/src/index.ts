@@ -67,6 +67,38 @@ function json(data: unknown, status = 200, headers: HeadersInit = {}): Response 
   });
 }
 
+/**
+ * A response that streams one JSON object per line as work progresses, for operations long
+ * enough that "please wait" isn't good enough -- screening hundreds of postings, or scanning a
+ * dozen company boards. `run` is handed an `emit` function it calls after each unit of work; the
+ * body starts streaming to the client immediately rather than only after everything finishes.
+ *
+ * Each unit of work is written to the database before its progress event is emitted (both endpoints
+ * that use this already do that), so if the connection drops or the request is cancelled partway
+ * through, everything done so far is saved -- resuming just means clicking the button again.
+ */
+function ndjsonResponse(ctx: ExecutionContext, run: (emit: (event: unknown) => Promise<void>) => Promise<unknown>): Response {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const emit = (event: unknown) => writer.write(encoder.encode(JSON.stringify(event) + "\n"));
+
+  ctx.waitUntil(
+    (async () => {
+      try {
+        const result = await run(emit);
+        await emit({ type: "done", ...(result as object) });
+      } catch (err) {
+        await emit({ type: "error", message: (err as Error).message });
+      } finally {
+        await writer.close();
+      }
+    })(),
+  );
+
+  return new Response(readable, { headers: { "content-type": "application/x-ndjson; charset=utf-8" } });
+}
+
 function randomToken(bytes = 32): string {
   const value = new Uint8Array(bytes);
   crypto.getRandomValues(value);
@@ -466,7 +498,7 @@ function toAssessable(rows: JobRow[]) {
  * whole point -- most scraped postings are obvious misses, and paying strong-model rates to
  * discover that is the expensive way to run this.
  */
-async function processJobs(request: Request, env: Env): Promise<Response> {
+async function processJobs(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as { provider?: string; calls?: number };
@@ -488,69 +520,82 @@ async function processJobs(request: Request, env: Env): Promise<Response> {
   const disqualifiers = await loadDisqualifiers(env, profileId);
 
   const budget = { remaining: Math.min(Math.max(Number(body.calls) || 6, 1), 12) };
-  const errors: string[] = [];
-  let screened = 0;
-  let screenedOut = 0;
-  let assessed = 0;
 
-  // Tier 1: cheap bulk screen over everything untouched.
-  while (budget.remaining > 0) {
-    const rows = await env.DB.prepare(
-      `SELECT id, title, company, location, raw_description FROM job_postings
-       WHERE fit_status = 'unassessed' ORDER BY created_at ASC LIMIT ?`,
-    )
-      .bind(SCREEN_BATCH_SIZE)
-      .all<JobRow>();
-    const batch = toAssessable(rows.results ?? []);
-    if (!batch.length) break;
-    budget.remaining -= 1;
-    try {
-      const results = await screenJobsBatch(env, provider, matchProfile, desiredRoles, disqualifiers, batch);
-      for (const result of results) {
-        await env.DB.prepare(
-          "UPDATE job_postings SET fit_status = ?, fit_reason = ?, screened_at = CURRENT_TIMESTAMP WHERE id = ?",
-        )
-          .bind(result.keep ? "screened_in" : "screened_out", result.keep ? "" : result.note, result.id)
-          .run();
-        if (!result.keep) screenedOut += 1;
+  return ndjsonResponse(ctx, async (emit) => {
+    const errors: string[] = [];
+    let screened = 0;
+    let screenedOut = 0;
+    let assessed = 0;
+
+    // Reported against the full backlog, not just what this click's budget can reach, so
+    // "screened 50 of 243" stays meaningful across however many clicks it takes to clear it.
+    const screenTotal = (await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'unassessed'").first<{ n: number }>())?.n ?? 0;
+
+    // Tier 1: cheap bulk screen over everything untouched.
+    while (budget.remaining > 0) {
+      const rows = await env.DB.prepare(
+        `SELECT id, title, company, location, raw_description FROM job_postings
+         WHERE fit_status = 'unassessed' ORDER BY created_at ASC LIMIT ?`,
+      )
+        .bind(SCREEN_BATCH_SIZE)
+        .all<JobRow>();
+      const batch = toAssessable(rows.results ?? []);
+      if (!batch.length) break;
+      budget.remaining -= 1;
+      try {
+        const results = await screenJobsBatch(env, provider, matchProfile, desiredRoles, disqualifiers, batch);
+        for (const result of results) {
+          // Written immediately, one posting at a time, so a dropped connection loses at most
+          // the single in-flight batch -- everything screened before it stays screened.
+          await env.DB.prepare(
+            "UPDATE job_postings SET fit_status = ?, fit_reason = ?, screened_at = CURRENT_TIMESTAMP WHERE id = ?",
+          )
+            .bind(result.keep ? "screened_in" : "screened_out", result.keep ? "" : result.note, result.id)
+            .run();
+          if (!result.keep) screenedOut += 1;
+        }
+        screened += results.length;
+        await emit({ type: "progress", stage: "screen", done: screened, total: screenTotal });
+      } catch (err) {
+        errors.push(`screen: ${(err as Error).message}`);
+        break;
       }
-      screened += results.length;
-    } catch (err) {
-      errors.push(`screen: ${(err as Error).message}`);
-      break;
     }
-  }
 
-  // Tier 2: strong model, only on survivors.
-  while (budget.remaining > 0) {
-    const rows = await env.DB.prepare(
-      `SELECT id, title, company, location, raw_description FROM job_postings
-       WHERE fit_status = 'screened_in' ORDER BY created_at ASC LIMIT ?`,
-    )
-      .bind(FIT_BATCH_SIZE)
-      .all<JobRow>();
-    const batch = toAssessable(rows.results ?? []);
-    if (!batch.length) break;
-    budget.remaining -= 1;
-    try {
-      const results = await assessJobFitBatch(
-        env,
-        provider,
-        JSON.stringify(structured),
-        desiredRoles,
-        disqualifiers,
-        batch,
-      );
-      await storeFitResults(env, results);
-      assessed += results.length;
-    } catch (err) {
-      errors.push(`assess: ${(err as Error).message}`);
-      break;
+    // Tier 2: strong model, only on survivors. Total is snapshotted now rather than at the top
+    // of the function, since tier 1 above is what populates this queue in the first place.
+    const assessTotal = (await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'screened_in'").first<{ n: number }>())?.n ?? 0;
+
+    while (budget.remaining > 0) {
+      const rows = await env.DB.prepare(
+        `SELECT id, title, company, location, raw_description FROM job_postings
+         WHERE fit_status = 'screened_in' ORDER BY created_at ASC LIMIT ?`,
+      )
+        .bind(FIT_BATCH_SIZE)
+        .all<JobRow>();
+      const batch = toAssessable(rows.results ?? []);
+      if (!batch.length) break;
+      budget.remaining -= 1;
+      try {
+        const results = await assessJobFitBatch(
+          env,
+          provider,
+          JSON.stringify(structured),
+          desiredRoles,
+          disqualifiers,
+          batch,
+        );
+        await storeFitResults(env, results);
+        assessed += results.length;
+        await emit({ type: "progress", stage: "assess", done: assessed, total: assessTotal });
+      } catch (err) {
+        errors.push(`assess: ${(err as Error).message}`);
+        break;
+      }
     }
-  }
 
-  const counts = await jobPipelineCounts(env);
-  return json({ screened, screened_out: screenedOut, assessed, errors, counts });
+    return { screened, screened_out: screenedOut, assessed, errors, counts: await jobPipelineCounts(env) };
+  });
 }
 
 /** Row counts per pipeline stage, used for both the Jobs status line and the Data tab. */
@@ -935,7 +980,7 @@ async function discoverCompanies(request: Request, env: Env): Promise<Response> 
  * this works in bounded batches against a shared subrequest budget and reports what is left --
  * the dashboard just calls it again rather than risking a single oversized request.
  */
-async function scanCompanies(request: Request, env: Env): Promise<Response> {
+async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as { limit?: number; company_id?: string };
@@ -964,24 +1009,37 @@ async function scanCompanies(request: Request, env: Env): Promise<Response> {
         .bind(profileId, limit)
         .all<CompanyScanRow>();
 
-  const budget = { remaining: 40 };
-  const results: { company: string; jobs: number; new_jobs: number; note: string }[] = [];
-  let newListings = 0;
+  const companies = targets.results ?? [];
 
-  for (const company of targets.results ?? []) {
-    const outcome = await scanOneCompany(env, company, desiredRoles, locationTerms, budget);
-    results.push({ company: company.name, jobs: outcome.jobs, new_jobs: outcome.newJobs, note: outcome.note });
-    newListings += outcome.newJobs;
-    if (budget.remaining <= 2) break;
-  }
+  return ndjsonResponse(ctx, async (emit) => {
+    const budget = { remaining: 40 };
+    const results: { company: string; jobs: number; new_jobs: number; note: string }[] = [];
+    let newListings = 0;
 
-  const remaining = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status != 'dismissed' AND last_scanned_at IS NULL",
-  )
-    .bind(profileId)
-    .first<{ n: number }>();
+    for (const company of companies) {
+      // scanOneCompany already writes each company's listings to the database before returning,
+      // so a company already reported here is durably saved even if the next one never runs.
+      const outcome = await scanOneCompany(env, company, desiredRoles, locationTerms, budget);
+      results.push({ company: company.name, jobs: outcome.jobs, new_jobs: outcome.newJobs, note: outcome.note });
+      newListings += outcome.newJobs;
+      await emit({
+        type: "progress",
+        done: results.length,
+        total: companies.length,
+        company: company.name,
+        new_jobs: outcome.newJobs,
+      });
+      if (budget.remaining <= 2) break;
+    }
 
-  return json({ scanned: results.length, results, new_listings: newListings, unscanned: remaining?.n ?? 0 });
+    const remaining = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status != 'dismissed' AND last_scanned_at IS NULL",
+    )
+      .bind(profileId)
+      .first<{ n: number }>();
+
+    return { scanned: results.length, results, new_listings: newListings, unscanned: remaining?.n ?? 0 };
+  });
 }
 
 type CompanyScanRow = {
@@ -2317,6 +2375,33 @@ const DASHBOARD_PAGE = `<!doctype html>
       return msg;
     }
 
+    // Reads a newline-delimited-JSON response as it arrives, calling onEvent for each line as
+    // soon as it's in -- used for long-running operations (scanning boards, filtering hundreds
+    // of postings) so progress shows up while the work is happening, not just at the end.
+    // Returns the final {type: "done", ...} event's payload, or throws on a {type: "error"} event.
+    async function readNdjson(res, onEvent) {
+      var reader = res.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = '';
+      var result = null;
+      while (true) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        var lines = buffer.split('\\n');
+        buffer = lines.pop();
+        for (var i = 0; i < lines.length; i++) {
+          if (!lines[i]) continue;
+          var event = JSON.parse(lines[i]);
+          if (event.type === 'error') throw new Error(event.message || 'stream_failed');
+          if (event.type === 'done') { result = event; continue; }
+          onEvent(event);
+        }
+      }
+      if (!result) throw new Error('stream_ended_unexpectedly');
+      return result;
+    }
+
     document.getElementById('sign-out').addEventListener('click', async function () {
       await api('/auth/logout', { method: 'POST' });
       goToEnroll();
@@ -3041,8 +3126,12 @@ const DASHBOARD_PAGE = `<!doctype html>
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ limit: 6 }),
         });
-        var data = await res.json();
-        if (!res.ok) throw new Error(errorMessage(data, 'scan_failed'));
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'scan_failed'));
+        var data = await readNdjson(res, function (event) {
+          statusEl.textContent =
+            'Scanning… ' + event.done + ' of ' + event.total + ' compan' + (event.total === 1 ? 'y' : 'ies') +
+            ' (' + event.company + (event.new_jobs ? ', ' + event.new_jobs + ' new' : '') + ')';
+        });
         statusEl.textContent =
           'Scanned ' + data.scanned + ' compan' + (data.scanned === 1 ? 'y' : 'ies') + ' — found ' +
           data.new_listings + ' new listing' + (data.new_listings === 1 ? '' : 's') + '. ' +
@@ -3236,8 +3325,11 @@ const DASHBOARD_PAGE = `<!doctype html>
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ provider: document.getElementById('jobs-provider').value }),
         });
-        var data = await res.json();
-        if (!res.ok) throw new Error(errorMessage(data, 'process_failed'));
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'process_failed'));
+        var data = await readNdjson(res, function (event) {
+          statusEl.textContent = (event.stage === 'screen' ? 'Screening… ' : 'Assessing… ') +
+            event.done + ' of ' + event.total;
+        });
         var counts = data.counts || {};
         var left = (counts.unassessed || 0) + (counts.screened_in || 0);
         var parts = [];
@@ -3487,7 +3579,7 @@ async function downloadArtifact(request: Request, env: Env, key: string): Promis
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") return json({ status: "ok", mode: "cloudflare" });
     if (request.method === "GET" && url.pathname === "/enroll") return enrollPage();
@@ -3502,13 +3594,13 @@ export default {
     if (request.method === "GET" && url.pathname === "/companies") return listCompanies(request, env);
     if (request.method === "POST" && url.pathname === "/companies") return createCompany(request, env);
     if (request.method === "POST" && url.pathname === "/companies/discover") return discoverCompanies(request, env);
-    if (request.method === "POST" && url.pathname === "/companies/scan") return scanCompanies(request, env);
+    if (request.method === "POST" && url.pathname === "/companies/scan") return scanCompanies(request, env, ctx);
     const companyMatch = url.pathname.match(/^\/companies\/([^/]+)$/);
     if (request.method === "PATCH" && companyMatch) return updateCompany(request, env, companyMatch[1]);
     if (request.method === "DELETE" && companyMatch) return deleteCompany(request, env, companyMatch[1]);
     if (request.method === "GET" && url.pathname === "/jobs") return listJobs(request, env);
     if (request.method === "POST" && url.pathname === "/jobs") return createJob(request, env);
-    if (request.method === "POST" && url.pathname === "/jobs/process") return processJobs(request, env);
+    if (request.method === "POST" && url.pathname === "/jobs/process") return processJobs(request, env, ctx);
     if (request.method === "GET" && url.pathname === "/data") return dataSummary(request, env);
     if (request.method === "POST" && url.pathname === "/data/purge-stage") return purgeStage(request, env);
     if (request.method === "POST" && url.pathname === "/data/purge-collection") return purgeCollection(request, env);
