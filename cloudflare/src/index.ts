@@ -1011,9 +1011,14 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
         // their site didn't resolve at discovery time, so spending scan budget retrying them
         // automatically would just fail again. The single-company scan query above (by id, no
         // status filter) still reaches them, for a deliberate manual retry.
+        //
+        // A company already scanned today is excluded too -- its board was just read, so
+        // re-reading it minutes or hours later within the same click cycle just re-pays for the
+        // same listings. It becomes eligible again once the calendar day rolls over.
         `SELECT id, name, website, careers_url, ats_provider, ats_token
          FROM companies
          WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable')
+           AND (last_scanned_at IS NULL OR date(last_scanned_at) < date('now'))
          ORDER BY last_scanned_at IS NOT NULL, last_scanned_at ASC
          LIMIT ?`,
       )
@@ -1043,8 +1048,12 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
       if (budget.remaining <= 2) break;
     }
 
+    // "Unscanned" here means "not yet scanned today", matching the query above -- a company
+    // scanned yesterday isn't owed another scan until this same cycle rolls into a new day.
     const remaining = await env.DB.prepare(
-      "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable') AND last_scanned_at IS NULL",
+      `SELECT COUNT(*) AS n FROM companies
+       WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable')
+         AND (last_scanned_at IS NULL OR date(last_scanned_at) < date('now'))`,
     )
       .bind(profileId)
       .first<{ n: number }>();
@@ -2276,7 +2285,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   <div id="panel-jobs" class="panel">
     <section id="jobs-scan-section">
       <h2>1. Scan for new listings</h2>
-      <p class="hint">Reads the job boards of companies on your list. Each company costs a few requests, so however many you ask for, a single click only gets through as many as safely fit in one request — the status line says if there's more, and clicking again picks up right where it left off.</p>
+      <p class="hint">Reads the job boards of companies on your list. Each company costs a few requests, so however many you ask for, a single request only gets through as many as safely fit at once — picking "All" re-fires automatically until every company is covered, so you don't have to click through it by hand. A company already scanned today is skipped until tomorrow.</p>
       <p id="jobs-scan-summary" class="summary-line">Loading…</p>
       <div class="controls">
         <div>
@@ -3199,26 +3208,40 @@ const DASHBOARD_PAGE = `<!doctype html>
     document.getElementById('jobs-scan-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('jobs-scan-status');
       var button = this;
+      var wantsAll = document.getElementById('jobs-scan-count').value === '500';
       button.disabled = true;
       statusEl.textContent = 'Reading job boards…';
       statusEl.className = 'status';
       try {
-        var res = await api('/companies/scan', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ limit: Number(document.getElementById('jobs-scan-count').value) }),
-        });
-        if (!res.ok) throw new Error(errorMessage(await res.json(), 'scan_failed'));
-        var data = await readNdjson(res, function (event) {
-          statusEl.textContent =
-            'Scanning… ' + event.done + ' of ' + event.total + ' compan' + (event.total === 1 ? 'y' : 'ies') +
-            ' (' + event.company + (event.new_jobs ? ', ' + event.new_jobs + ' new' : '') + ')';
-        });
+        var totalScanned = 0;
+        var totalNew = 0;
+        var round = 0;
+        var data;
+        // A single request only gets through as many companies as safely fit in one call. "All"
+        // means the user shouldn't have to click again to get the rest, so it re-fires on their
+        // behalf until nothing's left -- capped so a real server problem can't spin forever.
+        do {
+          round += 1;
+          var res = await api('/companies/scan', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ limit: Number(document.getElementById('jobs-scan-count').value) }),
+          });
+          if (!res.ok) throw new Error(errorMessage(await res.json(), 'scan_failed'));
+          data = await readNdjson(res, function (event) {
+            statusEl.textContent =
+              (round > 1 ? 'Round ' + round + ': ' : '') +
+              'Scanning… ' + event.done + ' of ' + event.total + ' compan' + (event.total === 1 ? 'y' : 'ies') +
+              ' (' + event.company + (event.new_jobs ? ', ' + event.new_jobs + ' new' : '') + ')';
+          });
+          totalScanned += data.scanned;
+          totalNew += data.new_listings;
+        } while (wantsAll && data.unscanned > 0 && data.scanned > 0 && round < 25);
         statusEl.textContent =
-          'Scanned ' + data.scanned + ' compan' + (data.scanned === 1 ? 'y' : 'ies') + ' — found ' +
-          data.new_listings + ' new listing' + (data.new_listings === 1 ? '' : 's') + '. ' +
+          'Scanned ' + totalScanned + ' compan' + (totalScanned === 1 ? 'y' : 'ies') + ' — found ' +
+          totalNew + ' new listing' + (totalNew === 1 ? '' : 's') + '. ' +
           (data.unscanned ? data.unscanned + ' compan' + (data.unscanned === 1 ? 'y' : 'ies') +
-            ' still unscanned, click again to continue.' : 'All companies scanned.');
+            ' still to scan today, click again to continue.' : 'All companies scanned for today.');
         statusEl.className = 'status success';
         await loadCompanies();
         await loadJobs();
