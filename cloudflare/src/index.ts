@@ -2916,6 +2916,8 @@ const DASHBOARD_PAGE = `<!doctype html>
 
       <p id="interested-resume-status" class="status" role="status" aria-live="polite"></p>
       <div id="interested-resume-section" style="display:none">
+        <p class="hint">On some phones the preview below can't scroll or show a page break — if that happens, use the link to open the actual PDF instead.</p>
+        <a id="interested-resume-open-link" class="row-title" target="_blank" rel="noopener">Open full PDF in a new tab</a>
         <iframe id="interested-resume-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
         <div id="interested-resume-checks"></div>
         <p id="interested-resume-critique" class="critique" style="display:none"></p>
@@ -4131,6 +4133,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       document.getElementById('interested-resume-status').textContent = '';
       document.getElementById('interested-resume-comment').value = '';
       document.getElementById('interested-resume-critique').style.display = 'none';
+      document.getElementById('interested-resume-open-link').removeAttribute('href');
 
       document.getElementById('interested-cover-section').style.display = 'none';
       document.getElementById('interested-cover-status').textContent = '';
@@ -4266,6 +4269,16 @@ const DASHBOARD_PAGE = `<!doctype html>
       critiqueEl.style.display = critique ? 'block' : 'none';
     }
 
+    // Embedded PDF viewers inside an iframe are unreliable on some phones -- notably iOS Safari,
+    // which often renders only a static first page with no scrolling and no visible page break.
+    // The direct link opens the exact same file as a real navigation, which uses the browser's
+    // actual PDF viewer (full scroll, pinch zoom, page breaks) instead of the embedded one.
+    function setInterestedResumePreview(resumeId) {
+      var url = '/resumes/' + encodeURIComponent(resumeId) + '/file?v=' + Date.now();
+      document.getElementById('interested-resume-frame').src = url;
+      document.getElementById('interested-resume-open-link').href = url;
+    }
+
     async function buildInterestedResume() {
       if (!activeInterestedJobId) return;
       var statusEl = document.getElementById('interested-resume-status');
@@ -4281,8 +4294,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         var data = await res.json();
         activeInterestedResumeId = data.id;
         document.getElementById('interested-resume-section').style.display = 'block';
-        document.getElementById('interested-resume-frame').src =
-          '/resumes/' + encodeURIComponent(data.id) + '/file?v=' + Date.now();
+        setInterestedResumePreview(data.id);
         renderInterestedResumeChecks(data.checks || []);
         showInterestedResumeCritique(data.critique);
         statusEl.textContent = data.reused
@@ -4309,8 +4321,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         });
         if (!res.ok) throw new Error(errorMessage(await res.json(), 'review_failed'));
         var data = await res.json();
-        document.getElementById('interested-resume-frame').src =
-          '/resumes/' + encodeURIComponent(activeInterestedResumeId) + '/file?v=' + Date.now();
+        setInterestedResumePreview(activeInterestedResumeId);
         renderInterestedResumeChecks(data.checks || []);
         showInterestedResumeCritique(data.critique);
         statusEl.textContent = 'Revised — now revision ' + data.revision + '.';
