@@ -450,12 +450,16 @@ type JobPosting = {
 async function listJobs(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
+  // No LIMIT here, and no raw_description: the dashboard's own pipeline summary (jobPipelineCounts,
+  // below) counts every row in the table, and a capped/truncated list here would silently disagree
+  // with it -- a posting the summary counts as a match could land outside the cap and never render.
+  // raw_description is dropped because the Jobs tab never displays it (only fit_reason and
+  // fit_missing_json do), and at up to 1500 chars per row it's the single biggest thing here.
   const jobs = await env.DB.prepare(
-    `SELECT id, title, company, source_url, raw_description, location, posted_at, ats_provider,
+    `SELECT id, title, company, source_url, location, posted_at, ats_provider,
             company_id, fit_status, fit_score, fit_reason, fit_missing_json, created_at
      FROM job_postings
-     ORDER BY COALESCE(posted_at, created_at) DESC
-     LIMIT 300`,
+     ORDER BY COALESCE(posted_at, created_at) DESC`,
   ).all();
   return json({ jobs: jobs.results, counts: await jobPipelineCounts(env) });
 }
