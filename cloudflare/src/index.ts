@@ -30,6 +30,7 @@ import {
   applyLayoutAdjustments,
   composeResumeDoc,
   defaultLayout,
+  escapeHtml,
   normalizeLayout,
   normalizeTemplate,
   renderResumeArtifacts,
@@ -661,7 +662,7 @@ async function dataSummary(request: Request, env: Env): Promise<Response> {
   const count = async (sql: string): Promise<number> =>
     (await env.DB.prepare(sql).first<{ n: number }>())?.n ?? 0;
 
-  const [companies, jobs, documents, notes, roleSignals, resumes, feedback, descBytes, docBytes] = await Promise.all([
+  const [companies, jobs, documents, notes, roleSignals, resumes, feedback, coverLetters, descBytes, docBytes] = await Promise.all([
     count("SELECT COUNT(*) AS n FROM companies"),
     count("SELECT COUNT(*) AS n FROM job_postings"),
     count("SELECT COUNT(*) AS n FROM source_documents"),
@@ -669,6 +670,7 @@ async function dataSummary(request: Request, env: Env): Promise<Response> {
     count("SELECT COUNT(*) AS n FROM candidate_evidence WHERE category = 'role_signal'"),
     count("SELECT COUNT(*) AS n FROM resumes"),
     count("SELECT COUNT(*) AS n FROM job_feedback"),
+    count("SELECT COUNT(*) AS n FROM cover_letters"),
     count("SELECT COALESCE(SUM(LENGTH(raw_description)), 0) AS n FROM job_postings"),
     count("SELECT COALESCE(SUM(LENGTH(extracted_text)), 0) AS n FROM source_documents"),
   ]);
@@ -683,6 +685,7 @@ async function dataSummary(request: Request, env: Env): Promise<Response> {
       role_signals: roleSignals,
       resumes,
       feedback,
+      cover_letters: coverLetters,
     },
     pipeline: await jobPipelineCounts(env),
     bytes: { job_descriptions: descBytes, document_text: docBytes },
@@ -733,6 +736,7 @@ async function purgeCollection(request: Request, env: Env): Promise<Response> {
     notes: "DELETE FROM candidate_evidence WHERE category = 'note'",
     role_signals: "DELETE FROM candidate_evidence WHERE category = 'role_signal'",
     manual_jobs: "DELETE FROM job_postings WHERE company_id IS NULL",
+    cover_letters: "DELETE FROM cover_letters",
   };
   const sql = statements[body.collection ?? ""];
   if (!sql) return json({ error: "unknown_collection" }, 400);
@@ -2042,6 +2046,177 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
   return json({ id: resumeId, name, template: layout.template, revision: 1, checks: built.checks, reused: false }, 201);
 }
 
+const COVER_LETTER_SCHEMA = {
+  type: "object",
+  properties: {
+    letter_body: {
+      type: "string",
+      description:
+        "The full cover letter, greeting through sign-off, as plain paragraphs separated by a blank line. No " +
+        "markdown, no placeholder brackets like [Company Name] -- use the real company name given below.",
+    },
+  },
+  required: ["letter_body"],
+} as const;
+
+/**
+ * Composes the letter text only -- rendering to HTML is a separate, deterministic step (renderCoverLetterHtml
+ * below), same content/layout split the resume pipeline uses. Contact details/résumé content, when available,
+ * are given as material to draw on but nothing here is invented: same anti-fabrication framing as résumés.
+ */
+async function composeCoverLetter(
+  env: Env,
+  provider: Provider,
+  profile: StructuredProfile,
+  job: { title: string; company: string; raw_description: string },
+  reviewAnswers: string[],
+  resumeContactLine: string,
+): Promise<string> {
+  const prompt = [
+    "Write a cover letter for this candidate applying to this specific job. Genuine and specific, not generic --",
+    "reference concrete evidence from the profile that actually matches what the posting asks for. Never invent",
+    "an employer, title, credential, or accomplishment not in the profile below.",
+    "",
+    "Structure: a brief greeting, 3-4 short paragraphs (why this role/company, the strongest relevant evidence,",
+    "one more concrete example, a short close), and a sign-off using the candidate's name. One page's worth of",
+    "text.",
+    "",
+    `JOB: ${job.title} at ${job.company}`,
+    `JOB DESCRIPTION:\n${job.raw_description.slice(0, 3000)}`,
+    "",
+    reviewAnswers.length
+      ? `ADDITIONAL CONTEXT SPECIFIC TO THIS APPLICATION:\n${reviewAnswers.map((a) => `- ${a}`).join("\n")}\n`
+      : "",
+    resumeContactLine ? `CONTACT LINE (for reference, do not repeat verbatim in the letter body): ${resumeContactLine}\n` : "",
+    `CANDIDATE PROFILE:\n${JSON.stringify(profile)}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const result = await callStructured<{ letter_body: string }>(
+    env,
+    provider,
+    prompt,
+    COVER_LETTER_SCHEMA,
+    "submit_cover_letter",
+    2000,
+  );
+  return (result.letter_body ?? "").trim();
+}
+
+/** Deterministic letterhead + body rendering -- the model only ever produces the letter text. */
+function renderCoverLetterHtml(name: string, letterBody: string): string {
+  const date = new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+  const paragraphs = letterBody
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => `<p>${escapeHtml(p).replace(/\n/g, "<br>")}</p>`)
+    .join("\n");
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>Cover letter</title><style>
+body { font-family: Georgia, 'Times New Roman', serif; max-width: 680px; margin: 2rem auto; padding: 0 1.5rem; color: #1a1a1a; line-height: 1.6; }
+.name { font-size: 1.3rem; font-weight: 600; margin-bottom: 0.25rem; }
+.date { color: #555; margin-bottom: 1.5rem; }
+p { margin: 0 0 1rem; }
+</style></head>
+<body>
+<div class="name">${escapeHtml(name)}</div>
+<div class="date">${date}</div>
+${paragraphs}
+</body></html>`;
+}
+
+async function getCoverLetter(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const row = await env.DB.prepare("SELECT id, content_html FROM cover_letters WHERE job_id = ?")
+    .bind(id)
+    .first<{ id: string; content_html: string }>();
+  return json({ cover_letter: row ?? null });
+}
+
+/** One cover letter per job -- generating again replaces it, no revision history (see 0012_cover_letters.sql). */
+async function buildCoverLetter(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string; regenerate?: boolean };
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const job = await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
+    .bind(id)
+    .first<{ title: string; company: string; raw_description: string }>();
+  if (!job) return json({ error: "not_found" }, 404);
+
+  const existing = await env.DB.prepare("SELECT id, content_html FROM cover_letters WHERE job_id = ?")
+    .bind(id)
+    .first<{ id: string; content_html: string }>();
+  if (existing && !body.regenerate) {
+    return json({ id: existing.id, content_html: existing.content_html, reused: true });
+  }
+
+  const profile = await loadProfileForResume(env);
+  if (profile instanceof Response) return profile;
+
+  const profileRow = await env.DB.prepare("SELECT label FROM candidate_profiles WHERE id = ?")
+    .bind(profile.profileId)
+    .first<{ label: string }>();
+
+  const reviewAnswers = await env.DB.prepare(
+    "SELECT claim FROM candidate_evidence WHERE job_id = ? AND category = 'job_review' ORDER BY created_at ASC",
+  )
+    .bind(id)
+    .all<{ claim: string }>();
+
+  // The job-tailored resume, if one exists, carries a real contact line -- reused here rather
+  // than asking the model to invent one, same anti-fabrication principle as everything else.
+  const tailoredResume = await env.DB.prepare("SELECT content_json FROM resumes WHERE job_id = ?")
+    .bind(id)
+    .first<{ content_json: string }>();
+  let contactLine = "";
+  if (tailoredResume?.content_json) {
+    try {
+      contactLine = (JSON.parse(tailoredResume.content_json) as ResumeDoc).contact_line ?? "";
+    } catch {
+      contactLine = "";
+    }
+  }
+
+  let letterBody: string;
+  try {
+    letterBody = await composeCoverLetter(
+      env,
+      provider,
+      profile.structured,
+      job,
+      (reviewAnswers.results ?? []).map((r) => r.claim),
+      contactLine,
+    );
+  } catch (err) {
+    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+  }
+
+  const name = profileRow?.label || profile.structured.headline || "Candidate";
+  const contentHtml = renderCoverLetterHtml(name, letterBody);
+
+  if (existing) {
+    await env.DB.prepare("UPDATE cover_letters SET content_html = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+      .bind(contentHtml, existing.id)
+      .run();
+    return json({ id: existing.id, content_html: contentHtml, reused: false });
+  }
+
+  const coverLetterId = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO cover_letters (id, profile_id, job_id, content_html) VALUES (?, ?, ?, ?)",
+  )
+    .bind(coverLetterId, profile.profileId, id, contentHtml)
+    .run();
+  return json({ id: coverLetterId, content_html: contentHtml, reused: false }, 201);
+}
+
 async function uploadArtifact(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -2680,7 +2855,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   <div id="panel-interested" class="panel">
     <section id="interested-list-section">
       <h2>Interested jobs</h2>
-      <p class="hint">Jobs you've marked "Interested" on the Jobs tab. Click one to open its workspace — the posting link, a quick review to fill in anything your profile is missing for it, and (coming soon) a tailored resume and cover letter.</p>
+      <p class="hint">Jobs you've marked "Interested" on the Jobs tab. Click one to open its workspace — the posting link, a quick review to fill in anything your profile is missing for it, a resume tailored to this posting, and a matching cover letter.</p>
       <div id="interested-list"><p class="empty">Loading…</p></div>
     </section>
 
@@ -2692,7 +2867,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <div class="controls">
         <button id="interested-review-button" type="button">Review</button>
         <button id="interested-resume-button" type="button">Resume</button>
-        <button id="interested-cover-button" type="button" disabled title="Coming soon — will draft a cover letter for this job">Cover letter</button>
+        <button id="interested-cover-button" type="button">Cover letter</button>
         <button id="interested-apply-button" type="button" disabled title="Not automated — use the posting link above to apply directly">Apply</button>
       </div>
       <p id="interested-review-status" class="status" role="status" aria-live="polite"></p>
@@ -2708,6 +2883,12 @@ const DASHBOARD_PAGE = `<!doctype html>
         <iframe id="interested-resume-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
         <div id="interested-resume-checks"></div>
         <button id="interested-resume-regenerate" class="secondary" type="button">Regenerate for this job</button>
+      </div>
+
+      <p id="interested-cover-status" class="status" role="status" aria-live="polite"></p>
+      <div id="interested-cover-section" style="display:none">
+        <iframe id="interested-cover-frame" style="width:100%; min-height:60vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+        <button id="interested-cover-regenerate" class="secondary" type="button">Regenerate for this job</button>
       </div>
 
       <div id="interested-review-history"></div>
@@ -3898,8 +4079,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       } else {
         link.style.display = 'none';
       }
-      // Review and resume state are both per-job -- switching to a different job shouldn't carry
-      // over a pending question, answer, or preview that belonged to the last one.
+      // Review, resume, and cover-letter state are all per-job -- switching to a different job
+      // shouldn't carry over a pending question, answer, or preview that belonged to the last one.
       pendingReviewQuestion = null;
       document.getElementById('interested-review-section').style.display = 'none';
       document.getElementById('interested-review-answer').value = '';
@@ -3908,6 +4089,9 @@ const DASHBOARD_PAGE = `<!doctype html>
 
       document.getElementById('interested-resume-section').style.display = 'none';
       document.getElementById('interested-resume-status').textContent = '';
+
+      document.getElementById('interested-cover-section').style.display = 'none';
+      document.getElementById('interested-cover-status').textContent = '';
     }
 
     function renderInterestedList() {
@@ -4068,6 +4252,36 @@ const DASHBOARD_PAGE = `<!doctype html>
       buildInterestedResume(true);
     });
 
+    async function buildInterestedCoverLetter(regenerate) {
+      if (!activeInterestedJobId) return;
+      var statusEl = document.getElementById('interested-cover-status');
+      statusEl.textContent = regenerate ? 'Regenerating…' : 'Drafting…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/cover-letter', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ regenerate: !!regenerate }),
+        });
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'cover_letter_failed'));
+        var data = await res.json();
+        document.getElementById('interested-cover-section').style.display = 'block';
+        document.getElementById('interested-cover-frame').srcdoc = data.content_html || '';
+        statusEl.textContent = data.reused ? 'Showing the letter already drafted for this job.' : 'Draft ready.';
+        statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    }
+
+    document.getElementById('interested-cover-button').addEventListener('click', function () {
+      buildInterestedCoverLetter(false);
+    });
+    document.getElementById('interested-cover-regenerate').addEventListener('click', function () {
+      buildInterestedCoverLetter(true);
+    });
+
     document.getElementById('job-form').addEventListener('submit', async function (event) {
       event.preventDefault();
       var statusEl = document.getElementById('job-status');
@@ -4161,6 +4375,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       countsHost.appendChild(dataRow('Notes', String(counts.notes || 0)));
       countsHost.appendChild(dataRow('Desired-role signals', String(counts.role_signals || 0)));
       countsHost.appendChild(dataRow('Resume versions', String(counts.resumes || 0)));
+      countsHost.appendChild(dataRow('Cover letters', String(counts.cover_letters || 0)));
       countsHost.appendChild(dataRow('Rejection reasons you taught it', String(counts.feedback || 0)));
 
       var stagesHost = document.getElementById('data-stages');
@@ -4206,6 +4421,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         { id: 'manual_jobs', name: 'Hand-added job postings', note: 'Postings you typed in yourself, which company scans never touch.' },
         { id: 'feedback', name: 'Rejection reasons', note: 'What you taught the filter by rejecting postings with a reason.' },
         { id: 'resumes', name: 'Resume versions', note: 'Generated resumes and their PDFs.' },
+        { id: 'cover_letters', name: 'Cover letters', note: 'Generated cover letters for interested jobs.' },
         { id: 'notes', name: 'Notes', note: 'Freeform notes on the Profile tab.' },
         { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Desired Roles tab.' },
       ].forEach(function (collection) {
@@ -4310,6 +4526,9 @@ export default {
     if (request.method === "POST" && jobReviewAnswerMatch) return createJobReviewAnswer(request, env, jobReviewAnswerMatch[1]);
     const jobResumeMatch = url.pathname.match(/^\/jobs\/([^/]+)\/resume$/);
     if (request.method === "POST" && jobResumeMatch) return buildJobResume(request, env, jobResumeMatch[1]);
+    const jobCoverLetterMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cover-letter$/);
+    if (request.method === "GET" && jobCoverLetterMatch) return getCoverLetter(request, env, jobCoverLetterMatch[1]);
+    if (request.method === "POST" && jobCoverLetterMatch) return buildCoverLetter(request, env, jobCoverLetterMatch[1]);
     const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
     if (request.method === "DELETE" && jobMatch) return deleteJob(request, env, jobMatch[1]);
     if (request.method === "GET" && url.pathname === "/documents") return listDocuments(request, env);
