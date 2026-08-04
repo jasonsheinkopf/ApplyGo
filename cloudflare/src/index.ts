@@ -800,7 +800,7 @@ async function listCompanies(request: Request, env: Env): Promise<Response> {
     .bind(profileId)
     .all();
   const pending = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status != 'dismissed' AND last_scanned_at IS NULL",
+    "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable') AND last_scanned_at IS NULL",
   )
     .bind(profileId)
     .first<{ n: number }>();
@@ -1000,9 +1000,13 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
         .bind(body.company_id, profileId)
         .all<CompanyScanRow>()
     : await env.DB.prepare(
+        // Unreachable companies are excluded from the bulk scan the same as dismissed ones --
+        // their site didn't resolve at discovery time, so spending scan budget retrying them
+        // automatically would just fail again. The single-company scan query above (by id, no
+        // status filter) still reaches them, for a deliberate manual retry.
         `SELECT id, name, website, careers_url, ats_provider, ats_token
          FROM companies
-         WHERE profile_id = ? AND status != 'dismissed'
+         WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable')
          ORDER BY last_scanned_at IS NOT NULL, last_scanned_at ASC
          LIMIT ?`,
       )
@@ -1033,7 +1037,7 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
     }
 
     const remaining = await env.DB.prepare(
-      "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status != 'dismissed' AND last_scanned_at IS NULL",
+      "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable') AND last_scanned_at IS NULL",
     )
       .bind(profileId)
       .first<{ n: number }>();
@@ -2253,6 +2257,9 @@ const DASHBOARD_PAGE = `<!doctype html>
         <section id="companies-list-section">
           <label for="companies-filter">Filter</label>
           <input id="companies-filter" placeholder="Search by name, location, or description">
+          <label class="checkbox-label">
+            <input id="companies-show-unscannable" type="checkbox"><span id="companies-unscannable-count">Show companies that can't be scanned</span>
+          </label>
           <div id="companies-list"><p class="empty">Loading…</p></div>
         </section>
       </div>
@@ -2289,6 +2296,16 @@ const DASHBOARD_PAGE = `<!doctype html>
       <h2>Job postings</h2>
       <label for="jobs-filter">Filter</label>
       <input id="jobs-filter" placeholder="Search by title, company, or location">
+      <div class="controls">
+        <div>
+          <label for="jobs-age">Posted</label>
+          <select id="jobs-age">
+            <option value="">Any time</option>
+            <option value="1">Last 24 hours</option>
+            <option value="3">Last 3 days</option>
+          </select>
+        </div>
+      </div>
       <label class="checkbox-label">
         <input id="jobs-show-unfiltered" type="checkbox"><span id="jobs-unfiltered-count">Show postings not filtered yet</span>
       </label>
@@ -2927,21 +2944,16 @@ const DASHBOARD_PAGE = `<!doctype html>
       return haystack.toLowerCase().indexOf(needle.toLowerCase()) !== -1;
     }
 
-    function renderCompanies() {
-      var needle = document.getElementById('companies-filter').value.trim();
-      var list = document.getElementById('companies-list');
-      list.innerHTML = '';
-      var shown = allCompanies.filter(function (c) {
-        return matchesFilter([c.name, c.location, c.bio, c.why_fit].join(' '), needle);
-      });
-      if (!shown.length) {
-        list.appendChild(el('p', {
-          className: 'empty',
-          textContent: allCompanies.length ? 'No companies match that filter.' : 'No companies yet — run a search on the left.',
-        }));
-        return;
-      }
-      shown.forEach(function (company) {
+    // A site that didn't resolve at discovery time, or one whose board we scanned and found
+    // nothing supported on, isn't going to start yielding postings on its own -- surfacing it
+    // in the main list every time is just noise. Kept in the database either way; this only
+    // controls what renders by default.
+    function isUnscannable(company) {
+      return company.status === 'unreachable' || company.ats_provider === 'none';
+    }
+
+    function renderCompanyRows(list, companies) {
+      companies.forEach(function (company) {
         var titleChildren = [];
         if (company.website) {
           titleChildren.push(el('a', {
@@ -2956,6 +2968,8 @@ const DASHBOARD_PAGE = `<!doctype html>
         }
         if (company.status === 'unreachable') {
           titleChildren.push(el('span', { className: 'badge warn', textContent: 'site unreachable' }));
+        } else if (company.ats_provider === 'none') {
+          titleChildren.push(el('span', { className: 'badge warn', textContent: 'no job board found' }));
         }
         if (company.status === 'dismissed') {
           titleChildren.push(el('span', { className: 'badge', textContent: 'dismissed' }));
@@ -3005,13 +3019,48 @@ const DASHBOARD_PAGE = `<!doctype html>
           loadCompanies();
         });
 
-        list.appendChild(el('div', { className: 'row-item' + (company.status === 'dismissed' ? ' is-muted' : '') }, [
+        var muted = company.status === 'dismissed' || isUnscannable(company);
+        list.appendChild(el('div', { className: 'row-item' + (muted ? ' is-muted' : '') }, [
           el('div', { className: 'row' }, [
             el('div', {}, body),
             el('div', { className: 'row-actions' }, [scanOne, dismiss, del]),
           ]),
         ]));
       });
+    }
+
+    function renderCompanies() {
+      var needle = document.getElementById('companies-filter').value.trim();
+      var showUnscannable = document.getElementById('companies-show-unscannable').checked;
+      var list = document.getElementById('companies-list');
+      list.innerHTML = '';
+
+      var matching = allCompanies.filter(function (c) {
+        return matchesFilter([c.name, c.location, c.bio, c.why_fit].join(' '), needle);
+      });
+      var scannable = matching.filter(function (c) { return !isUnscannable(c); });
+      var unscannable = matching.filter(isUnscannable);
+
+      var toggle = document.getElementById('companies-show-unscannable');
+      toggle.parentElement.style.display = unscannable.length ? 'flex' : 'none';
+      document.getElementById('companies-unscannable-count').textContent =
+        "Show " + unscannable.length + " compan" + (unscannable.length === 1 ? 'y' : 'ies') + " that can't be scanned";
+
+      if (!scannable.length && !(showUnscannable && unscannable.length)) {
+        list.appendChild(el('p', {
+          className: 'empty',
+          textContent: allCompanies.length
+            ? (matching.length ? "Nothing to show — try the checkbox above to reveal companies that can't be scanned." : 'No companies match that filter.')
+            : 'No companies yet — run a search on the left.',
+        }));
+        return;
+      }
+
+      renderCompanyRows(list, scannable);
+      if (showUnscannable && unscannable.length) {
+        list.appendChild(el('h3', { className: 'subhead', textContent: "Can't be scanned" }));
+        renderCompanyRows(list, unscannable);
+      }
     }
 
     function renderCompanyLocations() {
@@ -3046,12 +3095,17 @@ const DASHBOARD_PAGE = `<!doctype html>
       var data = await res.json();
       allCompanies = data.companies || [];
       var withJobs = allCompanies.filter(function (c) { return c.open_jobs > 0; }).length;
+      var unscannableCount = allCompanies.filter(isUnscannable).length;
       document.getElementById('companies-summary').innerHTML = '';
       document.getElementById('companies-summary').appendChild(
         el('span', {}, [
           el('strong', { textContent: String(allCompanies.length) }),
+          // "not scanned yet" = board-check hasn't run on it; "can't be scanned" = it ran (or the
+          // site never resolved) and there's nothing to read. Kept as separate counts since only
+          // the first one means "scanning again would help."
           el('span', { textContent: ' compan' + (allCompanies.length === 1 ? 'y' : 'ies') +
             ' · ' + withJobs + ' with open roles · ' + (data.unscanned || 0) + ' not scanned yet' +
+            (unscannableCount ? ' · ' + unscannableCount + " can't be scanned" : '') +
             (data.off_target ? ' · ' + data.off_target + ' outside your locations' : '') +
             (data.desired_locations ? ' · limited to ' + data.desired_locations : ' · no location limit set') }),
         ]),
@@ -3082,6 +3136,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     }
 
     document.getElementById('companies-filter').addEventListener('input', renderCompanies);
+    document.getElementById('companies-show-unscannable').addEventListener('change', renderCompanies);
 
     document.getElementById('companies-discover-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('companies-discover-status');
@@ -3258,15 +3313,24 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
     }
 
+    // A posting with no known post date is never excluded by an age filter -- there's no
+    // evidence it's stale, so the honest default is to show it rather than guess.
+    function withinAge(job, maxDays) {
+      if (!maxDays || !job.posted_at) return true;
+      var ageMs = Date.now() - new Date(job.posted_at).getTime();
+      return ageMs <= maxDays * 86400000;
+    }
+
     function renderJobs() {
       var needle = document.getElementById('jobs-filter').value.trim();
+      var maxAgeDays = Number(document.getElementById('jobs-age').value) || 0;
       var showQueued = document.getElementById('jobs-show-unfiltered').checked;
       var showRejected = document.getElementById('jobs-show-rejected').checked;
       var list = document.getElementById('jobs-list');
       list.innerHTML = '';
 
       var matching = allJobs.filter(function (job) {
-        return matchesFilter([job.title, job.company, job.location].join(' '), needle);
+        return matchesFilter([job.title, job.company, job.location].join(' '), needle) && withinAge(job, maxAgeDays);
       });
       // Kept as three separate groups rather than one filtered-and-sorted list, so a fresh
       // scan's unreviewed postings can never end up sitting among ones you've already judged --
@@ -3310,6 +3374,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     }
 
     document.getElementById('jobs-filter').addEventListener('input', renderJobs);
+    document.getElementById('jobs-age').addEventListener('change', renderJobs);
     document.getElementById('jobs-show-unfiltered').addEventListener('change', renderJobs);
     document.getElementById('jobs-show-rejected').addEventListener('change', renderJobs);
 
