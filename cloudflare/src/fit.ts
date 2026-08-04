@@ -66,10 +66,41 @@ export type JobToAssess = {
 
 export type FitResult = {
   id: string;
-  verdict: FitVerdict;
+  score: number;
   reason: string;
   missing: string[];
 };
+
+/**
+ * The strong tier rates every posting it sees on a 0-100 scale rather than a three-way label, so
+ * the Jobs tab can offer a real threshold instead of a fixed bucket. The bucket is still derived
+ * from it (for the existing hide/show/sort logic, which only needs to know strong/possible/reject),
+ * but the underlying number is what's actually stored and shown.
+ *
+ * Thresholds aren't arbitrary: below 40 lines up with what "reject" already meant -- a stated hard
+ * requirement the profile doesn't meet lands here regardless of how good the rest of the match is,
+ * per FIT_SCORE_GUIDANCE below. 40-69 is a genuine stretch worth seeing; 70+ is a strong overlap.
+ */
+export function verdictForScore(score: number): FitVerdict {
+  if (score >= 70) return "strong";
+  if (score >= 40) return "possible";
+  return "reject";
+}
+
+const FIT_SCORE_GUIDANCE = [
+  "Score each posting 0-100 for how well it fits this specific candidate, not how good the job is",
+  "in the abstract. Calibrate roughly like this:",
+  "  90-100: exceptional overlap, this is exactly their evident experience and level.",
+  "  70-89:  strong match, solidly within their demonstrated experience.",
+  "  40-69:  a genuine stretch or a posting too vague to be sure -- worth seeing, not a clear miss.",
+  "  15-39:  a real mismatch on the posting's own terms, but not a flatly stated disqualifier.",
+  "  0-14:   the posting states a hard requirement the profile clearly does not meet (a specific",
+  "          language/tool with no evidence of it, a degree not held, years of experience far",
+  "          beyond their history) -- score low here regardless of how good the rest looks, a",
+  "          single hard disqualifier should not be averaged away by an otherwise strong overlap.",
+  "Use the full range. Do not default to the middle when uncertain -- say what's actually uncertain",
+  "in the reason instead of hedging the number.",
+].join("\n");
 
 const FIT_BATCH_SCHEMA = {
   type: "object",
@@ -80,16 +111,7 @@ const FIT_BATCH_SCHEMA = {
         type: "object",
         properties: {
           id: { type: "string", description: "Must exactly match the job's id as given." },
-          verdict: {
-            type: "string",
-            enum: ["strong", "possible", "reject"],
-            description:
-              "strong: solid overlap between the posting's actual requirements and the candidate's evidence. " +
-              "possible: a genuine stretch or a posting too vague to rule out -- do not reject on a maybe. " +
-              "reject: the posting states a requirement the candidate's profile clearly does not meet " +
-              "(a specific language/tool they have no evidence of, a degree they don't hold, years of " +
-              "experience far beyond what their history shows).",
-          },
+          score: { type: "integer", minimum: 0, maximum: 100, description: "0-100 fit score. See scoring guidance." },
           reason: {
             type: "string",
             description:
@@ -102,7 +124,7 @@ const FIT_BATCH_SCHEMA = {
             description: "Specific requirements the candidate doesn't evidently meet. Empty if none.",
           },
         },
-        required: ["id", "verdict", "reason", "missing"],
+        required: ["id", "score", "reason", "missing"],
       },
     },
   },
@@ -139,12 +161,11 @@ function fitPrompt(
     "kind of judgment call a careful applicant makes before spending time on a posting, not a",
     "generic keyword match.",
     "",
-    "For each posting, decide strong, possible, or reject. Be decisive: 'reject' is for a stated",
-    "requirement the profile clearly does not satisfy, not for general uncertainty. A posting with",
-    "no explicit disqualifying requirement should be 'possible' or 'strong', even if it's a stretch",
-    "-- the candidate would rather see a long-shot than miss it. Only reject on requirements the",
-    "posting actually states (a specific language or tool, a degree, a minimum years of experience),",
-    "not on assumptions about culture fit, company size, or anything the posting doesn't say.",
+    FIT_SCORE_GUIDANCE,
+    "",
+    "Only score down for requirements the posting actually states (a specific language or tool, a",
+    "degree, a minimum years of experience), not for assumptions about culture fit, company size, or",
+    "anything the posting doesn't say.",
     "",
     experienceGapRule(new Date().getUTCFullYear()),
     "",
@@ -176,9 +197,10 @@ function fitPrompt(
 }
 
 /**
- * Assesses one batch (small enough for a single prompt) and returns a verdict per job, defaulting
- * to a fail-open "possible" for anything the model doesn't return a result for -- an assessment
- * gap should never silently hide a posting the candidate never got to see.
+ * Assesses one batch (small enough for a single prompt) and returns a score per job, defaulting
+ * to a fail-open 50 (the middle of the "possible" band) for anything the model doesn't return a
+ * result for -- an assessment gap should never silently hide a posting the candidate never got to
+ * see, the same way it never did back when the fail-open default was the "possible" verdict.
  */
 export async function assessJobFitBatch(
   env: LlmEnv,
@@ -200,11 +222,9 @@ export async function assessJobFitBatch(
   const byId = new Map(results.map((r) => [r.id, r]));
   return jobs.map((job) => {
     const found = byId.get(job.id);
-    if (!found) return { id: job.id, verdict: "possible", reason: "Not individually assessed.", missing: [] };
-    const verdict: FitVerdict = ["strong", "possible", "reject"].includes(found.verdict)
-      ? found.verdict
-      : "possible";
-    return { id: job.id, verdict, reason: found.reason ?? "", missing: found.missing ?? [] };
+    if (!found) return { id: job.id, score: 50, reason: "Not individually assessed.", missing: [] };
+    const score = Number.isFinite(found.score) ? Math.max(0, Math.min(100, Math.round(found.score))) : 50;
+    return { id: job.id, score, reason: found.reason ?? "", missing: found.missing ?? [] };
   });
 }
 
