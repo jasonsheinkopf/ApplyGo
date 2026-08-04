@@ -192,7 +192,7 @@ Finding listings is cheap; judging them is not. The naive version — send every
 | tier | what runs | cost | input per posting |
 |---|---|---|---|
 | 0 | location match + title keyword, in code | free | — |
-| 1 | cheap model, binary keep/drop, 25 postings per call | low | title, location, first 500 chars |
+| 1 | cheap model, binary keep/drop, 60 postings per call | low | title, location only |
 | 2 | strong model, 0-100 fit score + reason + gaps, 8 per call | high | full stored description |
 
 Two things make this work. **Scanning no longer judges anything** — `POST /companies/scan` only collects listings, so it stays fast and covers more companies per request. **`POST /jobs/process`** then runs tier 1 and tier 2 in that order against a shared call budget, reporting what remains at each stage so the dashboard just asks again. One "Find my matches" button drives the whole thing.
@@ -206,6 +206,8 @@ The response starts streaming immediately — the handler's async work runs via 
 Progress here is a reporting layer, not a resilience mechanism in itself — the actual data safety comes from each unit of work being written to D1 *before* its progress line is emitted (already true of both loops: a company's listings are inserted, then its progress line goes out; a screen/assess batch is written, then its progress line goes out). So if the connection drops or the tab closes mid-stream, whatever was already written stays written — resuming is just clicking the button again, same as before this streamed at all.
 
 The cheap tier is deliberately **biased toward keeping**: it exists to remove obvious misses, and a wrong drop there is invisible to the user, so anything ambiguous survives to tier 2. Postings the model doesn't return a result for are also kept. Screened-out postings stay in the database rather than being deleted, so a re-scan never re-pays to reject them.
+
+**Tier 1 judges on title and location alone, with no description.** A different profession or field (a mechanical/hardware role against a software profile) or a wildly off seniority word ("Staff"/"Director" vs. "Intern"/"Entry-Level") is obvious from the title, and dropping the description shrinks the per-posting prompt cost enough to raise the batch size (25 → 60 postings per call) for the same cost. Anything the title alone can't rule out — a stated years-of-experience minimum, a specific required tool, anything else that only shows up in the body — survives to tier 2, which reads the full description and can still catch it there.
 
 `fit_status` is the pipeline's state machine: `unassessed` → `screened_out` | `screened_in` → `strong` | `possible` | `reject`. The Jobs tab shows matches and anything still queued, and hides only what a filter actually ruled out. Since tier 2 (below), `fit_status` for a scored posting is *derived* from its `fit_score` via `verdictForScore()` in `src/fit.ts` — the number is what's actually computed and stored; the bucket exists only so the rest of the pipeline's hide/show/sort logic doesn't need to know about scores.
 

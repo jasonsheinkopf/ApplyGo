@@ -260,10 +260,14 @@ const SCREEN_BATCH_SCHEMA = {
 } as const;
 
 /**
- * The cheap pass. Runs a small model over many postings at once with only a title, location and
- * the opening of each description, and asks a single yes/no question. Deliberately biased toward
- * keeping: this tier exists to remove the obvious misses before the expensive tier runs, and a
- * wrong "drop" here is invisible to the user, so ambiguity must survive to the next stage.
+ * The cheap pass. Runs a small model over many postings at once with only a title and location --
+ * no description -- and asks a single yes/no question. Title and location are enough to catch what
+ * this tier actually exists to catch: a different profession or field entirely (a "Propulsion
+ * Engineer" posting isn't a software fit no matter what its description says). Deliberately biased
+ * toward keeping: a wrong "drop" here is invisible to the user, so ambiguity must survive to the
+ * next stage, which reads the full description and can catch a requirement the title didn't show.
+ * Dropping the description is also what makes the large batch size below affordable -- the prompt
+ * cost per posting is now just a title and a location, so far more fit in a single call.
  */
 export async function screenJobsBatch(
   env: LlmEnv,
@@ -275,13 +279,14 @@ export async function screenJobsBatch(
 ): Promise<ScreenResult[]> {
   if (!jobs.length) return [];
   const prompt = [
-    "Decide which of these job postings are worth a closer look for this candidate.",
+    "Decide which of these job postings are worth a closer look for this candidate, based only on",
+    "each posting's title and location -- you are not given a description.",
     "",
-    "Keep anything plausible. Drop only clear mismatches: a different profession entirely, a",
-    "seniority far outside their range, or a stated hard requirement they obviously lack.",
-    "When unsure, keep it -- a later, more careful pass will make the real call.",
-    "",
-    experienceGapRule(new Date().getUTCFullYear()),
+    "Keep anything plausible. Drop only clear mismatches obvious from the title alone: a different",
+    "profession or field entirely (e.g. a mechanical/aerospace/hardware title against a software",
+    "background), or a seniority word far outside their range (e.g. \"Staff\"/\"Director\" against an",
+    "early-career profile, or \"Intern\"/\"Entry-Level\" against a senior one). If the title alone",
+    "doesn't make the mismatch obvious, keep it -- the next stage reads the full posting.",
     "",
     disqualifiers.length
       ? `The candidate has already rejected roles for these reasons:\n${disqualifiers.map((d) => `- ${d}`).join("\n")}\n`
@@ -289,9 +294,7 @@ export async function screenJobsBatch(
     desiredRoles ? `WANTS: ${desiredRoles.slice(0, 600)}\n` : "",
     `CANDIDATE:\n${matchProfile}`,
     "",
-    `POSTINGS:\n${JSON.stringify(
-      jobs.map((j) => ({ id: j.id, title: j.title, location: j.location, snippet: j.description.slice(0, 500) })),
-    )}`,
+    `POSTINGS:\n${JSON.stringify(jobs.map((j) => ({ id: j.id, title: j.title, location: j.location })))}`,
     "",
     "Return one result per posting.",
   ]
@@ -304,7 +307,9 @@ export async function screenJobsBatch(
     prompt,
     SCREEN_BATCH_SCHEMA,
     "submit_screen",
-    2000,
+    // A 36-char id plus keep/note per posting adds up at 60 postings/call -- the previous 2000-token
+    // cap was sized for a 25-item batch and would risk truncating a full one.
+    4000,
     "screen",
   );
   const byId = new Map((results ?? []).map((r) => [r.id, r]));
@@ -316,7 +321,7 @@ export async function screenJobsBatch(
   });
 }
 
-export const SCREEN_BATCH_SIZE = 25;
+export const SCREEN_BATCH_SIZE = 60;
 export const FIT_BATCH_SIZE = 8;
 
 export function chunk<T>(items: T[], size: number): T[][] {
