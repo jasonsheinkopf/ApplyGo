@@ -1869,6 +1869,179 @@ async function getResumeFile(request: Request, env: Env, id: string): Promise<Re
   return new Response(object.body, { headers, status });
 }
 
+const RESUME_BASE_SCHEMA = {
+  type: "object",
+  properties: {
+    base_resume_id: {
+      type: "string",
+      description:
+        "The id of whichever existing resume version is the closest starting point for this job, exactly as " +
+        "given. Empty string if none of them are a reasonable starting point.",
+    },
+    tailoring_notes: {
+      type: "string",
+      description:
+        "What should change -- reordering, re-emphasis, trimming -- to fit this specific posting, using only " +
+        "what's already true. If the chosen version already fits well, say so instead of inventing a change.",
+    },
+  },
+  required: ["base_resume_id", "tailoring_notes"],
+} as const;
+
+/**
+ * Picks whichever existing general-purpose resume is the closest fit for a specific job, and asks
+ * for tailoring notes rather than trying to feed prior content back into composeResumeDoc directly
+ * -- composition always writes fresh from the profile (COMPOSE_RULES' anti-fabrication guarantee
+ * depends on that), so "start from an existing version" means "match its style/instructions and
+ * angle the same evidence toward this posting," not literally editing its saved content.
+ */
+async function decideResumeBase(
+  env: Env,
+  provider: Provider,
+  job: { title: string; company: string; raw_description: string },
+  candidates: { id: string; name: string; instructions: string }[],
+): Promise<{ base_resume_id: string; tailoring_notes: string }> {
+  const prompt = [
+    "A candidate has several existing general-purpose resume versions and wants to apply to a specific job.",
+    "Pick whichever existing version is the closest fit as a starting point, and say what -- if anything --",
+    "should change to tailor it for this specific posting. Only reordering, re-emphasizing, or trimming what's",
+    "already true is allowed; never suggest inventing anything not already in the candidate's profile.",
+    "",
+    `JOB: ${job.title} at ${job.company}`,
+    `JOB DESCRIPTION:\n${job.raw_description.slice(0, 2000)}`,
+    "",
+    `EXISTING VERSIONS:\n${JSON.stringify(candidates.map((c) => ({ id: c.id, name: c.name, instructions: c.instructions })))}`,
+  ].join("\n");
+
+  const result = await callStructured<{ base_resume_id: string; tailoring_notes: string }>(
+    env,
+    provider,
+    prompt,
+    RESUME_BASE_SCHEMA,
+    "submit_resume_base",
+    1000,
+  );
+  return {
+    base_resume_id: (result.base_resume_id ?? "").trim(),
+    tailoring_notes: (result.tailoring_notes ?? "").trim(),
+  };
+}
+
+/**
+ * Generates (or, with `regenerate`, redoes) the one resume version tailored to a specific job.
+ * Unlike general-purpose versions, only one exists per job -- regenerating updates that same row
+ * in place (bumping its revision) rather than accumulating a history, since a job-tailored resume
+ * is only ever meant to represent the current best version for that one application.
+ */
+async function buildJobResume(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string; regenerate?: boolean };
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const job = await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
+    .bind(id)
+    .first<{ title: string; company: string; raw_description: string }>();
+  if (!job) return json({ error: "not_found" }, 404);
+
+  const profile = await loadProfileForResume(env);
+  if (profile instanceof Response) return profile;
+
+  const existing = await env.DB.prepare(
+    "SELECT id, name, template, revision, checks_json FROM resumes WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+  )
+    .bind(id)
+    .first<{ id: string; name: string; template: string; revision: number; checks_json: string }>();
+
+  if (existing && !body.regenerate) {
+    return json({
+      id: existing.id,
+      name: existing.name,
+      template: existing.template,
+      revision: existing.revision,
+      checks: JSON.parse(existing.checks_json || "[]"),
+      reused: true,
+    });
+  }
+
+  const candidates = await env.DB.prepare(
+    "SELECT id, name, instructions FROM resumes WHERE profile_id = ? AND job_id IS NULL ORDER BY created_at DESC LIMIT 10",
+  )
+    .bind(profile.profileId)
+    .all<{ id: string; name: string; instructions: string }>();
+
+  const reviewAnswers = await env.DB.prepare(
+    "SELECT claim FROM candidate_evidence WHERE job_id = ? AND category = 'job_review' ORDER BY created_at ASC",
+  )
+    .bind(id)
+    .all<{ claim: string }>();
+
+  let baseInstructions = "";
+  let tailoringNotes = "";
+  if ((candidates.results ?? []).length) {
+    try {
+      const decision = await decideResumeBase(env, provider, job, candidates.results);
+      const base = candidates.results.find((c) => c.id === decision.base_resume_id);
+      baseInstructions = base?.instructions ?? "";
+      tailoringNotes = decision.tailoring_notes;
+    } catch {
+      // A failed base-selection call shouldn't block generation -- compose still works fine
+      // from the profile and job description alone, just without a stylistic starting point.
+    }
+  }
+
+  // Job-review answers become extra evidence the compose step can actually draw on. Grounding only
+  // checks employer/school names against the profile (see checkGrounding), never bullet content, so
+  // folding these into the narrative summary is safe and gives real material without inventing
+  // anything -- the compose step still can't fabricate an employer, title, or metric.
+  const augmentedProfile = (reviewAnswers.results ?? []).length
+    ? {
+        ...profile.structured,
+        narrative_summary: [
+          profile.structured.narrative_summary,
+          "Additional context specific to this application:",
+          ...reviewAnswers.results.map((r) => `- ${r.claim}`),
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      }
+    : profile.structured;
+
+  const targetRoles = `${job.title} at ${job.company}\n\n${job.raw_description.slice(0, 3000)}`;
+  const instructions = [baseInstructions, tailoringNotes].filter(Boolean).join("\n\n");
+  const layout = normalizeLayout(defaultLayout());
+  const resumeId = existing?.id ?? crypto.randomUUID();
+
+  let built;
+  try {
+    built = await buildResumeVersion(env, resumeId, provider, augmentedProfile, targetRoles, instructions, layout, "");
+  } catch (err) {
+    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+  }
+
+  const name = `${job.title} @ ${job.company}`.slice(0, 60);
+
+  if (existing) {
+    await env.DB.prepare(
+      `UPDATE resumes SET name = ?, instructions = ?, content_json = ?, pdf_r2_key = ?, template = ?,
+       layout_json = ?, checks_json = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    )
+      .bind(name, instructions, JSON.stringify(built.doc), built.pdfKey, layout.template, JSON.stringify(layout), JSON.stringify(built.checks), resumeId)
+      .run();
+    return json({ id: resumeId, name, template: layout.template, revision: existing.revision + 1, checks: built.checks, reused: false });
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json, job_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(resumeId, profile.profileId, name, instructions, JSON.stringify(built.doc), built.pdfKey, layout.template, JSON.stringify(layout), JSON.stringify(built.checks), id)
+    .run();
+  return json({ id: resumeId, name, template: layout.template, revision: 1, checks: built.checks, reused: false }, 201);
+}
+
 async function uploadArtifact(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -2518,7 +2691,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <a id="interested-detail-link" class="row-title" target="_blank" rel="noopener">Open posting</a>
       <div class="controls">
         <button id="interested-review-button" type="button">Review</button>
-        <button id="interested-resume-button" type="button" disabled title="Coming soon — will pick and tailor a resume version for this job">Resume</button>
+        <button id="interested-resume-button" type="button">Resume</button>
         <button id="interested-cover-button" type="button" disabled title="Coming soon — will draft a cover letter for this job">Cover letter</button>
         <button id="interested-apply-button" type="button" disabled title="Not automated — use the posting link above to apply directly">Apply</button>
       </div>
@@ -2528,6 +2701,13 @@ const DASHBOARD_PAGE = `<!doctype html>
         <p id="interested-review-question" class="job-reason"></p>
         <textarea id="interested-review-answer" placeholder="Answer in your own words — this gets added to your profile evidence for this job."></textarea>
         <button id="interested-review-submit" type="button">Submit answer</button>
+      </div>
+
+      <p id="interested-resume-status" class="status" role="status" aria-live="polite"></p>
+      <div id="interested-resume-section" style="display:none">
+        <iframe id="interested-resume-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+        <div id="interested-resume-checks"></div>
+        <button id="interested-resume-regenerate" class="secondary" type="button">Regenerate for this job</button>
       </div>
 
       <div id="interested-review-history"></div>
@@ -3718,13 +3898,16 @@ const DASHBOARD_PAGE = `<!doctype html>
       } else {
         link.style.display = 'none';
       }
-      // Review state is per-job -- switching to a different job shouldn't carry over a pending
-      // question or answer that belonged to the last one.
+      // Review and resume state are both per-job -- switching to a different job shouldn't carry
+      // over a pending question, answer, or preview that belonged to the last one.
       pendingReviewQuestion = null;
       document.getElementById('interested-review-section').style.display = 'none';
       document.getElementById('interested-review-answer').value = '';
       document.getElementById('interested-review-status').textContent = '';
       loadJobReviewHistory(job.id);
+
+      document.getElementById('interested-resume-section').style.display = 'none';
+      document.getElementById('interested-resume-status').textContent = '';
     }
 
     function renderInterestedList() {
@@ -3834,6 +4017,55 @@ const DASHBOARD_PAGE = `<!doctype html>
       } finally {
         button.disabled = false;
       }
+    });
+
+    function renderInterestedResumeChecks(checks) {
+      var host = document.getElementById('interested-resume-checks');
+      host.innerHTML = '';
+      if (!checks || !checks.length) return;
+      var list = el('ul', { className: 'checks' });
+      checks.forEach(function (check) {
+        var mark = check.severity === 'ok' ? '✓' : check.severity === 'warning' ? '!' : '✕';
+        list.appendChild(el('li', { className: check.severity }, [
+          el('span', { className: 'mark', textContent: mark }),
+          el('span', { textContent: check.message }),
+        ]));
+      });
+      host.appendChild(list);
+    }
+
+    async function buildInterestedResume(regenerate) {
+      if (!activeInterestedJobId) return;
+      var statusEl = document.getElementById('interested-resume-status');
+      statusEl.textContent = regenerate ? 'Regenerating…' : 'Picking the best version and tailoring it…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/resume', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ regenerate: !!regenerate }),
+        });
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'resume_failed'));
+        var data = await res.json();
+        document.getElementById('interested-resume-section').style.display = 'block';
+        document.getElementById('interested-resume-frame').src =
+          '/resumes/' + encodeURIComponent(data.id) + '/file?v=' + Date.now();
+        renderInterestedResumeChecks(data.checks || []);
+        statusEl.textContent = data.reused
+          ? 'Showing the version already tailored for this job.'
+          : 'Tailored version ' + data.revision + ' ready.';
+        statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    }
+
+    document.getElementById('interested-resume-button').addEventListener('click', function () {
+      buildInterestedResume(false);
+    });
+    document.getElementById('interested-resume-regenerate').addEventListener('click', function () {
+      buildInterestedResume(true);
     });
 
     document.getElementById('job-form').addEventListener('submit', async function (event) {
@@ -4076,6 +4308,8 @@ export default {
     if (request.method === "POST" && jobReviewMatch) return reviewJobQuestion(request, env, jobReviewMatch[1]);
     const jobReviewAnswerMatch = url.pathname.match(/^\/jobs\/([^/]+)\/review-answer$/);
     if (request.method === "POST" && jobReviewAnswerMatch) return createJobReviewAnswer(request, env, jobReviewAnswerMatch[1]);
+    const jobResumeMatch = url.pathname.match(/^\/jobs\/([^/]+)\/resume$/);
+    if (request.method === "POST" && jobResumeMatch) return buildJobResume(request, env, jobResumeMatch[1]);
     const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
     if (request.method === "DELETE" && jobMatch) return deleteJob(request, env, jobMatch[1]);
     if (request.method === "GET" && url.pathname === "/documents") return listDocuments(request, env);
