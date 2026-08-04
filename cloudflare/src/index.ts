@@ -1740,7 +1740,7 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
   if (profile instanceof Response) return profile;
 
   const row = await env.DB.prepare(
-    "SELECT instructions, content_json, layout_json, checks_json, revision FROM resumes WHERE id = ? AND profile_id = ?",
+    "SELECT instructions, content_json, layout_json, checks_json, revision, job_id FROM resumes WHERE id = ? AND profile_id = ?",
   )
     .bind(id, profile.profileId)
     .first<{
@@ -1749,12 +1749,28 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
       layout_json: string;
       checks_json: string;
       revision: number;
+      job_id: string | null;
     }>();
   if (!row) return json({ error: "not_found" }, 404);
 
   const layout = normalizeLayout(JSON.parse(row.layout_json || "{}"));
   const doc = JSON.parse(row.content_json || "{}") as ResumeDoc;
   const previousChecks = JSON.parse(row.checks_json || "[]") as ResumeCheck[];
+
+  // A job-tailored resume keeps targeting that specific posting through every revision -- without
+  // this, a content rewrite triggered by feedback would recompose against the profile's general
+  // desired roles instead, drifting the resume back away from the job it was tailored for.
+  let targetRoles = profile.desiredRoles;
+  let structured = profile.structured;
+  if (row.job_id) {
+    const job = await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
+      .bind(row.job_id)
+      .first<{ title: string; company: string; raw_description: string }>();
+    if (job) {
+      targetRoles = `${job.title} at ${job.company}\n\n${job.raw_description.slice(0, 3000)}`;
+      structured = augmentProfileWithReviewEvidence(profile.structured, await loadJobReviewClaims(env, row.job_id));
+    }
+  }
 
   try {
     // Re-render the current version so the reviewer sees exactly what is stored.
@@ -1779,8 +1795,8 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
         env,
         id,
         provider,
-        profile.structured,
-        profile.desiredRoles,
+        structured,
+        targetRoles,
         row.instructions ?? "",
         nextLayout,
         feedback,
@@ -1793,7 +1809,7 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
         doc,
         pdfKey: rendered.pdfKey,
         screenshotBase64: rendered.screenshotBase64,
-        checks: await runAllChecks(rendered.pdfBytes, doc, profile.structured, nextLayout),
+        checks: await runAllChecks(rendered.pdfBytes, doc, structured, nextLayout),
       };
     }
 
@@ -1931,6 +1947,35 @@ async function decideResumeBase(
   };
 }
 
+async function loadJobReviewClaims(env: Env, jobId: string): Promise<string[]> {
+  const rows = await env.DB.prepare(
+    "SELECT claim FROM candidate_evidence WHERE job_id = ? AND category = 'job_review' ORDER BY created_at ASC",
+  )
+    .bind(jobId)
+    .all<{ claim: string }>();
+  return (rows.results ?? []).map((r) => r.claim);
+}
+
+/**
+ * Job-review answers become extra evidence the compose step can actually draw on. Grounding only
+ * checks employer/school names against the profile (see checkGrounding), never bullet content, so
+ * folding these into the narrative summary is safe and gives real material without inventing
+ * anything -- the compose step still can't fabricate an employer, title, or metric.
+ */
+function augmentProfileWithReviewEvidence(structured: StructuredProfile, claims: string[]): StructuredProfile {
+  if (!claims.length) return structured;
+  return {
+    ...structured,
+    narrative_summary: [
+      structured.narrative_summary,
+      "Additional context specific to this application:",
+      ...claims.map((c) => `- ${c}`),
+    ]
+      .filter(Boolean)
+      .join("\n"),
+  };
+}
+
 /**
  * Generates (or, with `regenerate`, redoes) the one resume version tailored to a specific job.
  * Unlike general-purpose versions, only one exists per job -- regenerating updates that same row
@@ -1971,51 +2016,42 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
   }
 
   const candidates = await env.DB.prepare(
-    "SELECT id, name, instructions FROM resumes WHERE profile_id = ? AND job_id IS NULL ORDER BY created_at DESC LIMIT 10",
+    "SELECT id, name, instructions, layout_json FROM resumes WHERE profile_id = ? AND job_id IS NULL ORDER BY created_at DESC LIMIT 10",
   )
     .bind(profile.profileId)
-    .all<{ id: string; name: string; instructions: string }>();
+    .all<{ id: string; name: string; instructions: string; layout_json: string }>();
 
-  const reviewAnswers = await env.DB.prepare(
-    "SELECT claim FROM candidate_evidence WHERE job_id = ? AND category = 'job_review' ORDER BY created_at ASC",
-  )
-    .bind(id)
-    .all<{ claim: string }>();
+  const reviewClaims = await loadJobReviewClaims(env, id);
 
   let baseInstructions = "";
   let tailoringNotes = "";
+  let baseLayout: LayoutSpec | null = null;
   if ((candidates.results ?? []).length) {
     try {
       const decision = await decideResumeBase(env, provider, job, candidates.results);
       const base = candidates.results.find((c) => c.id === decision.base_resume_id);
-      baseInstructions = base?.instructions ?? "";
-      tailoringNotes = decision.tailoring_notes;
+      if (base) {
+        baseInstructions = base.instructions ?? "";
+        tailoringNotes = decision.tailoring_notes;
+        // Inherit the chosen version's template and page length too, not just its wording
+        // preferences -- otherwise every tailored resume gets forced back to the 1-page classic
+        // default regardless of what the candidate actually picked for their general versions.
+        try {
+          baseLayout = normalizeLayout(JSON.parse(base.layout_json || "{}"));
+        } catch {
+          baseLayout = null;
+        }
+      }
     } catch {
       // A failed base-selection call shouldn't block generation -- compose still works fine
       // from the profile and job description alone, just without a stylistic starting point.
     }
   }
 
-  // Job-review answers become extra evidence the compose step can actually draw on. Grounding only
-  // checks employer/school names against the profile (see checkGrounding), never bullet content, so
-  // folding these into the narrative summary is safe and gives real material without inventing
-  // anything -- the compose step still can't fabricate an employer, title, or metric.
-  const augmentedProfile = (reviewAnswers.results ?? []).length
-    ? {
-        ...profile.structured,
-        narrative_summary: [
-          profile.structured.narrative_summary,
-          "Additional context specific to this application:",
-          ...reviewAnswers.results.map((r) => `- ${r.claim}`),
-        ]
-          .filter(Boolean)
-          .join("\n"),
-      }
-    : profile.structured;
-
+  const augmentedProfile = augmentProfileWithReviewEvidence(profile.structured, reviewClaims);
   const targetRoles = `${job.title} at ${job.company}\n\n${job.raw_description.slice(0, 3000)}`;
   const instructions = [baseInstructions, tailoringNotes].filter(Boolean).join("\n\n");
-  const layout = normalizeLayout(defaultLayout());
+  const layout = baseLayout ?? normalizeLayout(defaultLayout());
   const resumeId = existing?.id ?? crypto.randomUUID();
 
   let built;
@@ -2882,7 +2918,9 @@ const DASHBOARD_PAGE = `<!doctype html>
       <div id="interested-resume-section" style="display:none">
         <iframe id="interested-resume-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
         <div id="interested-resume-checks"></div>
-        <button id="interested-resume-regenerate" class="secondary" type="button">Regenerate for this job</button>
+        <p id="interested-resume-critique" class="critique" style="display:none"></p>
+        <textarea id="interested-resume-comment" placeholder="Optional — steer the revision, e.g. tighten the second bullet, or point out what still doesn't fit"></textarea>
+        <button id="interested-resume-revise" class="secondary" type="button">Revise this version</button>
       </div>
 
       <p id="interested-cover-status" class="status" role="status" aria-live="polite"></p>
@@ -4044,6 +4082,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     }
 
     var activeInterestedJobId = null;
+    var activeInterestedResumeId = null;
     var pendingReviewQuestion = null;
 
     function renderReviewHistory(entries) {
@@ -4087,8 +4126,11 @@ const DASHBOARD_PAGE = `<!doctype html>
       document.getElementById('interested-review-status').textContent = '';
       loadJobReviewHistory(job.id);
 
+      activeInterestedResumeId = null;
       document.getElementById('interested-resume-section').style.display = 'none';
       document.getElementById('interested-resume-status').textContent = '';
+      document.getElementById('interested-resume-comment').value = '';
+      document.getElementById('interested-resume-critique').style.display = 'none';
 
       document.getElementById('interested-cover-section').style.display = 'none';
       document.getElementById('interested-cover-status').textContent = '';
@@ -4218,23 +4260,31 @@ const DASHBOARD_PAGE = `<!doctype html>
       host.appendChild(list);
     }
 
-    async function buildInterestedResume(regenerate) {
+    function showInterestedResumeCritique(critique) {
+      var critiqueEl = document.getElementById('interested-resume-critique');
+      critiqueEl.textContent = critique || '';
+      critiqueEl.style.display = critique ? 'block' : 'none';
+    }
+
+    async function buildInterestedResume() {
       if (!activeInterestedJobId) return;
       var statusEl = document.getElementById('interested-resume-status');
-      statusEl.textContent = regenerate ? 'Regenerating…' : 'Picking the best version and tailoring it…';
+      statusEl.textContent = 'Picking the best version and tailoring it…';
       statusEl.className = 'status';
       try {
         var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/resume', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ regenerate: !!regenerate }),
+          body: JSON.stringify({}),
         });
         if (!res.ok) throw new Error(errorMessage(await res.json(), 'resume_failed'));
         var data = await res.json();
+        activeInterestedResumeId = data.id;
         document.getElementById('interested-resume-section').style.display = 'block';
         document.getElementById('interested-resume-frame').src =
           '/resumes/' + encodeURIComponent(data.id) + '/file?v=' + Date.now();
         renderInterestedResumeChecks(data.checks || []);
+        showInterestedResumeCritique(data.critique);
         statusEl.textContent = data.reused
           ? 'Showing the version already tailored for this job.'
           : 'Tailored version ' + data.revision + ' ready.';
@@ -4245,11 +4295,37 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     }
 
+    async function reviseInterestedResume() {
+      if (!activeInterestedResumeId) return;
+      var statusEl = document.getElementById('interested-resume-status');
+      var comment = document.getElementById('interested-resume-comment').value.trim();
+      statusEl.textContent = 'Reviewing the rendered page and revising…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/resumes/' + encodeURIComponent(activeInterestedResumeId) + '/review', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ comment: comment }),
+        });
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'review_failed'));
+        var data = await res.json();
+        document.getElementById('interested-resume-frame').src =
+          '/resumes/' + encodeURIComponent(activeInterestedResumeId) + '/file?v=' + Date.now();
+        renderInterestedResumeChecks(data.checks || []);
+        showInterestedResumeCritique(data.critique);
+        statusEl.textContent = 'Revised — now revision ' + data.revision + '.';
+        statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    }
+
     document.getElementById('interested-resume-button').addEventListener('click', function () {
-      buildInterestedResume(false);
+      buildInterestedResume();
     });
-    document.getElementById('interested-resume-regenerate').addEventListener('click', function () {
-      buildInterestedResume(true);
+    document.getElementById('interested-resume-revise').addEventListener('click', function () {
+      reviseInterestedResume();
     });
 
     async function buildInterestedCoverLetter(regenerate) {
