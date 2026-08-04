@@ -819,6 +819,110 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
   return json({ id, fit_status: "reject", reason });
 }
 
+/**
+ * Asks one short, conversational clarifying question about a gap between what this specific
+ * job asks for and what the candidate's profile currently shows evidence of. Nothing is written
+ * to the DB here -- the question is only saved (as a candidate_evidence row) once the candidate
+ * actually answers it, via createJobReviewAnswer below.
+ */
+async function reviewJobQuestion(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string };
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const job = await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
+    .bind(id)
+    .first<{ title: string; company: string; raw_description: string }>();
+  if (!job) return json({ error: "not_found" }, 404);
+
+  const profile = await loadProfileForResume(env);
+  if (profile instanceof Response) return profile;
+
+  // Prior answers for this same job, so a second (or third) click asks about something new
+  // rather than circling back to ground already covered.
+  const prior = await env.DB.prepare(
+    "SELECT claim FROM candidate_evidence WHERE job_id = ? AND category = 'job_review' ORDER BY created_at ASC",
+  )
+    .bind(id)
+    .all<{ claim: string }>();
+
+  const prompt = [
+    "You are helping a candidate prepare to apply to a specific job. Find ONE concrete gap between",
+    "what this job asks for and what their profile currently shows evidence of, then ask a single",
+    "short, conversational question that would let them fill that gap in their own words.",
+    "",
+    "Rules:",
+    "- Ask about something the posting actually states or clearly implies, not a generic prompt.",
+    "- Phrase it the way a friend would, not a form -- e.g. \"This role wants people-management",
+    "  experience, tell me about a specific time you led something.\"",
+    "- One question only, one or two sentences, no preamble or explanation, just the question itself.",
+    "- If the profile already covers everything the posting asks for well, ask about whichever",
+    "  detail would most strengthen an application anyway, rather than inventing a gap.",
+    (prior.results ?? []).length
+      ? "- Don't repeat ground already covered by these previous answers for this same job:\n" +
+        prior.results.map((r) => `  - ${r.claim}`).join("\n")
+      : "",
+    "",
+    `JOB: ${job.title} at ${job.company}`,
+    `JOB DESCRIPTION:\n${job.raw_description.slice(0, 3000)}`,
+    "",
+    `CANDIDATE PROFILE:\n${JSON.stringify(profile.structured)}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  try {
+    const question = await callText(env, provider, prompt);
+    return json({ question: question.trim() });
+  } catch (err) {
+    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+  }
+}
+
+async function listJobReview(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const rows = await env.DB.prepare(
+    "SELECT id, claim, created_at FROM candidate_evidence WHERE job_id = ? AND category = 'job_review' ORDER BY created_at ASC",
+  )
+    .bind(id)
+    .all();
+  return json({ entries: rows.results });
+}
+
+async function createJobReviewAnswer(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { question?: string; answer?: string };
+  const answer = (body.answer ?? "").trim();
+  if (!answer) return json({ error: "answer_required" }, 400);
+  const question = (body.question ?? "").trim();
+
+  const job = await env.DB.prepare("SELECT id FROM job_postings WHERE id = ?").bind(id).first();
+  if (!job) return json({ error: "not_found" }, 404);
+
+  const profileId = await getOrCreateProfileId(env);
+  // Keeping the question alongside the answer makes the saved evidence self-explanatory later --
+  // "Q: ... / A: ..." reads sensibly on its own, unlike a bare answer with no context.
+  const claim = question ? `Q: ${question}\nA: ${answer}` : answer;
+  const evidenceId = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO candidate_evidence (id, profile_id, category, claim, usable_in_applications, job_id) VALUES (?, ?, 'job_review', ?, 1, ?)",
+  )
+    .bind(evidenceId, profileId, claim, id)
+    .run();
+
+  const rows = await env.DB.prepare(
+    "SELECT id, claim, created_at FROM candidate_evidence WHERE job_id = ? AND category = 'job_review' ORDER BY created_at ASC",
+  )
+    .bind(id)
+    .all();
+  return json({ id: evidenceId, entries: rows.results }, 201);
+}
+
 // ---------------------------------------------------------------------------
 // Companies
 // ---------------------------------------------------------------------------
@@ -2403,7 +2507,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   <div id="panel-interested" class="panel">
     <section id="interested-list-section">
       <h2>Interested jobs</h2>
-      <p class="hint">Jobs you've marked "Interested" on the Jobs tab. Click one to open its workspace — the posting link, and (coming soon) a tailored resume, cover letter, and a quick review to fill in anything your profile is missing for it.</p>
+      <p class="hint">Jobs you've marked "Interested" on the Jobs tab. Click one to open its workspace — the posting link, a quick review to fill in anything your profile is missing for it, and (coming soon) a tailored resume and cover letter.</p>
       <div id="interested-list"><p class="empty">Loading…</p></div>
     </section>
 
@@ -2413,11 +2517,20 @@ const DASHBOARD_PAGE = `<!doctype html>
       <p id="interested-detail-reason" class="job-reason"></p>
       <a id="interested-detail-link" class="row-title" target="_blank" rel="noopener">Open posting</a>
       <div class="controls">
-        <button id="interested-review-button" type="button" disabled title="Coming soon — will ask a quick question about anything this job needs that your profile doesn't cover yet">Review</button>
+        <button id="interested-review-button" type="button">Review</button>
         <button id="interested-resume-button" type="button" disabled title="Coming soon — will pick and tailor a resume version for this job">Resume</button>
         <button id="interested-cover-button" type="button" disabled title="Coming soon — will draft a cover letter for this job">Cover letter</button>
         <button id="interested-apply-button" type="button" disabled title="Not automated — use the posting link above to apply directly">Apply</button>
       </div>
+      <p id="interested-review-status" class="status" role="status" aria-live="polite"></p>
+
+      <div id="interested-review-section" style="display:none">
+        <p id="interested-review-question" class="job-reason"></p>
+        <textarea id="interested-review-answer" placeholder="Answer in your own words — this gets added to your profile evidence for this job."></textarea>
+        <button id="interested-review-submit" type="button">Submit answer</button>
+      </div>
+
+      <div id="interested-review-history"></div>
     </section>
   </div>
 
@@ -3570,6 +3683,23 @@ const DASHBOARD_PAGE = `<!doctype html>
     }
 
     var activeInterestedJobId = null;
+    var pendingReviewQuestion = null;
+
+    function renderReviewHistory(entries) {
+      var host = document.getElementById('interested-review-history');
+      host.innerHTML = '';
+      if (!entries.length) return;
+      host.appendChild(el('h3', { className: 'subhead', textContent: 'Answered so far' }));
+      entries.forEach(function (entry) {
+        host.appendChild(el('p', { className: 'job-reason', textContent: entry.claim }));
+      });
+    }
+
+    async function loadJobReviewHistory(jobId) {
+      var res = await api('/jobs/' + encodeURIComponent(jobId) + '/review');
+      var data = await res.json();
+      renderReviewHistory(data.entries || []);
+    }
 
     function showInterestedDetail(job) {
       activeInterestedJobId = job.id;
@@ -3588,6 +3718,13 @@ const DASHBOARD_PAGE = `<!doctype html>
       } else {
         link.style.display = 'none';
       }
+      // Review state is per-job -- switching to a different job shouldn't carry over a pending
+      // question or answer that belonged to the last one.
+      pendingReviewQuestion = null;
+      document.getElementById('interested-review-section').style.display = 'none';
+      document.getElementById('interested-review-answer').value = '';
+      document.getElementById('interested-review-status').textContent = '';
+      loadJobReviewHistory(job.id);
     }
 
     function renderInterestedList() {
@@ -3639,6 +3776,65 @@ const DASHBOARD_PAGE = `<!doctype html>
       var stillActive = interestedJobs.filter(function (j) { return j.id === activeInterestedJobId; })[0];
       showInterestedDetail(stillActive || interestedJobs[0]);
     }
+
+    document.getElementById('interested-review-button').addEventListener('click', async function () {
+      if (!activeInterestedJobId) return;
+      var statusEl = document.getElementById('interested-review-status');
+      var button = this;
+      button.disabled = true;
+      statusEl.textContent = 'Thinking of a question…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/review', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'review_failed'));
+        var data = await res.json();
+        pendingReviewQuestion = data.question;
+        document.getElementById('interested-review-question').textContent = data.question;
+        document.getElementById('interested-review-section').style.display = 'block';
+        document.getElementById('interested-review-answer').value = '';
+        statusEl.textContent = '';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    document.getElementById('interested-review-submit').addEventListener('click', async function () {
+      if (!activeInterestedJobId) return;
+      var answer = document.getElementById('interested-review-answer').value.trim();
+      if (!answer) return;
+      var statusEl = document.getElementById('interested-review-status');
+      var button = this;
+      button.disabled = true;
+      statusEl.textContent = 'Saving…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/review-answer', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ question: pendingReviewQuestion, answer: answer }),
+        });
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'save_failed'));
+        var data = await res.json();
+        renderReviewHistory(data.entries || []);
+        document.getElementById('interested-review-section').style.display = 'none';
+        document.getElementById('interested-review-answer').value = '';
+        pendingReviewQuestion = null;
+        statusEl.textContent = 'Saved — added to your profile evidence for this job.';
+        statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
+      }
+    });
 
     document.getElementById('job-form').addEventListener('submit', async function (event) {
       event.preventDefault();
@@ -3875,6 +4071,11 @@ export default {
     if (request.method === "POST" && url.pathname === "/data/purge-collection") return purgeCollection(request, env);
     const jobFitMatch = url.pathname.match(/^\/jobs\/([^/]+)\/fit$/);
     if (request.method === "PATCH" && jobFitMatch) return setJobFit(request, env, jobFitMatch[1]);
+    const jobReviewMatch = url.pathname.match(/^\/jobs\/([^/]+)\/review$/);
+    if (request.method === "GET" && jobReviewMatch) return listJobReview(request, env, jobReviewMatch[1]);
+    if (request.method === "POST" && jobReviewMatch) return reviewJobQuestion(request, env, jobReviewMatch[1]);
+    const jobReviewAnswerMatch = url.pathname.match(/^\/jobs\/([^/]+)\/review-answer$/);
+    if (request.method === "POST" && jobReviewAnswerMatch) return createJobReviewAnswer(request, env, jobReviewAnswerMatch[1]);
     const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
     if (request.method === "DELETE" && jobMatch) return deleteJob(request, env, jobMatch[1]);
     if (request.method === "GET" && url.pathname === "/documents") return listDocuments(request, env);
