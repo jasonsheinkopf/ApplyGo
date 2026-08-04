@@ -19,6 +19,7 @@ import {
   assessJobFitBatch,
   buildMatchProfile,
   screenJobsBatch,
+  verdictForScore,
 } from "./fit";
 import {
   type LayoutSpec,
@@ -451,7 +452,7 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
   const jobs = await env.DB.prepare(
     `SELECT id, title, company, source_url, raw_description, location, posted_at, ats_provider,
-            company_id, fit_status, fit_reason, fit_missing_json, created_at
+            company_id, fit_status, fit_score, fit_reason, fit_missing_json, created_at
      FROM job_postings
      ORDER BY COALESCE(posted_at, created_at) DESC
      LIMIT 300`,
@@ -737,10 +738,10 @@ async function purgeCollection(request: Request, env: Env): Promise<Response> {
 async function storeFitResults(env: Env, results: FitResult[]): Promise<void> {
   for (const result of results) {
     await env.DB.prepare(
-      `UPDATE job_postings SET fit_status = ?, fit_reason = ?, fit_missing_json = ?, assessed_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
+      `UPDATE job_postings SET fit_status = ?, fit_score = ?, fit_reason = ?, fit_missing_json = ?,
+       assessed_at = CURRENT_TIMESTAMP WHERE id = ?`,
     )
-      .bind(result.verdict, result.reason, JSON.stringify(result.missing), result.id)
+      .bind(verdictForScore(result.score), result.score, result.reason, JSON.stringify(result.missing), result.id)
       .run();
   }
 }
@@ -756,7 +757,7 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
 
   if (body.action === "restore") {
     await env.DB.prepare(
-      "UPDATE job_postings SET fit_status = 'unassessed', fit_reason = '', assessed_at = NULL WHERE id = ?",
+      "UPDATE job_postings SET fit_status = 'unassessed', fit_score = NULL, fit_reason = '', assessed_at = NULL WHERE id = ?",
     )
       .bind(id)
       .run();
@@ -764,8 +765,10 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
   }
 
   const reason = (body.reason ?? "").trim();
+  // A user rejection didn't come from the scoring model, but 0 is where a confirmed non-fit
+  // belongs on the same scale as a modeled score, so the score badge stays meaningful either way.
   await env.DB.prepare(
-    "UPDATE job_postings SET fit_status = 'reject', fit_reason = ?, assessed_at = CURRENT_TIMESTAMP WHERE id = ?",
+    "UPDATE job_postings SET fit_status = 'reject', fit_score = 0, fit_reason = ?, assessed_at = CURRENT_TIMESTAMP WHERE id = ?",
   )
     .bind(reason || "Not a fit.", id)
     .run();
@@ -992,7 +995,11 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
   const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
   const locationTerms = parseLocationFilter(readDesiredLocations(profileRow?.preferences_json ?? "{}"));
 
-  const limit = Math.min(Math.max(Number(body.limit) || 6, 1), 12);
+  // This bounds how many candidate rows the query below considers, which is cheap -- the actual
+  // cost governor is the fetch budget in the loop further down, which already stops early and
+  // reports what's left regardless of how high this number goes. So "scan all N companies" can
+  // just ask for all N; the budget decides how many of them a single request actually reaches.
+  const limit = Math.min(Math.max(Number(body.limit) || 6, 1), 500);
   const targets = body.company_id
     ? await env.DB.prepare(
         "SELECT id, name, website, careers_url, ats_provider, ats_token FROM companies WHERE id = ? AND profile_id = ?",
@@ -2269,9 +2276,20 @@ const DASHBOARD_PAGE = `<!doctype html>
   <div id="panel-jobs" class="panel">
     <section id="jobs-scan-section">
       <h2>1. Scan for new listings</h2>
-      <p class="hint">Reads the job boards of every company on your list. Runs in batches, so click again if there are more companies left to scan.</p>
+      <p class="hint">Reads the job boards of companies on your list. Each company costs a few requests, so however many you ask for, a single click only gets through as many as safely fit in one request — the status line says if there's more, and clicking again picks up right where it left off.</p>
       <p id="jobs-scan-summary" class="summary-line">Loading…</p>
-      <button id="jobs-scan-button" type="button">Scan company boards</button>
+      <div class="controls">
+        <div>
+          <label for="jobs-scan-count">Companies to scan</label>
+          <select id="jobs-scan-count">
+            <option value="1">1</option>
+            <option value="5">5</option>
+            <option value="10">10</option>
+            <option value="500" selected>All</option>
+          </select>
+        </div>
+        <button id="jobs-scan-button" type="button">Scan company boards</button>
+      </div>
       <p id="jobs-scan-status" class="status" role="status" aria-live="polite"></p>
     </section>
 
@@ -2303,6 +2321,15 @@ const DASHBOARD_PAGE = `<!doctype html>
             <option value="">Any time</option>
             <option value="1">Last 24 hours</option>
             <option value="3">Last 3 days</option>
+          </select>
+        </div>
+        <div>
+          <label for="jobs-min-score">Minimum score</label>
+          <select id="jobs-min-score">
+            <option value="">Any score</option>
+            <option value="50">50%+</option>
+            <option value="70">70%+</option>
+            <option value="90">90%+</option>
           </select>
         </div>
       </div>
@@ -3179,7 +3206,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         var res = await api('/companies/scan', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ limit: 6 }),
+          body: JSON.stringify({ limit: Number(document.getElementById('jobs-scan-count').value) }),
         });
         if (!res.ok) throw new Error(errorMessage(await res.json(), 'scan_failed'));
         var data = await readNdjson(res, function (event) {
@@ -3257,6 +3284,11 @@ const DASHBOARD_PAGE = `<!doctype html>
     function renderJobRows(list, jobs) {
       jobs.forEach(function (job) {
         var fitInfo = FIT_LABELS[job.fit_status] || FIT_LABELS.unassessed;
+        // A numeric score means the strong tier (or a manual "Not for me", scored 0) actually
+        // rated this posting -- show the real number. Postings still queued or dropped by the
+        // cheap screen never reach that tier, so they keep the descriptive label instead.
+        var hasScore = job.fit_score !== null && job.fit_score !== undefined;
+        var badgeText = hasScore ? job.fit_score + '% match' : fitInfo.text;
         var missing = [];
         try { missing = JSON.parse(job.fit_missing_json || '[]'); } catch (e) { missing = []; }
 
@@ -3266,7 +3298,7 @@ const DASHBOARD_PAGE = `<!doctype html>
               textContent: job.title,
             })
           : el('span', { className: 'row-title', textContent: job.title });
-        var titleLine = [titleNode, el('span', { className: ('badge ' + fitInfo.cls).trim(), textContent: fitInfo.text })];
+        var titleLine = [titleNode, el('span', { className: ('badge ' + fitInfo.cls).trim(), textContent: badgeText })];
 
         var meta = [
           job.company,
@@ -3321,16 +3353,27 @@ const DASHBOARD_PAGE = `<!doctype html>
       return ageMs <= maxDays * 86400000;
     }
 
+    // Same principle as withinAge: a posting with no score yet (still queued, or dropped by the
+    // cheap screen before ever reaching the scoring tier) is never excluded by a score threshold
+    // -- there's nothing to compare, and this filter isn't what's gating those groups anyway.
+    function withinScore(job, minScore) {
+      if (!minScore || job.fit_score === null || job.fit_score === undefined) return true;
+      return job.fit_score >= minScore;
+    }
+
     function renderJobs() {
       var needle = document.getElementById('jobs-filter').value.trim();
       var maxAgeDays = Number(document.getElementById('jobs-age').value) || 0;
+      var minScore = Number(document.getElementById('jobs-min-score').value) || 0;
       var showQueued = document.getElementById('jobs-show-unfiltered').checked;
       var showRejected = document.getElementById('jobs-show-rejected').checked;
       var list = document.getElementById('jobs-list');
       list.innerHTML = '';
 
       var matching = allJobs.filter(function (job) {
-        return matchesFilter([job.title, job.company, job.location].join(' '), needle) && withinAge(job, maxAgeDays);
+        return matchesFilter([job.title, job.company, job.location].join(' '), needle)
+          && withinAge(job, maxAgeDays)
+          && withinScore(job, minScore);
       });
       // Kept as three separate groups rather than one filtered-and-sorted list, so a fresh
       // scan's unreviewed postings can never end up sitting among ones you've already judged --
@@ -3338,8 +3381,9 @@ const DASHBOARD_PAGE = `<!doctype html>
       var matches = matching.filter(function (j) { return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status]; });
       var queued = matching.filter(function (j) { return QUEUED_STATUSES[j.fit_status]; });
       var ruledOut = matching.filter(function (j) { return RULED_OUT_STATUSES[j.fit_status]; });
-      var order = { strong: 0, possible: 1 };
-      matches.sort(function (a, b) { return (order[a.fit_status] ?? 2) - (order[b.fit_status] ?? 2); });
+      // Sorted by the actual score now that there is one, rather than just the two-bucket order --
+      // an 88% and a 71% were both "strong" under the old labels but aren't equally worth reading first.
+      matches.sort(function (a, b) { return (b.fit_score ?? 0) - (a.fit_score ?? 0); });
 
       var queuedToggle = document.getElementById('jobs-show-unfiltered');
       queuedToggle.parentElement.style.display = queued.length ? 'flex' : 'none';
@@ -3375,6 +3419,7 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     document.getElementById('jobs-filter').addEventListener('input', renderJobs);
     document.getElementById('jobs-age').addEventListener('change', renderJobs);
+    document.getElementById('jobs-min-score').addEventListener('change', renderJobs);
     document.getElementById('jobs-show-unfiltered').addEventListener('change', renderJobs);
     document.getElementById('jobs-show-rejected').addEventListener('change', renderJobs);
 
