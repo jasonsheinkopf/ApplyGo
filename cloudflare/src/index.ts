@@ -457,7 +457,7 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
   // fit_missing_json do), and at up to 1500 chars per row it's the single biggest thing here.
   const jobs = await env.DB.prepare(
     `SELECT id, title, company, source_url, location, posted_at, ats_provider,
-            company_id, fit_status, fit_score, fit_reason, fit_missing_json, created_at
+            company_id, fit_status, fit_score, fit_reason, fit_missing_json, interested_at, created_at
      FROM job_postings
      ORDER BY COALESCE(posted_at, created_at) DESC`,
   ).all();
@@ -615,6 +615,7 @@ async function jobPipelineCounts(env: Env): Promise<Record<string, number>> {
     strong: 0,
     possible: 0,
     reject: 0,
+    interested: 0,
   };
   for (const row of rows.results ?? []) counts[row.fit_status] = row.n;
   counts.total = Object.values(counts).reduce((a, b) => a + b, 0);
@@ -754,9 +755,9 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as { action?: string; reason?: string };
-  const job = await env.DB.prepare("SELECT title, company FROM job_postings WHERE id = ?")
+  const job = await env.DB.prepare("SELECT title, company, fit_score FROM job_postings WHERE id = ?")
     .bind(id)
-    .first<{ title: string; company: string }>();
+    .first<{ title: string; company: string; fit_score: number | null }>();
   if (!job) return json({ error: "not_found" }, 404);
 
   if (body.action === "restore") {
@@ -766,6 +767,33 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
       .bind(id)
       .run();
     return json({ id, fit_status: "unassessed" });
+  }
+
+  if (body.action === "interested") {
+    // A manual override on top of whatever the AI verdict was, the same way a rejection is --
+    // fit_score/fit_reason are left alone so the score/reason that made it interesting is still
+    // there to see once it's sitting in the Interested tab.
+    await env.DB.prepare(
+      "UPDATE job_postings SET fit_status = 'interested', interested_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+    return json({ id, fit_status: "interested" });
+  }
+
+  if (body.action === "uninterested") {
+    // Leaving "interested" shouldn't cost the posting its score the way a full "restore" would --
+    // it goes back to whatever bucket its existing score already implies, or unassessed if it was
+    // never scored, rather than always resetting to unassessed and losing that context.
+    const fitStatus = job.fit_score !== null && job.fit_score !== undefined
+      ? verdictForScore(job.fit_score)
+      : "unassessed";
+    await env.DB.prepare(
+      "UPDATE job_postings SET fit_status = ?, interested_at = NULL WHERE id = ?",
+    )
+      .bind(fitStatus, id)
+      .run();
+    return json({ id, fit_status: fitStatus });
   }
 
   const reason = (body.reason ?? "").trim();
@@ -2073,6 +2101,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     <button class="tab" data-tab="resume" type="button">Resume</button>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
+    <button class="tab" data-tab="interested" type="button">Interested</button>
     <button class="tab" data-tab="devices" type="button">Devices</button>
     <button class="tab" data-tab="data" type="button">Data</button>
   </nav>
@@ -2368,6 +2397,27 @@ const DASHBOARD_PAGE = `<!doctype html>
         </form>
         <p id="job-status" class="status" role="status" aria-live="polite"></p>
       </details>
+    </section>
+  </div>
+
+  <div id="panel-interested" class="panel">
+    <section id="interested-list-section">
+      <h2>Interested jobs</h2>
+      <p class="hint">Jobs you've marked "Interested" on the Jobs tab. Click one to open its workspace — the posting link, and (coming soon) a tailored resume, cover letter, and a quick review to fill in anything your profile is missing for it.</p>
+      <div id="interested-list"><p class="empty">Loading…</p></div>
+    </section>
+
+    <section id="interested-detail-section" style="display:none">
+      <h2 id="interested-detail-title"></h2>
+      <p id="interested-detail-meta" class="row-meta"></p>
+      <p id="interested-detail-reason" class="job-reason"></p>
+      <a id="interested-detail-link" class="row-title" target="_blank" rel="noopener">Open posting</a>
+      <div class="controls">
+        <button id="interested-review-button" type="button" disabled title="Coming soon — will ask a quick question about anything this job needs that your profile doesn't cover yet">Review</button>
+        <button id="interested-resume-button" type="button" disabled title="Coming soon — will pick and tailor a resume version for this job">Resume</button>
+        <button id="interested-cover-button" type="button" disabled title="Coming soon — will draft a cover letter for this job">Cover letter</button>
+        <button id="interested-apply-button" type="button" disabled title="Not automated — use the posting link above to apply directly">Apply</button>
+      </div>
     </section>
   </div>
 
@@ -3290,14 +3340,17 @@ const DASHBOARD_PAGE = `<!doctype html>
       screened_out: { text: 'Screened out', cls: 'warn' },
       screened_in: { text: 'Awaiting review', cls: 'queued' },
       unassessed: { text: 'Not filtered yet', cls: 'queued' },
+      interested: { text: 'Interested', cls: 'strong' },
     };
-    // Three buckets, kept visually and structurally separate so a fresh scan's unfiltered
+    // Four buckets, kept visually and structurally separate so a fresh scan's unfiltered
     // postings never get mixed in with results you've already reviewed:
     //   judged matches (green)      -- shown by default
     //   not filtered yet (yellow)   -- hidden by default, own toggle
     //   ruled out (red)             -- hidden by default, own toggle
+    //   interested                  -- never shown here at all, lives on its own tab instead
     var QUEUED_STATUSES = { unassessed: true, screened_in: true };
     var RULED_OUT_STATUSES = { reject: true, screened_out: true };
+    var INTERESTED_STATUSES = { interested: true };
 
     async function submitJobFit(jobId, action, reason) {
       await api('/jobs/' + encodeURIComponent(jobId) + '/fit', {
@@ -3355,6 +3408,11 @@ const DASHBOARD_PAGE = `<!doctype html>
           });
           actions.push(reject);
         }
+        // Every row that reaches this list is, by construction, not yet interested -- once marked,
+        // a job is excluded from all three Jobs-tab buckets and only shows up on the Interested tab.
+        var interested = el('button', { type: 'button', textContent: 'Interested' });
+        interested.addEventListener('click', function () { submitJobFit(job.id, 'interested'); });
+        actions.push(interested);
         var del = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
         del.addEventListener('click', async function () {
           await api('/jobs/' + encodeURIComponent(job.id), { method: 'DELETE' });
@@ -3405,7 +3463,9 @@ const DASHBOARD_PAGE = `<!doctype html>
       // Kept as three separate groups rather than one filtered-and-sorted list, so a fresh
       // scan's unreviewed postings can never end up sitting among ones you've already judged --
       // each group only ever appears in its own block, gated by its own toggle.
-      var matches = matching.filter(function (j) { return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status]; });
+      var matches = matching.filter(function (j) {
+        return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status] && !INTERESTED_STATUSES[j.fit_status];
+      });
       var queued = matching.filter(function (j) { return QUEUED_STATUSES[j.fit_status]; });
       var ruledOut = matching.filter(function (j) { return RULED_OUT_STATUSES[j.fit_status]; });
       // Sorted by the actual score now that there is one, rather than just the two-bucket order --
@@ -3506,6 +3566,78 @@ const DASHBOARD_PAGE = `<!doctype html>
       allJobs = data.jobs || [];
       renderJobPipeline(data.counts || {});
       renderJobs();
+      renderInterestedList();
+    }
+
+    var activeInterestedJobId = null;
+
+    function showInterestedDetail(job) {
+      activeInterestedJobId = job.id;
+      var section = document.getElementById('interested-detail-section');
+      section.style.display = 'block';
+      document.getElementById('interested-detail-title').textContent = job.title;
+      document.getElementById('interested-detail-meta').textContent =
+        [job.company, job.location].filter(Boolean).join(' · ');
+      var reasonEl = document.getElementById('interested-detail-reason');
+      reasonEl.textContent = job.fit_reason || '';
+      reasonEl.style.display = job.fit_reason ? 'block' : 'none';
+      var link = document.getElementById('interested-detail-link');
+      if (job.source_url) {
+        link.href = job.source_url;
+        link.style.display = 'inline-block';
+      } else {
+        link.style.display = 'none';
+      }
+    }
+
+    function renderInterestedList() {
+      var list = document.getElementById('interested-list');
+      list.innerHTML = '';
+      var interestedJobs = allJobs.filter(function (j) { return j.fit_status === 'interested'; });
+      // Most recently marked first -- this is the "what did I just decide to go after" list, not
+      // a freshness-of-posting one, so it sorts on interested_at rather than posted_at/fit_score.
+      interestedJobs.sort(function (a, b) { return new Date(b.interested_at || 0) - new Date(a.interested_at || 0); });
+
+      if (!interestedJobs.length) {
+        list.appendChild(el('p', {
+          className: 'empty',
+          textContent: 'No interested jobs yet — mark one from the Jobs tab.',
+        }));
+        document.getElementById('interested-detail-section').style.display = 'none';
+        activeInterestedJobId = null;
+        return;
+      }
+
+      interestedJobs.forEach(function (job) {
+        var hasScore = job.fit_score !== null && job.fit_score !== undefined;
+        var badgeText = hasScore ? job.fit_score + '% match' : FIT_LABELS.interested.text;
+        var titleLine = [
+          el('span', { className: 'row-title', textContent: job.title }),
+          el('span', { className: 'badge strong', textContent: badgeText }),
+        ];
+        var meta = [
+          job.company,
+          job.location,
+          job.posted_at ? 'posted ' + new Date(job.posted_at).toLocaleDateString() : '',
+        ].filter(Boolean).join(' · ');
+        var body = [el('div', { className: 'row-title-line' }, titleLine), el('div', { className: 'row-meta', textContent: meta })];
+
+        var view = el('button', { type: 'button', textContent: 'View' });
+        view.addEventListener('click', function () { showInterestedDetail(job); });
+        var remove = el('button', { className: 'danger', type: 'button', textContent: 'Remove interest' });
+        remove.addEventListener('click', function () { submitJobFit(job.id, 'uninterested'); });
+
+        list.appendChild(el('div', { className: 'row-item' }, [
+          el('div', { className: 'row' }, [
+            el('div', {}, body),
+            el('div', { className: 'row-actions' }, [view, remove]),
+          ]),
+        ]));
+      });
+
+      // Keep showing whichever job was already open across a refresh; default to the newest otherwise.
+      var stillActive = interestedJobs.filter(function (j) { return j.id === activeInterestedJobId; })[0];
+      showInterestedDetail(stillActive || interestedJobs[0]);
     }
 
     document.getElementById('job-form').addEventListener('submit', async function (event) {
