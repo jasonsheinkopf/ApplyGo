@@ -1877,8 +1877,52 @@ async function createResume(request: Request, env: Env): Promise<Response> {
  * The design-review loop: screenshot what we rendered, have a vision model critique it as a
  * designer would, then apply its (clamped) layout changes and, when it says the writing itself
  * is the problem, re-compose from verified evidence with its guidance. The user's own comment,
- * when given, outranks the model's opinion.
+ * when given, outranks the model's opinion. Shared by the explicit "Revise this version" endpoint
+ * and the automatic pass `buildJobResume` runs on every generate/regenerate before showing anything
+ * to the candidate -- same review, the only difference is whether there's a human comment to weigh.
  */
+async function reviseOnce(
+  env: Env,
+  provider: Provider,
+  resumeId: string,
+  doc: ResumeDoc,
+  layout: LayoutSpec,
+  checks: ResumeCheck[],
+  structured: StructuredProfile,
+  targetRoles: string,
+  instructions: string,
+  userComment: string,
+): Promise<{
+  doc: ResumeDoc;
+  pdfKey: string;
+  layout: LayoutSpec;
+  checks: ResumeCheck[];
+  critique: string;
+  verdict: "good" | "needs_work";
+  contentRevised: boolean;
+}> {
+  const current = await renderResumeArtifacts(env, resumeId, renderResumeHtml(doc, layout));
+  const review = await reviewResumeDesign(env, provider, current.screenshotBase64, layout, checks, userComment);
+  const nextLayout = applyLayoutAdjustments(layout, review.layout_adjustments);
+  const feedback = [review.needs_content_revision ? review.content_guidance : "", userComment].filter(Boolean).join("\n");
+
+  if (feedback) {
+    const built = await buildResumeVersion(env, resumeId, provider, structured, targetRoles, instructions, nextLayout, feedback);
+    return {
+      doc: built.doc, pdfKey: built.pdfKey, layout: nextLayout, checks: built.checks,
+      critique: review.critique, verdict: review.verdict, contentRevised: true,
+    };
+  }
+  // Layout-only fix, or no fix at all: keep the approved wording, just re-render at the new layout.
+  const html = renderResumeHtml(doc, nextLayout);
+  const rendered = await renderResumeArtifacts(env, resumeId, html);
+  const newChecks = await runAllChecks(rendered.pdfBytes, doc, structured, nextLayout);
+  return {
+    doc, pdfKey: rendered.pdfKey, layout: nextLayout, checks: newChecks,
+    critique: review.critique, verdict: review.verdict, contentRevised: false,
+  };
+}
+
 async function reviewResume(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -1926,47 +1970,12 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
     }
   }
 
+  const composeInstructions = [row.instructions ?? "", evidenceInstructions].filter(Boolean).join("\n\n");
+
   try {
-    // Re-render the current version so the reviewer sees exactly what is stored.
-    const current = await renderResumeArtifacts(env, id, renderResumeHtml(doc, layout));
-    const review = await reviewResumeDesign(
-      env,
-      provider,
-      current.screenshotBase64,
-      layout,
-      previousChecks,
-      comment,
+    const revised = await reviseOnce(
+      env, provider, id, doc, layout, previousChecks, profile.structured, targetRoles, composeInstructions, comment,
     );
-
-    const nextLayout = applyLayoutAdjustments(layout, review.layout_adjustments);
-    const feedback = [review.needs_content_revision ? review.content_guidance : "", comment]
-      .filter(Boolean)
-      .join("\n");
-
-    let built;
-    if (feedback) {
-      const composeInstructions = [row.instructions ?? "", evidenceInstructions].filter(Boolean).join("\n\n");
-      built = await buildResumeVersion(
-        env,
-        id,
-        provider,
-        profile.structured,
-        targetRoles,
-        composeInstructions,
-        nextLayout,
-        feedback,
-      );
-    } else {
-      // Layout-only fix: keep the approved wording, just re-render it.
-      const html = renderResumeHtml(doc, nextLayout);
-      const rendered = await renderResumeArtifacts(env, id, html);
-      built = {
-        doc,
-        pdfKey: rendered.pdfKey,
-        screenshotBase64: rendered.screenshotBase64,
-        checks: await runAllChecks(rendered.pdfBytes, doc, profile.structured, nextLayout),
-      };
-    }
 
     const revision = (row.revision ?? 1) + 1;
     await env.DB.prepare(
@@ -1974,13 +1983,13 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
        revision = ?, template = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     )
       .bind(
-        JSON.stringify(built.doc),
-        built.pdfKey,
-        JSON.stringify(nextLayout),
-        JSON.stringify(built.checks),
-        review.critique,
+        JSON.stringify(revised.doc),
+        revised.pdfKey,
+        JSON.stringify(revised.layout),
+        JSON.stringify(revised.checks),
+        revised.critique,
         revision,
-        nextLayout.template,
+        revised.layout.template,
         id,
       )
       .run();
@@ -1988,11 +1997,11 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
     return json({
       id,
       revision,
-      verdict: review.verdict,
-      critique: review.critique,
-      layout: nextLayout,
-      content_revised: Boolean(feedback),
-      checks: built.checks,
+      verdict: revised.verdict,
+      critique: revised.critique,
+      layout: revised.layout,
+      content_revised: revised.contentRevised,
+      checks: revised.checks,
     });
   } catch (err) {
     return json({ error: "review_failed", detail: (err as Error).message }, 502);
@@ -2128,12 +2137,16 @@ function jobReviewEvidenceInstructions(claims: string[]): string {
   if (!claims.length) return "";
   return [
     "The candidate answered follow-up questions specifically for this application; their answers are below in",
-    "their own words. Treat each one as real evidence about something they actually did -- not text to copy in",
-    "verbatim, and not a new bullet or section of its own. Rewrite it fully into the same professional resume",
-    "phrasing the writing rules above already require (action + object + problem/constraint + method + result,",
-    "quantified only where a number is actually given), and fold it into whichever existing experience entry",
-    "it belongs to. If it doesn't fit any existing role, use it to strengthen the summary instead -- but never",
-    "paste the raw answer text into the resume.",
+    "their own words. Treat each one as real evidence about something they actually did, available for you to",
+    "draw on where it genuinely helps -- not a requirement to use all of it, and not text to copy in verbatim",
+    "or as its own bullet or section. Where an answer does strengthen a specific point (it's more concrete, more",
+    "quantified, or fills a real gap), rewrite it fully into the same professional resume phrasing the writing",
+    "rules above already require (action + object + problem/constraint + method + result, quantified only where",
+    "a number is actually given) and fold it into whichever existing experience entry it belongs to, or the",
+    "summary if it doesn't fit any entry. If an answer is redundant with what the resume already says, only",
+    "administrative in nature (logistics, availability, and the like rather than a skill or accomplishment), or",
+    "otherwise wouldn't add anything a reader would value, leave it out rather than forcing it in somewhere.",
+    "Never paste the raw answer text into the resume.",
     "",
     "CANDIDATE'S OWN WORDS FOR THIS APPLICATION:",
     ...claims.map((c) => `- ${c}`),
@@ -2228,26 +2241,49 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
     return json({ error: "generation_failed", detail: (err as Error).message }, 502);
   }
 
+  // One automatic design-review-and-revise pass before this ever reaches the candidate. This is
+  // the same review "Revise this version" runs on demand, just run once up front with no human
+  // comment yet, so what gets shown on a fresh generate or a regenerate is already the refined
+  // version rather than a rough first draft the candidate then has to notice and fix themselves.
+  let finalLayout = layout;
+  let finalDoc = built.doc;
+  let finalPdfKey = built.pdfKey;
+  let finalChecks = built.checks;
+  let critique = "";
+  try {
+    const revised = await reviseOnce(
+      env, provider, resumeId, built.doc, layout, built.checks, profile.structured, targetRoles, composeInstructions, "",
+    );
+    finalLayout = revised.layout;
+    finalDoc = revised.doc;
+    finalPdfKey = revised.pdfKey;
+    finalChecks = revised.checks;
+    critique = revised.critique;
+  } catch {
+    // The first draft still stands if the automatic polish pass itself fails -- better to hand
+    // back something than to fail generation over an optional refinement step.
+  }
+
   const name = `${job.title} @ ${job.company}`.slice(0, 60);
 
   try {
     if (existing) {
       await env.DB.prepare(
         `UPDATE resumes SET name = ?, instructions = ?, content_json = ?, pdf_r2_key = ?, template = ?,
-         layout_json = ?, checks_json = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+         layout_json = ?, checks_json = ?, critique = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       )
-        .bind(name, instructions, JSON.stringify(built.doc), built.pdfKey, layout.template, JSON.stringify(layout), JSON.stringify(built.checks), resumeId)
+        .bind(name, instructions, JSON.stringify(finalDoc), finalPdfKey, finalLayout.template, JSON.stringify(finalLayout), JSON.stringify(finalChecks), critique, resumeId)
         .run();
-      return json({ id: resumeId, name, template: layout.template, revision: existing.revision + 1, checks: built.checks, reused: false });
+      return json({ id: resumeId, name, template: finalLayout.template, revision: existing.revision + 1, checks: finalChecks, critique, reused: false });
     }
 
     await env.DB.prepare(
-      `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json, job_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json, critique, job_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-      .bind(resumeId, profile.profileId, name, instructions, JSON.stringify(built.doc), built.pdfKey, layout.template, JSON.stringify(layout), JSON.stringify(built.checks), id)
+      .bind(resumeId, profile.profileId, name, instructions, JSON.stringify(finalDoc), finalPdfKey, finalLayout.template, JSON.stringify(finalLayout), JSON.stringify(finalChecks), critique, id)
       .run();
-    return json({ id: resumeId, name, template: layout.template, revision: 1, checks: built.checks, reused: false }, 201);
+    return json({ id: resumeId, name, template: finalLayout.template, revision: 1, checks: finalChecks, critique, reused: false }, 201);
   } catch (err) {
     return json({ error: "save_failed", detail: (err as Error).message }, 502);
   }
@@ -2300,8 +2336,11 @@ async function composeCoverLetter(
     reviewAnswers.length
       ? [
           "The candidate answered follow-up questions specifically for this application, in their own words",
-          "below. Treat these as real evidence, not text to quote directly -- weave the substance into the",
-          "letter's own voice and sentence structure rather than pasting an answer in verbatim.",
+          "below. Treat these as real evidence available to draw on, not a requirement to use all of it and",
+          "not text to quote directly -- where one genuinely strengthens the letter, weave the substance into",
+          "its own voice and sentence structure rather than pasting an answer in verbatim. Skip any answer that",
+          "is redundant with what the letter already says, purely administrative (logistics, availability, and",
+          "the like), or otherwise wouldn't add anything a reader would value.",
           "",
           "CANDIDATE'S OWN WORDS FOR THIS APPLICATION:",
           ...reviewAnswers.map((a) => `- ${a}`),
@@ -4598,6 +4637,10 @@ const DASHBOARD_PAGE = `<!doctype html>
         showInterestedSubtab(tab);
         if (tab === 'resume') maybeAutoLoadResume();
         if (tab === 'cover') maybeAutoLoadCoverLetter();
+        // The bank is only ever fetched once at page load, so an answer saved since then (from the
+        // Profile tab in another session, or the browser extension) would otherwise show as 0 here
+        // until a full page reload. Refetching on every visit to this tab keeps it live instead.
+        if (tab === 'apply') loadAnswers();
       });
     });
 
@@ -4864,7 +4907,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     async function buildInterestedResume() {
       if (!activeInterestedJobId) return;
       var statusEl = document.getElementById('interested-resume-status');
-      statusEl.textContent = 'Picking the best version and tailoring it…';
+      statusEl.textContent = 'Picking the best version, tailoring it, and reviewing the result…';
       statusEl.className = 'status';
       try {
         var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/resume', {
