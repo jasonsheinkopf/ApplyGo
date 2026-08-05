@@ -13,6 +13,33 @@ export interface LlmEnv {
 export type Provider = "anthropic" | "openai";
 
 /**
+ * Shared writing rules for every prompt whose output a human actually reads.
+ *
+ * The em dash is the single most recognizable tell that text was machine-written, and a resume or
+ * cover letter that reads as AI-generated is worse than one that reads as merely plain. Ordinary
+ * hyphens in real compound terms are left alone: "full-stack" and "end-to-end" are how those words
+ * are spelled, and removing the hyphen would look wrong to a recruiter rather than natural.
+ *
+ * The banned-phrase list is not exhaustive and isn't meant to be. It names the specific tics that
+ * show up most often, which is enough to push the model's register away from them generally.
+ */
+export const WRITING_STYLE_RULES = `
+WRITING STYLE (applies to every word you produce):
+- NEVER use an em dash (—) or an en dash (–). Not once. Where you would reach for one, use a period
+  and start a new sentence, or a comma, or parentheses, or a colon. This is the single most common
+  giveaway that writing was machine-generated, and it must not appear.
+- Ordinary hyphens inside genuine compound terms are correct and expected: "full-stack",
+  "end-to-end", "data-driven", "cross-functional". Keep those exactly as they are normally spelled.
+- Do not use: "delve", "leverage" as a verb, "robust", "seamless", "spearheaded", "passionate about",
+  "proven track record", "tapestry", "testament to", "in today's fast-paced world", "it's worth
+  noting". These read as filler.
+- Write plainly and concretely. Prefer the specific noun over the abstract one. State things directly
+  rather than hedging with "helped to", "worked to", or "was involved in".
+- Vary sentence length, and do not open consecutive sentences with the same word or structure.
+- No exclamation marks.
+`.trim();
+
+/**
  * Which class of model to use. "screen" is the cheap, high-volume tier used for bulk yes/no
  * passes; "reason" is the strong tier used where the answer actually has to be right.
  */

@@ -10,7 +10,7 @@
 // disqualifier fed back into future assessments. An AI misjudgment that never gets confirmed by
 // the user can't reinforce itself into a permanent rule -- see index.ts's job_feedback writes.
 
-import { type LlmEnv, type Provider, callStructured } from "./llm";
+import { type LlmEnv, type Provider, WRITING_STYLE_RULES, callStructured } from "./llm";
 
 /** The subset of the profile that matters for judging a job. Structurally compatible with StructuredProfile. */
 type ProfileForMatching = {
@@ -161,6 +161,8 @@ function fitPrompt(
     "kind of judgment call a careful applicant makes before spending time on a posting, not a",
     "generic keyword match.",
     "",
+    WRITING_STYLE_RULES,
+    "",
     FIT_SCORE_GUIDANCE,
     "",
     "Only score down for requirements the posting actually states (a specific language or tool, a",
@@ -287,6 +289,11 @@ export async function screenJobsBatch(
     "background), or a seniority word far outside their range (e.g. \"Staff\"/\"Director\" against an",
     "early-career profile, or \"Intern\"/\"Entry-Level\" against a senior one). If the title alone",
     "doesn't make the mismatch obvious, keep it -- the next stage reads the full posting.",
+    "",
+    // Only the dash rule here, not the full WRITING_STYLE_RULES block. This tier's entire output is
+    // an eight-word fragment, and it runs at the highest volume of anything in the app (60 postings
+    // per call, many calls), so the rest of the style guidance would be prompt cost buying nothing.
+    "Never use an em dash (—) or en dash (–) in the note. Use a comma or start a new phrase.",
     "",
     disqualifiers.length
       ? `The candidate has already rejected roles for these reasons:\n${disqualifiers.map((d) => `- ${d}`).join("\n")}\n`

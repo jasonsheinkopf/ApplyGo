@@ -15,6 +15,7 @@ import { extractText, getDocumentProxy } from "unpdf";
 import {
   type LlmEnv,
   type Provider,
+  WRITING_STYLE_RULES,
   bytesToBase64,
   callStructured,
   callStructuredWithImage,
@@ -189,6 +190,11 @@ const RESUME_DOC_SCHEMA = {
  * from recruiter research and broad professional convention; the rest are tunable preferences.
  */
 const COMPOSE_RULES = `
+${WRITING_STYLE_RULES}
+
+This document goes to an employer, so the register is formal throughout. No casual phrasing, no
+conversational asides, no rhetorical questions.
+
 HARD CONSTRAINTS (never violate):
 - Never invent an employer, title, date, degree, credential, metric, or accomplishment. Every claim must
   trace to the profile below. If something would strengthen the resume but is not in the profile, omit it.
@@ -763,6 +769,10 @@ export async function reviewResumeDesign(
     "needs_content_revision and giving precise content_guidance; a writer will rewrite from verified evidence.",
     "Do not ask for fabricated content. Do not request decorative elements, photos, icons, skill bars, or",
     "multi-column layouts -- those break applicant tracking system parsing.",
+    "",
+    // content_guidance is fed straight back into the compose step, so it has to follow the same
+    // rules the resume itself does or it will reintroduce exactly what those rules strip out.
+    WRITING_STYLE_RULES,
     "",
     `Current layout settings: ${JSON.stringify(layout)}`,
     problems.length
