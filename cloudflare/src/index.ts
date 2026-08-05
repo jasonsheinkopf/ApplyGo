@@ -485,7 +485,9 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
   // fit_missing_json do), and at up to 1500 chars per row it's the single biggest thing here.
   const jobs = await env.DB.prepare(
     `SELECT id, title, company, source_url, location, posted_at, ats_provider,
-            company_id, fit_status, fit_score, fit_reason, fit_missing_json, interested_at, applied_at, created_at
+            company_id, fit_status, fit_score, fit_reason, fit_missing_json, interested_at, applied_at, created_at,
+            EXISTS(SELECT 1 FROM resumes r WHERE r.job_id = job_postings.id) AS has_resume,
+            EXISTS(SELECT 1 FROM cover_letters c WHERE c.job_id = job_postings.id) AS has_cover_letter
      FROM job_postings
      ORDER BY COALESCE(posted_at, created_at) DESC`,
   ).all();
@@ -4560,6 +4562,8 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     var activeInterestedJobId = null;
     var activeInterestedResumeId = null;
+    var resumeAutoLoadedForJob = false;
+    var coverAutoLoadedForJob = false;
     var pendingReviewQuestion = null;
 
     function renderReviewHistory(entries) {
@@ -4592,8 +4596,33 @@ const DASHBOARD_PAGE = `<!doctype html>
     INTERESTED_SUBTABS.forEach(function (tab) {
       document.getElementById('interested-subtab-' + tab).addEventListener('click', function () {
         showInterestedSubtab(tab);
+        if (tab === 'resume') maybeAutoLoadResume();
+        if (tab === 'cover') maybeAutoLoadCoverLetter();
       });
     });
+
+    /**
+     * A resume or cover letter already generated for this job should show up the moment you look at
+     * its tab, not stay hidden until you press Generate/Draft again -- that button is for making a
+     * new one or a revision, not for revealing one that already exists. These reuse the same
+     * fast, no-LLM path the backend already takes when a document exists (reused: true), so
+     * opening the tab never triggers a fresh generation for a job that doesn't have one yet.
+     */
+    function maybeAutoLoadResume() {
+      if (resumeAutoLoadedForJob || !activeInterestedJobId) return;
+      var job = allJobs.filter(function (j) { return j.id === activeInterestedJobId; })[0];
+      if (!job || !job.has_resume) return;
+      resumeAutoLoadedForJob = true;
+      buildInterestedResume();
+    }
+
+    function maybeAutoLoadCoverLetter() {
+      if (coverAutoLoadedForJob || !activeInterestedJobId) return;
+      var job = allJobs.filter(function (j) { return j.id === activeInterestedJobId; })[0];
+      if (!job || !job.has_cover_letter) return;
+      coverAutoLoadedForJob = true;
+      buildInterestedCoverLetter(false);
+    }
 
     function showInterestedDetail(job) {
       activeInterestedJobId = job.id;
@@ -4622,17 +4651,29 @@ const DASHBOARD_PAGE = `<!doctype html>
       loadJobReviewHistory(job.id);
 
       activeInterestedResumeId = null;
+      resumeAutoLoadedForJob = false;
       document.getElementById('interested-resume-section').style.display = 'none';
       document.getElementById('interested-resume-status').textContent = '';
       document.getElementById('interested-resume-comment').value = '';
       document.getElementById('interested-resume-critique').style.display = 'none';
       document.getElementById('interested-resume-open-link').removeAttribute('href');
 
+      coverAutoLoadedForJob = false;
       document.getElementById('interested-cover-section').style.display = 'none';
       document.getElementById('interested-cover-status').textContent = '';
 
       document.getElementById('interested-apply-status').textContent = '';
       renderApplyReadiness();
+
+      // The Resume/Cover-letter subtabs may already be showing from the previously selected job
+      // (switching jobs doesn't reset which subtab is active) -- if this one is freshly opened
+      // straight to that subtab, load its existing document immediately rather than waiting for a
+      // second click on the subtab button, which never comes.
+      var currentSubtab = INTERESTED_SUBTABS.filter(function (tab) {
+        return document.getElementById('interested-' + tab + '-panel').style.display !== 'none';
+      })[0];
+      if (currentSubtab === 'resume') maybeAutoLoadResume();
+      if (currentSubtab === 'cover') maybeAutoLoadCoverLetter();
     }
 
     function renderAppliedList() {
@@ -4842,6 +4883,9 @@ const DASHBOARD_PAGE = `<!doctype html>
           ? 'Showing the version already tailored for this job.'
           : 'Tailored version ' + data.revision + ' ready.';
         statusEl.className = 'status success';
+        var job = allJobs.filter(function (j) { return j.id === activeInterestedJobId; })[0];
+        if (job) job.has_resume = true;
+        renderApplyReadiness();
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
@@ -4897,6 +4941,9 @@ const DASHBOARD_PAGE = `<!doctype html>
         document.getElementById('interested-cover-frame').srcdoc = data.content_html || '';
         statusEl.textContent = data.reused ? 'Showing the letter already drafted for this job.' : 'Draft ready.';
         statusEl.className = 'status success';
+        var job = allJobs.filter(function (j) { return j.id === activeInterestedJobId; })[0];
+        if (job) job.has_cover_letter = true;
+        renderApplyReadiness();
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
@@ -4915,7 +4962,8 @@ const DASHBOARD_PAGE = `<!doctype html>
 
       var items = [
         { label: 'Posting link', ready: Boolean(job.source_url) },
-        { label: 'Tailored resume', ready: Boolean(activeInterestedResumeId) },
+        { label: 'Tailored resume', ready: Boolean(job.has_resume) },
+        { label: 'Cover letter', ready: Boolean(job.has_cover_letter) },
         { label: 'Answers on file', ready: applicationAnswers.length > 0,
           detail: applicationAnswers.length + ' saved' },
       ];
