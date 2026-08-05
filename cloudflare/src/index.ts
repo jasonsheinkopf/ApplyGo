@@ -2930,38 +2930,54 @@ const DASHBOARD_PAGE = `<!doctype html>
       <p id="interested-detail-meta" class="row-meta"></p>
       <p id="interested-detail-reason" class="job-reason"></p>
       <a id="interested-detail-link" class="row-title" target="_blank" rel="noopener">Open posting</a>
+
+      <!-- Assistant/Resume/Cover letter/Apply are sub-tabs, not stacked sections -- only one shows
+           at a time, the same way the top-level dashboard tabs work, so opening one doesn't leave
+           the others piled up underneath with no way to get back to just looking at one thing. -->
       <div class="controls">
-        <button id="interested-review-button" type="button">Assistant</button>
-        <button id="interested-resume-button" type="button">Resume</button>
-        <button id="interested-cover-button" type="button">Cover letter</button>
-        <button id="interested-apply-button" type="button" disabled title="Not automated — use the posting link above to apply directly">Apply</button>
-      </div>
-      <p id="interested-review-status" class="status" role="status" aria-live="polite"></p>
-
-      <div id="interested-review-section" style="display:none">
-        <p id="interested-review-question" class="job-reason"></p>
-        <textarea id="interested-review-answer" placeholder="Answer in your own words — this gets added to your profile evidence for this job."></textarea>
-        <button id="interested-review-submit" type="button">Submit answer</button>
+        <button id="interested-subtab-assistant" type="button">Assistant</button>
+        <button id="interested-subtab-resume" class="secondary" type="button">Resume</button>
+        <button id="interested-subtab-cover" class="secondary" type="button">Cover letter</button>
+        <button id="interested-subtab-apply" class="secondary" type="button">Apply</button>
       </div>
 
-      <p id="interested-resume-status" class="status" role="status" aria-live="polite"></p>
-      <div id="interested-resume-section" style="display:none">
-        <p class="hint">On some phones the preview below can't scroll or show a page break — if that happens, use the link to open the actual PDF instead.</p>
-        <a id="interested-resume-open-link" class="row-title" target="_blank" rel="noopener">Open full PDF in a new tab</a>
-        <iframe id="interested-resume-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
-        <div id="interested-resume-checks"></div>
-        <p id="interested-resume-critique" class="critique" style="display:none"></p>
-        <textarea id="interested-resume-comment" placeholder="Optional — steer the revision, e.g. tighten the second bullet, or point out what still doesn't fit"></textarea>
-        <button id="interested-resume-revise" class="secondary" type="button">Revise this version</button>
+      <div id="interested-assistant-panel">
+        <p id="interested-review-status" class="status" role="status" aria-live="polite"></p>
+        <button id="interested-review-button" type="button">Ask a question</button>
+        <div id="interested-review-section" style="display:none">
+          <p id="interested-review-question" class="job-reason"></p>
+          <textarea id="interested-review-answer" placeholder="Answer in your own words — this gets added to your profile evidence for this job."></textarea>
+          <button id="interested-review-submit" type="button">Submit answer</button>
+        </div>
+        <div id="interested-review-history"></div>
       </div>
 
-      <p id="interested-cover-status" class="status" role="status" aria-live="polite"></p>
-      <div id="interested-cover-section" style="display:none">
-        <iframe id="interested-cover-frame" style="width:100%; min-height:60vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
-        <button id="interested-cover-regenerate" class="secondary" type="button">Regenerate for this job</button>
+      <div id="interested-resume-panel" style="display:none">
+        <p id="interested-resume-status" class="status" role="status" aria-live="polite"></p>
+        <button id="interested-resume-button" type="button">Generate tailored resume</button>
+        <div id="interested-resume-section" style="display:none">
+          <p class="hint">On some phones the preview below can't scroll or show a page break — if that happens, use the link to open the actual PDF instead.</p>
+          <a id="interested-resume-open-link" class="row-title" target="_blank" rel="noopener">Open full PDF in a new tab</a>
+          <iframe id="interested-resume-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+          <div id="interested-resume-checks"></div>
+          <p id="interested-resume-critique" class="critique" style="display:none"></p>
+          <textarea id="interested-resume-comment" placeholder="Optional — steer the revision, e.g. tighten the second bullet, or point out what still doesn't fit"></textarea>
+          <button id="interested-resume-revise" class="secondary" type="button">Revise this version</button>
+        </div>
       </div>
 
-      <div id="interested-review-history"></div>
+      <div id="interested-cover-panel" style="display:none">
+        <p id="interested-cover-status" class="status" role="status" aria-live="polite"></p>
+        <button id="interested-cover-button" type="button">Draft cover letter</button>
+        <div id="interested-cover-section" style="display:none">
+          <iframe id="interested-cover-frame" style="width:100%; min-height:60vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+          <button id="interested-cover-regenerate" class="secondary" type="button">Regenerate for this job</button>
+        </div>
+      </div>
+
+      <div id="interested-apply-panel" style="display:none">
+        <p class="hint">Not automated yet — use the posting link above to apply directly.</p>
+      </div>
     </section>
   </div>
 
@@ -4142,8 +4158,26 @@ const DASHBOARD_PAGE = `<!doctype html>
       renderReviewHistory(data.entries || []);
     }
 
+    var INTERESTED_SUBTABS = ['assistant', 'resume', 'cover', 'apply'];
+
+    function showInterestedSubtab(name) {
+      INTERESTED_SUBTABS.forEach(function (tab) {
+        var active = tab === name;
+        document.getElementById('interested-' + tab + '-panel').style.display = active ? 'block' : 'none';
+        var button = document.getElementById('interested-subtab-' + tab);
+        button.classList.toggle('secondary', !active);
+      });
+    }
+
+    INTERESTED_SUBTABS.forEach(function (tab) {
+      document.getElementById('interested-subtab-' + tab).addEventListener('click', function () {
+        showInterestedSubtab(tab);
+      });
+    });
+
     function showInterestedDetail(job) {
       activeInterestedJobId = job.id;
+      showInterestedSubtab('assistant');
       var section = document.getElementById('interested-detail-section');
       section.style.display = 'block';
       document.getElementById('interested-detail-title').textContent = job.title;
