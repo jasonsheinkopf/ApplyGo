@@ -190,6 +190,18 @@ This is kept **separate from `candidate_evidence`** on purpose. That table holds
 
 The Interested tab's **Apply** sub-tab shows a readiness checklist (posting link, tailored résumé, answers on file) and a "Mark as applied" button. Autofill arrives with the browser extension; this is the tracking half of that feature, built first because it is useful on its own and is what the extension will read from.
 
+### Autofill and the browser extension
+
+`extension/` is a Manifest V3 browser extension (see its own README for install steps). It exists because server-side form filling does not work reliably: Cloudflare's headless browsers run from datacenter IPs that ATS bot detection flags, CAPTCHAs end an attempt with no recourse, and there is no way for the candidate to intervene mid-run. Running in the candidate's own browser solves all of that, and reading the live DOM means it works on job boards ApplyGo has never seen rather than only the four ATS platforms it can scan.
+
+**It fills and stops. It never submits.** Submitting an application cannot be undone, and a mis-filled auto-submit is not recoverable, so the last click stays with the human. Filled fields are outlined blue, skipped ones amber.
+
+`POST /applications/match` turns a live form into answers. Resolution runs cheapest and most trustworthy first: contact facts parsed deterministically from the profile label and the tailored résumé's `contact_line` (StructuredProfile models career history, not contact details), then the answer bank by normalized `questionKey()`, then one model call for whatever is left. **Anything unresolved comes back as `missing` rather than guessed**, including when the model call fails outright, so a provider outage degrades into "you answer these" instead of silently skipped fields.
+
+**`NEVER_INFER` fields skip the model entirely.** Work authorization, sponsorship, citizenship, veteran status, disability, gender, race, criminal history, salary, notice period, start date, relocation, and security clearance are legally or personally consequential, and a confident guess is worse than no answer. Either the bank already holds it or the candidate is asked. The regex is stem-based (`disab\w*`, `relocat\w*`) because word-boundary matching silently missed "disability" and "relocate"; `scratchpad/ui/assert_never_infer.mjs` reads the pattern straight out of the source and checks 27 real question phrasings against it so the two cannot drift apart.
+
+**Auth reuses the existing device sessions.** `requireSession` accepts `Authorization: Bearer` alongside the cookie, hashed against the same `device_sessions` table, and the extension enrolls through the ordinary one-time-code flow (`return_token: true` on `POST /auth/enroll` hands back the raw token, which the caller already receives via `Set-Cookie` anyway). So the extension shows up in the Devices tab and is revoked like any other device, with no second credential system to outlive a revoke. CORS is scoped to the handful of paths the extension calls and **never allows credentials**, which keeps cookie auth strictly same-origin: a cross-origin caller must present a bearer token, and only the enrolled extension has one.
+
 Authenticated data endpoints:
 
 - `GET /profile` / `PUT /profile` — `PUT` only updates `label` (name) now. Response includes `desired_roles` (from `preferences_json`) and `structured` (parsed `structured_json`, or `null` if nothing generated yet). The first `candidate_profiles` row is created on first use (by any tab) and updated in place after that.

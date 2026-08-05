@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "ApplyGo Autofill",
+  "version": "0.1.0",
+  "description": "Fills a job application form from your ApplyGo profile, resume, and saved answers. Never submits for you.",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "https://boards.greenhouse.io/*",
+    "https://job-boards.greenhouse.io/*",
+    "https://jobs.lever.co/*",
+    "https://jobs.eu.lever.co/*",
+    "https://jobs.ashbyhq.com/*",
+    "https://careers.smartrecruiters.com/*",
+    "https://jobs.smartrecruiters.com/*",
+    "https://applygo-prod.jasonsheinkopf.workers.dev/*"
+  ],
+  "action": {
+    "default_title": "ApplyGo Autofill",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://boards.greenhouse.io/*",
+        "https://job-boards.greenhouse.io/*",
+        "https://jobs.lever.co/*",
+        "https://jobs.eu.lever.co/*",
+        "https://jobs.ashbyhq.com/*",
+        "https://careers.smartrecruiters.com/*",
+        "https://jobs.smartrecruiters.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
