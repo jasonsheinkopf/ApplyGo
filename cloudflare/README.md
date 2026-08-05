@@ -252,6 +252,14 @@ The cheap tier is deliberately **biased toward keeping**: it exists to remove ob
 
 Model tiers are configured per provider — `ANTHROPIC_SCREEN_MODEL` (default `claude-haiku-4-5-20251001`) and `OPENAI_SCREEN_MODEL` (default `gpt-4o-mini`) for tier 1, `ANTHROPIC_MODEL` / `OPENAI_MODEL` for tier 2.
 
+### Writing style rules
+
+`WRITING_STYLE_RULES` in `src/llm.ts` is a single shared prompt block imported by every prompt whose output a human actually reads: résumé composition and design review (`src/resume.ts`), cover letters, the Assistant's question, desired-roles drafting, profile generation, and résumé base selection (`src/index.ts`), fit reasons (`src/fit.ts`), and company bios (`src/companies.ts`).
+
+Its main job is banning the **em dash (—) and en dash (–)**, which is the single most recognizable tell that text was machine-written. A résumé that reads as AI-generated is worse than one that reads as merely plain. Ordinary hyphens inside real compound terms are explicitly *kept* ("full-stack", "end-to-end", "data-driven") because that is how those words are spelled, and stripping the hyphen would look wrong to a recruiter rather than natural. The block also names the specific filler phrases that show up most ("delve", "leverage" as a verb, "robust", "seamless", "passionate about") — not an exhaustive list, just enough to push the register away from them — and asks for varied sentence structure and no exclamation marks. The résumé and cover-letter prompts layer an additional formality instruction on top, since those two documents are the ones an employer actually sees.
+
+**The cheap screen tier deliberately gets only the dash rule, not the whole block.** Its entire output is an eight-word fragment, and it runs at the highest volume of anything in the app (60 postings per call, many calls per session), so the rest of the guidance would be prompt cost buying nothing. Two prompts that feed *back into* composition — the design reviewer's `content_guidance` and `decideResumeBase`'s tailoring notes — do get the full block, because guidance written in the banned style reintroduces exactly what the résumé rules strip out.
+
 Storage is bounded on the way in: scraped descriptions are capped at 1500 characters, which is more than tier 1 reads and enough for tier 2 to judge against. Descriptions are the largest column in the database, and the Data tab reports exactly how much space they take.
 
 ### Stored data and stage resets

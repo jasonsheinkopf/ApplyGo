@@ -13,7 +13,7 @@
 // resolve is marked unreachable rather than silently trusted, because a model listing plausible
 // employers will occasionally invent or misremember one.
 
-import { type LlmEnv, type Provider, callStructured } from "./llm";
+import { type LlmEnv, type Provider, WRITING_STYLE_RULES, callStructured } from "./llm";
 
 export type AtsProvider = "greenhouse" | "lever" | "ashby" | "smartrecruiters";
 
@@ -192,6 +192,10 @@ export async function proposeCompanies(
   const prompt = [
     "You are helping a candidate build a target list of companies to watch for openings.",
     `Propose ${count} companies that genuinely fit the profile and target roles below.`,
+    "",
+    // The bio and why_fit strings are rendered straight into the Companies tab, so they get the
+    // same treatment as everything else the candidate reads.
+    WRITING_STYLE_RULES,
     "",
     locations
       ? [

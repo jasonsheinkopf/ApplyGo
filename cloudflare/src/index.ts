@@ -1,6 +1,13 @@
 import { extractText, getDocumentProxy } from "unpdf";
 import { type BrowserWorker } from "@cloudflare/puppeteer";
-import { type Provider, callStructured, callText, normalizeProvider, providerKeyMissing } from "./llm";
+import {
+  type Provider,
+  WRITING_STYLE_RULES,
+  callStructured,
+  callText,
+  normalizeProvider,
+  providerKeyMissing,
+} from "./llm";
 import {
   type AtsProvider,
   companyNameKey,
@@ -413,6 +420,8 @@ async function generateDesiredRoles(request: Request, env: Env): Promise<Respons
     "A job candidate has given you loose notes, job links, and preferences about the kind of roles they want next.",
     "Write a clear, structured description of the roles they are looking for: role families/titles, seniority, domain,",
     "must-have vs nice-to-have aspects, and anything they explicitly ruled out. Base this only on the notes below.",
+    "",
+    WRITING_STYLE_RULES,
     "",
     "Notes:",
     ...signals.results.map((s) => `- ${s.claim}`),
@@ -857,6 +866,8 @@ async function reviewJobQuestion(request: Request, env: Env, id: string): Promis
     "You are helping a candidate prepare to apply to a specific job. Find ONE concrete gap between",
     "what this job asks for and what their profile currently shows evidence of, then ask a single",
     "short, conversational question that would let them fill that gap in their own words.",
+    "",
+    WRITING_STYLE_RULES,
     "",
     "Rules:",
     "- Ask about something the posting actually states or clearly implies, not a generic prompt.",
@@ -1591,6 +1602,8 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
     "Do not invent schools, employers, dates, or accomplishments that are not present in the current profile or",
     "the new material. Leave a field empty rather than guessing.",
     "",
+    WRITING_STYLE_RULES,
+    "",
     ...(existingStructured ? [`Current profile:\n${JSON.stringify(existingStructured)}`, ""] : []),
     "New material:",
     ...sourceParts,
@@ -1930,6 +1943,10 @@ async function decideResumeBase(
     "should change to tailor it for this specific posting. Only reordering, re-emphasizing, or trimming what's",
     "already true is allowed; never suggest inventing anything not already in the candidate's profile.",
     "",
+    // tailoring_notes is passed straight through as compose instructions, so it carries the same
+    // rules; otherwise the guidance itself can reintroduce the phrasing the resume rules strip.
+    WRITING_STYLE_RULES,
+    "",
     `JOB: ${job.title} at ${job.company}`,
     `JOB DESCRIPTION:\n${job.raw_description.slice(0, 2000)}`,
     "",
@@ -2127,6 +2144,12 @@ async function composeCoverLetter(
     "Write a cover letter for this candidate applying to this specific job. Genuine and specific, not generic --",
     "reference concrete evidence from the profile that actually matches what the posting asks for. Never invent",
     "an employer, title, credential, or accomplishment not in the profile below.",
+    "",
+    WRITING_STYLE_RULES,
+    "",
+    "This letter goes to an employer, so the register is professional throughout: no casual phrasing, no",
+    "gushing, no rhetorical questions, and no restating the job description back at them. Confident and",
+    "direct, without overclaiming.",
     "",
     "Structure: a brief greeting, 3-4 short paragraphs (why this role/company, the strongest relevant evidence,",
     "one more concrete example, a short close), and a sign-off using the candidate's name. One page's worth of",
