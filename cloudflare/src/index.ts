@@ -467,7 +467,7 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
   // fit_missing_json do), and at up to 1500 chars per row it's the single biggest thing here.
   const jobs = await env.DB.prepare(
     `SELECT id, title, company, source_url, location, posted_at, ats_provider,
-            company_id, fit_status, fit_score, fit_reason, fit_missing_json, interested_at, created_at
+            company_id, fit_status, fit_score, fit_reason, fit_missing_json, interested_at, applied_at, created_at
      FROM job_postings
      ORDER BY COALESCE(posted_at, created_at) DESC`,
   ).all();
@@ -626,6 +626,7 @@ async function jobPipelineCounts(env: Env): Promise<Record<string, number>> {
     possible: 0,
     reject: 0,
     interested: 0,
+    applied: 0,
   };
   for (const row of rows.results ?? []) counts[row.fit_status] = row.n;
   counts.total = Object.values(counts).reduce((a, b) => a + b, 0);
@@ -671,7 +672,7 @@ async function dataSummary(request: Request, env: Env): Promise<Response> {
   const count = async (sql: string): Promise<number> =>
     (await env.DB.prepare(sql).first<{ n: number }>())?.n ?? 0;
 
-  const [companies, jobs, documents, notes, roleSignals, resumes, feedback, coverLetters, descBytes, docBytes] = await Promise.all([
+  const [companies, jobs, documents, notes, roleSignals, resumes, feedback, coverLetters, applicationAnswers, descBytes, docBytes] = await Promise.all([
     count("SELECT COUNT(*) AS n FROM companies"),
     count("SELECT COUNT(*) AS n FROM job_postings"),
     count("SELECT COUNT(*) AS n FROM source_documents"),
@@ -680,6 +681,7 @@ async function dataSummary(request: Request, env: Env): Promise<Response> {
     count("SELECT COUNT(*) AS n FROM resumes"),
     count("SELECT COUNT(*) AS n FROM job_feedback"),
     count("SELECT COUNT(*) AS n FROM cover_letters"),
+    count("SELECT COUNT(*) AS n FROM application_answers"),
     count("SELECT COALESCE(SUM(LENGTH(raw_description)), 0) AS n FROM job_postings"),
     count("SELECT COALESCE(SUM(LENGTH(extracted_text)), 0) AS n FROM source_documents"),
   ]);
@@ -695,6 +697,7 @@ async function dataSummary(request: Request, env: Env): Promise<Response> {
       resumes,
       feedback,
       cover_letters: coverLetters,
+      application_answers: applicationAnswers,
     },
     pipeline: await jobPipelineCounts(env),
     bytes: { job_descriptions: descBytes, document_text: docBytes },
@@ -746,6 +749,7 @@ async function purgeCollection(request: Request, env: Env): Promise<Response> {
     role_signals: "DELETE FROM candidate_evidence WHERE category = 'role_signal'",
     manual_jobs: "DELETE FROM job_postings WHERE company_id IS NULL",
     cover_letters: "DELETE FROM cover_letters",
+    application_answers: "DELETE FROM application_answers",
   };
   const sql = statements[body.collection ?? ""];
   if (!sql) return json({ error: "unknown_collection" }, 400);
@@ -788,6 +792,30 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
     // there to see once it's sitting in the Interested tab.
     await env.DB.prepare(
       "UPDATE job_postings SET fit_status = 'interested', interested_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+    return json({ id, fit_status: "interested" });
+  }
+
+  if (body.action === "applied") {
+    // Same manual-override shape as 'interested'. interested_at is deliberately left set: a job you
+    // applied to was necessarily one you were interested in, and keeping the timestamp means
+    // un-applying can put it back on the Interested tab in its original position.
+    await env.DB.prepare(
+      "UPDATE job_postings SET fit_status = 'applied', applied_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+    return json({ id, fit_status: "applied" });
+  }
+
+  if (body.action === "unapplied") {
+    // Undoing an application returns the job to Interested rather than all the way to the Jobs tab.
+    // Marking something applied by mistake shouldn't also discard the decision to pursue it.
+    await env.DB.prepare(
+      `UPDATE job_postings SET fit_status = 'interested', applied_at = NULL,
+       interested_at = COALESCE(interested_at, CURRENT_TIMESTAMP) WHERE id = ?`,
     )
       .bind(id)
       .run();
@@ -1516,6 +1544,97 @@ async function deleteNote(request: Request, env: Env, id: string): Promise<Respo
     .bind(id)
     .run();
   return json({ deleted: result.meta.changes > 0 });
+}
+
+// ---------------------------------------------------------------------------
+// Application answers: the ask-once-remember-forever bank
+// ---------------------------------------------------------------------------
+
+/**
+ * Collapses a form question down to something that matches across employers. Every ATS words the
+ * same question slightly differently ("Are you legally authorized to work in the United States?"
+ * vs "Are you authorized to work in the US?"), and an exact-string key would store a near-duplicate
+ * row per company and never hit on the next form.
+ *
+ * Deliberately crude and deterministic rather than model-driven: this runs on every field of every
+ * form, and a stable, inspectable key matters more here than catching every possible rewording. The
+ * matching endpoint layers a semantic pass on top for whatever this misses.
+ */
+export function questionKey(question: string): string {
+  return String(question ?? "")
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    // Filler that varies between phrasings of the same question but never changes its meaning.
+    .replace(
+      /\b(are|is|do|does|did|you|your|the|a|an|of|to|for|in|on|at|this|that|please|kindly|we|us|our|will|would|can|could|any|have|has|been|be|if|as|and|or|it|its|with|from|by|about|currently|legally|ever)\b/g,
+      " ",
+    )
+    .replace(/\b(usa|u s a|united states|us|america)\b/g, "us")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 200);
+}
+
+async function listApplicationAnswers(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const rows = await env.DB.prepare(
+    `SELECT id, question_key, question_text, answer, answer_type, updated_at
+     FROM application_answers WHERE profile_id = ? ORDER BY updated_at DESC`,
+  )
+    .bind(profileId)
+    .all();
+  return json({ answers: rows.results });
+}
+
+/**
+ * Upsert by question_key, so answering the same question on a second form updates the one stored
+ * row rather than accumulating duplicates that later disagree with each other.
+ */
+async function saveApplicationAnswer(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    question?: string;
+    answer?: string;
+    answer_type?: string;
+  };
+  const question = (body.question ?? "").trim();
+  const answer = (body.answer ?? "").trim();
+  if (!question || !answer) return json({ error: "question_and_answer_required" }, 400);
+
+  const key = questionKey(question);
+  if (!key) return json({ error: "question_not_recognizable" }, 400);
+
+  const profileId = await getOrCreateProfileId(env);
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO application_answers (id, profile_id, question_key, question_text, answer, answer_type)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(profile_id, question_key) DO UPDATE SET
+       question_text = excluded.question_text,
+       answer = excluded.answer,
+       answer_type = excluded.answer_type,
+       updated_at = CURRENT_TIMESTAMP`,
+  )
+    .bind(id, profileId, key, question, answer, (body.answer_type ?? "text").trim() || "text")
+    .run();
+
+  const saved = await env.DB.prepare(
+    "SELECT id, question_key, question_text, answer, answer_type, updated_at FROM application_answers WHERE profile_id = ? AND question_key = ?",
+  )
+    .bind(profileId, key)
+    .first();
+  return json({ answer: saved }, 201);
+}
+
+async function deleteApplicationAnswer(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const result = await env.DB.prepare("DELETE FROM application_answers WHERE id = ?").bind(id).run();
+  return json({ deleted: (result.meta.changes ?? 0) > 0 });
 }
 
 
@@ -2643,6 +2762,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
     <button class="tab" data-tab="interested" type="button">Interested</button>
+    <button class="tab" data-tab="applied" type="button">Applied</button>
     <button class="tab" data-tab="devices" type="button">Devices</button>
     <button class="tab" data-tab="data" type="button">Data</button>
   </nav>
@@ -2721,6 +2841,20 @@ const DASHBOARD_PAGE = `<!doctype html>
             <button type="submit">Add note</button>
           </form>
           <p id="note-status" class="status" role="status" aria-live="polite"></p>
+
+          <hr class="divider">
+
+          <h3 class="subhead">Application answers</h3>
+          <p class="hint">Questions every application form asks (work authorization, veteran status, disability disclosure, notice period). Answered once here or on a form, reused everywhere after. Stored as exact values, never paraphrased.</p>
+          <div id="answers-list"><p class="empty">Loading…</p></div>
+          <form id="answer-form">
+            <label for="answer-question">Question</label>
+            <input id="answer-question" required placeholder="e.g. Are you legally authorized to work in the United States?">
+            <label for="answer-value">Answer</label>
+            <input id="answer-value" required placeholder="e.g. Yes">
+            <button type="submit">Save answer</button>
+          </form>
+          <p id="answer-status" class="status" role="status" aria-live="polite"></p>
         </section>
       </div>
       <div class="split-sticky">
@@ -2999,8 +3133,20 @@ const DASHBOARD_PAGE = `<!doctype html>
       </div>
 
       <div id="interested-apply-panel" style="display:none">
-        <p class="hint">Not automated yet — use the posting link above to apply directly.</p>
+        <p class="hint">What's ready for this application. Autofill arrives with the browser extension; for now, open the posting, use the resume and cover letter above, then mark it applied to move it to the Applied tab.</p>
+        <div id="interested-apply-readiness"></div>
+        <p id="interested-apply-status" class="status" role="status" aria-live="polite"></p>
+        <button id="interested-apply-mark" type="button">Mark as applied</button>
       </div>
+    </section>
+  </div>
+
+  <div id="panel-applied" class="panel">
+    <section id="applied-section">
+      <h2>Applied</h2>
+      <p class="hint">Jobs you've applied to, most recent first. Everything generated for each one stays available.</p>
+      <p id="applied-summary" class="summary-line"></p>
+      <div id="applied-list"><p class="empty">Loading…</p></div>
     </section>
   </div>
 
@@ -3933,16 +4079,18 @@ const DASHBOARD_PAGE = `<!doctype html>
       screened_in: { text: 'Awaiting review', cls: 'queued' },
       unassessed: { text: 'Not filtered yet', cls: 'queued' },
       interested: { text: 'Interested', cls: 'strong' },
+      applied: { text: 'Applied', cls: 'strong' },
     };
     // Four buckets, kept visually and structurally separate so a fresh scan's unfiltered
     // postings never get mixed in with results you've already reviewed:
     //   judged matches (green)      -- shown by default
     //   not filtered yet (yellow)   -- hidden by default, own toggle
     //   ruled out (red)             -- hidden by default, own toggle
-    //   interested                  -- never shown here at all, lives on its own tab instead
+    //   interested / applied        -- never shown here at all, each lives on its own tab instead
     var QUEUED_STATUSES = { unassessed: true, screened_in: true };
     var RULED_OUT_STATUSES = { reject: true, screened_out: true };
     var INTERESTED_STATUSES = { interested: true };
+    var APPLIED_STATUSES = { applied: true };
 
     async function submitJobFit(jobId, action, reason) {
       await api('/jobs/' + encodeURIComponent(jobId) + '/fit', {
@@ -4056,7 +4204,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       // scan's unreviewed postings can never end up sitting among ones you've already judged --
       // each group only ever appears in its own block, gated by its own toggle.
       var matches = matching.filter(function (j) {
-        return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status] && !INTERESTED_STATUSES[j.fit_status];
+        return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status]
+          && !INTERESTED_STATUSES[j.fit_status] && !APPLIED_STATUSES[j.fit_status];
       });
       var queued = matching.filter(function (j) { return QUEUED_STATUSES[j.fit_status]; });
       var ruledOut = matching.filter(function (j) { return RULED_OUT_STATUSES[j.fit_status]; });
@@ -4159,6 +4308,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       renderJobPipeline(data.counts || {});
       renderJobs();
       renderInterestedList();
+      renderAppliedList();
     }
 
     var activeInterestedJobId = null;
@@ -4233,6 +4383,54 @@ const DASHBOARD_PAGE = `<!doctype html>
 
       document.getElementById('interested-cover-section').style.display = 'none';
       document.getElementById('interested-cover-status').textContent = '';
+
+      document.getElementById('interested-apply-status').textContent = '';
+      renderApplyReadiness();
+    }
+
+    function renderAppliedList() {
+      var list = document.getElementById('applied-list');
+      list.innerHTML = '';
+      var appliedJobs = allJobs.filter(function (j) { return j.fit_status === 'applied'; });
+      appliedJobs.sort(function (a, b) { return new Date(b.applied_at || 0) - new Date(a.applied_at || 0); });
+
+      document.getElementById('applied-summary').textContent = appliedJobs.length
+        ? appliedJobs.length + ' application' + (appliedJobs.length === 1 ? '' : 's') + ' sent'
+        : '';
+
+      if (!appliedJobs.length) {
+        list.appendChild(el('p', {
+          className: 'empty',
+          textContent: 'Nothing applied to yet. Mark a job applied from the Apply tab of an interested job.',
+        }));
+        return;
+      }
+
+      appliedJobs.forEach(function (job) {
+        var titleNode = job.source_url
+          ? el('a', { className: 'row-title', href: job.source_url, target: '_blank', rel: 'noopener', textContent: job.title })
+          : el('span', { className: 'row-title', textContent: job.title });
+        var meta = [
+          job.company,
+          job.location,
+          job.applied_at ? 'applied ' + new Date(job.applied_at).toLocaleDateString() : '',
+        ].filter(Boolean).join(' · ');
+
+        var body = [
+          el('div', { className: 'row-title-line' }, [titleNode]),
+          el('div', { className: 'row-meta', textContent: meta }),
+        ];
+
+        var undo = el('button', { type: 'button', textContent: 'Not applied' });
+        undo.addEventListener('click', function () { submitJobFit(job.id, 'unapplied'); });
+
+        list.appendChild(el('div', { className: 'row-item' }, [
+          el('div', { className: 'row' }, [
+            el('div', {}, body),
+            el('div', { className: 'row-actions' }, [undo]),
+          ]),
+        ]));
+      });
     }
 
     function renderInterestedList() {
@@ -4458,6 +4656,117 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     }
 
+    // The Apply tab is a readiness summary rather than an action: it says what has been prepared for
+    // this job so far, and lets you record that you sent it. Autofill lands with the extension.
+    var applicationAnswers = [];
+
+    function renderApplyReadiness() {
+      var host = document.getElementById('interested-apply-readiness');
+      host.innerHTML = '';
+      var job = allJobs.filter(function (j) { return j.id === activeInterestedJobId; })[0];
+      if (!job) return;
+
+      var items = [
+        { label: 'Posting link', ready: Boolean(job.source_url) },
+        { label: 'Tailored resume', ready: Boolean(activeInterestedResumeId) },
+        { label: 'Answers on file', ready: applicationAnswers.length > 0,
+          detail: applicationAnswers.length + ' saved' },
+      ];
+      var list = el('ul', { className: 'checks' });
+      items.forEach(function (item) {
+        list.appendChild(el('li', { className: item.ready ? 'ok' : 'warning' }, [
+          el('span', { className: 'mark', textContent: item.ready ? '✓' : '!' }),
+          el('span', { textContent: item.label + (item.detail ? ' (' + item.detail + ')' : '') }),
+        ]));
+      });
+      host.appendChild(list);
+
+      var alreadyApplied = job.fit_status === 'applied';
+      var button = document.getElementById('interested-apply-mark');
+      button.textContent = alreadyApplied ? 'Already applied' : 'Mark as applied';
+      button.disabled = alreadyApplied;
+    }
+
+    document.getElementById('interested-apply-mark').addEventListener('click', async function () {
+      if (!activeInterestedJobId) return;
+      var statusEl = document.getElementById('interested-apply-status');
+      var button = this;
+      button.disabled = true;
+      statusEl.textContent = 'Recording…';
+      statusEl.className = 'status';
+      try {
+        await submitJobFit(activeInterestedJobId, 'applied');
+        statusEl.textContent = 'Recorded. Moved to the Applied tab.';
+        statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+        button.disabled = false;
+      }
+    });
+
+    function renderAnswers() {
+      var list = document.getElementById('answers-list');
+      list.innerHTML = '';
+      if (!applicationAnswers.length) {
+        list.appendChild(el('p', {
+          className: 'empty',
+          textContent: 'No saved answers yet. Add the questions every form asks so you only answer them once.',
+        }));
+        return;
+      }
+      applicationAnswers.forEach(function (entry) {
+        var body = [
+          el('div', { className: 'row-title', textContent: entry.question_text }),
+          el('div', { className: 'row-meta', textContent: entry.answer }),
+        ];
+        var remove = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
+        remove.addEventListener('click', async function () {
+          await api('/application-answers/' + encodeURIComponent(entry.id), { method: 'DELETE' });
+          loadAnswers();
+        });
+        list.appendChild(el('div', { className: 'row-item' }, [
+          el('div', { className: 'row' }, [
+            el('div', {}, body),
+            el('div', { className: 'row-actions' }, [remove]),
+          ]),
+        ]));
+      });
+    }
+
+    async function loadAnswers() {
+      var res = await api('/application-answers');
+      var data = await res.json();
+      applicationAnswers = data.answers || [];
+      renderAnswers();
+      renderApplyReadiness();
+    }
+
+    document.getElementById('answer-form').addEventListener('submit', async function (event) {
+      event.preventDefault();
+      var statusEl = document.getElementById('answer-status');
+      statusEl.textContent = 'Saving…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/application-answers', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            question: document.getElementById('answer-question').value,
+            answer: document.getElementById('answer-value').value,
+          }),
+        });
+        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'save_failed'));
+        document.getElementById('answer-form').reset();
+        statusEl.textContent = 'Saved.';
+        statusEl.className = 'status success';
+        await loadAnswers();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
     document.getElementById('interested-cover-button').addEventListener('click', function () {
       buildInterestedCoverLetter(false);
     });
@@ -4648,6 +4957,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     loadCompanies();
     loadJobs();
     loadDevices();
+    loadAnswers();
     loadData();
   </script>
 </body>
@@ -4725,6 +5035,10 @@ export default {
     if (request.method === "POST" && url.pathname === "/notes") return createNote(request, env);
     const noteMatch = url.pathname.match(/^\/notes\/([^/]+)$/);
     if (request.method === "DELETE" && noteMatch) return deleteNote(request, env, noteMatch[1]);
+    if (request.method === "GET" && url.pathname === "/application-answers") return listApplicationAnswers(request, env);
+    if (request.method === "PUT" && url.pathname === "/application-answers") return saveApplicationAnswer(request, env);
+    const answerMatch = url.pathname.match(/^\/application-answers\/([^/]+)$/);
+    if (request.method === "DELETE" && answerMatch) return deleteApplicationAnswer(request, env, answerMatch[1]);
     if (request.method === "POST" && url.pathname === "/profile/generate") return generateProfile(request, env);
     if (request.method === "GET" && url.pathname === "/role-signals") return listRoleSignals(request, env);
     if (request.method === "POST" && url.pathname === "/role-signals") return createRoleSignal(request, env);
