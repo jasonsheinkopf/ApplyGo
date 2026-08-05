@@ -1759,16 +1759,18 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
 
   // A job-tailored resume keeps targeting that specific posting through every revision -- without
   // this, a content rewrite triggered by feedback would recompose against the profile's general
-  // desired roles instead, drifting the resume back away from the job it was tailored for.
+  // desired roles instead, drifting the resume back away from the job it was tailored for. The
+  // review evidence is re-fetched fresh here rather than reused from the stored row, so an answer
+  // added since the last revision still reaches this one.
   let targetRoles = profile.desiredRoles;
-  let structured = profile.structured;
+  let evidenceInstructions = "";
   if (row.job_id) {
     const job = await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
       .bind(row.job_id)
       .first<{ title: string; company: string; raw_description: string }>();
     if (job) {
       targetRoles = `${job.title} at ${job.company}\n\n${job.raw_description.slice(0, 3000)}`;
-      structured = augmentProfileWithReviewEvidence(profile.structured, await loadJobReviewClaims(env, row.job_id));
+      evidenceInstructions = jobReviewEvidenceInstructions(await loadJobReviewClaims(env, row.job_id));
     }
   }
 
@@ -1791,13 +1793,14 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
 
     let built;
     if (feedback) {
+      const composeInstructions = [row.instructions ?? "", evidenceInstructions].filter(Boolean).join("\n\n");
       built = await buildResumeVersion(
         env,
         id,
         provider,
-        structured,
+        profile.structured,
         targetRoles,
-        row.instructions ?? "",
+        composeInstructions,
         nextLayout,
         feedback,
       );
@@ -1809,7 +1812,7 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
         doc,
         pdfKey: rendered.pdfKey,
         screenshotBase64: rendered.screenshotBase64,
-        checks: await runAllChecks(rendered.pdfBytes, doc, structured, nextLayout),
+        checks: await runAllChecks(rendered.pdfBytes, doc, profile.structured, nextLayout),
       };
     }
 
@@ -1957,23 +1960,28 @@ async function loadJobReviewClaims(env: Env, jobId: string): Promise<string[]> {
 }
 
 /**
- * Job-review answers become extra evidence the compose step can actually draw on. Grounding only
- * checks employer/school names against the profile (see checkGrounding), never bullet content, so
- * folding these into the narrative summary is safe and gives real material without inventing
- * anything -- the compose step still can't fabricate an employer, title, or metric.
+ * Job-review answers are raw, informally-worded evidence -- a candidate answering a quick question
+ * in the moment, not pre-written resume content. Composing must not just paste that text in as its
+ * own bullet or section; it needs the same explicit "rewrite it, don't quote it" instruction as
+ * anything else the writing rules cover, since a plain instruction to "use this" tends to get taken
+ * literally. This is folded into the compose call's `instructions` (not the stored profile), and
+ * recomputed fresh on every call rather than baked into a resume row, so a new answer added after a
+ * resume already exists still reaches the very next revision.
  */
-function augmentProfileWithReviewEvidence(structured: StructuredProfile, claims: string[]): StructuredProfile {
-  if (!claims.length) return structured;
-  return {
-    ...structured,
-    narrative_summary: [
-      structured.narrative_summary,
-      "Additional context specific to this application:",
-      ...claims.map((c) => `- ${c}`),
-    ]
-      .filter(Boolean)
-      .join("\n"),
-  };
+function jobReviewEvidenceInstructions(claims: string[]): string {
+  if (!claims.length) return "";
+  return [
+    "The candidate answered follow-up questions specifically for this application; their answers are below in",
+    "their own words. Treat each one as real evidence about something they actually did -- not text to copy in",
+    "verbatim, and not a new bullet or section of its own. Rewrite it fully into the same professional resume",
+    "phrasing the writing rules above already require (action + object + problem/constraint + method + result,",
+    "quantified only where a number is actually given), and fold it into whichever existing experience entry",
+    "it belongs to. If it doesn't fit any existing role, use it to strengthen the summary instead -- but never",
+    "paste the raw answer text into the resume.",
+    "",
+    "CANDIDATE'S OWN WORDS FOR THIS APPLICATION:",
+    ...claims.map((c) => `- ${c}`),
+  ].join("\n");
 }
 
 /**
@@ -2048,38 +2056,45 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
     }
   }
 
-  const augmentedProfile = augmentProfileWithReviewEvidence(profile.structured, reviewClaims);
   const targetRoles = `${job.title} at ${job.company}\n\n${job.raw_description.slice(0, 3000)}`;
+  // Stored on the row so future revisions know this version's base/tailoring preferences; the
+  // review evidence is deliberately NOT baked in here -- it's layered on fresh below so a new
+  // answer added after this resume already exists still reaches the very next revision.
   const instructions = [baseInstructions, tailoringNotes].filter(Boolean).join("\n\n");
+  const composeInstructions = [instructions, jobReviewEvidenceInstructions(reviewClaims)].filter(Boolean).join("\n\n");
   const layout = baseLayout ?? normalizeLayout(defaultLayout());
   const resumeId = existing?.id ?? crypto.randomUUID();
 
   let built;
   try {
-    built = await buildResumeVersion(env, resumeId, provider, augmentedProfile, targetRoles, instructions, layout, "");
+    built = await buildResumeVersion(env, resumeId, provider, profile.structured, targetRoles, composeInstructions, layout, "");
   } catch (err) {
     return json({ error: "generation_failed", detail: (err as Error).message }, 502);
   }
 
   const name = `${job.title} @ ${job.company}`.slice(0, 60);
 
-  if (existing) {
-    await env.DB.prepare(
-      `UPDATE resumes SET name = ?, instructions = ?, content_json = ?, pdf_r2_key = ?, template = ?,
-       layout_json = ?, checks_json = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    )
-      .bind(name, instructions, JSON.stringify(built.doc), built.pdfKey, layout.template, JSON.stringify(layout), JSON.stringify(built.checks), resumeId)
-      .run();
-    return json({ id: resumeId, name, template: layout.template, revision: existing.revision + 1, checks: built.checks, reused: false });
-  }
+  try {
+    if (existing) {
+      await env.DB.prepare(
+        `UPDATE resumes SET name = ?, instructions = ?, content_json = ?, pdf_r2_key = ?, template = ?,
+         layout_json = ?, checks_json = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      )
+        .bind(name, instructions, JSON.stringify(built.doc), built.pdfKey, layout.template, JSON.stringify(layout), JSON.stringify(built.checks), resumeId)
+        .run();
+      return json({ id: resumeId, name, template: layout.template, revision: existing.revision + 1, checks: built.checks, reused: false });
+    }
 
-  await env.DB.prepare(
-    `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json, job_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(resumeId, profile.profileId, name, instructions, JSON.stringify(built.doc), built.pdfKey, layout.template, JSON.stringify(layout), JSON.stringify(built.checks), id)
-    .run();
-  return json({ id: resumeId, name, template: layout.template, revision: 1, checks: built.checks, reused: false }, 201);
+    await env.DB.prepare(
+      `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json, job_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(resumeId, profile.profileId, name, instructions, JSON.stringify(built.doc), built.pdfKey, layout.template, JSON.stringify(layout), JSON.stringify(built.checks), id)
+      .run();
+    return json({ id: resumeId, name, template: layout.template, revision: 1, checks: built.checks, reused: false }, 201);
+  } catch (err) {
+    return json({ error: "save_failed", detail: (err as Error).message }, 502);
+  }
 }
 
 const COVER_LETTER_SCHEMA = {
@@ -2121,7 +2136,15 @@ async function composeCoverLetter(
     `JOB DESCRIPTION:\n${job.raw_description.slice(0, 3000)}`,
     "",
     reviewAnswers.length
-      ? `ADDITIONAL CONTEXT SPECIFIC TO THIS APPLICATION:\n${reviewAnswers.map((a) => `- ${a}`).join("\n")}\n`
+      ? [
+          "The candidate answered follow-up questions specifically for this application, in their own words",
+          "below. Treat these as real evidence, not text to quote directly -- weave the substance into the",
+          "letter's own voice and sentence structure rather than pasting an answer in verbatim.",
+          "",
+          "CANDIDATE'S OWN WORDS FOR THIS APPLICATION:",
+          ...reviewAnswers.map((a) => `- ${a}`),
+          "",
+        ].join("\n")
       : "",
     resumeContactLine ? `CONTACT LINE (for reference, do not repeat verbatim in the letter body): ${resumeContactLine}\n` : "",
     `CANDIDATE PROFILE:\n${JSON.stringify(profile)}`,
@@ -2237,20 +2260,27 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
   const name = profileRow?.label || profile.structured.headline || "Candidate";
   const contentHtml = renderCoverLetterHtml(name, letterBody);
 
-  if (existing) {
-    await env.DB.prepare("UPDATE cover_letters SET content_html = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .bind(contentHtml, existing.id)
-      .run();
-    return json({ id: existing.id, content_html: contentHtml, reused: false });
-  }
+  try {
+    if (existing) {
+      await env.DB.prepare("UPDATE cover_letters SET content_html = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .bind(contentHtml, existing.id)
+        .run();
+      return json({ id: existing.id, content_html: contentHtml, reused: false });
+    }
 
-  const coverLetterId = crypto.randomUUID();
-  await env.DB.prepare(
-    "INSERT INTO cover_letters (id, profile_id, job_id, content_html) VALUES (?, ?, ?, ?)",
-  )
-    .bind(coverLetterId, profile.profileId, id, contentHtml)
-    .run();
-  return json({ id: coverLetterId, content_html: contentHtml, reused: false }, 201);
+    const coverLetterId = crypto.randomUUID();
+    await env.DB.prepare(
+      "INSERT INTO cover_letters (id, profile_id, job_id, content_html) VALUES (?, ?, ?, ?)",
+    )
+      .bind(coverLetterId, profile.profileId, id, contentHtml)
+      .run();
+    return json({ id: coverLetterId, content_html: contentHtml, reused: false }, 201);
+  } catch (err) {
+    // A save failure shouldn't surface as a raw, uncaught exception -- the letter itself composed
+    // fine at this point, so a clear error here (rather than a generic Workers error page the
+    // frontend can't parse as JSON) is what actually helps track down what went wrong.
+    return json({ error: "save_failed", detail: (err as Error).message }, 502);
+  }
 }
 
 async function uploadArtifact(request: Request, env: Env): Promise<Response> {
@@ -2891,7 +2921,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   <div id="panel-interested" class="panel">
     <section id="interested-list-section">
       <h2>Interested jobs</h2>
-      <p class="hint">Jobs you've marked "Interested" on the Jobs tab. Click one to open its workspace — the posting link, a quick review to fill in anything your profile is missing for it, a resume tailored to this posting, and a matching cover letter.</p>
+      <p class="hint">Jobs you've marked "Interested" on the Jobs tab. Click one to open its workspace — the posting link, an assistant that asks what your profile is still missing for it, a resume tailored to this posting, and a matching cover letter.</p>
       <div id="interested-list"><p class="empty">Loading…</p></div>
     </section>
 
@@ -2901,7 +2931,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <p id="interested-detail-reason" class="job-reason"></p>
       <a id="interested-detail-link" class="row-title" target="_blank" rel="noopener">Open posting</a>
       <div class="controls">
-        <button id="interested-review-button" type="button">Review</button>
+        <button id="interested-review-button" type="button">Assistant</button>
         <button id="interested-resume-button" type="button">Resume</button>
         <button id="interested-cover-button" type="button">Cover letter</button>
         <button id="interested-apply-button" type="button" disabled title="Not automated — use the posting link above to apply directly">Apply</button>
@@ -2994,6 +3024,15 @@ const DASHBOARD_PAGE = `<!doctype html>
       var msg = (data && data.error) || fallback;
       if (data && data.detail) msg += ': ' + data.detail;
       return msg;
+    }
+
+    // A failed request should always end up with a readable message, even if the response body
+    // isn't valid JSON (a raw platform error page, a network-level failure) -- res.json() throwing
+    // there would otherwise surface as an opaque parse error instead of anything actionable.
+    async function errorMessageFromResponse(res, fallback) {
+      var data = null;
+      try { data = await res.json(); } catch (e) { data = null; }
+      return errorMessage(data, fallback + ' (HTTP ' + res.status + ')');
     }
 
     // Reads a newline-delimited-JSON response as it arrives, calling onEvent for each line as
@@ -4202,7 +4241,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({}),
         });
-        if (!res.ok) throw new Error(errorMessage(await res.json(), 'review_failed'));
+        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'review_failed'));
         var data = await res.json();
         pendingReviewQuestion = data.question;
         document.getElementById('interested-review-question').textContent = data.question;
@@ -4232,7 +4271,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ question: pendingReviewQuestion, answer: answer }),
         });
-        if (!res.ok) throw new Error(errorMessage(await res.json(), 'save_failed'));
+        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'save_failed'));
         var data = await res.json();
         renderReviewHistory(data.entries || []);
         document.getElementById('interested-review-section').style.display = 'none';
@@ -4290,7 +4329,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({}),
         });
-        if (!res.ok) throw new Error(errorMessage(await res.json(), 'resume_failed'));
+        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'resume_failed'));
         var data = await res.json();
         activeInterestedResumeId = data.id;
         document.getElementById('interested-resume-section').style.display = 'block';
@@ -4319,7 +4358,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ comment: comment }),
         });
-        if (!res.ok) throw new Error(errorMessage(await res.json(), 'review_failed'));
+        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'review_failed'));
         var data = await res.json();
         setInterestedResumePreview(activeInterestedResumeId);
         renderInterestedResumeChecks(data.checks || []);
@@ -4350,7 +4389,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ regenerate: !!regenerate }),
         });
-        if (!res.ok) throw new Error(errorMessage(await res.json(), 'cover_letter_failed'));
+        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'cover_letter_failed'));
         var data = await res.json();
         document.getElementById('interested-cover-section').style.display = 'block';
         document.getElementById('interested-cover-frame').srcdoc = data.content_html || '';
