@@ -143,8 +143,19 @@ function clearSessionCookie(): string {
   return "applygo_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0";
 }
 
+/**
+ * Accepts either the dashboard's cookie or an `Authorization: Bearer` token, both hashed against
+ * the same device_sessions table. The bearer path exists for the browser extension, which runs on
+ * an ATS origin and so cannot rely on a same-site cookie.
+ *
+ * Deliberately the same table and the same token: the extension enrolls through the normal
+ * one-time-code flow, appears in the Devices tab like any other device, and is revoked the same
+ * way. A separate API-key system would be more code and one more thing that can outlive a revoke.
+ */
 async function requireSession(request: Request, env: Env): Promise<Session | Response> {
-  const token = cookieValue(request, "applygo_session");
+  const header = request.headers.get("authorization") ?? "";
+  const bearer = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
+  const token = cookieValue(request, "applygo_session") ?? bearer;
   if (!token) return json({ error: "authentication_required" }, 401);
   const tokenHash = await sha256(token);
   const session = await env.DB.prepare(
@@ -154,7 +165,13 @@ async function requireSession(request: Request, env: Env): Promise<Session | Res
   )
     .bind(tokenHash)
     .first<Session>();
-  if (!session) return json({ error: "invalid_or_expired_session" }, 401, { "set-cookie": clearSessionCookie() });
+  if (!session) {
+    // Only clear the cookie when the request actually presented one; a bad bearer token from the
+    // extension has no business expiring the dashboard's session in the same browser.
+    return bearer && !cookieValue(request, "applygo_session")
+      ? json({ error: "invalid_or_expired_session" }, 401)
+      : json({ error: "invalid_or_expired_session" }, 401, { "set-cookie": clearSessionCookie() });
+  }
   await env.DB.prepare("UPDATE device_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?")
     .bind(session.id)
     .run();
@@ -179,7 +196,7 @@ async function createEnrollment(request: Request, env: Env): Promise<Response> {
 }
 
 async function exchangeEnrollment(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { code?: string; device_name?: string };
+  const body = (await request.json()) as { code?: string; device_name?: string; return_token?: boolean };
   if (!body.code || !body.device_name) return json({ error: "code_and_device_name_required" }, 400);
   const codeHash = await sha256(body.code);
   const enrollment = await env.DB.prepare(
@@ -200,11 +217,12 @@ async function exchangeEnrollment(request: Request, env: Env): Promise<Response>
       "INSERT INTO device_sessions (id, token_hash, device_name, expires_at) VALUES (?, ?, ?, datetime('now', ?))",
     ).bind(sessionId, tokenHash, body.device_name.slice(0, 120), `+${days} days`),
   ]);
-  return json(
-    { authenticated: true, device_id: sessionId, expires_in_days: days },
-    201,
-    { "set-cookie": sessionCookie(token, days * 86400) },
-  );
+  // The extension can't use the cookie (it calls from an ATS origin), so it asks for the raw token
+  // instead. Returning it here gives away nothing extra: the caller just proved it holds a valid
+  // single-use enrollment code, and it receives the very same token via Set-Cookie regardless.
+  const payload: Record<string, unknown> = { authenticated: true, device_id: sessionId, expires_in_days: days };
+  if (body.return_token === true) payload.token = token;
+  return json(payload, 201, { "set-cookie": sessionCookie(token, days * 86400) });
 }
 
 async function listDevices(request: Request, env: Env): Promise<Response> {
@@ -2423,6 +2441,235 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
     // frontend can't parse as JSON) is what actually helps track down what went wrong.
     return json({ error: "save_failed", detail: (err as Error).message }, 502);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Application autofill: turning a live form into answers
+// ---------------------------------------------------------------------------
+
+type FormField = { name: string; label: string; type?: string; required?: boolean; options?: string[] };
+
+const MATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    answers: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "The field's name, exactly as given." },
+          value: { type: "string", description: "The answer to type into it." },
+          answered: {
+            type: "boolean",
+            description:
+              "false if the profile does not actually establish this. Decline rather than guessing; " +
+              "a declined field is handed to the candidate to answer themselves.",
+          },
+        },
+        required: ["name", "value", "answered"],
+      },
+    },
+  },
+  required: ["answers"],
+} as const;
+
+/**
+ * Fields whose answer is a fact about the person that is legally or personally consequential, and
+ * which a model must never infer. Work authorization, sponsorship, and the EEO questions have real
+ * consequences if answered wrongly, and "probably yes" is not a defensible basis for any of them.
+ * These skip the model entirely: either the answer bank has it, or the candidate is asked.
+ */
+const NEVER_INFER =
+  /\b(sponsor\w*|visa|authoriz\w*|work permit|citizen\w*|veteran\w*|disab\w*|gender|sex|race|ethnic\w*|hispanic|latino|felon\w*|convict\w*|criminal|background check|salary|salaries|compensat\w*|expected pay|desired pay|notice period|start date|available to start|relocat\w*|security clearance|clearance)\b/i;
+
+/**
+ * The identity fields every form starts with. StructuredProfile has no name/email/phone of its own
+ * (it models career history, not contact details), so these come from the profile label and from
+ * the contact line of whichever resume was built for this job. Parsed rather than modelled: an
+ * email address is either present in the candidate's own resume or it is not.
+ */
+type ContactFacts = { name: string; email: string; phone: string; linkedin: string; website: string };
+
+function contactFactsFrom(label: string, contactLine: string): ContactFacts {
+  const parts = String(contactLine ?? "").split("|").map((x) => x.trim());
+  const find = (re: RegExp) => parts.find((x) => re.test(x)) ?? "";
+  return {
+    name: (label ?? "").trim(),
+    email: (contactLine.match(/[\w.+-]+@[\w-]+\.[\w.-]+/) ?? [""])[0],
+    phone: (contactLine.match(/(\+?\d[\d\s().-]{7,}\d)/) ?? [""])[0].trim(),
+    linkedin: find(/linkedin\.com/i),
+    website: find(/^https?:\/\//i) && !/linkedin\.com/i.test(find(/^https?:\/\//i)) ? find(/^https?:\/\//i) : "",
+  };
+}
+
+/** Straight lookups. No model call, because there is nothing to reason about. */
+function deterministicAnswer(label: string, contact: ContactFacts): string | null {
+  const l = label.toLowerCase();
+  const [first, ...rest] = contact.name.split(/\s+/).filter(Boolean);
+  if (/\b(first|given)\s*name\b/.test(l)) return first || null;
+  if (/\b(last|family|sur)\s*name\b/.test(l)) return rest.join(" ") || null;
+  if (/\b(full name|your name)\b/.test(l) || l.trim() === "name") return contact.name || null;
+  if (/\be-?mail\b/.test(l)) return contact.email || null;
+  if (/\b(phone|mobile|telephone)\b/.test(l)) return contact.phone || null;
+  if (/\blinkedin\b/.test(l)) return contact.linkedin || null;
+  if (/\b(website|portfolio|personal site)\b/.test(l)) return contact.website || null;
+  return null;
+}
+
+/**
+ * Turns the form the extension is looking at into a set of answers.
+ *
+ * Resolution order is cheapest and most trustworthy first: the saved answer bank, then a single
+ * model call for whatever is left. Anything unresolved comes back as `missing` rather than guessed,
+ * and the sensitive categories above never reach the model at all.
+ */
+async function matchApplication(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    job_id?: string;
+    fields?: FormField[];
+    provider?: string;
+  };
+  const fields = (body.fields ?? []).filter((f) => f && f.name);
+  if (!fields.length) return json({ error: "fields_required" }, 400);
+
+  const provider = normalizeProvider(body.provider);
+  const profile = await loadProfileForResume(env);
+  if (profile instanceof Response) return profile;
+
+  const profileId = profile.profileId;
+  const profileRow = await env.DB.prepare("SELECT label FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ label: string }>();
+  const resumeRow = body.job_id
+    ? await env.DB.prepare("SELECT id, content_json FROM resumes WHERE job_id = ?")
+        .bind(body.job_id)
+        .first<{ id: string; content_json: string }>()
+    : null;
+  let contactLine = "";
+  if (resumeRow?.content_json) {
+    try {
+      contactLine = (JSON.parse(resumeRow.content_json) as ResumeDoc).contact_line ?? "";
+    } catch {
+      contactLine = "";
+    }
+  }
+  const contact = contactFactsFrom(profileRow?.label ?? "", contactLine);
+
+  const bankRows = await env.DB.prepare(
+    "SELECT question_key, question_text, answer FROM application_answers WHERE profile_id = ?",
+  )
+    .bind(profileId)
+    .all<{ question_key: string; question_text: string; answer: string }>();
+  const bank = new Map((bankRows.results ?? []).map((r) => [r.question_key, r.answer]));
+
+  const answers: { name: string; value: string; source: string }[] = [];
+  const unresolved: FormField[] = [];
+
+  for (const field of fields) {
+    const label = (field.label || field.name).trim();
+    const hit = bank.get(questionKey(label));
+    if (hit) {
+      answers.push({ name: field.name, value: hit, source: "bank" });
+      continue;
+    }
+    const deterministic = deterministicAnswer(label, contact);
+    if (deterministic) {
+      answers.push({ name: field.name, value: deterministic, source: "profile" });
+      continue;
+    }
+    unresolved.push(field);
+  }
+
+  // Sensitive fields are never sent to the model. If the bank did not already answer one, the
+  // candidate answers it, full stop.
+  const askable = unresolved.filter((f) => !NEVER_INFER.test(f.label || f.name));
+  const sensitive = unresolved.filter((f) => NEVER_INFER.test(f.label || f.name));
+  const missing: FormField[] = [...sensitive];
+
+  if (askable.length && !providerKeyMissing(env, provider)) {
+    const jobRow = body.job_id
+      ? await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
+          .bind(body.job_id)
+          .first<{ title: string; company: string; raw_description: string }>()
+      : null;
+    const reviewClaims = body.job_id ? await loadJobReviewClaims(env, body.job_id) : [];
+
+    const prompt = [
+      "Fill in this job application form on the candidate's behalf, using only what their profile",
+      "below actually establishes.",
+      "",
+      WRITING_STYLE_RULES,
+      "",
+      "Set answered=false for any field the profile does not genuinely support. A declined field is",
+      "handed back to the candidate to answer themselves, which is the correct outcome. Never guess,",
+      "never approximate, and never invent an employer, title, date, credential, or number. For a",
+      "field offering fixed options, the value must be exactly one of them.",
+      "",
+      jobRow ? `JOB: ${jobRow.title} at ${jobRow.company}` : "",
+      jobRow ? `JOB DESCRIPTION:\n${jobRow.raw_description.slice(0, 2000)}` : "",
+      reviewClaims.length ? `CONTEXT THE CANDIDATE GAVE FOR THIS APPLICATION:\n${reviewClaims.map((c) => `- ${c}`).join("\n")}` : "",
+      "",
+      `CANDIDATE PROFILE:\n${JSON.stringify(profile.structured)}`,
+      "",
+      `FIELDS:\n${JSON.stringify(askable.map((f) => ({ name: f.name, label: f.label, type: f.type, options: f.options })))}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    try {
+      const result = await callStructured<{ answers: { name: string; value: string; answered: boolean }[] }>(
+        env,
+        provider,
+        prompt,
+        MATCH_SCHEMA,
+        "submit_application_answers",
+        3000,
+      );
+      const byName = new Map((result.answers ?? []).map((a) => [a.name, a]));
+      for (const field of askable) {
+        const got = byName.get(field.name);
+        if (got && got.answered && (got.value ?? "").trim()) {
+          answers.push({ name: field.name, value: got.value.trim(), source: "generated" });
+        } else {
+          missing.push(field);
+        }
+      }
+    } catch {
+      // A failed model call must not silently drop fields; they all become the candidate's to fill.
+      missing.push(...askable);
+    }
+  } else {
+    missing.push(...askable);
+  }
+
+  const letter = body.job_id
+    ? await env.DB.prepare("SELECT content_html FROM cover_letters WHERE job_id = ?")
+        .bind(body.job_id)
+        .first<{ content_html: string }>()
+    : null;
+
+  return json({
+    answers,
+    missing: missing.map((f) => ({ name: f.name, label: f.label, type: f.type ?? "text", options: f.options ?? [] })),
+    resume_url: resumeRow ? `/resumes/${resumeRow.id}/file` : null,
+    cover_letter_text: letter ? stripHtmlToText(letter.content_html) : null,
+  });
+}
+
+/** The stored cover letter is HTML; a form textarea needs the plain text back out of it. */
+function stripHtmlToText(html: string): string {
+  return String(html ?? "")
+    .replace(/<\s*(br|\/p|\/div|\/h[1-6])\s*>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 async function uploadArtifact(request: Request, env: Env): Promise<Response> {
@@ -4984,9 +5231,60 @@ async function downloadArtifact(request: Request, env: Env, key: string): Promis
   return new Response(object.body, { headers, status });
 }
 
+/**
+ * The extension calls the Worker from an ATS origin (boards.greenhouse.io and friends), so those
+ * requests need CORS. Two deliberate limits keep this from widening the app's attack surface:
+ *
+ * - Credentials are never allowed. Cookie auth therefore stays strictly same-origin, and a random
+ *   web page cannot ride the dashboard's logged-in session. Cross-origin callers must present a
+ *   bearer token, which only the enrolled extension has.
+ * - Only the handful of paths the extension actually uses are exposed.
+ */
+const EXTENSION_CORS_PATHS = [
+  /^\/auth\/enroll$/,
+  /^\/applications\/match$/,
+  /^\/application-answers$/,
+  /^\/jobs$/,
+  /^\/jobs\/[^/]+\/fit$/,
+  /^\/resumes\/[^/]+\/file$/,
+];
+
+function corsHeaders(origin: string): Record<string, string> {
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, OPTIONS",
+    "access-control-allow-headers": "authorization, content-type",
+    "access-control-max-age": "86400",
+    vary: "origin",
+  };
+}
+
+function extensionCorsOrigin(request: Request, pathname: string): string | null {
+  const origin = request.headers.get("origin");
+  if (!origin || !origin.startsWith("chrome-extension://")) return null;
+  return EXTENSION_CORS_PATHS.some((re) => re.test(pathname)) ? origin : null;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    const corsOrigin = extensionCorsOrigin(request, url.pathname);
+    if (corsOrigin && request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(corsOrigin) });
+    }
+    if (corsOrigin) {
+      const response = await handle(request, env, ctx, url);
+      const headers = new Headers(response.headers);
+      for (const [k, v] of Object.entries(corsHeaders(corsOrigin))) headers.set(k, v);
+      return new Response(response.body, { status: response.status, headers });
+    }
+    return handle(request, env, ctx, url);
+  },
+} satisfies ExportedHandler<Env>;
+
+async function handle(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
+  {
     if (request.method === "GET" && url.pathname === "/health") return json({ status: "ok", mode: "cloudflare" });
     if (request.method === "GET" && url.pathname === "/enroll") return enrollPage();
     if (request.method === "GET" && url.pathname === "/") {
@@ -5063,6 +5361,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/devices") return listDevices(request, env);
     const deviceMatch = url.pathname.match(/^\/devices\/([^/]+)\/revoke$/);
     if (request.method === "POST" && deviceMatch) return revokeDevice(request, env, deviceMatch[1]);
+    if (request.method === "POST" && url.pathname === "/applications/match") return matchApplication(request, env);
     if (request.method === "POST" && url.pathname === "/artifacts") return uploadArtifact(request, env);
     const artifactMatch = url.pathname.match(/^\/artifacts\/(.+)$/);
     if (request.method === "GET" && artifactMatch) return downloadArtifact(request, env, decodeURIComponent(artifactMatch[1]));
@@ -5071,5 +5370,5 @@ export default {
       return auth instanceof Response ? auth : json({ authenticated: true, device: auth });
     }
     return json({ error: "not_found" }, 404);
-  },
-} satisfies ExportedHandler<Env>;
+  }
+}
