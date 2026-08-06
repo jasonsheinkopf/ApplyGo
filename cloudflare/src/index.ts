@@ -300,6 +300,19 @@ function readDesiredRoles(preferencesJson: string): string {
   }
 }
 
+/** Free-text hard requirements the candidate wrote themselves, enforced by tier-2 scoring as
+ * binding rules alongside the built-in guidance (see fitPrompt in src/fit.ts). Deliberately
+ * generic rather than a fixed "years of experience" field -- what counts as a dealbreaker (a
+ * years-of-experience ceiling, a tech stack, a certification, anything) is different for everyone
+ * and shouldn't require editing the prompt in code to change. */
+function readDealbreakers(preferencesJson: string): string {
+  try {
+    return (JSON.parse(preferencesJson || "{}") as { dealbreakers?: string }).dealbreakers ?? "";
+  } catch {
+    return "";
+  }
+}
+
 function readStructuredProfile(structuredJson: string): StructuredProfile | null {
   try {
     const parsed = JSON.parse(structuredJson || "{}");
@@ -354,6 +367,7 @@ async function getProfile(request: Request, env: Env): Promise<Response> {
       ...profile,
       desired_roles: readDesiredRoles(profile?.preferences_json ?? "{}"),
       desired_locations: readDesiredLocations(profile?.preferences_json ?? "{}"),
+      dealbreakers: readDealbreakers(profile?.preferences_json ?? "{}"),
       structured: readStructuredProfile(profile?.structured_json ?? "{}"),
     },
   });
@@ -386,9 +400,14 @@ async function saveStructuredProfile(request: Request, env: Env): Promise<Respon
 async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { desired_roles?: string; desired_locations?: string };
+  const body = (await request.json().catch(() => ({}))) as {
+    desired_roles?: string;
+    desired_locations?: string;
+    dealbreakers?: string;
+  };
   const desiredRoles = (body.desired_roles ?? "").trim();
   const desiredLocations = (body.desired_locations ?? "").trim();
+  const dealbreakers = (body.dealbreakers ?? "").trim();
   const profileId = await getOrCreateProfileId(env);
   const existing = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
     .bind(profileId)
@@ -401,10 +420,11 @@ async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
   }
   prefs.desired_roles = desiredRoles;
   prefs.desired_locations = desiredLocations;
+  prefs.dealbreakers = dealbreakers;
   await env.DB.prepare("UPDATE candidate_profiles SET preferences_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
     .bind(JSON.stringify(prefs), profileId)
     .run();
-  return json({ desired_roles: desiredRoles, desired_locations: desiredLocations });
+  return json({ desired_roles: desiredRoles, desired_locations: desiredLocations, dealbreakers });
 }
 
 async function listRoleSignals(request: Request, env: Env): Promise<Response> {
@@ -511,7 +531,7 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
   // fit_missing_json do), and at up to 1500 chars per row it's the single biggest thing here.
   const jobs = await env.DB.prepare(
     `SELECT id, title, company, source_url, location, posted_at, ats_provider,
-            company_id, fit_status, fit_score, fit_reason, fit_missing_json, interested_at, applied_at, created_at,
+            company_id, fit_status, fit_score, fit_reason, fit_missing_json, fit_detail_json, interested_at, applied_at, created_at,
             assessed_at,
             EXISTS(SELECT 1 FROM resumes r WHERE r.job_id = job_postings.id) AS has_resume,
             EXISTS(SELECT 1 FROM cover_letters c WHERE c.job_id = job_postings.id) AS has_cover_letter
@@ -550,6 +570,59 @@ function toAssessable(rows: JobRow[]) {
     location: r.location,
     description: r.raw_description ?? "",
   }));
+}
+
+// Same reasoning as the company-scan concurrency: an assess call is one LLM request per batch of
+// FIT_BATCH_SIZE postings, and the batches don't depend on each other, so several run at once
+// instead of one after another. Shared between processJobs's own tier-2 pass and the "reassess my
+// top matches" action below, so both get the same throughput.
+const ASSESS_CONCURRENCY = 8;
+
+/**
+ * Tier-2 assessment over an already-fetched set of rows: batches them, fires the batches
+ * concurrently, and writes+reports each as it completes. Factored out of processJobs so
+ * `reassessTopMatches` below can reuse the exact same scoring logic against a different row
+ * selection instead of duplicating the batching/concurrency/storage code.
+ */
+async function assessRowsBatched(
+  env: Env,
+  provider: Provider,
+  structured: StructuredProfile,
+  desiredRoles: string,
+  disqualifiers: string[],
+  dealbreakers: string,
+  rows: JobRow[],
+  total: number,
+  emit: (event: unknown) => Promise<void>,
+): Promise<{ assessed: number; errors: string[] }> {
+  const items = toAssessable(rows);
+  const batches: (typeof items)[] = [];
+  for (let i = 0; i < items.length; i += FIT_BATCH_SIZE) batches.push(items.slice(i, i + FIT_BATCH_SIZE));
+
+  const errors: string[] = [];
+  let assessed = 0;
+  let failed = false;
+  await runPooled(
+    batches,
+    ASSESS_CONCURRENCY,
+    async (batch) => {
+      if (failed) return null;
+      try {
+        return await assessJobFitBatch(env, provider, JSON.stringify(structured), desiredRoles, disqualifiers, dealbreakers, batch);
+      } catch (err) {
+        errors.push(`assess: ${(err as Error).message}`);
+        failed = true;
+        return null;
+      }
+    },
+    async (_batch, results) => {
+      if (!results) return;
+      await storeFitResults(env, results);
+      assessed += results.length;
+      await emit({ type: "progress", stage: "assess", done: assessed, total });
+    },
+  );
+  return { assessed, errors };
 }
 
 /**
@@ -653,33 +726,77 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
     )
       .bind(budget.remaining * FIT_BATCH_SIZE)
       .all<JobRow>();
-    const assessItems = toAssessable(assessRows.results ?? []);
-    const assessBatches: (typeof assessItems)[] = [];
-    for (let i = 0; i < assessItems.length; i += FIT_BATCH_SIZE) assessBatches.push(assessItems.slice(i, i + FIT_BATCH_SIZE));
 
-    let assessFailed = false;
-    await runPooled(
-      assessBatches,
-      LLM_CONCURRENCY,
-      async (batch) => {
-        if (assessFailed) return null;
-        try {
-          return await assessJobFitBatch(env, provider, JSON.stringify(structured), desiredRoles, disqualifiers, batch);
-        } catch (err) {
-          errors.push(`assess: ${(err as Error).message}`);
-          assessFailed = true;
-          return null;
-        }
-      },
-      async (_batch, results) => {
-        if (!results) return;
-        await storeFitResults(env, results);
-        assessed += results.length;
-        await emit({ type: "progress", stage: "assess", done: assessed, total: assessTotal });
-      },
+    const dealbreakers = readDealbreakers(profileRow?.preferences_json ?? "{}");
+    const assessResult = await assessRowsBatched(
+      env, provider, structured, desiredRoles, disqualifiers, dealbreakers,
+      assessRows.results ?? [], assessTotal, emit,
     );
+    assessed = assessResult.assessed;
+    errors.push(...assessResult.errors);
 
     return { screened, screened_out: screenedOut, assessed, errors, counts: await jobPipelineCounts(env) };
+  });
+}
+
+/**
+ * Re-scores whatever's already sitting at or above a score threshold, against the candidate's
+ * current dealbreakers/preferences -- for after editing them, when the postings that mattered most
+ * were already judged under the old criteria. Only reaches jobs still in the fresh-match buckets
+ * (`strong`/`possible`); a job the candidate already acted on (interested/applied/manually
+ * rejected) is a decision already made and isn't silently re-touched by this. Reuses the exact
+ * scoring logic `processJobs`'s own tier-2 pass uses, via `assessRowsBatched`, rather than a
+ * separate implementation that could drift from it.
+ */
+async function reassessTopMatches(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string; min_score?: number };
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+  const minScore = Math.min(Math.max(Number(body.min_score) || 70, 0), 100);
+
+  const profileId = await getOrCreateProfileId(env);
+  const profileRow = await env.DB.prepare(
+    "SELECT preferences_json, structured_json FROM candidate_profiles WHERE id = ?",
+  )
+    .bind(profileId)
+    .first<{ preferences_json: string; structured_json: string }>();
+  const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
+  if (!structured) return json({ error: "no_profile_yet" }, 400);
+  const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
+  const dealbreakers = readDealbreakers(profileRow?.preferences_json ?? "{}");
+  const disqualifiers = await loadDisqualifiers(env, profileId);
+
+  // Capped defensively -- this is a deliberate one-off action the candidate chose to trigger with
+  // their own threshold, not a routine high-frequency operation, but a threshold of 0 shouldn't be
+  // able to re-run the strong model against the entire history in one click.
+  const targets = await env.DB.prepare(
+    `SELECT id, title, company, location, raw_description FROM job_postings
+     WHERE fit_status IN ('strong', 'possible') AND fit_score >= ?
+     ORDER BY fit_score DESC LIMIT 300`,
+  )
+    .bind(minScore)
+    .all<JobRow>();
+  const rows = targets.results ?? [];
+
+  return ndjsonResponse(ctx, async (emit) => {
+    if (!rows.length) return { assessed: 0, errors: [], counts: await jobPipelineCounts(env) };
+
+    // Flips them back to screened_in first (the same state a fresh screen would leave them in),
+    // so assessRowsBatched's write path is identical either way and a dropped connection here
+    // just means clicking the button again re-selects the same still-strong/possible rows.
+    await env.DB.prepare(
+      `UPDATE job_postings SET fit_status = 'screened_in' WHERE id IN (${rows.map(() => "?").join(",")})`,
+    )
+      .bind(...rows.map((r) => r.id))
+      .run();
+
+    const { assessed, errors } = await assessRowsBatched(
+      env, provider, structured, desiredRoles, disqualifiers, dealbreakers, rows, rows.length, emit,
+    );
+    return { assessed, errors, counts: await jobPipelineCounts(env) };
   });
 }
 
@@ -829,11 +946,15 @@ async function purgeCollection(request: Request, env: Env): Promise<Response> {
 
 async function storeFitResults(env: Env, results: FitResult[]): Promise<void> {
   for (const result of results) {
+    const detail = { years_required: result.years_required, remote: result.remote, salary: result.salary };
     await env.DB.prepare(
       `UPDATE job_postings SET fit_status = ?, fit_score = ?, fit_reason = ?, fit_missing_json = ?,
-       assessed_at = CURRENT_TIMESTAMP WHERE id = ?`,
+       fit_detail_json = ?, assessed_at = CURRENT_TIMESTAMP WHERE id = ?`,
     )
-      .bind(verdictForScore(result.score), result.score, result.reason, JSON.stringify(result.missing), result.id)
+      .bind(
+        verdictForScore(result.score), result.score, result.reason,
+        JSON.stringify(result.missing), JSON.stringify(detail), result.id,
+      )
       .run();
   }
 }
@@ -3256,8 +3377,21 @@ const DASHBOARD_PAGE = `<!doctype html>
           <label for="desired-locations">Locations you'll work in</label>
           <input id="desired-locations" placeholder="e.g. California, or Bay Area, Seattle, Remote">
           <p class="hint">Enforced as a hard filter: company discovery won't add employers outside these, and board scans skip postings elsewhere. Leave blank for no location limit.</p>
+          <label for="dealbreakers">Dealbreakers (optional)</label>
+          <textarea id="dealbreakers" placeholder="e.g. Reject anything requiring 5+ years of experience for a technical role. 3-4 years is fine."></textarea>
+          <p class="hint">Enforced during scoring (the detailed pass on postings that survive the quick screen) as a binding rule, the same weight as a stated hard requirement -- write down whatever you don't want to see, in your own words.</p>
           <button id="desired-roles-save-button" type="button">Save</button>
           <p id="desired-roles-save-status" class="status" role="status" aria-live="polite"></p>
+          <h3 class="subhead">Already have matches?</h3>
+          <p class="hint">Re-score your existing top matches against whatever you just saved above, without re-running the whole pipeline from scratch.</p>
+          <div class="controls">
+            <div>
+              <label for="reassess-min-score">Minimum score to re-check</label>
+              <input id="reassess-min-score" type="number" min="0" max="100" value="70">
+            </div>
+            <button id="reassess-button" type="button">Re-check my top matches</button>
+          </div>
+          <p id="reassess-status" class="status" role="status" aria-live="polite"></p>
         </section>
       </div>
     </div>
@@ -3730,6 +3864,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         document.getElementById('profile-label').value = data.profile.label || '';
         document.getElementById('desired-roles-description').value = data.profile.desired_roles || '';
         document.getElementById('desired-locations').value = data.profile.desired_locations || '';
+        document.getElementById('dealbreakers').value = data.profile.dealbreakers || '';
         renderStructuredProfileView('structured-profile-view', data.profile.structured);
         renderStructuredProfileView('resume-profile-view', data.profile.structured);
       }
@@ -4047,6 +4182,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           body: JSON.stringify({
             desired_roles: document.getElementById('desired-roles-description').value,
             desired_locations: document.getElementById('desired-locations').value,
+            dealbreakers: document.getElementById('dealbreakers').value,
           }),
         });
         if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
@@ -4055,6 +4191,36 @@ const DASHBOARD_PAGE = `<!doctype html>
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
+      }
+    });
+
+    document.getElementById('reassess-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('reassess-status');
+      var button = this;
+      var minScore = Number(document.getElementById('reassess-min-score').value) || 70;
+      button.disabled = true;
+      statusEl.textContent = 'Re-checking…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/jobs/reassess', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ min_score: minScore }),
+        });
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'reassess_failed'));
+        var data = await readNdjson(res, function (event) {
+          statusEl.textContent = 'Re-checking… ' + event.done + ' of ' + event.total;
+        });
+        statusEl.textContent = data.assessed
+          ? 'Re-checked ' + data.assessed + ' match' + (data.assessed === 1 ? '' : 'es') + ' against your updated preferences.'
+          : 'Nothing at or above ' + minScore + '% to re-check.';
+        statusEl.className = (data.errors || []).length ? 'status error' : 'status success';
+        await loadJobs();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
       }
     });
 
@@ -4612,6 +4778,8 @@ const DASHBOARD_PAGE = `<!doctype html>
         var badgeText = hasScore ? job.fit_score + '% match' : fitInfo.text;
         var missing = [];
         try { missing = JSON.parse(job.fit_missing_json || '[]'); } catch (e) { missing = []; }
+        var fitDetail = {};
+        try { fitDetail = JSON.parse(job.fit_detail_json || '{}'); } catch (e) { fitDetail = {}; }
 
         var titleNode = job.source_url
           ? el('a', {
@@ -4620,6 +4788,11 @@ const DASHBOARD_PAGE = `<!doctype html>
             })
           : el('span', { className: 'row-title', textContent: job.title });
         var titleLine = [titleNode, el('span', { className: ('badge ' + fitInfo.cls).trim(), textContent: badgeText })];
+        // The years-of-experience requirement is the one thing worth seeing without opening the
+        // posting -- surfaced as its own badge, not just buried in the reason paragraph below.
+        if (fitDetail.years_required) {
+          titleLine.push(el('span', { className: 'badge', textContent: fitDetail.years_required }));
+        }
 
         var meta = [
           job.company,
@@ -5640,6 +5813,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "GET" && url.pathname === "/jobs") return listJobs(request, env);
     if (request.method === "POST" && url.pathname === "/jobs") return createJob(request, env);
     if (request.method === "POST" && url.pathname === "/jobs/process") return processJobs(request, env, ctx);
+    if (request.method === "POST" && url.pathname === "/jobs/reassess") return reassessTopMatches(request, env, ctx);
     if (request.method === "GET" && url.pathname === "/data") return dataSummary(request, env);
     if (request.method === "POST" && url.pathname === "/data/purge-stage") return purgeStage(request, env);
     if (request.method === "POST" && url.pathname === "/data/purge-collection") return purgeCollection(request, env);
