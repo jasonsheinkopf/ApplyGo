@@ -21,11 +21,13 @@ import {
   verifyWebsite,
 } from "./companies";
 import {
+  type CareAboutTopic,
   FIT_BATCH_SIZE,
   type FitResult,
   SCREEN_BATCH_SIZE,
   assessJobFitBatch,
   buildMatchProfile,
+  deriveCareAboutTopics,
   screenJobsBatch,
   verdictForScore,
 } from "./fit";
@@ -326,6 +328,61 @@ function readCareAbout(preferencesJson: string): string {
   }
 }
 
+/** The interpreted topic list derived from `care_about` -- see deriveCareAboutTopics in src/fit.ts. */
+function readCareAboutTopics(preferencesJson: string): CareAboutTopic[] {
+  try {
+    const topics = (JSON.parse(preferencesJson || "{}") as { care_about_topics?: CareAboutTopic[] })
+      .care_about_topics;
+    return Array.isArray(topics) ? topics.filter((topic) => topic?.label) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeCareAboutTopics(env: Env, profileId: string, topics: CareAboutTopic[]): Promise<void> {
+  const existing = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  let prefs: Record<string, unknown> = {};
+  try {
+    prefs = JSON.parse(existing?.preferences_json || "{}");
+  } catch {
+    prefs = {};
+  }
+  prefs.care_about_topics = topics;
+  await env.DB.prepare("UPDATE candidate_profiles SET preferences_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(JSON.stringify(prefs), profileId)
+    .run();
+}
+
+/**
+ * The topic list the scoring pass should use, deriving and caching it if it isn't there yet.
+ *
+ * Topics are normally resolved once when the candidate saves their "what do you care about" text.
+ * This covers the two cases where that hasn't happened: text saved before topics existed, and a
+ * save whose derivation call failed. Deriving here costs one cheap call per pipeline run at most,
+ * and the result is persisted, so it self-heals rather than re-deriving on every run. Failing to
+ * derive is not worth failing a scan over -- an empty list just means no fact chips this round.
+ */
+async function ensureCareAboutTopics(
+  env: Env,
+  provider: Provider,
+  profileId: string,
+  preferencesJson: string,
+): Promise<CareAboutTopic[]> {
+  const existing = readCareAboutTopics(preferencesJson);
+  if (existing.length) return existing;
+  const careAbout = readCareAbout(preferencesJson);
+  if (!careAbout.trim() || providerKeyMissing(env, provider)) return [];
+  try {
+    const topics = await deriveCareAboutTopics(env, provider, careAbout);
+    if (topics.length) await writeCareAboutTopics(env, profileId, topics);
+    return topics;
+  } catch {
+    return [];
+  }
+}
+
 function readStructuredProfile(structuredJson: string): StructuredProfile | null {
   try {
     const parsed = JSON.parse(structuredJson || "{}");
@@ -382,6 +439,7 @@ async function getProfile(request: Request, env: Env): Promise<Response> {
       desired_locations: readDesiredLocations(profile?.preferences_json ?? "{}"),
       dealbreakers: readDealbreakers(profile?.preferences_json ?? "{}"),
       care_about: readCareAbout(profile?.preferences_json ?? "{}"),
+      care_about_topics: readCareAboutTopics(profile?.preferences_json ?? "{}"),
       structured: readStructuredProfile(profile?.structured_json ?? "{}"),
     },
   });
@@ -419,6 +477,7 @@ async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
     desired_locations?: string;
     dealbreakers?: string;
     care_about?: string;
+    provider?: string;
   };
   const desiredRoles = (body.desired_roles ?? "").trim();
   const desiredLocations = (body.desired_locations ?? "").trim();
@@ -434,14 +493,42 @@ async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
   } catch {
     prefs = {};
   }
+
+  // Re-interpreting the free text into topics is a model call, so it only runs when that text
+  // actually changed -- editing a location shouldn't re-derive (and possibly re-word) the fact
+  // columns. Clearing the text clears the topics without a call.
+  const previousCareAbout = readCareAbout(existing?.preferences_json ?? "{}");
+  let topics = readCareAboutTopics(existing?.preferences_json ?? "{}");
+  if (!careAbout) {
+    topics = [];
+  } else if (careAbout !== previousCareAbout || !topics.length) {
+    const provider = normalizeProvider(body.provider);
+    if (!providerKeyMissing(env, provider)) {
+      // A failed derivation must not fail the save -- the text is still stored, and the pipeline
+      // re-derives on its next run via ensureCareAboutTopics.
+      try {
+        topics = await deriveCareAboutTopics(env, provider, careAbout);
+      } catch {
+        topics = [];
+      }
+    }
+  }
+
   prefs.desired_roles = desiredRoles;
   prefs.desired_locations = desiredLocations;
   prefs.dealbreakers = dealbreakers;
   prefs.care_about = careAbout;
+  prefs.care_about_topics = topics;
   await env.DB.prepare("UPDATE candidate_profiles SET preferences_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
     .bind(JSON.stringify(prefs), profileId)
     .run();
-  return json({ desired_roles: desiredRoles, desired_locations: desiredLocations, dealbreakers, care_about: careAbout });
+  return json({
+    desired_roles: desiredRoles,
+    desired_locations: desiredLocations,
+    dealbreakers,
+    care_about: careAbout,
+    care_about_topics: topics,
+  });
 }
 
 async function listRoleSignals(request: Request, env: Env): Promise<Response> {
@@ -608,7 +695,7 @@ async function assessRowsBatched(
   desiredRoles: string,
   disqualifiers: string[],
   dealbreakers: string,
-  careAbout: string,
+  careAboutTopics: CareAboutTopic[],
   rows: JobRow[],
   total: number,
   emit: (event: unknown) => Promise<void>,
@@ -627,7 +714,7 @@ async function assessRowsBatched(
       if (failed) return null;
       try {
         return await assessJobFitBatch(
-          env, provider, JSON.stringify(structured), desiredRoles, disqualifiers, dealbreakers, careAbout, batch,
+          env, provider, JSON.stringify(structured), desiredRoles, disqualifiers, dealbreakers, careAboutTopics, batch,
         );
       } catch (err) {
         errors.push(`assess: ${(err as Error).message}`);
@@ -748,9 +835,9 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
       .all<JobRow>();
 
     const dealbreakers = readDealbreakers(profileRow?.preferences_json ?? "{}");
-    const careAbout = readCareAbout(profileRow?.preferences_json ?? "{}");
+    const careAboutTopics = await ensureCareAboutTopics(env, provider, profileId, profileRow?.preferences_json ?? "{}");
     const assessResult = await assessRowsBatched(
-      env, provider, structured, desiredRoles, disqualifiers, dealbreakers, careAbout,
+      env, provider, structured, desiredRoles, disqualifiers, dealbreakers, careAboutTopics,
       assessRows.results ?? [], assessTotal, emit,
     );
     assessed = assessResult.assessed;
@@ -788,7 +875,7 @@ async function reassessTopMatches(request: Request, env: Env, ctx: ExecutionCont
   if (!structured) return json({ error: "no_profile_yet" }, 400);
   const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
   const dealbreakers = readDealbreakers(profileRow?.preferences_json ?? "{}");
-  const careAbout = readCareAbout(profileRow?.preferences_json ?? "{}");
+  const careAboutTopics = await ensureCareAboutTopics(env, provider, profileId, profileRow?.preferences_json ?? "{}");
   const disqualifiers = await loadDisqualifiers(env, profileId);
 
   // Capped defensively -- this is a deliberate one-off action the candidate chose to trigger with
@@ -816,7 +903,7 @@ async function reassessTopMatches(request: Request, env: Env, ctx: ExecutionCont
       .run();
 
     const { assessed, errors } = await assessRowsBatched(
-      env, provider, structured, desiredRoles, disqualifiers, dealbreakers, careAbout, rows, rows.length, emit,
+      env, provider, structured, desiredRoles, disqualifiers, dealbreakers, careAboutTopics, rows, rows.length, emit,
     );
     return { assessed, errors, counts: await jobPipelineCounts(env) };
   });
@@ -3493,7 +3580,8 @@ const DASHBOARD_PAGE = `<!doctype html>
           <p class="hint">Enforced during scoring (the detailed pass on postings that survive the quick screen) as a binding rule, the same weight as a stated hard requirement -- write down whatever you don't want to see, in your own words.</p>
           <label for="care-about">What do you care about? (optional)</label>
           <textarea id="care-about" placeholder="e.g. Salary, years of experience required, remote or in office, typical hours"></textarea>
-          <p class="hint">Name the topics you want to see at a glance for every posting, not a target number -- dealbreakers above is where you rule things out. Shown as quick facts on the Jindr and Jobs tabs; never affects the score.</p>
+          <p class="hint">Write it however you'd say it out loud -- saving reads what you meant and turns it into the fact columns below, so you don't have to phrase it as labels. These are the topics you want at a glance for every posting, not targets to filter on (dealbreakers above is where you rule things out), and they never affect the score.</p>
+          <div id="care-about-topics" class="row-facts"></div>
           <button id="desired-roles-save-button" type="button">Save</button>
           <p id="desired-roles-save-status" class="status" role="status" aria-live="polite"></p>
           <h3 class="subhead">Already have matches?</h3>
@@ -4011,6 +4099,17 @@ const DASHBOARD_PAGE = `<!doctype html>
       goToEnroll();
     });
 
+    // Shows what the saved free text was actually understood to mean, using the same chip the
+    // Jindr and Jobs cards use -- so the columns you'll see there are visible before any scan runs.
+    function renderCareAboutTopics(topics) {
+      var host = document.getElementById('care-about-topics');
+      host.innerHTML = '';
+      (topics || []).forEach(function (topic) {
+        var chip = factChip({ label: topic.label, value: topic.looking_for || '' });
+        if (chip) host.appendChild(chip);
+      });
+    }
+
     async function loadProfile() {
       var res = await api('/profile');
       var data = await res.json();
@@ -4020,6 +4119,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         document.getElementById('desired-locations').value = data.profile.desired_locations || '';
         document.getElementById('dealbreakers').value = data.profile.dealbreakers || '';
         document.getElementById('care-about').value = data.profile.care_about || '';
+        renderCareAboutTopics(data.profile.care_about_topics);
         renderStructuredProfileView('structured-profile-view', data.profile.structured);
         renderStructuredProfileView('resume-profile-view', data.profile.structured);
       }
@@ -4342,10 +4442,16 @@ const DASHBOARD_PAGE = `<!doctype html>
             desired_locations: document.getElementById('desired-locations').value,
             dealbreakers: document.getElementById('dealbreakers').value,
             care_about: document.getElementById('care-about').value,
+            provider: document.getElementById('desired-roles-provider').value,
           }),
         });
         if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
-        statusEl.textContent = 'Saved.';
+        var saved = await res.json();
+        renderCareAboutTopics(saved.care_about_topics);
+        var topicCount = (saved.care_about_topics || []).length;
+        statusEl.textContent = topicCount
+          ? 'Saved. Reading "what do you care about" gave these ' + topicCount + ' fact columns -- they show on every posting after the next re-check.'
+          : 'Saved.';
         statusEl.className = 'status success';
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
