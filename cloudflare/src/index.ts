@@ -4787,8 +4787,9 @@ const DASHBOARD_PAGE = `<!doctype html>
         });
         if (!res.ok) throw new Error(errorMessage(await res.json(), 'process_failed'));
         var data = await readNdjson(res, function (event) {
-          statusEl.textContent = (event.stage === 'screen' ? 'Screening… ' : 'Assessing… ') +
-            event.done + ' of ' + event.total;
+          statusEl.textContent = (event.stage === 'screen'
+            ? 'Step 1 of 2 — quick screen: '
+            : 'Step 2 of 2 — detailed scoring: ') + event.done + ' of ' + event.total;
         });
         var counts = data.counts || {};
         var left = (counts.unassessed || 0) + (counts.screened_in || 0);
