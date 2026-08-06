@@ -132,21 +132,23 @@ const FIT_BATCH_SCHEMA = {
               properties: {
                 label: {
                   type: "string",
-                  description: "Short label for the topic, e.g. 'Years required', 'Remote', 'Salary', 'Team size'.",
+                  description:
+                    "Copied EXACTLY from the matching topic's label in QUICK FACTS TO REPORT. Never reword it, " +
+                    "never substitute the candidate's original phrasing.",
                 },
                 value: {
                   type: "string",
                   description:
-                    "This posting's actual stated value for that topic, as stated or closely paraphrased. " +
-                    "'Not specified' if the posting doesn't say -- never estimate or guess a value that isn't " +
-                    "actually written.",
+                    "This posting's actual stated value for that topic, as stated or closely paraphrased, kept " +
+                    "short enough to read at a glance. 'Not specified' if the posting doesn't say -- never " +
+                    "estimate or guess a value that isn't actually written.",
                 },
               },
               required: ["label", "value"],
             },
             description:
-              "One fact per distinct topic the candidate said they want to see at a glance (see CANDIDATE'S " +
-              "QUICK FACTS below). Empty array if the candidate didn't specify any topics.",
+              "Exactly one entry per topic listed in QUICK FACTS TO REPORT, in that same order, using those " +
+              "exact labels. Empty array only when no topics are listed there.",
           },
         },
         required: ["id", "score", "reason", "missing", "facts"],
@@ -155,6 +157,94 @@ const FIT_BATCH_SCHEMA = {
   },
   required: ["results"],
 } as const;
+
+/** One quick-fact topic: a clean display name plus what to actually look for in a posting. */
+export type CareAboutTopic = { label: string; looking_for: string };
+
+const CARE_ABOUT_TOPICS_SCHEMA = {
+  type: "object",
+  properties: {
+    topics: {
+      type: "array",
+      maxItems: 8,
+      items: {
+        type: "object",
+        properties: {
+          label: {
+            type: "string",
+            description:
+              "A short, clean display name for this topic, at most 22 characters, in sentence case " +
+              "(e.g. 'Salary', 'Years required', 'Work setup', 'Weekend work', 'Travel'). This is a column " +
+              "heading, not a sentence: strip conditional phrasing like 'if it says' or 'like how much', drop " +
+              "filler words, and never echo the candidate's phrasing back verbatim.",
+          },
+          looking_for: {
+            type: "string",
+            description:
+              "One clause naming what to extract from a posting for this topic, capturing what the candidate " +
+              "actually meant rather than repeating their words (e.g. for 'Work setup': 'whether the role is " +
+              "remote, hybrid, or onsite').",
+          },
+        },
+        required: ["label", "looking_for"],
+      },
+    },
+  },
+  required: ["topics"],
+} as const;
+
+/**
+ * Turns the candidate's free-text "what do you care about" into a clean, canonical topic list.
+ *
+ * The candidate writes conversationally ("remote or hybrid if it says", "like how much percent you
+ * have to travel"), and an earlier version fed that straight into the per-posting scoring call,
+ * which dutifully echoed it back as the label on every card. Column headings written in someone's
+ * off-hand phrasing read as unfinished, and worse, they drifted -- the same topic could come back
+ * worded differently on two different postings, since nothing pinned the wording down.
+ *
+ * Resolving the topics **once, here** rather than per posting fixes both: the model interprets the
+ * intent and names it properly, and every posting afterward is handed the identical label list to
+ * fill in, so the cards line up. `looking_for` carries the interpreted meaning forward so the
+ * extraction step still knows what the candidate was actually asking about.
+ */
+export async function deriveCareAboutTopics(
+  env: LlmEnv,
+  provider: Provider,
+  careAbout: string,
+): Promise<CareAboutTopic[]> {
+  const text = careAbout.trim();
+  if (!text) return [];
+  const prompt = [
+    "A job seeker described, in their own words, which details they want to see at a glance for every",
+    "job posting -- the handful of things they'd otherwise open each posting to go find.",
+    "",
+    "Work out what they actually mean and turn it into a short list of topics. Interpret intent rather",
+    "than transcribing: they are describing what matters to them, not writing the labels themselves.",
+    "Split a sentence that covers several things into separate topics, merge duplicates, and keep the",
+    "order they seem to care about most. Only include topics that could plausibly be answered from a",
+    "job posting's own text.",
+    "",
+    WRITING_STYLE_RULES,
+    "",
+    `WHAT THEY WROTE:\n${text.slice(0, 2000)}`,
+  ].join("\n");
+
+  const { topics } = await callStructured<{ topics: CareAboutTopic[] }>(
+    env,
+    provider,
+    prompt,
+    CARE_ABOUT_TOPICS_SCHEMA,
+    "submit_topics",
+    1200,
+    "screen",
+  );
+  return (topics ?? [])
+    .map((topic) => ({
+      label: String(topic?.label ?? "").trim().slice(0, 40),
+      looking_for: String(topic?.looking_for ?? "").trim(),
+    }))
+    .filter((topic) => topic.label);
+}
 
 /**
  * A years-of-experience gap is one of the few requirements precise enough to reason about
@@ -180,7 +270,7 @@ function fitPrompt(
   desiredRoles: string,
   disqualifiers: string[],
   customPreferences: string,
-  careAbout: string,
+  careAboutTopics: CareAboutTopic[],
   jobs: JobToAssess[],
 ): string {
   return [
@@ -215,14 +305,15 @@ function fitPrompt(
           "",
         ].join("\n")
       : "",
-    careAbout
+    careAboutTopics.length
       ? [
-          "CANDIDATE'S QUICK FACTS: the candidate wants these specific topics surfaced at a glance for every",
-          "posting, in their own words. Populate `facts` with one entry per distinct topic they name below --",
-          "a short label plus this posting's actual value, or 'Not specified' if the posting doesn't say.",
-          "This is informational only and must NOT affect `score` -- naming a topic here is not a requirement,",
-          "it's just what the candidate wants to see without opening the posting:",
-          careAbout,
+          "QUICK FACTS TO REPORT: fill in `facts` with exactly one entry per topic below, in this order,",
+          "copying each `label` verbatim -- these are fixed column headings shown next to every posting, so",
+          "rewording one makes the same topic look like a different one from posting to posting. For each,",
+          "read the posting for what's described and give the value it states, or exactly 'Not specified'.",
+          "This is informational only and must NOT affect `score` -- a topic here is something the candidate",
+          "wants to see without opening the posting, not a requirement the posting has to meet:",
+          ...careAboutTopics.map((topic) => `- ${topic.label} -- ${topic.looking_for}`),
           "",
         ].join("\n")
       : "",
@@ -258,6 +349,33 @@ function fitPrompt(
 }
 
 /**
+ * Rebuilds a posting's facts from the canonical topic list, taking only the *values* from the model.
+ *
+ * Same split the rest of this file runs on: the model proposes, code owns the stored record. The
+ * prompt asks for labels verbatim, but a label is a fixed column heading shown against every
+ * posting, and one reworded label makes the same topic read as a different one two cards later.
+ * Pinning labels here means that can't happen regardless of what comes back. Values are matched by
+ * label first, then by position, so a reworded label still keeps its value instead of dropping it.
+ */
+function alignFactsToTopics(
+  topics: CareAboutTopic[],
+  returned: { label?: string; value?: string }[] | undefined,
+): { label: string; value: string }[] {
+  if (!topics.length) return [];
+  const facts = returned ?? [];
+  const normalize = (value: string): string => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const byLabel = new Map<string, string>();
+  for (const fact of facts) {
+    const key = normalize(String(fact?.label ?? ""));
+    if (key && !byLabel.has(key)) byLabel.set(key, String(fact?.value ?? "").trim());
+  }
+  return topics.map((topic, index) => ({
+    label: topic.label,
+    value: byLabel.get(normalize(topic.label)) || String(facts[index]?.value ?? "").trim() || "Not specified",
+  }));
+}
+
+/**
  * Assesses one batch (small enough for a single prompt) and returns a score per job, defaulting
  * to a fail-open 50 (the middle of the "possible" band) for anything the model doesn't return a
  * result for -- an assessment gap should never silently hide a posting the candidate never got to
@@ -270,14 +388,14 @@ export async function assessJobFitBatch(
   desiredRoles: string,
   disqualifiers: string[],
   customPreferences: string,
-  careAbout: string,
+  careAboutTopics: CareAboutTopic[],
   jobs: JobToAssess[],
 ): Promise<FitResult[]> {
   if (!jobs.length) return [];
   const { results } = await callStructured<{ results: FitResult[] }>(
     env,
     provider,
-    fitPrompt(profileJson, desiredRoles, disqualifiers, customPreferences, careAbout, jobs),
+    fitPrompt(profileJson, desiredRoles, disqualifiers, customPreferences, careAboutTopics, jobs),
     FIT_BATCH_SCHEMA,
     "submit_fit_assessment",
     // Bumped alongside the richer per-posting schema (up to 8 candidate-defined facts per posting) --
@@ -297,7 +415,7 @@ export async function assessJobFitBatch(
       score,
       reason: found.reason ?? "",
       missing: found.missing ?? [],
-      facts: found.facts ?? [],
+      facts: alignFactsToTopics(careAboutTopics, found.facts),
     };
   });
 }
