@@ -1473,7 +1473,7 @@ async function discoverCompanies(request: Request, env: Env): Promise<Response> 
 async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { limit?: number; company_id?: string };
+  const body = (await request.json().catch(() => ({}))) as { limit?: number; company_id?: string; force?: boolean };
   const profileId = await getOrCreateProfileId(env);
 
   const profileRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
@@ -1499,17 +1499,22 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
         // automatically would just fail again. The single-company scan query above (by id, no
         // status filter) still reaches them, for a deliberate manual retry.
         //
-        // A company already scanned today is excluded too -- its board was just read, so
-        // re-reading it minutes or hours later within the same click cycle just re-pays for the
-        // same listings. It becomes eligible again once the calendar day rolls over.
+        // A company already scanned today is excluded too by default -- its board was just read,
+        // so re-reading it minutes or hours later within the same click cycle just re-pays for the
+        // same listings. It becomes eligible again once the calendar day rolls over -- or
+        // immediately, with `force`, for the one case that guard actively works against: after a
+        // change to what gets captured from a posting (e.g. a widened description-length cap),
+        // every already-scanned posting is stuck on its old, thinner text until it's re-read, and
+        // the ordinary daily guard silently no-ops the very re-scan that's supposed to fix that
+        // (reports "0 scanned" with no indication anything was skipped, rather than an error).
         `SELECT id, name, website, careers_url, ats_provider, ats_token
          FROM companies
          WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable')
-           AND (last_scanned_at IS NULL OR date(last_scanned_at) < date('now'))
+           AND (? OR last_scanned_at IS NULL OR date(last_scanned_at) < date('now'))
          ORDER BY last_scanned_at IS NOT NULL, last_scanned_at ASC
          LIMIT ?`,
       )
-        .bind(profileId, limit)
+        .bind(profileId, body.force === true ? 1 : 0, limit)
         .all<CompanyScanRow>();
 
   const companies = targets.results ?? [];
@@ -3705,6 +3710,8 @@ const DASHBOARD_PAGE = `<!doctype html>
         </div>
         <button id="jobs-scan-button" type="button">Scan company boards</button>
       </div>
+      <label><input id="jobs-scan-force" type="checkbox"> Re-scan companies already read today too</label>
+      <p class="hint">Off by default to avoid re-paying for boards you just read. Turn this on for a one-off re-read of everything right now — for example right after a fix widens what gets captured from a posting, so already-scanned postings pick up the fuller text instead of waiting until tomorrow's normal scan.</p>
       <p id="jobs-scan-status" class="status" role="status" aria-live="polite"></p>
     </section>
 
@@ -4801,7 +4808,10 @@ const DASHBOARD_PAGE = `<!doctype html>
           var res = await api('/companies/scan', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ limit: Number(document.getElementById('jobs-scan-count').value) }),
+            body: JSON.stringify({
+              limit: Number(document.getElementById('jobs-scan-count').value),
+              force: document.getElementById('jobs-scan-force').checked,
+            }),
           });
           if (!res.ok) throw new Error(errorMessage(await res.json(), 'scan_failed'));
           data = await readNdjson(res, function (event) {
@@ -4813,11 +4823,19 @@ const DASHBOARD_PAGE = `<!doctype html>
           totalScanned += data.scanned;
           totalNew += data.new_listings;
         } while (wantsAll && data.unscanned > 0 && data.scanned > 0 && round < 25);
-        statusEl.textContent =
-          'Scanned ' + totalScanned + ' compan' + (totalScanned === 1 ? 'y' : 'ies') + ' — found ' +
-          totalNew + ' new listing' + (totalNew === 1 ? '' : 's') + '. ' +
-          (data.unscanned ? data.unscanned + ' compan' + (data.unscanned === 1 ? 'y' : 'ies') +
-            ' still to scan today, click again to continue.' : 'All companies scanned for today.');
+        if (totalScanned === 0 && !document.getElementById('jobs-scan-force').checked) {
+          // The single most confusing outcome this button can produce: it looks identical to "ran
+          // fine, nothing new" whether that's actually true or every candidate was just skipped for
+          // already being scanned today -- say so explicitly instead of leaving that ambiguous.
+          statusEl.textContent = 'Nothing scanned -- every company on your list was already scanned today. ' +
+            'Check "Re-scan companies already read today too" above if you specifically need a fresh read right now.';
+        } else {
+          statusEl.textContent =
+            'Scanned ' + totalScanned + ' compan' + (totalScanned === 1 ? 'y' : 'ies') + ' — found ' +
+            totalNew + ' new listing' + (totalNew === 1 ? '' : 's') + '. ' +
+            (data.unscanned ? data.unscanned + ' compan' + (data.unscanned === 1 ? 'y' : 'ies') +
+              ' still to scan today, click again to continue.' : 'All companies scanned for today.');
+        }
         statusEl.className = 'status success';
         await loadCompanies();
         await loadJobs();
