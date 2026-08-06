@@ -1138,35 +1138,60 @@ async function createCompany(request: Request, env: Env): Promise<Response> {
   return json({ added }, added ? 201 : 200);
 }
 
+/** True for a bare token that's clearly a URL/domain rather than a company name -- "acme.com" or
+ * "https://acme.com", but not "3M Co." or "Dr. Squatch" (an internal period isn't at the end, or
+ * isn't immediately followed by the last word). Used to attach an optional website to whichever
+ * name came just before it, without requiring it on the same line. */
+function looksLikeUrl(token: string): boolean {
+  return /^(https?:\/\/|www\.)/i.test(token) || /\.[a-z]{2,}(\/\S*)?$/i.test(token);
+}
+
 /**
  * Adds many companies from one pasted list -- for a candidate who already has their own list of
- * employers to target, typing them into the single-company form one at a time doesn't scale. Each
- * line is either a bare name or "Name, https://site.com" (a comma splits the two, since commas
- * don't otherwise appear in company names); blank lines are skipped. Capped at 50 -- comfortably
- * more than anyone pastes in one sitting, and small enough that this stays a handful of fast,
- * sequential inserts rather than needing its own progress stream.
+ * employers to target, typing them into the single-company form one at a time doesn't scale.
+ * Deliberately permissive about how that list is formatted: one company per line, several on one
+ * line separated by commas or semicolons, a numbered or bulleted list, or any mix, since there's no
+ * reason to make someone reformat a list they already have. Splitting happens on newlines, commas,
+ * and semicolons together, each token has a leading bullet/number stripped, and any token that
+ * looks like a URL is attached as the website of whichever name preceded it rather than treated as
+ * its own entry -- so "Acme, https://acme.com, Beta Corp" reads as two companies, not three.
+ * Capped at 50 -- comfortably more than anyone pastes in one sitting, and small enough that this
+ * stays a handful of fast, sequential inserts rather than needing its own progress stream.
  */
 async function bulkAddCompanies(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as { text?: string };
-  const lines = (body.text ?? "")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .slice(0, 50);
-  if (!lines.length) return json({ error: "no_companies_found" }, 400);
+
+  const tokens = (body.text ?? "")
+    .split(/[\n,;]+/)
+    .map((token) =>
+      token
+        .trim()
+        .replace(/^["“]|["”]$/g, "")
+        .replace(/^[-*•]\s*/, "")
+        .replace(/^\(?\d+[.)]\s*/, "")
+        .trim(),
+    )
+    .filter(Boolean);
+
+  const companies: { name: string; website: string }[] = [];
+  for (const token of tokens) {
+    if (looksLikeUrl(token) && companies.length && !companies[companies.length - 1].website) {
+      companies[companies.length - 1].website = token;
+    } else {
+      companies.push({ name: token, website: "" });
+    }
+  }
+  const capped = companies.slice(0, 50);
+  if (!capped.length) return json({ error: "no_companies_found" }, 400);
 
   const profileId = await getOrCreateProfileId(env);
   let added = 0;
-  for (const line of lines) {
-    const commaIndex = line.indexOf(",");
-    const name = (commaIndex === -1 ? line : line.slice(0, commaIndex)).trim();
-    const website = (commaIndex === -1 ? "" : line.slice(commaIndex + 1)).trim();
-    if (!name) continue;
+  for (const company of capped) {
     const wasAdded = await addCompanyRow(env, profileId, {
-      name,
-      website,
+      name: company.name,
+      website: company.website,
       careers_url: "",
       bio: "",
       location: "",
@@ -1176,7 +1201,7 @@ async function bulkAddCompanies(request: Request, env: Env): Promise<Response> {
     });
     if (wasAdded) added += 1;
   }
-  return json({ added, skipped: lines.length - added, total: lines.length }, 201);
+  return json({ added, skipped: capped.length - added, total: capped.length }, 201);
 }
 
 /**
@@ -3371,8 +3396,8 @@ const DASHBOARD_PAGE = `<!doctype html>
             <p id="company-add-status" class="status" role="status" aria-live="polite"></p>
 
             <h3 class="subhead">Already have a list? Add several at once</h3>
-            <label for="company-bulk-text">One company per line -- a name alone, or "Name, https://site.com"</label>
-            <textarea id="company-bulk-text" rows="6" placeholder="Acme Robotics, https://acme.com&#10;Another Company&#10;A Third One, https://third.example"></textarea>
+            <label for="company-bulk-text">Names separated by commas, semicolons, or line breaks -- paste it however you already have it. A website right after a name attaches to it.</label>
+            <textarea id="company-bulk-text" rows="6" placeholder="Acme Robotics, Another Company, A Third One, https://third.example"></textarea>
             <button id="company-bulk-button" type="button">Add up to 50</button>
             <p id="company-bulk-status" class="status" role="status" aria-live="polite"></p>
           </details>
