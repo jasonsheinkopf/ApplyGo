@@ -108,6 +108,32 @@ function ndjsonResponse(ctx: ExecutionContext, run: (emit: (event: unknown) => P
   return new Response(readable, { headers: { "content-type": "application/x-ndjson; charset=utf-8" } });
 }
 
+/**
+ * Runs `fn` over `items` with at most `concurrency` in flight at once, calling `onSettle` as each
+ * one finishes (in completion order, not list order) so progress can still stream live rather than
+ * only once the whole batch is done. Company board scans and job-fit LLM calls are both purely
+ * I/O-bound -- almost all of their time is spent waiting on a fetch or a model response, not on
+ * CPU -- so running a handful at once instead of one after another cuts wall-clock time roughly by
+ * the concurrency factor for free, which is what turns "several minutes across multiple rounds"
+ * into "under a minute in one click" for a realistic company list or posting backlog.
+ */
+async function runPooled<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+  onSettle: (item: T, result: R) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (next < items.length) {
+      const item = items[next++];
+      const result = await fn(item);
+      await onSettle(item, result);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, () => worker()));
+}
+
 function randomToken(bytes = 32): string {
   const value = new Uint8Array(bytes);
   crypto.getRandomValues(value);
@@ -554,7 +580,11 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
   const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
   const disqualifiers = await loadDisqualifiers(env, profileId);
 
-  const budget = { remaining: Math.min(Math.max(Number(body.calls) || 6, 1), 12) };
+  // Raised alongside the switch to concurrent batches below: each call is a single LLM request
+  // covering a whole batch of postings (60 for screen, 8 for assess), and firing several of those
+  // at once instead of one after another is what lets a realistic backlog clear in one click.
+  const budget = { remaining: Math.min(Math.max(Number(body.calls) || 6, 1), 24) };
+  const LLM_CONCURRENCY = 8;
 
   return ndjsonResponse(ctx, async (emit) => {
     const errors: string[] = [];
@@ -566,22 +596,40 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
     // "screened 50 of 243" stays meaningful across however many clicks it takes to clear it.
     const screenTotal = (await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'unassessed'").first<{ n: number }>())?.n ?? 0;
 
-    // Tier 1: cheap bulk screen over everything untouched.
-    while (budget.remaining > 0) {
-      const rows = await env.DB.prepare(
-        `SELECT id, title, company, location, raw_description FROM job_postings
-         WHERE fit_status = 'unassessed' ORDER BY created_at ASC LIMIT ?`,
-      )
-        .bind(SCREEN_BATCH_SIZE)
-        .all<JobRow>();
-      const batch = toAssessable(rows.results ?? []);
-      if (!batch.length) break;
-      budget.remaining -= 1;
-      try {
-        const results = await screenJobsBatch(env, provider, matchProfile, desiredRoles, disqualifiers, batch);
+    // Tier 1: cheap bulk screen over everything untouched. Every batch this round's budget can
+    // afford is fetched up front and split into disjoint chunks (so concurrent calls never see
+    // overlapping rows), then fired at once -- batches don't depend on each other, so there's no
+    // reason to wait for one to finish before starting the next.
+    const screenRows = await env.DB.prepare(
+      `SELECT id, title, company, location, raw_description FROM job_postings
+       WHERE fit_status = 'unassessed' ORDER BY created_at ASC LIMIT ?`,
+    )
+      .bind(budget.remaining * SCREEN_BATCH_SIZE)
+      .all<JobRow>();
+    const screenItems = toAssessable(screenRows.results ?? []);
+    const screenBatches: (typeof screenItems)[] = [];
+    for (let i = 0; i < screenItems.length; i += SCREEN_BATCH_SIZE) screenBatches.push(screenItems.slice(i, i + SCREEN_BATCH_SIZE));
+    budget.remaining -= screenBatches.length;
+
+    let screenFailed = false;
+    await runPooled(
+      screenBatches,
+      LLM_CONCURRENCY,
+      async (batch) => {
+        if (screenFailed) return null;
+        try {
+          return await screenJobsBatch(env, provider, matchProfile, desiredRoles, disqualifiers, batch);
+        } catch (err) {
+          errors.push(`screen: ${(err as Error).message}`);
+          screenFailed = true;
+          return null;
+        }
+      },
+      async (_batch, results) => {
+        if (!results) return;
         for (const result of results) {
           // Written immediately, one posting at a time, so a dropped connection loses at most
-          // the single in-flight batch -- everything screened before it stays screened.
+          // the still-in-flight batches -- everything already screened stays screened.
           await env.DB.prepare(
             "UPDATE job_postings SET fit_status = ?, fit_reason = ?, screened_at = CURRENT_TIMESTAMP WHERE id = ?",
           )
@@ -591,43 +639,44 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
         }
         screened += results.length;
         await emit({ type: "progress", stage: "screen", done: screened, total: screenTotal });
-      } catch (err) {
-        errors.push(`screen: ${(err as Error).message}`);
-        break;
-      }
-    }
+      },
+    );
 
     // Tier 2: strong model, only on survivors. Total is snapshotted now rather than at the top
     // of the function, since tier 1 above is what populates this queue in the first place.
     const assessTotal = (await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'screened_in'").first<{ n: number }>())?.n ?? 0;
 
-    while (budget.remaining > 0) {
-      const rows = await env.DB.prepare(
-        `SELECT id, title, company, location, raw_description FROM job_postings
-         WHERE fit_status = 'screened_in' ORDER BY created_at ASC LIMIT ?`,
-      )
-        .bind(FIT_BATCH_SIZE)
-        .all<JobRow>();
-      const batch = toAssessable(rows.results ?? []);
-      if (!batch.length) break;
-      budget.remaining -= 1;
-      try {
-        const results = await assessJobFitBatch(
-          env,
-          provider,
-          JSON.stringify(structured),
-          desiredRoles,
-          disqualifiers,
-          batch,
-        );
+    const assessRows = await env.DB.prepare(
+      `SELECT id, title, company, location, raw_description FROM job_postings
+       WHERE fit_status = 'screened_in' ORDER BY created_at ASC LIMIT ?`,
+    )
+      .bind(budget.remaining * FIT_BATCH_SIZE)
+      .all<JobRow>();
+    const assessItems = toAssessable(assessRows.results ?? []);
+    const assessBatches: (typeof assessItems)[] = [];
+    for (let i = 0; i < assessItems.length; i += FIT_BATCH_SIZE) assessBatches.push(assessItems.slice(i, i + FIT_BATCH_SIZE));
+
+    let assessFailed = false;
+    await runPooled(
+      assessBatches,
+      LLM_CONCURRENCY,
+      async (batch) => {
+        if (assessFailed) return null;
+        try {
+          return await assessJobFitBatch(env, provider, JSON.stringify(structured), desiredRoles, disqualifiers, batch);
+        } catch (err) {
+          errors.push(`assess: ${(err as Error).message}`);
+          assessFailed = true;
+          return null;
+        }
+      },
+      async (_batch, results) => {
+        if (!results) return;
         await storeFitResults(env, results);
         assessed += results.length;
         await emit({ type: "progress", stage: "assess", done: assessed, total: assessTotal });
-      } catch (err) {
-        errors.push(`assess: ${(err as Error).message}`);
-        break;
-      }
-    }
+      },
+    );
 
     return { screened, screened_out: screenedOut, assessed, errors, counts: await jobPipelineCounts(env) };
   });
@@ -1090,6 +1139,47 @@ async function createCompany(request: Request, env: Env): Promise<Response> {
 }
 
 /**
+ * Adds many companies from one pasted list -- for a candidate who already has their own list of
+ * employers to target, typing them into the single-company form one at a time doesn't scale. Each
+ * line is either a bare name or "Name, https://site.com" (a comma splits the two, since commas
+ * don't otherwise appear in company names); blank lines are skipped. Capped at 50 -- comfortably
+ * more than anyone pastes in one sitting, and small enough that this stays a handful of fast,
+ * sequential inserts rather than needing its own progress stream.
+ */
+async function bulkAddCompanies(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { text?: string };
+  const lines = (body.text ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 50);
+  if (!lines.length) return json({ error: "no_companies_found" }, 400);
+
+  const profileId = await getOrCreateProfileId(env);
+  let added = 0;
+  for (const line of lines) {
+    const commaIndex = line.indexOf(",");
+    const name = (commaIndex === -1 ? line : line.slice(0, commaIndex)).trim();
+    const website = (commaIndex === -1 ? "" : line.slice(commaIndex + 1)).trim();
+    if (!name) continue;
+    const wasAdded = await addCompanyRow(env, profileId, {
+      name,
+      website,
+      careers_url: "",
+      bio: "",
+      location: "",
+      why_fit: "",
+      status: "reachable",
+      source: "manual",
+    });
+    if (wasAdded) added += 1;
+  }
+  return json({ added, skipped: lines.length - added, total: lines.length }, 201);
+}
+
+/**
  * Proposes companies from the candidate's own profile, then checks each proposed site actually
  * resolves before trusting it. A model listing employers will occasionally invent or misremember
  * one, so nothing here is taken on faith.
@@ -1227,25 +1317,42 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
   const companies = targets.results ?? [];
 
   return ndjsonResponse(ctx, async (emit) => {
-    const budget = { remaining: 40 };
+    // Raised alongside the switch to concurrent scanning below: this was originally sized for a
+    // sequential loop where the real limit was how long one request could reasonably run, not how
+    // many subrequests were actually safe. Reading a board is a plain fetch with no LLM cost, so a
+    // higher shared cap just means a realistic company list (tens to a couple hundred) clears in
+    // one click instead of needing several.
+    const budget = { remaining: 150 };
     const results: { company: string; jobs: number; new_jobs: number; note: string }[] = [];
     let newListings = 0;
+    let done = 0;
 
-    for (const company of companies) {
-      // scanOneCompany already writes each company's listings to the database before returning,
-      // so a company already reported here is durably saved even if the next one never runs.
-      const outcome = await scanOneCompany(env, company, desiredRoles, locationTerms, budget);
-      results.push({ company: company.name, jobs: outcome.jobs, new_jobs: outcome.newJobs, note: outcome.note });
-      newListings += outcome.newJobs;
-      await emit({
-        type: "progress",
-        done: results.length,
-        total: companies.length,
-        company: company.name,
-        new_jobs: outcome.newJobs,
-      });
-      if (budget.remaining <= 2) break;
-    }
+    // Companies don't depend on each other, and scanning one is almost entirely waiting on a fetch
+    // to that company's own board plus a few DB writes -- essentially no CPU time. Running several
+    // at once instead of one after another turns "minutes across multiple rounds" into one click.
+    await runPooled(
+      companies,
+      8,
+      async (company) => {
+        if (budget.remaining <= 2) return null;
+        // scanOneCompany already writes each company's listings to the database before returning,
+        // so a company already reported here is durably saved even if others in flight never finish.
+        return scanOneCompany(env, company, desiredRoles, locationTerms, budget);
+      },
+      async (company, outcome) => {
+        if (!outcome) return;
+        done += 1;
+        results.push({ company: company.name, jobs: outcome.jobs, new_jobs: outcome.newJobs, note: outcome.note });
+        newListings += outcome.newJobs;
+        await emit({
+          type: "progress",
+          done,
+          total: companies.length,
+          company: company.name,
+          new_jobs: outcome.newJobs,
+        });
+      },
+    );
 
     // "Unscanned" here means "not yet scanned today", matching the query above -- a company
     // scanned yesterday isn't owed another scan until this same cycle rolls into a new day.
@@ -3262,6 +3369,12 @@ const DASHBOARD_PAGE = `<!doctype html>
               <button type="submit">Add company</button>
             </form>
             <p id="company-add-status" class="status" role="status" aria-live="polite"></p>
+
+            <h3 class="subhead">Already have a list? Add several at once</h3>
+            <label for="company-bulk-text">One company per line -- a name alone, or "Name, https://site.com"</label>
+            <textarea id="company-bulk-text" rows="6" placeholder="Acme Robotics, https://acme.com&#10;Another Company&#10;A Third One, https://third.example"></textarea>
+            <button id="company-bulk-button" type="button">Add up to 50</button>
+            <p id="company-bulk-status" class="status" role="status" aria-live="polite"></p>
           </details>
         </section>
       </div>
@@ -4359,6 +4472,36 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
+    document.getElementById('company-bulk-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('company-bulk-status');
+      var textEl = document.getElementById('company-bulk-text');
+      var text = textEl.value.trim();
+      if (!text) {
+        statusEl.textContent = 'Paste at least one company first.';
+        statusEl.className = 'status error';
+        return;
+      }
+      statusEl.textContent = 'Adding…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/companies/bulk', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text: text }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(errorMessage(data, 'add_failed'));
+        statusEl.textContent = 'Added ' + data.added + ' of ' + data.total + '.' +
+          (data.skipped ? ' ' + data.skipped + ' already on your list.' : '');
+        statusEl.className = 'status success';
+        textEl.value = '';
+        loadCompanies();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
     var FIT_LABELS = {
       strong: { text: 'Strong match', cls: 'strong' },
       possible: { text: 'Possible match', cls: 'possible' },
@@ -5388,6 +5531,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "PUT" && url.pathname === "/profile/structured") return saveStructuredProfile(request, env);
     if (request.method === "GET" && url.pathname === "/companies") return listCompanies(request, env);
     if (request.method === "POST" && url.pathname === "/companies") return createCompany(request, env);
+    if (request.method === "POST" && url.pathname === "/companies/bulk") return bulkAddCompanies(request, env);
     if (request.method === "POST" && url.pathname === "/companies/discover") return discoverCompanies(request, env);
     if (request.method === "POST" && url.pathname === "/companies/scan") return scanCompanies(request, env, ctx);
     const companyMatch = url.pathname.match(/^\/companies\/([^/]+)$/);
