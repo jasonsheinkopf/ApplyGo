@@ -962,7 +962,15 @@ async function storeFitResults(env: Env, results: FitResult[]): Promise<void> {
 async function setJobFit(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { action?: string; reason?: string };
+  const body = (await request.json().catch(() => ({}))) as {
+    action?: string;
+    reason?: string;
+    fit_status?: string;
+    fit_score?: number | null;
+    fit_reason?: string;
+    fit_missing_json?: string;
+    fit_detail_json?: string;
+  };
   const job = await env.DB.prepare("SELECT title, company, fit_score FROM job_postings WHERE id = ?")
     .bind(id)
     .first<{ title: string; company: string; fit_score: number | null }>();
@@ -975,6 +983,28 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
       .bind(id)
       .run();
     return json({ id, fit_status: "unassessed" });
+  }
+
+  if (body.action === "restore_snapshot") {
+    // Undo for Jindr: a reject overwrites fit_score/fit_reason below, so there's nothing left in
+    // the database to restore from once one happens -- the client has to hold onto its own copy of
+    // the row from just before the swipe and hand it back verbatim. interested_at is explicitly
+    // cleared since Jindr only ever swipes from the not-yet-interested state in the first place.
+    const fitStatus = body.fit_status || "unassessed";
+    await env.DB.prepare(
+      `UPDATE job_postings SET fit_status = ?, fit_score = ?, fit_reason = ?, fit_missing_json = ?,
+       fit_detail_json = ?, interested_at = NULL WHERE id = ?`,
+    )
+      .bind(
+        fitStatus,
+        body.fit_score ?? null,
+        body.fit_reason ?? "",
+        body.fit_missing_json ?? "[]",
+        body.fit_detail_json ?? "{}",
+        id,
+      )
+      .run();
+    return json({ id, fit_status: fitStatus });
   }
 
   if (body.action === "interested") {
@@ -3264,6 +3294,21 @@ const DASHBOARD_PAGE = `<!doctype html>
     font-size: 0.9rem; border-left: 3px solid var(--accent); padding: 0.5rem 0.75rem;
     background: var(--surface-2, rgba(127,127,127,0.08)); border-radius: 0 0.4rem 0.4rem 0;
   }
+  /* One-at-a-time review card. touch-action:pan-y leaves vertical scroll to the browser and hands
+     horizontal movement to the drag handler; select:none stops a fast swipe from also highlighting
+     the card's text on desktop. */
+  .jindr-card {
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 1.1rem;
+    background: var(--surface-2); touch-action: pan-y; user-select: none; cursor: grab;
+  }
+  .jindr-card.dragging { cursor: grabbing; transition: none; }
+  .jindr-facts { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.6rem 0; }
+  .jindr-actions { display: flex; gap: 0.75rem; margin-top: 1.1rem; }
+  .jindr-actions button { flex: 1; font-size: 0.95rem; padding: 0.75rem; margin-top: 0; }
+  .jindr-actions button.danger {
+    background: var(--surface); border: 1px solid var(--error); color: var(--error);
+  }
+  .jindr-actions button.danger:hover:not(:disabled) { background: var(--error-soft); opacity: 1; }
   .summary-line {
     font-size: 0.85rem; color: var(--text-muted); margin: 0 0 1rem; padding: 0.6rem 0.75rem;
     background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -3337,6 +3382,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="search" type="button">Search</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
+    <button class="tab" data-tab="jindr" type="button">Jindr</button>
     <button class="tab" data-tab="interested" type="button">Interested</button>
     <button class="tab" data-tab="applied" type="button">Applied</button>
     <button class="tab" data-tab="devices" type="button">Devices</button>
@@ -3680,6 +3726,31 @@ const DASHBOARD_PAGE = `<!doctype html>
         </form>
         <p id="job-status" class="status" role="status" aria-live="polite"></p>
       </details>
+    </section>
+  </div>
+
+  <div id="panel-jindr" class="panel">
+    <section id="jindr-section">
+      <h2>Jindr</h2>
+      <p class="hint">One posting at a time, best match first. Judge it and move on -- the same Interested/Not-for-me decision the Jobs tab makes, just without the scrolling.</p>
+      <p id="jindr-progress" class="summary-line"></p>
+      <div id="jindr-empty" class="empty" style="display:none">All caught up -- nothing left to review. New matches will show up here after your next "Find my matches" pass.</div>
+      <div id="jindr-card" class="jindr-card" style="display:none">
+        <div class="row-title-line">
+          <a id="jindr-title" class="row-title" target="_blank" rel="noopener"></a>
+          <span id="jindr-score" class="badge strong"></span>
+        </div>
+        <div id="jindr-meta" class="row-meta"></div>
+        <div id="jindr-facts" class="jindr-facts"></div>
+        <p id="jindr-reason" class="job-reason"></p>
+        <div id="jindr-missing"></div>
+        <div class="jindr-actions">
+          <button id="jindr-reject" class="danger" type="button">✕ Not for me</button>
+          <button id="jindr-interested" type="button">♥ Interested</button>
+        </div>
+      </div>
+      <button id="jindr-undo" class="secondary" type="button" style="display:none">Undo</button>
+      <p id="jindr-status" class="status" role="status" aria-live="polite"></p>
     </section>
   </div>
 
@@ -4770,6 +4841,172 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
       await loadJobs();
     }
+
+    // Jindr: the same judged-matches bucket the Jobs tab shows, one at a time instead of scrolled,
+    // always ordered best-match-first regardless of whatever sort the Jobs tab currently has
+    // selected. The queue is a plain snapshot taken when the tab is opened -- not rebuilt on every
+    // loadJobs() -- so a background scan or reassess finishing mid-review doesn't reshuffle the
+    // stack out from under you.
+    var jindrQueue = [];
+    var jindrIndex = 0;
+    var jindrLastSwipe = null;
+
+    function jindrBuildQueue() {
+      jindrQueue = allJobs.filter(function (j) {
+        return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status]
+          && !INTERESTED_STATUSES[j.fit_status] && !APPLIED_STATUSES[j.fit_status];
+      }).sort(jobSortComparator('score'));
+      jindrIndex = 0;
+      jindrLastSwipe = null;
+      renderJindrCard();
+    }
+
+    function jindrFactBadge(text) {
+      return text ? el('span', { className: 'badge', textContent: text }) : null;
+    }
+
+    function renderJindrCard() {
+      document.getElementById('jindr-undo').style.display = jindrLastSwipe ? 'inline-block' : 'none';
+      document.getElementById('jindr-status').textContent = '';
+
+      if (jindrIndex >= jindrQueue.length) {
+        document.getElementById('jindr-progress').textContent = jindrQueue.length
+          ? 'Reviewed all ' + jindrQueue.length + '.' : '';
+        document.getElementById('jindr-card').style.display = 'none';
+        document.getElementById('jindr-empty').style.display = 'block';
+        return;
+      }
+
+      document.getElementById('jindr-empty').style.display = 'none';
+      document.getElementById('jindr-card').style.display = 'block';
+      var card = document.getElementById('jindr-card');
+      card.style.transform = '';
+      card.classList.remove('dragging');
+
+      var job = jindrQueue[jindrIndex];
+      document.getElementById('jindr-progress').textContent = (jindrIndex + 1) + ' of ' + jindrQueue.length + ' to review';
+
+      var titleEl = document.getElementById('jindr-title');
+      titleEl.textContent = job.title;
+      if (job.source_url) { titleEl.href = job.source_url; } else { titleEl.removeAttribute('href'); }
+
+      var hasScore = job.fit_score !== null && job.fit_score !== undefined;
+      document.getElementById('jindr-score').textContent = hasScore ? job.fit_score + '% match' : 'Not yet scored';
+
+      document.getElementById('jindr-meta').textContent = [job.company, job.location].filter(Boolean).join(' · ');
+
+      var detail = {};
+      try { detail = JSON.parse(job.fit_detail_json || '{}'); } catch (e) { detail = {}; }
+      var factsHost = document.getElementById('jindr-facts');
+      factsHost.innerHTML = '';
+      [
+        jindrFactBadge(detail.years_required),
+        jindrFactBadge(detail.remote),
+        jindrFactBadge(detail.salary),
+      ].filter(Boolean).forEach(function (badge) { factsHost.appendChild(badge); });
+
+      document.getElementById('jindr-reason').textContent = job.fit_reason || '';
+
+      var missing = [];
+      try { missing = JSON.parse(job.fit_missing_json || '[]'); } catch (e) { missing = []; }
+      var missingHost = document.getElementById('jindr-missing');
+      missingHost.innerHTML = '';
+      if (missing.length) {
+        missingHost.appendChild(el('p', { className: 'job-missing', textContent: 'Gaps: ' + missing.join('; ') }));
+      }
+    }
+
+    function jindrSwipe(action) {
+      if (jindrIndex >= jindrQueue.length) return;
+      var job = jindrQueue[jindrIndex];
+      jindrLastSwipe = { job: JSON.parse(JSON.stringify(job)), action: action };
+      jindrIndex += 1;
+      renderJindrCard();
+      // Fired after the UI has already moved on -- reviewing one posting shouldn't stall on a
+      // round trip the same way a swipe app never waits for the server before showing the next card.
+      submitJobFit(job.id, action).catch(function (err) {
+        document.getElementById('jindr-status').textContent = 'Error saving that decision: ' + err.message;
+        document.getElementById('jindr-status').className = 'status error';
+      });
+    }
+
+    document.getElementById('jindr-interested').addEventListener('click', function () { jindrSwipe('interested'); });
+    document.getElementById('jindr-reject').addEventListener('click', function () { jindrSwipe('reject'); });
+
+    document.getElementById('jindr-undo').addEventListener('click', async function () {
+      if (!jindrLastSwipe) return;
+      var snapshot = jindrLastSwipe.job;
+      var button = this;
+      button.disabled = true;
+      try {
+        await api('/jobs/' + encodeURIComponent(snapshot.id) + '/fit', {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            action: 'restore_snapshot',
+            fit_status: snapshot.fit_status,
+            fit_score: snapshot.fit_score,
+            fit_reason: snapshot.fit_reason,
+            fit_missing_json: snapshot.fit_missing_json,
+            fit_detail_json: snapshot.fit_detail_json,
+          }),
+        });
+        jindrIndex -= 1;
+        jindrLastSwipe = null;
+        renderJindrCard();
+        await loadJobs();
+      } catch (err) {
+        document.getElementById('jindr-status').textContent = 'Error: ' + err.message;
+        document.getElementById('jindr-status').className = 'status error';
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    // Drag-to-swipe: a bonus on top of the buttons above, not a replacement -- pointer events so
+    // it works with both touch and mouse, translateX follows the pointer, releasing past a distance
+    // threshold commits to the same action the corresponding button would.
+    (function () {
+      var card = document.getElementById('jindr-card');
+      var dragging = false;
+      var startX = 0;
+      var dx = 0;
+      var THRESHOLD = 100;
+
+      card.addEventListener('pointerdown', function (event) {
+        if (jindrIndex >= jindrQueue.length) return;
+        // The buttons are children of the card -- without this, pressing one starts a drag first
+        // (capturing the pointer to the card) and the button never sees its own click at all.
+        if (event.target.closest('.jindr-actions')) return;
+        dragging = true;
+        startX = event.clientX;
+        dx = 0;
+        card.classList.add('dragging');
+        card.setPointerCapture(event.pointerId);
+      });
+      card.addEventListener('pointermove', function (event) {
+        if (!dragging) return;
+        dx = event.clientX - startX;
+        card.style.transform = 'translateX(' + dx + 'px) rotate(' + (dx / 20) + 'deg)';
+      });
+      function endDrag() {
+        if (!dragging) return;
+        dragging = false;
+        card.classList.remove('dragging');
+        if (dx > THRESHOLD) {
+          jindrSwipe('interested');
+        } else if (dx < -THRESHOLD) {
+          jindrSwipe('reject');
+        } else {
+          card.style.transform = '';
+        }
+        dx = 0;
+      }
+      card.addEventListener('pointerup', endDrag);
+      card.addEventListener('pointercancel', endDrag);
+    })();
+
+    document.querySelector('[data-tab="jindr"]').addEventListener('click', jindrBuildQueue);
 
     function renderJobRows(list, jobs) {
       jobs.forEach(function (job) {
