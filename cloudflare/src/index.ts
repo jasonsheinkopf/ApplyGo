@@ -1625,6 +1625,12 @@ async function scanOneCompany(
   // a scan stays cheap and fast and can cover far more companies per request.
   let newJobs = 0;
   for (const job of relevant) {
+    // Compensation, remote/onsite, hours, and travel -- exactly what the tier-2 "what do you care
+    // about" facts need -- routinely sit in a "Compensation and benefits" section at the very end
+    // of a real posting, well past where a tighter cap used to cut off. 4000 matches the ceiling
+    // companies.ts's own scrape already caps at (see fetchBoardJobs), so this is no longer the
+    // bottleneck -- the description actually available is what gets stored.
+    const description = (job.description ?? "").slice(0, 4000);
     const inserted = await env.DB.prepare(
       `INSERT OR IGNORE INTO job_postings
          (id, title, company, source_url, raw_description, location, posted_at, ats_provider, company_id,
@@ -1636,9 +1642,7 @@ async function scanOneCompany(
         job.title,
         company.name,
         job.url,
-        // Only the opening of a description is ever needed for screening, and this is the single
-        // biggest column in the database, so it is capped on the way in.
-        (job.description ?? "").slice(0, 1500),
+        description,
         job.location,
         job.posted_at || null,
         provider,
@@ -1648,7 +1652,19 @@ async function scanOneCompany(
       .run();
     // relevant.length also counts postings the board already showed on a previous scan;
     // meta.changes is the only reliable signal for "actually new this time".
-    if (inserted.meta.changes > 0) newJobs += 1;
+    if (inserted.meta.changes > 0) {
+      newJobs += 1;
+    } else {
+      // A posting already on file (from before this cap was raised, or from any run that captured
+      // less) gets backfilled with the fuller text on its next scan -- only grows, never shrinks,
+      // and a no-op once a posting already has the fuller description, so repeat scans stay cheap.
+      await env.DB.prepare(
+        `UPDATE job_postings SET raw_description = ?
+         WHERE company_id = ? AND external_id = ? AND LENGTH(raw_description) < LENGTH(?)`,
+      )
+        .bind(description, company.id, job.external_id, description)
+        .run();
+    }
   }
 
   const total = await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE company_id = ?")
@@ -3323,7 +3339,21 @@ const DASHBOARD_PAGE = `<!doctype html>
     background: var(--surface-2); touch-action: pan-y; user-select: none; cursor: grab;
   }
   .jindr-card.dragging { cursor: grabbing; transition: none; }
-  .jindr-facts { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.6rem 0; }
+  .jindr-facts, .row-facts { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.6rem 0; }
+  .row-facts { margin: 0.3rem 0 0; }
+  /* Label above value, not squeezed onto one line -- a long value (e.g. a full remote/onsite
+     policy sentence) used to force a single-line badge past the edge of the card/screen instead
+     of wrapping. min-width:0 lets the value actually wrap inside a flex-wrap parent. */
+  .fact-chip {
+    display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; max-width: 100%;
+    font-size: 0.78rem; padding: 0.3rem 0.55rem; border-radius: 0.5rem;
+    background: var(--surface-2); border: 1px solid var(--border);
+  }
+  .fact-chip .fact-label {
+    font-size: 0.62rem; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
+    color: var(--text-muted);
+  }
+  .fact-chip .fact-value { color: var(--text); word-break: break-word; }
   .jindr-actions { display: flex; gap: 0.75rem; margin-top: 1.1rem; }
   .jindr-actions button { flex: 1; font-size: 0.95rem; padding: 0.75rem; margin-top: 0; }
   .jindr-actions button.danger {
@@ -3902,6 +3932,17 @@ const DASHBOARD_PAGE = `<!doctype html>
       return node;
     }
     function text(value) { return document.createTextNode(value); }
+
+    // Shared by the Jindr card and the Jobs tab rows -- label above value so a long value (a full
+    // sentence, not just a short word) wraps inside the chip instead of forcing a single-line
+    // badge past the edge of the card or screen.
+    function factChip(fact) {
+      if (!fact || !fact.label) return null;
+      return el('div', { className: 'fact-chip' }, [
+        el('span', { className: 'fact-label', textContent: fact.label }),
+        el('span', { className: 'fact-value', textContent: fact.value || 'Not specified' }),
+      ]);
+    }
 
     function goToEnroll() { window.location.href = '/enroll'; }
 
@@ -4893,10 +4934,6 @@ const DASHBOARD_PAGE = `<!doctype html>
       renderJindrCard();
     }
 
-    function jindrFactBadge(fact) {
-      return fact && fact.label ? el('span', { className: 'badge', textContent: fact.label + ': ' + (fact.value || 'Not specified') }) : null;
-    }
-
     function renderJindrCard() {
       document.getElementById('jindr-undo').style.display = jindrLastSwipe ? 'inline-block' : 'none';
       document.getElementById('jindr-status').textContent = '';
@@ -4931,7 +4968,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       try { detail = JSON.parse(job.fit_detail_json || '{}'); } catch (e) { detail = {}; }
       var factsHost = document.getElementById('jindr-facts');
       factsHost.innerHTML = '';
-      (detail.facts || []).map(jindrFactBadge).filter(Boolean).forEach(function (badge) { factsHost.appendChild(badge); });
+      (detail.facts || []).map(factChip).filter(Boolean).forEach(function (chip) { factsHost.appendChild(chip); });
 
       document.getElementById('jindr-reason').textContent = job.fit_reason || '';
 
@@ -5056,12 +5093,6 @@ const DASHBOARD_PAGE = `<!doctype html>
             })
           : el('span', { className: 'row-title', textContent: job.title });
         var titleLine = [titleNode, el('span', { className: ('badge ' + fitInfo.cls).trim(), textContent: badgeText })];
-        // Whatever the candidate said they care about (Desired Roles tab) -- one badge per fact,
-        // so it's visible without opening the posting, not just buried in the reason paragraph below.
-        (fitDetail.facts || []).forEach(function (fact) {
-          if (!fact || !fact.label) return;
-          titleLine.push(el('span', { className: 'badge', textContent: fact.label + ': ' + (fact.value || 'Not specified') }));
-        });
 
         var meta = [
           job.company,
@@ -5071,6 +5102,10 @@ const DASHBOARD_PAGE = `<!doctype html>
         ].filter(Boolean).join(' · ');
 
         var body = [el('div', { className: 'row-title-line' }, titleLine), el('div', { className: 'row-meta', textContent: meta })];
+        // Whatever the candidate said they care about (Desired Roles tab) -- one chip per fact, on
+        // its own line so a long value wraps instead of forcing the title line to overflow.
+        var facts = (fitDetail.facts || []).map(factChip).filter(Boolean);
+        if (facts.length) body.push(el('div', { className: 'row-facts' }, facts));
         if (job.fit_reason) body.push(el('p', { className: 'job-reason', textContent: job.fit_reason }));
         if (missing.length) body.push(el('p', { className: 'job-missing', textContent: 'Gaps: ' + missing.join('; ') }));
 
