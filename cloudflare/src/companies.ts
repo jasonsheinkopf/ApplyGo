@@ -383,7 +383,18 @@ function stripHtml(value: string): string {
 /**
  * Each provider's response is parsed defensively -- these are third-party shapes that can change,
  * and a company with one odd field should degrade to a thinner posting rather than fail the scan.
+ *
+ * DESCRIPTION_CAP bounds each posting's plain-text length right here, at the source -- this is the
+ * actual ceiling on what any later stage (storage, tier-2 scoring) can ever work with, no matter
+ * what those stages' own caps allow. A real single-role posting -- intro, responsibilities,
+ * requirements, preferred quals, an "about the company" paragraph, and a compensation/benefits
+ * section -- routinely runs several thousand characters once you count all of that, and the
+ * compensation section in particular tends to sit near the very end. 8000 is chosen generously: no
+ * aggregator pages are ever scanned (see companies.ts's own docs), so there's no risk of an
+ * unbounded multi-listing payload landing here, just an occasional long single posting.
  */
+const DESCRIPTION_CAP = 8000;
+
 export async function fetchBoardJobs(provider: AtsProvider, token: string): Promise<ScannedJob[]> {
   const res = await fetchWithTimeout(boardApiUrl(provider, token), 12000);
   if (!res || !res.ok) throw new Error(`board_http_${res ? res.status : "unreachable"}`);
@@ -402,7 +413,7 @@ export async function fetchBoardJobs(provider: AtsProvider, token: string): Prom
       url: str(j.absolute_url),
       location: str((j.location as { name?: string } | undefined)?.name),
       posted_at: str(j.updated_at),
-      description: stripHtml(str(j.content)).slice(0, 4000),
+      description: stripHtml(str(j.content)).slice(0, DESCRIPTION_CAP),
     }));
   }
 
@@ -413,7 +424,7 @@ export async function fetchBoardJobs(provider: AtsProvider, token: string): Prom
       url: str(j.hostedUrl),
       location: str((j.categories as { location?: string } | undefined)?.location),
       posted_at: j.createdAt ? new Date(Number(j.createdAt)).toISOString() : "",
-      description: (str(j.descriptionPlain) || stripHtml(str(j.description))).slice(0, 4000),
+      description: (str(j.descriptionPlain) || stripHtml(str(j.description))).slice(0, DESCRIPTION_CAP),
     }));
   }
 
@@ -425,7 +436,7 @@ export async function fetchBoardJobs(provider: AtsProvider, token: string): Prom
       url: str(j.jobUrl) || str(j.applyUrl),
       location: str(j.location),
       posted_at: str(j.publishedAt),
-      description: (str(j.descriptionPlain) || stripHtml(str(j.descriptionHtml))).slice(0, 4000),
+      description: (str(j.descriptionPlain) || stripHtml(str(j.descriptionHtml))).slice(0, DESCRIPTION_CAP),
     }));
   }
 

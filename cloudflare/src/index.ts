@@ -1627,10 +1627,10 @@ async function scanOneCompany(
   for (const job of relevant) {
     // Compensation, remote/onsite, hours, and travel -- exactly what the tier-2 "what do you care
     // about" facts need -- routinely sit in a "Compensation and benefits" section at the very end
-    // of a real posting, well past where a tighter cap used to cut off. 4000 matches the ceiling
-    // companies.ts's own scrape already caps at (see fetchBoardJobs), so this is no longer the
-    // bottleneck -- the description actually available is what gets stored.
-    const description = (job.description ?? "").slice(0, 4000);
+    // of a real posting, well past where a tighter cap used to cut off. Matches the ceiling
+    // companies.ts's own scrape already caps at (DESCRIPTION_CAP in fetchBoardJobs), so this is
+    // never the bottleneck -- whatever description actually made it through scraping gets stored.
+    const description = (job.description ?? "").slice(0, 8000);
     const inserted = await env.DB.prepare(
       `INSERT OR IGNORE INTO job_postings
          (id, title, company, source_url, raw_description, location, posted_at, ats_provider, company_id,
@@ -6022,7 +6022,14 @@ const DASHBOARD_PAGE = `<!doctype html>
 </html>`;
 
 function dashboardPage(): Response {
-  return new Response(DASHBOARD_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
+  // The whole dashboard (markup, CSS, JS) is one inline page with no separately-versioned asset
+  // URLs, so a cached copy of this response is a cached copy of the entire app -- including bug
+  // fixes that already shipped. Explicit no-store (same as every other private response here)
+  // instead of leaving it to whatever default heuristic a browser or intermediate cache would
+  // otherwise apply to an HTML response with no cache-control header at all.
+  return new Response(DASHBOARD_PAGE, {
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "private, no-store" },
+  });
 }
 
 async function downloadArtifact(request: Request, env: Env, key: string): Promise<Response> {

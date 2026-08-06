@@ -243,10 +243,11 @@ function fitPrompt(
         title: j.title,
         company: j.company,
         location: j.location,
-        // Matches the storage cap (src/index.ts) -- compensation, remote/onsite, hours, and travel
-        // facts routinely sit at the very end of a real posting, past where a tighter slice here
-        // used to cut them off even when the fuller text was already stored.
-        description: j.description.slice(0, 4000),
+        // Matches the storage cap (src/index.ts) and the scrape cap (DESCRIPTION_CAP in
+        // companies.ts) -- compensation, remote/onsite, hours, and travel facts routinely sit at
+        // the very end of a real posting, past where a tighter slice here used to cut them off
+        // even when the fuller text was already stored.
+        description: j.description.slice(0, 8000),
       })),
     )}`,
     "",
