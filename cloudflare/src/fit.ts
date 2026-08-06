@@ -69,6 +69,9 @@ export type FitResult = {
   score: number;
   reason: string;
   missing: string[];
+  years_required: string;
+  remote: string;
+  salary: string;
 };
 
 /**
@@ -123,8 +126,25 @@ const FIT_BATCH_SCHEMA = {
             items: { type: "string" },
             description: "Specific requirements the candidate doesn't evidently meet. Empty if none.",
           },
+          years_required: {
+            type: "string",
+            description:
+              "The years of experience this posting states as REQUIRED (not preferred/desired), as stated or " +
+              "closely paraphrased, e.g. '5+ years' or '3-5 years'. Empty string if the posting states no " +
+              "experience requirement at all.",
+          },
+          remote: {
+            type: "string",
+            description: "One of: Remote, Hybrid, Onsite, or empty string if the posting doesn't say.",
+          },
+          salary: {
+            type: "string",
+            description:
+              "Any stated compensation/salary range, as stated, e.g. '$140k-$180k + equity'. Empty string if " +
+              "the posting doesn't state one -- never estimate or guess a figure that isn't actually written.",
+          },
         },
-        required: ["id", "score", "reason", "missing"],
+        required: ["id", "score", "reason", "missing", "years_required", "remote", "salary"],
       },
     },
   },
@@ -154,6 +174,7 @@ function fitPrompt(
   profileJson: string,
   desiredRoles: string,
   disqualifiers: string[],
+  customPreferences: string,
   jobs: JobToAssess[],
 ): string {
   return [
@@ -171,6 +192,23 @@ function fitPrompt(
     "",
     experienceGapRule(new Date().getUTCFullYear()),
     "",
+    // The one thing a candidate scrolling a list of these actually wants at a glance is whether the
+    // years requirement is a problem -- burying it in the middle of a reason about other things
+    // means they still have to open the real posting to find it, which defeats the point of scoring
+    // it in the first place.
+    "Whenever a posting states a required (not preferred) years-of-experience figure, say so plainly",
+    "in `reason` itself, not just as a factor silently weighed into the score -- e.g. \"Requires 5+",
+    "years; you have about 3, a real stretch\" or \"Requires 3-5 years, comfortably within your range\".",
+    "",
+    customPreferences
+      ? [
+          "The candidate wrote these matching preferences themselves, in their own words. Enforce them as",
+          "binding rules with the same weight as a stated hard requirement above -- if a posting clearly",
+          "violates one, that is a hard disqualifier regardless of how strong the rest of the overlap is:",
+          customPreferences,
+          "",
+        ].join("\n")
+      : "",
     disqualifiers.length
       ? [
           "The candidate has previously confirmed these were NOT a fit, and why -- weigh a posting",
@@ -210,23 +248,39 @@ export async function assessJobFitBatch(
   profileJson: string,
   desiredRoles: string,
   disqualifiers: string[],
+  customPreferences: string,
   jobs: JobToAssess[],
 ): Promise<FitResult[]> {
   if (!jobs.length) return [];
   const { results } = await callStructured<{ results: FitResult[] }>(
     env,
     provider,
-    fitPrompt(profileJson, desiredRoles, disqualifiers, jobs),
+    fitPrompt(profileJson, desiredRoles, disqualifiers, customPreferences, jobs),
     FIT_BATCH_SCHEMA,
     "submit_fit_assessment",
-    4000,
+    // Bumped alongside the richer per-posting schema (years_required/remote/salary) -- the previous
+    // cap was sized for score/reason/missing alone and would risk truncating a full 8-item batch.
+    5000,
   );
   const byId = new Map(results.map((r) => [r.id, r]));
   return jobs.map((job) => {
     const found = byId.get(job.id);
-    if (!found) return { id: job.id, score: 50, reason: "Not individually assessed.", missing: [] };
+    if (!found) {
+      return {
+        id: job.id, score: 50, reason: "Not individually assessed.", missing: [],
+        years_required: "", remote: "", salary: "",
+      };
+    }
     const score = Number.isFinite(found.score) ? Math.max(0, Math.min(100, Math.round(found.score))) : 50;
-    return { id: job.id, score, reason: found.reason ?? "", missing: found.missing ?? [] };
+    return {
+      id: job.id,
+      score,
+      reason: found.reason ?? "",
+      missing: found.missing ?? [],
+      years_required: found.years_required ?? "",
+      remote: found.remote ?? "",
+      salary: found.salary ?? "",
+    };
   });
 }
 
