@@ -313,6 +313,18 @@ function readDealbreakers(preferencesJson: string): string {
   }
 }
 
+/** Free-text topics the candidate wants surfaced as quick facts per posting (see fitPrompt in
+ * src/fit.ts) -- purely informational, unlike dealbreakers this never affects the fit score. What
+ * counts as worth seeing at a glance (salary, years required, remote/hybrid/onsite, anything) is
+ * personal, so it's the candidate's own words rather than a fixed set of fields the app picked. */
+function readCareAbout(preferencesJson: string): string {
+  try {
+    return (JSON.parse(preferencesJson || "{}") as { care_about?: string }).care_about ?? "";
+  } catch {
+    return "";
+  }
+}
+
 function readStructuredProfile(structuredJson: string): StructuredProfile | null {
   try {
     const parsed = JSON.parse(structuredJson || "{}");
@@ -368,6 +380,7 @@ async function getProfile(request: Request, env: Env): Promise<Response> {
       desired_roles: readDesiredRoles(profile?.preferences_json ?? "{}"),
       desired_locations: readDesiredLocations(profile?.preferences_json ?? "{}"),
       dealbreakers: readDealbreakers(profile?.preferences_json ?? "{}"),
+      care_about: readCareAbout(profile?.preferences_json ?? "{}"),
       structured: readStructuredProfile(profile?.structured_json ?? "{}"),
     },
   });
@@ -404,10 +417,12 @@ async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
     desired_roles?: string;
     desired_locations?: string;
     dealbreakers?: string;
+    care_about?: string;
   };
   const desiredRoles = (body.desired_roles ?? "").trim();
   const desiredLocations = (body.desired_locations ?? "").trim();
   const dealbreakers = (body.dealbreakers ?? "").trim();
+  const careAbout = (body.care_about ?? "").trim();
   const profileId = await getOrCreateProfileId(env);
   const existing = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
     .bind(profileId)
@@ -421,10 +436,11 @@ async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
   prefs.desired_roles = desiredRoles;
   prefs.desired_locations = desiredLocations;
   prefs.dealbreakers = dealbreakers;
+  prefs.care_about = careAbout;
   await env.DB.prepare("UPDATE candidate_profiles SET preferences_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
     .bind(JSON.stringify(prefs), profileId)
     .run();
-  return json({ desired_roles: desiredRoles, desired_locations: desiredLocations, dealbreakers });
+  return json({ desired_roles: desiredRoles, desired_locations: desiredLocations, dealbreakers, care_about: careAbout });
 }
 
 async function listRoleSignals(request: Request, env: Env): Promise<Response> {
@@ -591,6 +607,7 @@ async function assessRowsBatched(
   desiredRoles: string,
   disqualifiers: string[],
   dealbreakers: string,
+  careAbout: string,
   rows: JobRow[],
   total: number,
   emit: (event: unknown) => Promise<void>,
@@ -608,7 +625,9 @@ async function assessRowsBatched(
     async (batch) => {
       if (failed) return null;
       try {
-        return await assessJobFitBatch(env, provider, JSON.stringify(structured), desiredRoles, disqualifiers, dealbreakers, batch);
+        return await assessJobFitBatch(
+          env, provider, JSON.stringify(structured), desiredRoles, disqualifiers, dealbreakers, careAbout, batch,
+        );
       } catch (err) {
         errors.push(`assess: ${(err as Error).message}`);
         failed = true;
@@ -728,8 +747,9 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
       .all<JobRow>();
 
     const dealbreakers = readDealbreakers(profileRow?.preferences_json ?? "{}");
+    const careAbout = readCareAbout(profileRow?.preferences_json ?? "{}");
     const assessResult = await assessRowsBatched(
-      env, provider, structured, desiredRoles, disqualifiers, dealbreakers,
+      env, provider, structured, desiredRoles, disqualifiers, dealbreakers, careAbout,
       assessRows.results ?? [], assessTotal, emit,
     );
     assessed = assessResult.assessed;
@@ -767,6 +787,7 @@ async function reassessTopMatches(request: Request, env: Env, ctx: ExecutionCont
   if (!structured) return json({ error: "no_profile_yet" }, 400);
   const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
   const dealbreakers = readDealbreakers(profileRow?.preferences_json ?? "{}");
+  const careAbout = readCareAbout(profileRow?.preferences_json ?? "{}");
   const disqualifiers = await loadDisqualifiers(env, profileId);
 
   // Capped defensively -- this is a deliberate one-off action the candidate chose to trigger with
@@ -794,7 +815,7 @@ async function reassessTopMatches(request: Request, env: Env, ctx: ExecutionCont
       .run();
 
     const { assessed, errors } = await assessRowsBatched(
-      env, provider, structured, desiredRoles, disqualifiers, dealbreakers, rows, rows.length, emit,
+      env, provider, structured, desiredRoles, disqualifiers, dealbreakers, careAbout, rows, rows.length, emit,
     );
     return { assessed, errors, counts: await jobPipelineCounts(env) };
   });
@@ -946,7 +967,7 @@ async function purgeCollection(request: Request, env: Env): Promise<Response> {
 
 async function storeFitResults(env: Env, results: FitResult[]): Promise<void> {
   for (const result of results) {
-    const detail = { years_required: result.years_required, remote: result.remote, salary: result.salary };
+    const detail = { facts: result.facts };
     await env.DB.prepare(
       `UPDATE job_postings SET fit_status = ?, fit_score = ?, fit_reason = ?, fit_missing_json = ?,
        fit_detail_json = ?, assessed_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -3395,7 +3416,10 @@ const DASHBOARD_PAGE = `<!doctype html>
         <section id="role-signals-section">
           <h2>What are you looking for?</h2>
           <p class="hint">Paste job links, or write loosely about what you want next. The more you add, the better the generated description.</p>
-          <div id="role-signals-list"><p class="empty">Loading…</p></div>
+          <details id="role-signals-details" class="disclosure">
+            <summary id="role-signals-summary">Notes on file</summary>
+            <div id="role-signals-list"><p class="empty">Loading…</p></div>
+          </details>
           <form id="role-signal-form">
             <label for="role-signal-text">Add a note or link</label>
             <textarea id="role-signal-text" required placeholder="e.g. a link to a posting, or 'I want senior IC roles in applied AI, remote-friendly, not pure infra'"></textarea>
@@ -3427,6 +3451,9 @@ const DASHBOARD_PAGE = `<!doctype html>
           <label for="dealbreakers">Dealbreakers (optional)</label>
           <textarea id="dealbreakers" placeholder="e.g. Reject anything requiring 5+ years of experience for a technical role. 3-4 years is fine."></textarea>
           <p class="hint">Enforced during scoring (the detailed pass on postings that survive the quick screen) as a binding rule, the same weight as a stated hard requirement -- write down whatever you don't want to see, in your own words.</p>
+          <label for="care-about">What do you care about? (optional)</label>
+          <textarea id="care-about" placeholder="e.g. Salary, years of experience required, remote or in office, typical hours"></textarea>
+          <p class="hint">Name the topics you want to see at a glance for every posting, not a target number -- dealbreakers above is where you rule things out. Shown as quick facts on the Jindr and Jobs tabs; never affects the score.</p>
           <button id="desired-roles-save-button" type="button">Save</button>
           <p id="desired-roles-save-status" class="status" role="status" aria-live="polite"></p>
           <h3 class="subhead">Already have matches?</h3>
@@ -3939,6 +3966,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         document.getElementById('desired-roles-description').value = data.profile.desired_roles || '';
         document.getElementById('desired-locations').value = data.profile.desired_locations || '';
         document.getElementById('dealbreakers').value = data.profile.dealbreakers || '';
+        document.getElementById('care-about').value = data.profile.care_about || '';
         renderStructuredProfileView('structured-profile-view', data.profile.structured);
         renderStructuredProfileView('resume-profile-view', data.profile.structured);
       }
@@ -4186,6 +4214,9 @@ const DASHBOARD_PAGE = `<!doctype html>
     async function loadRoleSignals() {
       var res = await api('/role-signals');
       var data = await res.json();
+      var count = (data.role_signals || []).length;
+      document.getElementById('role-signals-summary').textContent =
+        count === 1 ? '1 note on file' : count + ' notes on file';
       renderCollapsibleList('role-signals-list', data.role_signals, 'Nothing added yet.', function (s) { return s.claim; }, async function (s) {
         await api('/role-signals/' + encodeURIComponent(s.id), { method: 'DELETE' });
         loadRoleSignals();
@@ -4257,6 +4288,7 @@ const DASHBOARD_PAGE = `<!doctype html>
             desired_roles: document.getElementById('desired-roles-description').value,
             desired_locations: document.getElementById('desired-locations').value,
             dealbreakers: document.getElementById('dealbreakers').value,
+            care_about: document.getElementById('care-about').value,
           }),
         });
         if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
@@ -4861,8 +4893,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       renderJindrCard();
     }
 
-    function jindrFactBadge(text) {
-      return text ? el('span', { className: 'badge', textContent: text }) : null;
+    function jindrFactBadge(fact) {
+      return fact && fact.label ? el('span', { className: 'badge', textContent: fact.label + ': ' + (fact.value || 'Not specified') }) : null;
     }
 
     function renderJindrCard() {
@@ -4899,11 +4931,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       try { detail = JSON.parse(job.fit_detail_json || '{}'); } catch (e) { detail = {}; }
       var factsHost = document.getElementById('jindr-facts');
       factsHost.innerHTML = '';
-      [
-        jindrFactBadge(detail.years_required),
-        jindrFactBadge(detail.remote),
-        jindrFactBadge(detail.salary),
-      ].filter(Boolean).forEach(function (badge) { factsHost.appendChild(badge); });
+      (detail.facts || []).map(jindrFactBadge).filter(Boolean).forEach(function (badge) { factsHost.appendChild(badge); });
 
       document.getElementById('jindr-reason').textContent = job.fit_reason || '';
 
@@ -5028,11 +5056,12 @@ const DASHBOARD_PAGE = `<!doctype html>
             })
           : el('span', { className: 'row-title', textContent: job.title });
         var titleLine = [titleNode, el('span', { className: ('badge ' + fitInfo.cls).trim(), textContent: badgeText })];
-        // The years-of-experience requirement is the one thing worth seeing without opening the
-        // posting -- surfaced as its own badge, not just buried in the reason paragraph below.
-        if (fitDetail.years_required) {
-          titleLine.push(el('span', { className: 'badge', textContent: fitDetail.years_required }));
-        }
+        // Whatever the candidate said they care about (Desired Roles tab) -- one badge per fact,
+        // so it's visible without opening the posting, not just buried in the reason paragraph below.
+        (fitDetail.facts || []).forEach(function (fact) {
+          if (!fact || !fact.label) return;
+          titleLine.push(el('span', { className: 'badge', textContent: fact.label + ': ' + (fact.value || 'Not specified') }));
+        });
 
         var meta = [
           job.company,

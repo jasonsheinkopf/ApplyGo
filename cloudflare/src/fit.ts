@@ -69,9 +69,7 @@ export type FitResult = {
   score: number;
   reason: string;
   missing: string[];
-  years_required: string;
-  remote: string;
-  salary: string;
+  facts: { label: string; value: string }[];
 };
 
 /**
@@ -126,25 +124,32 @@ const FIT_BATCH_SCHEMA = {
             items: { type: "string" },
             description: "Specific requirements the candidate doesn't evidently meet. Empty if none.",
           },
-          years_required: {
-            type: "string",
+          facts: {
+            type: "array",
+            maxItems: 8,
+            items: {
+              type: "object",
+              properties: {
+                label: {
+                  type: "string",
+                  description: "Short label for the topic, e.g. 'Years required', 'Remote', 'Salary', 'Team size'.",
+                },
+                value: {
+                  type: "string",
+                  description:
+                    "This posting's actual stated value for that topic, as stated or closely paraphrased. " +
+                    "'Not specified' if the posting doesn't say -- never estimate or guess a value that isn't " +
+                    "actually written.",
+                },
+              },
+              required: ["label", "value"],
+            },
             description:
-              "The years of experience this posting states as REQUIRED (not preferred/desired), as stated or " +
-              "closely paraphrased, e.g. '5+ years' or '3-5 years'. Empty string if the posting states no " +
-              "experience requirement at all.",
-          },
-          remote: {
-            type: "string",
-            description: "One of: Remote, Hybrid, Onsite, or empty string if the posting doesn't say.",
-          },
-          salary: {
-            type: "string",
-            description:
-              "Any stated compensation/salary range, as stated, e.g. '$140k-$180k + equity'. Empty string if " +
-              "the posting doesn't state one -- never estimate or guess a figure that isn't actually written.",
+              "One fact per distinct topic the candidate said they want to see at a glance (see CANDIDATE'S " +
+              "QUICK FACTS below). Empty array if the candidate didn't specify any topics.",
           },
         },
-        required: ["id", "score", "reason", "missing", "years_required", "remote", "salary"],
+        required: ["id", "score", "reason", "missing", "facts"],
       },
     },
   },
@@ -175,6 +180,7 @@ function fitPrompt(
   desiredRoles: string,
   disqualifiers: string[],
   customPreferences: string,
+  careAbout: string,
   jobs: JobToAssess[],
 ): string {
   return [
@@ -206,6 +212,17 @@ function fitPrompt(
           "binding rules with the same weight as a stated hard requirement above -- if a posting clearly",
           "violates one, that is a hard disqualifier regardless of how strong the rest of the overlap is:",
           customPreferences,
+          "",
+        ].join("\n")
+      : "",
+    careAbout
+      ? [
+          "CANDIDATE'S QUICK FACTS: the candidate wants these specific topics surfaced at a glance for every",
+          "posting, in their own words. Populate `facts` with one entry per distinct topic they name below --",
+          "a short label plus this posting's actual value, or 'Not specified' if the posting doesn't say.",
+          "This is informational only and must NOT affect `score` -- naming a topic here is not a requirement,",
+          "it's just what the candidate wants to see without opening the posting:",
+          careAbout,
           "",
         ].join("\n")
       : "",
@@ -249,27 +266,26 @@ export async function assessJobFitBatch(
   desiredRoles: string,
   disqualifiers: string[],
   customPreferences: string,
+  careAbout: string,
   jobs: JobToAssess[],
 ): Promise<FitResult[]> {
   if (!jobs.length) return [];
   const { results } = await callStructured<{ results: FitResult[] }>(
     env,
     provider,
-    fitPrompt(profileJson, desiredRoles, disqualifiers, customPreferences, jobs),
+    fitPrompt(profileJson, desiredRoles, disqualifiers, customPreferences, careAbout, jobs),
     FIT_BATCH_SCHEMA,
     "submit_fit_assessment",
-    // Bumped alongside the richer per-posting schema (years_required/remote/salary) -- the previous
-    // cap was sized for score/reason/missing alone and would risk truncating a full 8-item batch.
-    5000,
+    // Bumped alongside the richer per-posting schema (up to 8 candidate-defined facts per posting) --
+    // the previous cap was sized for score/reason/missing plus three fixed fields and would risk
+    // truncating a full 8-item batch now that the fact count is candidate-controlled.
+    7000,
   );
   const byId = new Map(results.map((r) => [r.id, r]));
   return jobs.map((job) => {
     const found = byId.get(job.id);
     if (!found) {
-      return {
-        id: job.id, score: 50, reason: "Not individually assessed.", missing: [],
-        years_required: "", remote: "", salary: "",
-      };
+      return { id: job.id, score: 50, reason: "Not individually assessed.", missing: [], facts: [] };
     }
     const score = Number.isFinite(found.score) ? Math.max(0, Math.min(100, Math.round(found.score))) : 50;
     return {
@@ -277,9 +293,7 @@ export async function assessJobFitBatch(
       score,
       reason: found.reason ?? "",
       missing: found.missing ?? [],
-      years_required: found.years_required ?? "",
-      remote: found.remote ?? "",
-      salary: found.salary ?? "",
+      facts: found.facts ?? [],
     };
   });
 }
