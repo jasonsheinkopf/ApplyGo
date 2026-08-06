@@ -512,6 +512,7 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
   const jobs = await env.DB.prepare(
     `SELECT id, title, company, source_url, location, posted_at, ats_provider,
             company_id, fit_status, fit_score, fit_reason, fit_missing_json, interested_at, applied_at, created_at,
+            assessed_at,
             EXISTS(SELECT 1 FROM resumes r WHERE r.job_id = job_postings.id) AS has_resume,
             EXISTS(SELECT 1 FROM cover_letters c WHERE c.job_id = job_postings.id) AS has_cover_letter
      FROM job_postings
@@ -2162,19 +2163,43 @@ async function deleteResume(request: Request, env: Env, id: string): Promise<Res
   return json({ deleted: true });
 }
 
+/** A name or company as a filesystem-safe token: no path separators or quotes, spaces to
+ * underscores, so it drops cleanly into a Content-Disposition filename either quoted or bare. */
+function safeFilenamePart(text: string): string {
+  return text
+    .trim()
+    .replace(/[\\/:*?"<>|]/g, "")
+    .replace(/\s+/g, "_")
+    .slice(0, 60);
+}
+
 async function getResumeFile(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const row = await env.DB.prepare("SELECT pdf_r2_key, name FROM resumes WHERE id = ?")
+  const row = await env.DB.prepare(
+    `SELECT r.pdf_r2_key, r.name, j.company AS job_company, p.label AS profile_label
+     FROM resumes r
+     LEFT JOIN job_postings j ON j.id = r.job_id
+     LEFT JOIN candidate_profiles p ON p.id = r.profile_id
+     WHERE r.id = ?`,
+  )
     .bind(id)
-    .first<{ pdf_r2_key: string | null; name: string }>();
+    .first<{ pdf_r2_key: string | null; name: string; job_company: string | null; profile_label: string | null }>();
   if (!row?.pdf_r2_key) return json({ error: "not_found" }, 404);
   const object = await env.FILES.get(row.pdf_r2_key, { range: request.headers });
   if (!object) return json({ error: "not_found" }, 404);
   const headers = new Headers();
   object.writeHttpMetadata(headers);
   headers.set("content-type", "application/pdf");
-  headers.set("content-disposition", `inline; filename="${row.name.replace(/["\r\n]/g, "")}.pdf"`);
+  // A job-tailored resume's own `name` is "<job title> @ <company>" -- fine on screen, but a poor
+  // download filename (spaces, punctuation, and the title itself all just noise once you're staring
+  // at a folder of PDFs trying to tell them apart). "<Candidate Name>_Resume_<Company>.pdf" is what
+  // you'd actually want to see there; a general-purpose version without a job falls back to its own
+  // name since there's no company to use instead.
+  const namePart = safeFilenamePart(row.profile_label || "Resume");
+  const targetPart = safeFilenamePart(row.job_company || row.name || "General");
+  const filename = `${namePart}_Resume_${targetPart}.pdf`;
+  headers.set("content-disposition", `inline; filename="${filename}"`);
   headers.set("cache-control", "private, no-store");
   headers.set("etag", object.httpEtag);
   headers.set("accept-ranges", "bytes");
@@ -3057,6 +3082,15 @@ const DASHBOARD_PAGE = `<!doctype html>
   .controls label { margin-top: 0; }
   .controls select, .controls input { width: auto; min-width: 9rem; }
   .controls button { margin-top: 0; }
+  /* Sub-tab row (Ask/Resume/Cover/Apply): stays one line by scrolling horizontally instead of
+     wrapping to a second row, the same pattern the top-level nav bar already uses for the same
+     reason -- a button that wraps alone onto its own line reads as broken, not as a real tab. */
+  .subtabs {
+    display: flex; flex-wrap: nowrap; gap: 0.5rem; overflow-x: auto; padding-bottom: 0.2rem;
+    margin-bottom: 0.9rem; -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  .subtabs::-webkit-scrollbar { display: none; }
+  .subtabs button { flex: none; margin-top: 0; white-space: nowrap; }
   details.disclosure {
     margin-top: 1.1rem; border-top: 1px solid var(--border); padding-top: 0.9rem;
   }
@@ -3471,8 +3505,19 @@ const DASHBOARD_PAGE = `<!doctype html>
           <select id="jobs-min-score">
             <option value="">Any score</option>
             <option value="50">50%+</option>
+            <option value="60">60%+</option>
             <option value="70">70%+</option>
+            <option value="80">80%+</option>
             <option value="90">90%+</option>
+            <option value="100">100%</option>
+          </select>
+        </div>
+        <div>
+          <label for="jobs-sort">Sort by</label>
+          <select id="jobs-sort">
+            <option value="score">Best match</option>
+            <option value="processed">Recently processed</option>
+            <option value="posted">Recently posted</option>
           </select>
         </div>
       </div>
@@ -3517,10 +3562,10 @@ const DASHBOARD_PAGE = `<!doctype html>
       <!-- Assistant/Resume/Cover letter/Apply are sub-tabs, not stacked sections -- only one shows
            at a time, the same way the top-level dashboard tabs work, so opening one doesn't leave
            the others piled up underneath with no way to get back to just looking at one thing. -->
-      <div class="controls">
-        <button id="interested-subtab-assistant" type="button">Assistant</button>
+      <div class="subtabs">
+        <button id="interested-subtab-assistant" type="button">Ask</button>
         <button id="interested-subtab-resume" class="secondary" type="button">Resume</button>
-        <button id="interested-subtab-cover" class="secondary" type="button">Cover letter</button>
+        <button id="interested-subtab-cover" class="secondary" type="button">Cover</button>
         <button id="interested-subtab-apply" class="secondary" type="button">Apply</button>
       </div>
 
@@ -4642,6 +4687,28 @@ const DASHBOARD_PAGE = `<!doctype html>
       return job.fit_score >= minScore;
     }
 
+    // A posting missing whatever field this sort is on (never processed, no known post date)
+    // sorts to the end rather than jumping to the top under a naive falsy-first-value comparison
+    // -- same "don't penalize missing data, but don't let it masquerade as new either" principle
+    // withinAge/withinScore already use for filtering.
+    function jobSortComparator(mode) {
+      return function (a, b) {
+        if (mode === 'processed') {
+          var pa = a.assessed_at ? new Date(a.assessed_at).getTime() : -1;
+          var pb = b.assessed_at ? new Date(b.assessed_at).getTime() : -1;
+          return pb - pa;
+        }
+        if (mode === 'posted') {
+          var da = a.posted_at ? new Date(a.posted_at).getTime() : -1;
+          var db = b.posted_at ? new Date(b.posted_at).getTime() : -1;
+          return db - da;
+        }
+        // Sorted by the actual score now that there is one, rather than just the two-bucket order --
+        // an 88% and a 71% were both "strong" under the old labels but aren't equally worth reading first.
+        return (b.fit_score ?? 0) - (a.fit_score ?? 0);
+      };
+    }
+
     function renderJobs() {
       var needle = document.getElementById('jobs-filter').value.trim();
       var maxAgeDays = Number(document.getElementById('jobs-age').value) || 0;
@@ -4665,9 +4732,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
       var queued = matching.filter(function (j) { return QUEUED_STATUSES[j.fit_status]; });
       var ruledOut = matching.filter(function (j) { return RULED_OUT_STATUSES[j.fit_status]; });
-      // Sorted by the actual score now that there is one, rather than just the two-bucket order --
-      // an 88% and a 71% were both "strong" under the old labels but aren't equally worth reading first.
-      matches.sort(function (a, b) { return (b.fit_score ?? 0) - (a.fit_score ?? 0); });
+      matches.sort(jobSortComparator(document.getElementById('jobs-sort').value));
 
       var queuedToggle = document.getElementById('jobs-show-unfiltered');
       queuedToggle.parentElement.style.display = queued.length ? 'flex' : 'none';
@@ -4704,6 +4769,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     document.getElementById('jobs-filter').addEventListener('input', renderJobs);
     document.getElementById('jobs-age').addEventListener('change', renderJobs);
     document.getElementById('jobs-min-score').addEventListener('change', renderJobs);
+    document.getElementById('jobs-sort').addEventListener('change', renderJobs);
     document.getElementById('jobs-show-unfiltered').addEventListener('change', renderJobs);
     document.getElementById('jobs-show-rejected').addEventListener('change', renderJobs);
 
@@ -4953,8 +5019,16 @@ const DASHBOARD_PAGE = `<!doctype html>
       interestedJobs.forEach(function (job) {
         var hasScore = job.fit_score !== null && job.fit_score !== undefined;
         var badgeText = hasScore ? job.fit_score + '% match' : FIT_LABELS.interested.text;
+        // Same direct link the Jobs tab row has -- marking a job interested shouldn't cost the
+        // one-click "just take me to the posting" path it had before, only add the workspace below.
+        var titleNode = job.source_url
+          ? el('a', {
+              className: 'row-title', href: job.source_url, target: '_blank', rel: 'noopener',
+              textContent: job.title,
+            })
+          : el('span', { className: 'row-title', textContent: job.title });
         var titleLine = [
-          el('span', { className: 'row-title', textContent: job.title }),
+          titleNode,
           el('span', { className: 'badge strong', textContent: badgeText }),
         ];
         var meta = [
