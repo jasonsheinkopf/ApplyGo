@@ -3335,6 +3335,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     <button class="tab" data-tab="profile" type="button">Profile</button>
     <button class="tab" data-tab="resume" type="button">Resume</button>
     <button class="tab" data-tab="companies" type="button">Companies</button>
+    <button class="tab" data-tab="search" type="button">Search</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
     <button class="tab" data-tab="interested" type="button">Interested</button>
     <button class="tab" data-tab="applied" type="button">Applied</button>
@@ -3584,7 +3585,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     </div>
   </div>
 
-  <div id="panel-jobs" class="panel">
+  <div id="panel-search" class="panel">
     <section id="jobs-scan-section">
       <h2>1. Scan for new listings</h2>
       <p class="hint">Reads the job boards of companies on your list. Each company costs a few requests, so however many you ask for, a single request only gets through as many as safely fit at once — picking "All" re-fires automatically until every company is covered, so you don't have to click through it by hand. A company already scanned today is skipped until tomorrow.</p>
@@ -3620,7 +3621,9 @@ const DASHBOARD_PAGE = `<!doctype html>
       </div>
       <p id="jobs-assess-status" class="status" role="status" aria-live="polite"></p>
     </section>
+  </div>
 
+  <div id="panel-jobs" class="panel">
     <section id="jobs-section">
       <h2>Job postings</h2>
       <label for="jobs-filter">Filter</label>
