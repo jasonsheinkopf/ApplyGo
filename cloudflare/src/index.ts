@@ -12,6 +12,7 @@ import {
   type AtsProvider,
   companyNameKey,
   fetchBoardJobs,
+  fetchMissingDescriptions,
   filterJobsByRoles,
   locationMatches,
   parseLocationFilter,
@@ -1625,6 +1626,10 @@ async function scanOneCompany(
   const relevant = filterJobsByRoles(inArea, desiredRoles)
     .filter((job) => job.title && job.external_id)
     .map((job) => ({ ...job, id: crypto.randomUUID() }));
+
+  // Providers whose listing endpoint carries no description need one fetch per posting to get it.
+  // Run after filtering so that cost is only paid for postings that actually survived.
+  await fetchMissingDescriptions(provider as AtsProvider, token, relevant, budget);
 
   // Scanning only collects listings. Judging them is a separate, explicitly triggered stage, so
   // a scan stays cheap and fast and can cover far more companies per request.

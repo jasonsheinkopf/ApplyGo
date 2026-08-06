@@ -368,16 +368,58 @@ function safeJoin(base: string, path: string): string {
 // Board reading
 // ---------------------------------------------------------------------------
 
-function stripHtml(value: string): string {
-  return String(value ?? "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&#\d+;/g, " ")
-    .replace(/\s+/g, " ")
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: "&", nbsp: " ", lt: "<", gt: ">", quot: '"', apos: "'",
+  rsquo: "'", lsquo: "'", ldquo: '"', rdquo: '"', mdash: "-", ndash: "-", hellip: "...",
+};
+
+function decodeEntities(value: string): string {
+  return value
+    .replace(/&#(\d+);/g, (_m, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_m, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&([a-z]+);/gi, (m, name: string) => NAMED_ENTITIES[name.toLowerCase()] ?? m);
+}
+
+/**
+ * HTML (or entity-escaped HTML) to readable plain text.
+ *
+ * **Decoding has to happen before tag-stripping, not after.** Greenhouse's board API returns each
+ * posting's `content` entity-escaped (`&lt;p&gt;` rather than `<p>`), so stripping tags first is a
+ * no-op on it -- and then decoding turns every `&lt;`/`&gt;` into a literal angle bracket, leaving
+ * the markup behind as visible text. The stored description ends up padded with `<p>`, `<strong>`,
+ * `</div>` noise that crowds out real content against the length cap and buries the sentences the
+ * scoring pass is actually looking for. Decoding twice (before and after the strip) covers content
+ * that was double-escaped, which is common for `&amp;` inside an already-escaped document.
+ *
+ * Block-level tags become newlines rather than spaces so a heading stays attached to what follows
+ * it ("Base Salary Range:\n$199,000 - $331,000") instead of dissolving into one long run-on line.
+ */
+function htmlToText(value: string): string {
+  const decoded = decodeEntities(String(value ?? ""));
+  const withBreaks = decoded
+    .replace(/<\s*br\s*\/?\s*>/gi, "\n")
+    .replace(/<\/\s*(p|div|li|tr|h[1-6]|section|ul|ol|table|blockquote)\s*>/gi, "\n");
+  return decodeEntities(withBreaks.replace(/<[^>]+>/g, " "))
+    .replace(/[ \t ]+/g, " ")
+    .replace(/\s*\n\s*/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+/**
+ * Builds one posting's description from every text-bearing section the board exposes, in order.
+ *
+ * Providers do not put a whole posting in one field, and picking a single "the description" field
+ * per provider is what silently loses the parts a candidate most wants (see the Lever branch
+ * below). Empty or missing sections drop out rather than leaving blank gaps, so a provider that
+ * renames or removes a field degrades to a thinner posting instead of an empty one.
+ */
+function joinSections(parts: (string | undefined)[]): string {
+  return parts
+    .map((part) => htmlToText(part ?? ""))
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, DESCRIPTION_CAP);
 }
 
 /**
@@ -413,33 +455,63 @@ export async function fetchBoardJobs(provider: AtsProvider, token: string): Prom
       url: str(j.absolute_url),
       location: str((j.location as { name?: string } | undefined)?.name),
       posted_at: str(j.updated_at),
-      description: stripHtml(str(j.content)).slice(0, DESCRIPTION_CAP),
+      // Greenhouse does put the whole posting in one field -- but entity-escaped, which is what
+      // htmlToText's decode-before-strip ordering exists for.
+      description: joinSections([str(j.content)]),
     }));
   }
 
   if (provider === "lever") {
-    return asArray(data).map((j) => ({
-      external_id: str(j.id),
-      title: str(j.text),
-      url: str(j.hostedUrl),
-      location: str((j.categories as { location?: string } | undefined)?.location),
-      posted_at: j.createdAt ? new Date(Number(j.createdAt)).toISOString() : "",
-      description: (str(j.descriptionPlain) || stripHtml(str(j.description))).slice(0, DESCRIPTION_CAP),
-    }));
+    return asArray(data).map((j) => {
+      // Lever splits a posting across several fields, and `description` is only the opening
+      // paragraph. The responsibilities and requirements bullets live in `lists[]`, and the
+      // closing block -- which is where a Lever posting almost always states compensation --
+      // lives in `additional`. Reading `description` alone captured the intro and threw the rest
+      // of the posting away, so salary and years-of-experience were never in the text the scoring
+      // pass saw, and it correctly reported them as not specified.
+      const lists = asArray(j.lists).map((list) => {
+        const heading = str(list.text);
+        const body = str(list.content);
+        return heading ? `${heading}:\n${body}` : body;
+      });
+      return {
+        external_id: str(j.id),
+        title: str(j.text),
+        url: str(j.hostedUrl),
+        location: str((j.categories as { location?: string } | undefined)?.location),
+        posted_at: j.createdAt ? new Date(Number(j.createdAt)).toISOString() : "",
+        description: joinSections([
+          str(j.descriptionPlain) || str(j.description),
+          ...lists,
+          str(j.additionalPlain) || str(j.additional),
+        ]),
+      };
+    });
   }
 
   if (provider === "ashby") {
     const jobs = asArray((data as { jobs?: unknown }).jobs);
-    return jobs.map((j) => ({
-      external_id: str(j.id),
-      title: str(j.title),
-      url: str(j.jobUrl) || str(j.applyUrl),
-      location: str(j.location),
-      posted_at: str(j.publishedAt),
-      description: (str(j.descriptionPlain) || stripHtml(str(j.descriptionHtml))).slice(0, DESCRIPTION_CAP),
-    }));
+    return jobs.map((j) => {
+      // Ashby exposes a pay range separately from the description on boards that publish one,
+      // rather than only inside the prose, so it's picked up explicitly when present.
+      const compensation = str(j.compensationTierSummary);
+      return {
+        external_id: str(j.id),
+        title: str(j.title),
+        url: str(j.jobUrl) || str(j.applyUrl),
+        location: str(j.location),
+        posted_at: str(j.publishedAt),
+        description: joinSections([
+          str(j.descriptionPlain) || str(j.descriptionHtml),
+          compensation ? `Compensation: ${compensation}` : "",
+        ]),
+      };
+    });
   }
 
+  // SmartRecruiters' postings list carries no description at all -- it has to be read per posting
+  // from the detail endpoint, which `fetchMissingDescriptions` below does for the postings that
+  // survive filtering rather than for every posting on the board.
   const content = asArray((data as { content?: unknown }).content);
   return content.map((j) => {
     const loc = (j.location ?? {}) as { city?: string; region?: string; country?: string };
@@ -452,6 +524,65 @@ export async function fetchBoardJobs(provider: AtsProvider, token: string): Prom
       description: "",
     };
   });
+}
+
+/** Detail fetches are one request per posting, so this is capped per company on top of the budget. */
+const MAX_DETAIL_FETCHES = 25;
+const DETAIL_CONCURRENCY = 5;
+
+/**
+ * Fills in descriptions for providers whose board listing doesn't include one.
+ *
+ * Only SmartRecruiters needs this today: its `/postings` list returns titles and locations but no
+ * body at all, so without this every SmartRecruiters posting reached tier-2 scoring with an empty
+ * description -- judged on its title alone, and structurally unable to report a salary or
+ * years-of-experience figure no matter how clearly the real posting states one.
+ *
+ * Deliberately called on the *filtered* set (after role and location matching), not on the whole
+ * board: a detail fetch costs a request each, and there's no reason to spend one on a posting that
+ * was already ruled out. Bounded twice over -- by the shared scan budget and by MAX_DETAIL_FETCHES
+ * -- and every failure is swallowed, since a posting with no description is exactly the state this
+ * is trying to improve on and never worse than before.
+ */
+export async function fetchMissingDescriptions(
+  provider: AtsProvider,
+  token: string,
+  jobs: ScannedJob[],
+  budget: { remaining: number },
+): Promise<void> {
+  if (provider !== "smartrecruiters") return;
+  const pending = jobs.filter((job) => !job.description && job.external_id).slice(0, MAX_DETAIL_FETCHES);
+
+  for (let i = 0; i < pending.length; i += DETAIL_CONCURRENCY) {
+    if (budget.remaining <= 5) return;
+    const batch = pending.slice(i, i + DETAIL_CONCURRENCY);
+    budget.remaining -= batch.length;
+    await Promise.all(
+      batch.map(async (job) => {
+        try {
+          const url = `https://api.smartrecruiters.com/v1/companies/${encodeURIComponent(token)}/postings/${encodeURIComponent(job.external_id)}`;
+          const res = await fetchWithTimeout(url, 8000);
+          if (!res || !res.ok) return;
+          const detail = (await res.json().catch(() => null)) as {
+            jobAd?: { sections?: Record<string, { title?: string; text?: string } | undefined> };
+          } | null;
+          const sections = detail?.jobAd?.sections;
+          if (!sections) return;
+          // Ordered the way the posting itself reads, with additionalInformation last since that's
+          // where a compensation or benefits block typically sits.
+          job.description = joinSections(
+            ["jobDescription", "qualifications", "additionalInformation", "companyDescription"].map((key) => {
+              const section = sections[key];
+              if (!section?.text) return "";
+              return section.title ? `${section.title}:\n${section.text}` : section.text;
+            }),
+          );
+        } catch {
+          // Leave the description empty -- same as before this existed.
+        }
+      }),
+    );
+  }
 }
 
 /** Keeps obviously irrelevant postings out of the Jobs tab without needing a model call. */
