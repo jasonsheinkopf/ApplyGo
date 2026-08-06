@@ -3409,6 +3409,22 @@ const DASHBOARD_PAGE = `<!doctype html>
     .row-actions { justify-content: flex-start; flex-wrap: wrap; }
   }
   .empty { color: var(--text-muted); font-size: 0.88rem; margin: 0.35rem 0; }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+    clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
+  /* Pipeline flow diagram (Search tab) -- a small sankey of where scanned postings currently sit:
+     not yet screened, screened out, awaiting the detailed pass, matched, or ruled out. Node bars
+     and link ribbons are sized in JS from the live counts; this just fixes the constant look --
+     stroke widths, gaps, label type -- shared by both the left-to-right and stacked-rows layouts. */
+  #jobs-pipeline { margin: 0.6rem 0 1rem; max-width: 640px; }
+  #jobs-pipeline svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .pf-node-value { font-size: 11px; font-weight: 700; fill: var(--text); }
+  .pf-node-sub { font-size: 8.5px; fill: var(--text-muted); }
+  .pf-link { opacity: 0.55; }
+  .pf-node-rect { stroke: var(--surface); stroke-width: 2; }
+  .pf-dot { filter: drop-shadow(0 0 2px rgba(0,0,0,0.25)); }
+  @media (prefers-reduced-motion: reduce) { .pf-dot { display: none; } }
   .template-choices { display: grid; gap: 0.5rem; margin-bottom: 0.9rem; }
   @media (min-width: 560px) { .template-choices { grid-template-columns: repeat(3, 1fr); } }
   .template-card {
@@ -3811,7 +3827,8 @@ const DASHBOARD_PAGE = `<!doctype html>
     <section id="jobs-filter-section">
       <h2>2. Filter for your best matches</h2>
       <p class="hint">Screens new listings against your profile in two passes — a quick check, then a closer look at anything that survives it — so you only spend real attention on postings worth reading.</p>
-      <p id="jobs-pipeline" class="summary-line">Loading…</p>
+      <p id="jobs-pipeline-summary" class="sr-only" aria-live="polite"></p>
+      <div id="jobs-pipeline" aria-hidden="true"><p class="empty">Loading…</p></div>
       <div class="controls">
         <div>
           <label for="jobs-provider">Filter using</label>
@@ -4668,6 +4685,7 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     var allCompanies = [];
     var allJobs = [];
+    var pfLastCounts = null;
 
     function matchesFilter(haystack, needle) {
       if (!needle) return true;
@@ -5416,19 +5434,250 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
-    function renderJobPipeline(counts) {
+    // ---- Pipeline flow diagram (Search tab) --------------------------------------------------
+    // A small sankey of where scanned postings currently sit. Two real split points -- the cheap
+    // screen, then the detailed pass -- so this is two branch levels, not a generic n-level sankey:
+    // col0 is a single "all scanned postings" root; col1 is what the screen did with them (not
+    // screened yet / screened out / passed); col2 is what the detailed pass did with whatever
+    // passed (still queued / matched / ruled out). Hand-laying-out two fixed branch points is far
+    // simpler and more robust than a general sankey-layout algorithm for a shape this small.
+    var PF_GAP = 10;
+    var PF_BAR = 14;
+    var PF_COLOR = { good: 'var(--success)', bad: 'var(--error)', pending: 'var(--warning)', neutral: 'var(--text-muted)' };
+
+    function pfFlowData(counts) {
+      var notScreened = counts.unassessed || 0;
+      var screenedOut = counts.screened_out || 0;
+      var waiting = counts.screened_in || 0;
+      var matches = (counts.strong || 0) + (counts.possible || 0);
+      var ruledOut = counts.reject || 0;
+      var passedScreen = waiting + matches + ruledOut;
+      var total = notScreened + screenedOut + passedScreen;
+      if (!total) return null;
+      var col1 = [
+        { id: 'notScreened', label: 'Not screened yet', value: notScreened, kind: 'pending' },
+        { id: 'screenedOut', label: 'Screened out', value: screenedOut, kind: 'bad' },
+        { id: 'passedScreen', label: 'Passed screening', value: passedScreen, kind: 'neutral' },
+      ].filter(function (n) { return n.value > 0; });
+      var col2 = [
+        { id: 'waiting', label: 'Awaiting review', value: waiting, kind: 'pending' },
+        { id: 'matches', label: 'Matches', value: matches, kind: 'good' },
+        { id: 'ruledOut', label: 'Ruled out', value: ruledOut, kind: 'bad' },
+      ].filter(function (n) { return n.value > 0; });
+      return { total: total, root: { id: 'total', label: 'Scanned postings', value: total, kind: 'neutral' }, col1: col1, col2: col2 };
+    }
+
+    // Positions every node along a single "main axis" (0..mainAvail), independent of whether that
+    // axis ends up drawn as screen Y (left-to-right layout) or screen X (stacked-rows layout) --
+    // the SVG builder below is the only thing that knows which. A ribbon's thickness at its PARENT
+    // end is a proportional slice of the parent's own rendered length (so sibling ribbons exactly
+    // tile the parent with no gap); at its CHILD end it's the child's own bar length. Those two
+    // don't have to match -- col2 has its own gap overhead from being 1-3 separately spaced bars,
+    // so its scale is derived from the span passedScreen actually occupies in col1, not reused
+    // wholesale from col0/col1's scale. A tapering ribbon is normal sankey behavior, not a bug.
+    function pfLayout(flow, mainAvail) {
+      var maxGaps = Math.max(flow.col1.length - 1, flow.col2.length - 1, 0);
+      var scale = (mainAvail - PF_GAP * maxGaps) / flow.total;
+      if (!isFinite(scale) || scale <= 0) scale = mainAvail / flow.total;
+
+      function stack(nodes, avail) {
+        var lenSum = 0, i;
+        for (i = 0; i < nodes.length; i++) lenSum += nodes[i].value * scale;
+        var span = lenSum + PF_GAP * (nodes.length - 1);
+        var cursor = (avail - span) / 2;
+        for (i = 0; i < nodes.length; i++) {
+          nodes[i].mainLen = nodes[i].value * scale;
+          nodes[i].mainStart = cursor;
+          cursor += nodes[i].mainLen + PF_GAP;
+        }
+      }
+
+      var root = flow.root;
+      root.mainLen = root.value * scale;
+      root.mainStart = (mainAvail - root.mainLen) / 2;
+      stack(flow.col1, mainAvail);
+
+      var passedNode = null, i;
+      for (i = 0; i < flow.col1.length; i++) { if (flow.col1[i].id === 'passedScreen') passedNode = flow.col1[i]; }
+      if (passedNode && flow.col2.length) {
+        var scale2 = (passedNode.mainLen - PF_GAP * (flow.col2.length - 1)) / passedNode.value;
+        if (!isFinite(scale2) || scale2 <= 0) scale2 = passedNode.mainLen / passedNode.value;
+        var cursor2 = passedNode.mainStart;
+        for (i = 0; i < flow.col2.length; i++) {
+          flow.col2[i].mainLen = flow.col2[i].value * scale2;
+          flow.col2[i].mainStart = cursor2;
+          cursor2 += flow.col2[i].mainLen + PF_GAP;
+        }
+      }
+
+      var links = [], cursorSrc = root.mainStart;
+      for (i = 0; i < flow.col1.length; i++) {
+        var n = flow.col1[i], thick = n.value * scale;
+        links.push({ target: n, fromCol: 0, toCol: 1, kind: n.kind, srcStart: cursorSrc, srcLen: thick, dstStart: n.mainStart, dstLen: n.mainLen });
+        cursorSrc += thick;
+      }
+      if (passedNode) {
+        var cursorSrc2 = passedNode.mainStart;
+        for (i = 0; i < flow.col2.length; i++) {
+          var n2 = flow.col2[i], thick2 = n2.value * scale;
+          links.push({ target: n2, fromCol: 1, toCol: 2, kind: n2.kind, srcStart: cursorSrc2, srcLen: thick2, dstStart: n2.mainStart, dstLen: n2.mainLen });
+          cursorSrc2 += thick2;
+        }
+      }
+      return links;
+    }
+
+    function pfEsc(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+    function pfCount(n) {
+      return n >= 10000 ? Math.round(n / 1000) + 'k' : n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+    }
+    // A background halo behind every label -- small labels sit right next to (sometimes over) a
+    // ribbon curve in a diagram this compact, and a solid halo keeps them readable regardless of
+    // what's underneath, rather than trying to keep every label clear of every ribbon by hand.
+    function pfLabelHalo(cx, top, lines, anchor) {
+      var w = 0, i;
+      for (i = 0; i < lines.length; i++) w = Math.max(w, lines[i].text.length * lines[i].size * 0.58);
+      var h = lines.length === 2 ? 24 : 13;
+      var x = anchor === 'middle' ? cx - w / 2 - 4 : anchor === 'end' ? cx - w - 4 : cx - 4;
+      return '<rect class="pf-halo" x="' + x + '" y="' + (top - 2) + '" width="' + (w + 8) + '" height="' + h + '" rx="3" fill="var(--surface)" fill-opacity="0.82"></rect>';
+    }
+    // At an extreme value imbalance (a 1-vs-999 split), a node's bar can be a sliver sitting right
+    // at the edge of the diagram -- its label, centered on that sliver, would then extend past the
+    // edge and get clipped. clampBounds (when given) nudges the label's anchor coordinate inward
+    // by half its own estimated footprint so the whole label always stays inside the viewBox,
+    // rather than clipping (per the "measure first, a label never gets clipped" rule).
+    function pfLabelText(cx, midY, node, anchor, clampBounds) {
+      var lines = [
+        { text: pfCount(node.value), size: 11, cls: 'pf-node-value' },
+        { text: node.label, size: 8.5, cls: 'pf-node-sub' },
+      ];
+      if (clampBounds) {
+        var maxLineW = 0, li;
+        for (li = 0; li < lines.length; li++) maxLineW = Math.max(maxLineW, lines[li].text.length * lines[li].size * 0.58);
+        if (clampBounds.axis === 'x') {
+          var halfW = maxLineW / 2 + 4;
+          cx = Math.max(clampBounds.min + halfW, Math.min(clampBounds.max - halfW, cx));
+        } else {
+          var halfH = 14;
+          midY = Math.max(clampBounds.min + halfH, Math.min(clampBounds.max - halfH, midY));
+        }
+      }
+      var halo = pfLabelHalo(cx, midY - 12, lines, anchor);
+      var text = '<text x="' + cx + '" y="' + (midY - 1) + '" text-anchor="' + anchor + '" class="pf-node-value">' + pfEsc(lines[0].text) +
+        '</text><text x="' + cx + '" y="' + (midY + 10) + '" text-anchor="' + anchor + '" class="pf-node-sub">' + pfEsc(lines[1].text) + '</text>';
+      return halo + text;
+    }
+
+    function pfRibbon(orientation, cross, link) {
+      var d, cd, id = 'pf-link-' + link.target.id;
+      if (orientation === 'h') {
+        var xA = cross[link.fromCol] + PF_BAR, xB = cross[link.toCol];
+        var ay0 = link.srcStart, ay1 = link.srcStart + link.srcLen, by0 = link.dstStart, by1 = link.dstStart + link.dstLen;
+        var mx = (xA + xB) / 2;
+        d = 'M' + xA + ',' + ay0 + ' C' + mx + ',' + ay0 + ' ' + mx + ',' + by0 + ' ' + xB + ',' + by0 +
+          ' L' + xB + ',' + by1 + ' C' + mx + ',' + by1 + ' ' + mx + ',' + ay1 + ' ' + xA + ',' + ay1 + ' Z';
+        cd = 'M' + xA + ',' + ((ay0 + ay1) / 2) + ' C' + mx + ',' + ((ay0 + ay1) / 2) + ' ' + mx + ',' + ((by0 + by1) / 2) + ' ' + xB + ',' + ((by0 + by1) / 2);
+      } else {
+        var yA = cross[link.fromCol] + PF_BAR, yB = cross[link.toCol];
+        var ax0 = link.srcStart, ax1 = link.srcStart + link.srcLen, bx0 = link.dstStart, bx1 = link.dstStart + link.dstLen;
+        var my = (yA + yB) / 2;
+        d = 'M' + ax0 + ',' + yA + ' C' + ax0 + ',' + my + ' ' + bx0 + ',' + my + ' ' + bx0 + ',' + yB +
+          ' L' + bx1 + ',' + yB + ' C' + bx1 + ',' + my + ' ' + ax1 + ',' + my + ' ' + ax1 + ',' + yA + ' Z';
+        cd = 'M' + ((ax0 + ax1) / 2) + ',' + yA + ' C' + ((ax0 + ax1) / 2) + ',' + my + ' ' + ((bx0 + bx1) / 2) + ',' + my + ' ' + ((bx0 + bx1) / 2) + ',' + yB;
+      }
+      var color = PF_COLOR[link.kind];
+      var dur = (2.4 + (link.dstStart % 3) * 0.3).toFixed(2);
+      var out = '<path d="' + d + '" fill="' + color + '" class="pf-link"></path>';
+      out += '<path id="' + id + '" d="' + cd + '" fill="none" stroke="none"></path>';
+      out += '<circle r="2.6" fill="' + color + '" class="pf-dot"><animateMotion dur="' + dur + 's" repeatCount="indefinite" begin="0s"><mpath href="#' + id + '" xlink:href="#' + id + '"></mpath></animateMotion></circle>';
+      out += '<circle r="2.6" fill="' + color + '" class="pf-dot"><animateMotion dur="' + dur + 's" repeatCount="indefinite" begin="-' + (dur / 2) + 's"><mpath href="#' + id + '" xlink:href="#' + id + '"></mpath></animateMotion></circle>';
+      return out;
+    }
+
+    function pfBuildSvg(counts, containerWidth) {
+      var flow = pfFlowData(counts);
+      if (!flow) return null;
+      var vertical = containerWidth < 480;
+      var body = '', W, H, cross;
+
+      if (!vertical) {
+        W = containerWidth;
+        var MARGIN = 18, SIDE = 10;
+        H = 232;
+        var mainAvail = H - MARGIN * 2;
+        var links = pfLayout(flow, mainAvail);
+        // Three columns need three label gaps, not two -- one after each bar, including the last
+        // (its label reads to the right of it, same as the other two, and needs its own reserved
+        // room rather than sharing the right-hand margin).
+        var labelGap = (W - SIDE * 2 - 3 * PF_BAR) / 3;
+        cross = [SIDE, SIDE + PF_BAR + labelGap, SIDE + 2 * (PF_BAR + labelGap)];
+
+        var nodesByCol = [[flow.root], flow.col1, flow.col2];
+        var i, j;
+        for (i = 0; i < links.length; i++) body += pfRibbon('h', cross, links[i]);
+        for (i = 0; i < 3; i++) {
+          for (j = 0; j < nodesByCol[i].length; j++) {
+            var n = nodesByCol[i][j];
+            var x = cross[i], y = MARGIN + n.mainStart;
+            body += '<rect class="pf-node-rect" x="' + x + '" y="' + y + '" width="' + PF_BAR + '" height="' + n.mainLen + '" rx="3" fill="' + PF_COLOR[n.kind] + '"></rect>';
+            body += pfLabelText(x + PF_BAR + 6, y + n.mainLen / 2, n, 'start', { axis: 'y', min: 0, max: H });
+          }
+        }
+      } else {
+        W = containerWidth;
+        var MARGINv = 10;
+        var mainAvailV = W - MARGINv * 2;
+        var ROW_GAP = 54, LABEL_H = 30;
+        var row0Y = MARGINv, row1Y = row0Y + PF_BAR + ROW_GAP, row2Y = row1Y + PF_BAR + ROW_GAP;
+        H = row2Y + PF_BAR + LABEL_H + MARGINv;
+        cross = [row0Y, row1Y, row2Y];
+        var linksV = pfLayout(flow, mainAvailV);
+        var nodesByColV = [[flow.root], flow.col1, flow.col2];
+        var ii, jj;
+        for (ii = 0; ii < linksV.length; ii++) body += pfRibbon('v', cross, linksV[ii]);
+        for (ii = 0; ii < 3; ii++) {
+          for (jj = 0; jj < nodesByColV[ii].length; jj++) {
+            var nv = nodesByColV[ii][jj];
+            var nx = MARGINv + nv.mainStart, ny = cross[ii];
+            body += '<rect class="pf-node-rect" x="' + nx + '" y="' + ny + '" width="' + nv.mainLen + '" height="' + PF_BAR + '" rx="3" fill="' + PF_COLOR[nv.kind] + '"></rect>';
+            body += pfLabelText(nx + nv.mainLen / 2, ny + PF_BAR + 16, nv, 'middle', { axis: 'x', min: 0, max: W });
+          }
+        }
+      }
+      return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg">' + body + '</svg>';
+    }
+
+    function renderPipelineDiagram() {
       var host = document.getElementById('jobs-pipeline');
-      host.innerHTML = '';
+      if (!host || !pfLastCounts) return;
+      var svg = pfBuildSvg(pfLastCounts, host.clientWidth || 360);
+      host.innerHTML = svg || '<p class="empty">Scan companies and click "Find my matches" to see your pipeline here.</p>';
+    }
+
+    var pfResizeTimer = null;
+    window.addEventListener('resize', function () {
+      clearTimeout(pfResizeTimer);
+      pfResizeTimer = setTimeout(renderPipelineDiagram, 150);
+    });
+
+    function renderJobPipeline(counts) {
+      pfLastCounts = counts;
       var matches = (counts.strong || 0) + (counts.possible || 0);
       var queued = (counts.unassessed || 0) + (counts.screened_in || 0);
-      host.appendChild(el('span', {}, [
-        el('strong', { textContent: String(matches) }),
-        el('span', { textContent: ' match' + (matches === 1 ? '' : 'es') +
-          ' · ' + queued + ' waiting to be filtered' +
-          ' · ' + (counts.screened_out || 0) + ' dropped in screening' +
-          ' · ' + (counts.reject || 0) + ' ruled out' }),
-      ]));
+      document.getElementById('jobs-pipeline-summary').textContent =
+        matches + ' match' + (matches === 1 ? '' : 'es') +
+        ', ' + queued + ' waiting to be filtered' +
+        ', ' + (counts.screened_out || 0) + ' dropped in screening' +
+        ', ' + (counts.reject || 0) + ' ruled out.';
+      renderPipelineDiagram();
     }
+
+    // The Search tab isn't the active panel on first load (Desired Roles is), so the very first
+    // renderPipelineDiagram() call above measures a hidden (0-width) container and draws nothing
+    // useful. Re-measure and redraw once the panel actually becomes visible.
+    document.querySelector('[data-tab="search"]').addEventListener('click', renderPipelineDiagram);
 
     async function loadJobs() {
       var res = await api('/jobs');
