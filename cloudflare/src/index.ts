@@ -1,13 +1,23 @@
 import { extractText, getDocumentProxy } from "unpdf";
 import { type BrowserWorker } from "@cloudflare/puppeteer";
 import {
+  type LlmTrace,
   type Provider,
+  type TraceSink,
   WRITING_STYLE_RULES,
   callStructured,
   callText,
   normalizeProvider,
   providerKeyMissing,
 } from "./llm";
+import {
+  DEV_PAGE,
+  TRACE_RETENTION,
+  costSummary,
+  getTrace,
+  listTraces,
+  taskRollups,
+} from "./devconsole";
 import {
   type AtsProvider,
   companyNameKey,
@@ -61,6 +71,10 @@ interface Env {
   OPENAI_MODEL?: string;
   ANTHROPIC_SCREEN_MODEL?: string;
   OPENAI_SCREEN_MODEL?: string;
+  /** Set to "off" to stop recording model calls. Anything else (including unset) records them. */
+  LLM_TRACE?: string;
+  /** Installed once per isolate by the router; see attachTraceSink. */
+  LLM_TRACE_SINK?: TraceSink;
 }
 
 type Session = {
@@ -135,6 +149,64 @@ async function runPooled<T, R>(
     }
   }
   await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, () => worker()));
+}
+
+/**
+ * Writes each completed model call to D1.
+ *
+ * The write is awaited inside the call rather than deferred: an LLM call takes seconds, a D1 insert
+ * takes milliseconds, so the overhead is noise, and awaiting means a trace is never lost to a
+ * request finishing before its background write did. Failures are swallowed upstream in llm.ts --
+ * observability must not be able to break the thing it observes.
+ */
+function createTraceSink(env: Env): TraceSink {
+  return async (trace: LlmTrace) => {
+    await env.DB.prepare(
+      `INSERT INTO llm_traces
+       (id, task, provider, model, tier, prompt, response, input_tokens, output_tokens,
+        cost_usd, latency_ms, ok, error)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        crypto.randomUUID(),
+        trace.task,
+        trace.provider,
+        trace.model,
+        trace.tier,
+        trace.prompt,
+        trace.response,
+        trace.inputTokens,
+        trace.outputTokens,
+        trace.costUsd,
+        trace.latencyMs,
+        trace.ok ? 1 : 0,
+        trace.error,
+      )
+      .run();
+
+    // Pruning on every insert would mean a full ordering scan per model call, and calls arrive
+    // eight at a time. Sampling keeps the table bounded at negligible cost -- the exact row count
+    // hovering somewhere above the cap between prunes doesn't matter for a debugging tool.
+    if (Math.random() < 0.02) {
+      await env.DB.prepare(
+        `DELETE FROM llm_traces WHERE id IN (
+           SELECT id FROM llm_traces ORDER BY created_at DESC LIMIT -1 OFFSET ?
+         )`,
+      )
+        .bind(TRACE_RETENTION)
+        .run();
+    }
+  };
+}
+
+/**
+ * Installs the trace sink on the env object once. `env` is shared across requests within an
+ * isolate, but the sink closes over nothing request-specific (only the D1 binding, which is
+ * constant), so installing it once and reusing it is safe.
+ */
+function attachTraceSink(env: Env): void {
+  if (env.LLM_TRACE === "off" || env.LLM_TRACE_SINK) return;
+  env.LLM_TRACE_SINK = createTraceSink(env);
 }
 
 function randomToken(bytes = 32): string {
@@ -596,7 +668,7 @@ async function generateDesiredRoles(request: Request, env: Env): Promise<Respons
   ].join("\n\n");
 
   try {
-    const draft = await callText(env, provider, prompt);
+    const draft = await callText(env, provider, "roles.describe", prompt);
     return json({ provider, draft_description: draft });
   } catch (err) {
     return json({ error: "generation_failed", detail: (err as Error).message }, 502);
@@ -1248,7 +1320,7 @@ async function reviewJobQuestion(request: Request, env: Env, id: string): Promis
     .join("\n");
 
   try {
-    const question = await callText(env, provider, prompt);
+    const question = await callText(env, provider, "review.question", prompt);
     return json({ question: question.trim() });
   } catch (err) {
     return json({ error: "generation_failed", detail: (err as Error).message }, 502);
@@ -2170,6 +2242,7 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
     const raw = await callStructured<StructuredProfile>(
       env,
       provider,
+      "profile.structure",
       prompt,
       STRUCTURED_PROFILE_JSON_SCHEMA,
       "submit_structured_profile",
@@ -2546,6 +2619,7 @@ async function decideResumeBase(
   const result = await callStructured<{ base_resume_id: string; tailoring_notes: string }>(
     env,
     provider,
+    "resume.select_base",
     prompt,
     RESUME_BASE_SCHEMA,
     "submit_resume_base",
@@ -2798,6 +2872,7 @@ async function composeCoverLetter(
   const result = await callStructured<{ letter_body: string }>(
     env,
     provider,
+    "cover_letter.write",
     prompt,
     COVER_LETTER_SCHEMA,
     "submit_cover_letter",
@@ -3105,6 +3180,7 @@ async function matchApplication(request: Request, env: Env): Promise<Response> {
       const result = await callStructured<{ answers: { name: string; value: string; answered: boolean }[] }>(
         env,
         provider,
+        "application.answers",
         prompt,
         MATCH_SCHEMA,
         "submit_application_answers",
@@ -6455,6 +6531,51 @@ function corsHeaders(origin: string): Record<string, string> {
   };
 }
 
+/**
+ * The dev console and its data endpoints.
+ *
+ * Gated on the same device session as everything else: the traces contain the full text of every
+ * prompt, which includes the candidate's profile and the postings being assessed. That is at least
+ * as sensitive as the dashboard itself, so it gets the same protection rather than being left open
+ * on the grounds that it is "just a debug page".
+ */
+async function devConsole(request: Request, env: Env, url: URL): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+
+  const path = url.pathname;
+  const days = Math.min(Math.max(Number(url.searchParams.get("days")) || 7, 1), 90);
+
+  if (path === "/dev") {
+    return new Response(DEV_PAGE, {
+      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "private, no-store" },
+    });
+  }
+  if (path === "/dev/tasks") {
+    return json({ days, tasks: await taskRollups(env.DB, days) });
+  }
+  if (path === "/dev/costs") {
+    return json(await costSummary(env.DB, days));
+  }
+
+  const traceMatch = path.match(/^\/dev\/traces\/(.+)$/);
+  if (traceMatch) {
+    const trace = await getTrace(env.DB, decodeURIComponent(traceMatch[1]));
+    return trace ? json({ trace }) : json({ error: "not_found" }, 404);
+  }
+  if (path === "/dev/traces") {
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 200);
+    return json({
+      traces: await listTraces(env.DB, {
+        task: url.searchParams.get("task") || undefined,
+        onlyErrors: url.searchParams.get("errors") === "1",
+        limit,
+      }),
+    });
+  }
+  return json({ error: "not_found" }, 404);
+}
+
 function extensionCorsOrigin(request: Request, pathname: string): string | null {
   const origin = request.headers.get("origin");
   if (!origin || !origin.startsWith("chrome-extension://")) return null;
@@ -6464,6 +6585,7 @@ function extensionCorsOrigin(request: Request, pathname: string): string | null 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    attachTraceSink(env);
 
     const corsOrigin = extensionCorsOrigin(request, url.pathname);
     if (corsOrigin && request.method === "OPTIONS") {
@@ -6482,6 +6604,7 @@ export default {
 async function handle(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   {
     if (request.method === "GET" && url.pathname === "/health") return json({ status: "ok", mode: "cloudflare" });
+    if (request.method === "GET" && url.pathname.startsWith("/dev")) return devConsole(request, env, url);
     if (request.method === "GET" && url.pathname === "/enroll") return enrollPage();
     if (request.method === "GET" && url.pathname === "/") {
       const auth = await requireSession(request, env);

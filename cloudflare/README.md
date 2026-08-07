@@ -409,6 +409,26 @@ Authenticated file endpoints:
 
 Uploads are limited to 15 MB and PDF, plain text, or Markdown in this initial slice. R2 objects are not made public; the bucket has no public access binding or custom domain.
 
+## Model-call tracing and the developer console (`/dev`)
+
+Every prompt this app sends is recorded, and `/dev` is where you read them. It is a developer tool, not a product surface: it exists so the prompts can be worked on deliberately instead of inferred from whatever the dashboard happens to render.
+
+The motivation is concrete. The description-capture problem survived five rounds of fixes because the scoring model was answering honestly about text nobody could see — each fix was real and necessary, and none of them was checkable from the UI, because a dropped section looks exactly like a posting that genuinely omits one. A trace makes that difference visible in one click.
+
+**How it's wired.** `src/llm.ts` is the single choke point every model call passes through, so instrumentation lives there rather than at the twelve call sites: there is one place to get right, and a new call site cannot forget to opt in. Each call now takes a task id as its third argument, and the transport stamps that id onto the trace it writes, giving a stable key to group by.
+
+- `src/tasks.ts` names all twelve calls with a description, tier, pipeline stage, and the function that builds the prompt. The console renders the registry joined onto the trace data, so a call that has **never run** still appears — "this prompt has never been exercised" is a finding, not an empty row to hide.
+- `migrations/0015_llm_traces.sql` stores prompt and response **in full**. A trace whose input you cannot read is useless for evaluating a prompt, which is the entire point of keeping it. Retention is a rolling cap (`TRACE_RETENTION`, 2000 rows) pruned in code, sampled at ~2% of writes rather than run on every insert — calls arrive eight at a time and a full ordering scan per call would cost more than the tool is worth.
+- Cost comes from a published-price table in `src/llm.ts`, in USD per million tokens, with date snapshots stripped (`claude-haiku-4-5-20251001` prices as `claude-haiku-4-5`). Sonnet 5's introductory rate is encoded with its expiry so spend is reported correctly on both sides of that date instead of being overstated by 50% until it lapses.
+- **A model with no price on file records `NULL`, never `0`.** Pricing an unknown model at zero would make the dashboard worse than having none — the console instead names the unpriced models and says plainly that totals are an undercount.
+- Tracing failures are swallowed inside `llm.ts`: observability must not be able to break the thing it observes. Set `LLM_TRACE=off` to stop recording entirely.
+
+**Access.** `/dev` is gated on the same device session as the dashboard. The traces contain every prompt in full, which means the candidate profile and the postings being assessed — at least as sensitive as the dashboard itself, so it gets the same protection rather than being left open on the grounds that it is "just a debug page".
+
+**On reading the numbers.** Batched calls are marked as such in the console. One screen call covers 60 postings and one assess call covers 8, so per-call cost and per-posting cost differ by an order of magnitude and the table says which it is showing.
+
+`assert_dev_console.mjs` covers the price maths (including the introductory-rate boundary and the unknown-model case), the console itself, and — most importantly — parses the real source to assert that every call site's task id exists in the registry and every registered task is wired to a call site. A task id is a positional string, so a typo files traces under a name the console never shows: silent, and invisible from the UI. That check was verified to fail when a call site's id is altered.
+
 ## Secrets and credential handling
 
 - `SETUP_SECRET` lives only in Cloudflare's Worker secret store (`wrangler secret put ... --env production`), never in Git, GitHub Actions secrets, or this repository.
