@@ -113,7 +113,7 @@ export type ResumeCheck = { id: string; severity: "error" | "warning" | "ok"; me
 // Stage 1 -- compose
 // ---------------------------------------------------------------------------
 
-const RESUME_DOC_SCHEMA = {
+export const RESUME_DOC_SCHEMA = {
   type: "object",
   properties: {
     full_name: { type: "string", description: "The candidate's name exactly as it should head the resume." },

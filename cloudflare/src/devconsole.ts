@@ -236,6 +236,7 @@ export const DEV_PAGE = `<!doctype html>
 <nav>
   <button data-panel="calls" aria-selected="true">Calls</button>
   <button data-panel="traces" aria-selected="false">Traces</button>
+  <button data-panel="evals" aria-selected="false">Evals</button>
   <button data-panel="costs" aria-selected="false">Cost</button>
 </nav>
 <main>
@@ -276,6 +277,32 @@ export const DEV_PAGE = `<!doctype html>
     <div id="trace-detail"></div>
   </section>
 
+  <section class="panel" id="panel-evals" hidden>
+    <div class="controls">
+      <label>Call <select id="eval-task-filter"><option value="">all</option></select></label>
+      <button class="action" id="eval-new-open">New case</button>
+    </div>
+    <div class="detail" id="eval-new-form" hidden>
+      <h3 style="margin-top:0">New eval case</h3>
+      <label>Call<br><select id="eval-new-task" style="width:100%;max-width:26rem"></select></label><br><br>
+      <label>Name<br><input id="eval-new-name" style="width:100%;max-width:26rem"></label><br><br>
+      <label>Prompt (the exact text to send)<br>
+        <textarea id="eval-new-prompt" rows="8" style="width:100%;font-family:var(--mono);font-size:.78rem"></textarea>
+      </label><br><br>
+      <label>Notes for the judge (optional -- a rubric, a known edge case, what matters here)<br>
+        <textarea id="eval-new-notes" rows="3" style="width:100%"></textarea>
+      </label><br><br>
+      <button class="action" id="eval-new-save">Save case</button>
+      <button class="action" id="eval-new-cancel">Cancel</button>
+      <span class="sub" id="eval-new-status"></span>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Call</th><th class="num">Runs</th><th class="num">Best score</th><th>Last run</th></tr></thead>
+      <tbody id="eval-cases-body"></tbody>
+    </table>
+    <div id="eval-case-detail"></div>
+  </section>
+
   <section class="panel" id="panel-costs">
     <div id="cost-warn"></div>
     <h3 style="font-size:.85rem;color:var(--muted);font-weight:550">By model</h3>
@@ -299,7 +326,7 @@ export const DEV_PAGE = `<!doctype html>
 
 <script>
 (function () {
-  var state = { days: 7, task: '', errorsOnly: false, panel: 'calls' };
+  var state = { days: 7, task: '', errorsOnly: false, panel: 'calls', evalTask: '' };
 
   function esc(value) {
     return String(value === null || value === undefined ? '' : value)
@@ -380,12 +407,18 @@ export const DEV_PAGE = `<!doctype html>
   }
 
   function renderDetail(t) {
+    window.__currentTrace = t;
     var head = '<div class="detail"><strong>' + esc(t.task) + '</strong> &middot; ' +
       esc(t.provider) + ' / ' + esc(t.model) + ' &middot; ' + esc(t.tier) + ' &middot; ' +
       ms(t.latency_ms) + ' &middot; ' + t.input_tokens + ' in / ' + t.output_tokens + ' out &middot; ' +
       (t.cost_usd === null ? '<span class="bad">unpriced model</span>' : money(t.cost_usd)) +
       ' &middot; ' + esc(when(t.created_at));
     if (!t.ok) head += '<div class="warn" style="margin-top:.6rem">' + esc(t.error) + '</div>';
+    var meta = window.__taskMeta && window.__taskMeta[t.task];
+    if (meta && meta.replayable) {
+      head += '<div style="margin-top:.6rem"><button class="action" id="save-as-case-btn">Save as eval case</button> ' +
+        '<span class="sub" id="save-as-case-status"></span></div>';
+    }
     head += '<h3>Prompt (' + String(t.prompt || '').length + ' chars)</h3><pre>' + esc(t.prompt) + '</pre>';
     head += '<h3>Response</h3><pre>' + esc(t.response || '(none)') + '</pre></div>';
     document.getElementById('trace-detail').innerHTML = head;
@@ -421,18 +454,115 @@ export const DEV_PAGE = `<!doctype html>
     }).join('');
   }
 
+  function renderEvalCases(cases) {
+    if (!cases.length) {
+      document.getElementById('eval-cases-body').innerHTML =
+        '<tr><td colspan="5" class="empty">No saved cases yet. Save a trace from the Traces tab, or start one with "New case".</td></tr>';
+      return;
+    }
+    document.getElementById('eval-cases-body').innerHTML = cases.map(function (c) {
+      return '<tr class="row-click" data-case="' + esc(c.id) + '">' +
+        '<td>' + esc(c.name) + '</td>' +
+        '<td>' + esc(c.task) + '</td>' +
+        '<td class="num">' + c.run_count + '</td>' +
+        '<td class="num">' + (c.best_score === null ? '' : c.best_score) + '</td>' +
+        '<td>' + (c.last_run_at ? esc(when(c.last_run_at)) : '<span class="never">never run</span>') + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  function renderEvalRunDetail(r) {
+    var html = '<div class="detail"><strong>' + esc(r.provider) + ' / ' + esc(r.model) + '</strong> &middot; ' +
+      ms(r.latency_ms) + ' &middot; ' + r.input_tokens + ' in / ' + r.output_tokens + ' out &middot; ' +
+      (r.cost_usd === null ? '<span class="bad">unpriced model</span>' : money(r.cost_usd)) +
+      ' &middot; ' + esc(when(r.created_at));
+    if (!r.ok) html += '<div class="warn" style="margin-top:.6rem">' + esc(r.error || 'Call failed.') + '</div>';
+    if (r.judge_score !== null && r.judge_score !== undefined) {
+      html += '<h3>Judge score: ' + r.judge_score + ' / 100</h3><div class="sub">' + esc(r.judge_reasoning || '') + '</div>';
+    } else if (r.judge_reasoning) {
+      html += '<div class="warn" style="margin-top:.6rem">' + esc(r.judge_reasoning) + '</div>';
+    }
+    html += '<h3>Prompt sent (' + String(r.prompt || '').length + ' chars)</h3><pre>' + esc(r.prompt) + '</pre>';
+    html += '<h3>Response</h3><pre>' + esc(r.response || '(none)') + '</pre></div>';
+    document.getElementById('eval-run-detail').innerHTML = html;
+    document.getElementById('eval-run-detail').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  function renderEvalRunsTable(runs) {
+    window.__evalRuns = {};
+    runs.forEach(function (r) { window.__evalRuns[r.id] = r; });
+    document.getElementById('eval-runs-body').innerHTML = runs.length
+      ? runs.map(function (r) {
+          return '<tr class="row-click" data-run="' + esc(r.id) + '">' +
+            '<td>' + esc(when(r.created_at)) + '</td>' +
+            '<td>' + esc(r.provider) + ' / ' + esc(r.model) + (r.ok ? '' : ' <span class="bad">failed</span>') + '</td>' +
+            '<td class="num">' + (r.judge_score === null || r.judge_score === undefined ? '' : r.judge_score) + '</td>' +
+            '<td class="num">' + (r.cost_usd === null ? '<span class="bad">?</span>' : money(r.cost_usd)) + '</td>' +
+            '<td class="num">' + ms(r.latency_ms) + '</td>' +
+          '</tr>';
+        }).join('')
+      : '<tr><td colspan="5" class="empty">No runs yet -- pick a provider and model above and run it.</td></tr>';
+  }
+
+  function renderEvalCaseDetail(data, priceModels) {
+    window.__currentCase = data.case;
+    var c = data.case;
+    var options = (priceModels || []).map(function (p) {
+      return '<option value="' + esc(p.model) + '">';
+    }).join('');
+    var html = '<div class="detail"><h3 style="margin-top:0">' + esc(c.name) +
+      ' <span class="pill">' + esc(c.task) + '</span></h3>';
+    if (c.source_trace_id) html += '<div class="sub">Promoted from a trace.</div>';
+    html += '<h3>Prompt</h3><textarea id="eval-detail-prompt" rows="10" ' +
+      'style="width:100%;font-family:var(--mono);font-size:.78rem;background:var(--surface);color:var(--text);' +
+      'border:1px solid var(--border);border-radius:8px;padding:.6rem">' + esc(c.prompt) + '</textarea>' +
+      '<h3>Notes for the judge</h3><textarea id="eval-detail-notes" rows="3" ' +
+      'style="width:100%;background:var(--surface);color:var(--text);border:1px solid var(--border);' +
+      'border-radius:8px;padding:.6rem">' + esc(c.notes) + '</textarea>' +
+      '<div style="margin-top:.5rem"><button class="action" id="eval-save-changes">Save changes</button> ' +
+      '<span class="sub" id="eval-save-status"></span></div>' +
+      '<h3>Run a new variant</h3>' +
+      '<div class="controls">' +
+      '<select id="eval-run-provider"><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option></select>' +
+      '<input id="eval-run-model" list="eval-model-list" placeholder="model id, e.g. claude-opus-5" style="min-width:16rem">' +
+      '<datalist id="eval-model-list">' + options + '</datalist>' +
+      '<button class="action" id="eval-run-btn">Run</button>' +
+      '<span class="sub" id="eval-run-status"></span>' +
+      '</div>' +
+      '<h3>Runs</h3><table><thead><tr><th>When</th><th>Provider / model</th>' +
+      '<th class="num">Score</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead>' +
+      '<tbody id="eval-runs-body"></tbody></table><div id="eval-run-detail"></div></div>';
+    document.getElementById('eval-case-detail').innerHTML = html;
+    renderEvalRunsTable(data.runs);
+    document.getElementById('eval-case-detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
   function loadCalls() {
     return get('/dev/tasks?days=' + state.days).then(function (data) {
       renderCalls(data.tasks);
-      var sel = document.getElementById('trace-task');
-      if (sel.options.length <= 1) {
+      window.__taskMeta = {};
+      data.tasks.forEach(function (t) { window.__taskMeta[t.id] = t; });
+
+      var traceSel = document.getElementById('trace-task');
+      if (traceSel.options.length <= 1) {
         data.tasks.forEach(function (t) {
+          var opt = document.createElement('option');
+          opt.value = t.id;
+          opt.textContent = t.name;
+          traceSel.appendChild(opt);
+        });
+      }
+
+      var replayable = data.tasks.filter(function (t) { return t.replayable; });
+      [document.getElementById('eval-task-filter'), document.getElementById('eval-new-task')].forEach(function (sel) {
+        if (!sel || sel.options.length > (sel.id === 'eval-task-filter' ? 1 : 0)) return;
+        replayable.forEach(function (t) {
           var opt = document.createElement('option');
           opt.value = t.id;
           opt.textContent = t.name;
           sel.appendChild(opt);
         });
-      }
+      });
     });
   }
   function loadTraces() {
@@ -443,12 +573,21 @@ export const DEV_PAGE = `<!doctype html>
   function loadCosts() {
     return get('/dev/costs?days=' + state.days).then(renderCosts);
   }
+  function loadEvalCases() {
+    var q = '/dev/evals/cases' + (state.evalTask ? '?task=' + encodeURIComponent(state.evalTask) : '');
+    return get(q).then(function (data) { renderEvalCases(data.cases); });
+  }
+  function openEvalCase(id) {
+    Promise.all([get('/dev/evals/cases/' + encodeURIComponent(id)), get('/dev/costs?days=1')])
+      .then(function (results) { renderEvalCaseDetail(results[0], results[1].price_table); });
+  }
 
   function refresh() {
     setStatus('Loading...');
     var jobs = [loadCalls()];
     if (state.panel === 'traces') jobs.push(loadTraces());
     if (state.panel === 'costs') jobs.push(loadCosts());
+    if (state.panel === 'evals') jobs.push(loadEvalCases());
     Promise.all(jobs).then(function () { setStatus(''); })
       .catch(function (err) { setStatus('Failed: ' + err.message); });
   }
@@ -459,7 +598,7 @@ export const DEV_PAGE = `<!doctype html>
       Array.prototype.forEach.call(document.querySelectorAll('nav button'), function (b) {
         b.setAttribute('aria-selected', String(b === btn));
       });
-      ['calls', 'traces', 'costs'].forEach(function (name) {
+      ['calls', 'traces', 'evals', 'costs'].forEach(function (name) {
         document.getElementById('panel-' + name).hidden = name !== state.panel;
       });
       refresh();
@@ -481,6 +620,98 @@ export const DEV_PAGE = `<!doctype html>
     if (!row) return;
     get('/dev/traces/' + encodeURIComponent(row.getAttribute('data-trace')))
       .then(function (data) { renderDetail(data.trace); });
+  });
+  document.getElementById('trace-detail').addEventListener('click', function (e) {
+    if (!e.target || e.target.id !== 'save-as-case-btn') return;
+    var t = window.__currentTrace;
+    var statusEl = document.getElementById('save-as-case-status');
+    statusEl.textContent = 'Saving...';
+    fetch('/dev/evals/cases', {
+      method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        task: t.task, prompt: t.prompt, source_trace_id: t.id,
+        name: t.task + ' -- ' + new Date().toLocaleString(),
+      }),
+    }).then(function (r) { return r.json(); }).then(function () {
+      statusEl.textContent = 'Saved. Open the Evals tab to run it.';
+    }).catch(function (err) { statusEl.textContent = 'Failed: ' + err.message; });
+  });
+
+  document.getElementById('eval-task-filter').addEventListener('change', function (e) {
+    state.evalTask = e.target.value; loadEvalCases();
+  });
+  document.getElementById('eval-new-open').addEventListener('click', function () {
+    document.getElementById('eval-new-form').hidden = false;
+  });
+  document.getElementById('eval-new-cancel').addEventListener('click', function () {
+    document.getElementById('eval-new-form').hidden = true;
+  });
+  document.getElementById('eval-new-save').addEventListener('click', function () {
+    var body = {
+      task: document.getElementById('eval-new-task').value,
+      name: document.getElementById('eval-new-name').value.trim(),
+      prompt: document.getElementById('eval-new-prompt').value,
+      notes: document.getElementById('eval-new-notes').value,
+    };
+    var statusEl = document.getElementById('eval-new-status');
+    if (!body.name || !body.prompt.trim()) { statusEl.textContent = 'Name and prompt are required.'; return; }
+    statusEl.textContent = 'Saving...';
+    fetch('/dev/evals/cases', {
+      method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(function (r) { return r.json(); }).then(function (res) {
+      document.getElementById('eval-new-form').hidden = true;
+      document.getElementById('eval-new-name').value = '';
+      document.getElementById('eval-new-prompt').value = '';
+      document.getElementById('eval-new-notes').value = '';
+      statusEl.textContent = '';
+      loadEvalCases().then(function () { if (res.id) openEvalCase(res.id); });
+    }).catch(function (err) { statusEl.textContent = 'Failed: ' + err.message; });
+  });
+  document.getElementById('eval-cases-body').addEventListener('click', function (e) {
+    var row = e.target.closest('[data-case]');
+    if (!row) return;
+    openEvalCase(row.getAttribute('data-case'));
+  });
+  document.getElementById('eval-case-detail').addEventListener('click', function (e) {
+    var run = e.target.closest('[data-run]');
+    if (run) { renderEvalRunDetail(window.__evalRuns[run.getAttribute('data-run')]); return; }
+
+    if (e.target.id === 'eval-save-changes') {
+      var c = window.__currentCase;
+      var statusEl = document.getElementById('eval-save-status');
+      statusEl.textContent = 'Saving...';
+      fetch('/dev/evals/cases/' + encodeURIComponent(c.id), {
+        method: 'PATCH', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          prompt: document.getElementById('eval-detail-prompt').value,
+          notes: document.getElementById('eval-detail-notes').value,
+        }),
+      }).then(function () { statusEl.textContent = 'Saved.'; })
+        .catch(function (err) { statusEl.textContent = 'Failed: ' + err.message; });
+      return;
+    }
+
+    if (e.target.id === 'eval-run-btn') {
+      var c2 = window.__currentCase;
+      var provider = document.getElementById('eval-run-provider').value;
+      var model = document.getElementById('eval-run-model').value.trim();
+      var runStatus = document.getElementById('eval-run-status');
+      if (!model) { runStatus.textContent = 'Enter a model id first.'; return; }
+      runStatus.textContent = 'Running (this calls the real model)...';
+      e.target.disabled = true;
+      fetch('/dev/evals/cases/' + encodeURIComponent(c2.id) + '/runs', {
+        method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ provider: provider, model: model }),
+      }).then(function (r) { return r.json(); }).then(function (res) {
+        e.target.disabled = false;
+        runStatus.textContent = res.outcome && res.outcome.ok ? 'Done.' : 'Call failed -- see the run for the error.';
+        openEvalCase(c2.id);
+      }).catch(function (err) {
+        e.target.disabled = false;
+        runStatus.textContent = 'Failed: ' + err.message;
+      });
+    }
   });
 
   refresh();

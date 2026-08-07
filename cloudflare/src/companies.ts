@@ -151,7 +151,7 @@ function normalizeUrl(value: string): string {
 // Discovery
 // ---------------------------------------------------------------------------
 
-const COMPANY_LIST_SCHEMA = {
+export const COMPANY_LIST_SCHEMA = {
   type: "object",
   properties: {
     companies: {

@@ -103,7 +103,7 @@ const FIT_SCORE_GUIDANCE = [
   "in the reason instead of hedging the number.",
 ].join("\n");
 
-const FIT_BATCH_SCHEMA = {
+export const FIT_BATCH_SCHEMA = {
   type: "object",
   properties: {
     results: {
@@ -161,7 +161,7 @@ const FIT_BATCH_SCHEMA = {
 /** One quick-fact topic: a clean display name plus what to actually look for in a posting. */
 export type CareAboutTopic = { label: string; looking_for: string };
 
-const CARE_ABOUT_TOPICS_SCHEMA = {
+export const CARE_ABOUT_TOPICS_SCHEMA = {
   type: "object",
   properties: {
     topics: {
@@ -428,7 +428,7 @@ export async function assessJobFitBatch(
 
 export type ScreenResult = { id: string; keep: boolean; note: string };
 
-const SCREEN_BATCH_SCHEMA = {
+export const SCREEN_BATCH_SCHEMA = {
   type: "object",
   properties: {
     results: {
