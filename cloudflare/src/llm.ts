@@ -216,6 +216,54 @@ export function providerKeyMissing(env: LlmEnv, provider: Provider): string | nu
   return null;
 }
 
+/**
+ * Turns a raw thrown error into something a candidate can act on. Without this, a provider
+ * failure reaches the dashboard as the literal wire error -- `anthropic_error_400: {"type":
+ * "error","error":{"type":"invalid_request_error","message":"Your credit balance is too
+ * low..."}}` -- and a Browser Rendering capacity error reaches it as `Unable to create new
+ * browser: code: 429: message: Rate limit exceeded`. Neither tells the candidate what to do.
+ * Falls back to the original message untouched when nothing recognizable matches, so a genuinely
+ * new failure mode is never silently hidden.
+ */
+export function friendlyMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+
+  const providerMatch = raw.match(/^(anthropic|openai)_error_(\d+):? ?([\s\S]*)$/);
+  if (providerMatch) {
+    const [, provider, status, body] = providerMatch;
+    const label = provider === "anthropic" ? "Anthropic" : "OpenAI";
+    const billingUrl = provider === "anthropic" ? "console.anthropic.com/settings/billing" : "platform.openai.com/settings/billing";
+    let detail = "";
+    let errorType = "";
+    try {
+      const parsed = JSON.parse(body);
+      detail = parsed?.error?.message || parsed?.message || "";
+      errorType = parsed?.error?.type || parsed?.type || "";
+    } catch {
+      // Body wasn't JSON -- a truncated blob or a non-JSON error page. Fall through with no detail.
+    }
+    if (/credit balance is too low/i.test(detail) || /insufficient_quota/i.test(errorType)) {
+      return `${label} is out of credits. Add credits at ${billingUrl}, then try again.`;
+    }
+    if (status === "429" || /rate.?limit/i.test(detail) || /rate.?limit/i.test(errorType)) {
+      return `${label} is rate-limiting requests right now. Wait a bit and try again.`;
+    }
+    if (status === "401" || status === "403") {
+      return `${label} rejected the API key. Check the key in Settings, then try again.`;
+    }
+    if (status === "529" || status === "503") {
+      return `${label} is temporarily overloaded. Wait a bit and try again.`;
+    }
+    return detail ? `${label} error: ${detail}` : raw;
+  }
+
+  if (/unable to create new browser/i.test(raw) && /(429|rate limit)/i.test(raw)) {
+    return "Too many resume previews are rendering right now. Wait about 30 seconds and try again.";
+  }
+
+  return raw;
+}
+
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 

@@ -593,11 +593,31 @@ export function renderResumeHtml(doc: ResumeDoc, layout: LayoutSpec): string {
 export type RenderResult = { pdfKey: string; pdfBytes: Uint8Array; screenshotBase64: string };
 
 /**
+ * The Browser Rendering binding caps concurrent/per-minute session creation; a generate followed
+ * immediately by the automatic design-review render can trip that even though nothing is actually
+ * overloaded. A short retry turns that transient 429 into a brief wait instead of a failed
+ * generation -- the raw "Unable to create new browser: code: 429" is not something a candidate
+ * can act on.
+ */
+async function launchBrowser(env: ResumeEnv, attempts = 3) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await puppeteer.launch(env.BROWSER);
+    } catch (err) {
+      const message = (err as Error).message || "";
+      const isRateLimit = /unable to create new browser/i.test(message) && /(429|rate limit)/i.test(message);
+      if (!isRateLimit || attempt >= attempts) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
+    }
+  }
+}
+
+/**
  * One browser session produces both the PDF and the print-media screenshot, so the image the
  * vision reviewer sees is the same rendering the PDF came from.
  */
 export async function renderResumeArtifacts(env: ResumeEnv, resumeId: string, html: string): Promise<RenderResult> {
-  const browser = await puppeteer.launch(env.BROWSER);
+  const browser = await launchBrowser(env);
   try {
     const page = await browser.newPage();
     // 8.5in x 11in at 96dpi, so CSS inches map to the real page.

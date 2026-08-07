@@ -7,6 +7,7 @@ import {
   WRITING_STYLE_RULES,
   callStructured,
   callText,
+  friendlyMessage,
   normalizeProvider,
   providerKeyMissing,
 } from "./llm";
@@ -688,7 +689,7 @@ async function generateDesiredRoles(request: Request, env: Env): Promise<Respons
     const draft = await callText(env, provider, "roles.describe", prompt);
     return json({ provider, draft_description: draft });
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -1311,16 +1312,29 @@ async function reviewJobQuestion(request: Request, env: Env, id: string): Promis
 
   const prompt = [
     "You are helping a candidate prepare to apply to a specific job. Find ONE concrete gap between",
-    "what this job asks for and what their profile currently shows evidence of, then ask a single",
-    "short, conversational question that would let them fill that gap in their own words.",
+    "what this job asks for and what their profile currently shows evidence of, then write a single",
+    "short, conversational nudge that helps them fill that gap in their own words.",
+    "",
+    "A bare question makes people freeze on a blank page, even when they have a relevant story --",
+    "they just don't immediately connect it to the ask. So don't only ask; do some of the connecting",
+    "for them. Actually look through the candidate profile below for one or two SPECIFIC, REAL",
+    "things -- a project, a role, an employer, a tool -- that plausibly relate to the gap, name them",
+    "by name, and float them as tentative possibilities: \"maybe something like the X you did at Y?",
+    "Or was it more Z?\" Give them something concrete to react to, correct, or build on, instead of",
+    "an empty prompt. If nothing in the profile plausibly connects, it's fine to ask straight instead",
+    "of forcing a stretch.",
     "",
     WRITING_STYLE_RULES,
     "",
     "Rules:",
+    "- Only name things that actually appear in the candidate profile below. Never invent a project,",
+    "  employer, or skill that isn't there -- a confident wrong guess is worse than no guess at all.",
     "- Ask about something the posting actually states or clearly implies, not a generic prompt.",
-    "- Phrase it the way a friend would, not a form -- e.g. \"This role wants people-management",
-    "  experience, tell me about a specific time you led something.\"",
-    "- One question only, one or two sentences, no preamble or explanation, just the question itself.",
+    "- Phrase it the way a sharp friend prepping you for an interview would, not a form -- e.g. \"This",
+    "  role wants people-management experience -- did leading the migration team at Acme count, or",
+    "  was that more of an individual push?\"",
+    "- Two or three sentences: the question itself, plus the specific thing(s) you're floating. Still",
+    "  no preamble or throat-clearing -- go straight into it.",
     "- If the profile already covers everything the posting asks for well, ask about whichever",
     "  detail would most strengthen an application anyway, rather than inventing a gap.",
     (prior.results ?? []).length
@@ -1340,7 +1354,7 @@ async function reviewJobQuestion(request: Request, env: Env, id: string): Promis
     const question = await callText(env, provider, "review.question", prompt);
     return json({ question: question.trim() });
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -1603,7 +1617,7 @@ async function discoverCompanies(request: Request, env: Env): Promise<Response> 
       desiredLocations,
     );
   } catch (err) {
-    return json({ error: "discovery_failed", detail: (err as Error).message }, 502);
+    return json({ error: "discovery_failed", detail: friendlyMessage(err) }, 502);
   }
 
   const known = new Set(existingNames.map(companyNameKey));
@@ -2268,7 +2282,7 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
     const draft = mergeStructuredProfiles(existingStructured, raw);
     return json({ provider, draft_structured: draft });
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -2357,7 +2371,7 @@ async function createResume(request: Request, env: Env): Promise<Response> {
       "",
     );
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 
   const name = instructions ? instructions.slice(0, 60) : `Resume ${new Date().toISOString().slice(0, 10)}`;
@@ -2431,6 +2445,54 @@ async function reviseOnce(
   };
 }
 
+function pageOverflowCheck(checks: ResumeCheck[]): ResumeCheck | undefined {
+  return checks.find((c) => c.id === "page_count" && c.severity !== "ok");
+}
+
+/**
+ * reviseOnce's design review sometimes tightens spacing or type instead of actually cutting
+ * content, so one pass can come back still over the page target -- the candidate would then have
+ * to click Revise again by hand and type the same "fewer bullets" note themselves. This automates
+ * exactly that: pass a userComment on every retry, since reviseOnce always rebuilds content when
+ * userComment is non-empty regardless of what the vision model itself concluded. It keeps going,
+ * telling it plainly to cut real content rather than shrink type further, until the deterministic
+ * page-count check -- real PDF text extraction, not the model's opinion -- says it fits, or the
+ * attempt budget runs out.
+ */
+async function reviseUntilFits(
+  env: Env,
+  provider: Provider,
+  resumeId: string,
+  doc: ResumeDoc,
+  layout: LayoutSpec,
+  checks: ResumeCheck[],
+  structured: StructuredProfile,
+  targetRoles: string,
+  instructions: string,
+  userComment: string,
+  maxAttempts = 3,
+): Promise<Awaited<ReturnType<typeof reviseOnce>>> {
+  let result = await reviseOnce(env, provider, resumeId, doc, layout, checks, structured, targetRoles, instructions, userComment);
+  for (let attempt = 1; attempt < maxAttempts && pageOverflowCheck(result.checks); attempt++) {
+    const overflow = pageOverflowCheck(result.checks)!;
+    const comment = [
+      overflow.message,
+      "This is a hard constraint, not a suggestion: cut actual content rather than shrinking font or spacing further.",
+      "Remove the least impactful bullet from every role, drop bullets entirely from the oldest or least relevant role first, and tighten any bullet that still runs long. Do not restore anything trimmed in a previous pass.",
+    ].join(" ");
+    result = await reviseOnce(
+      env, provider, resumeId, result.doc, result.layout, result.checks, structured, targetRoles, instructions, comment,
+    );
+  }
+  if (pageOverflowCheck(result.checks)) {
+    result.critique = [
+      result.critique,
+      `Still over the ${layout.max_pages}-page target after ${maxAttempts} automatic tightening passes. There may just be too much career history for the page count -- try dropping an older role, or switch to the 2-page layout.`,
+    ].filter(Boolean).join(" ");
+  }
+  return result;
+}
+
 async function reviewResume(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -2481,7 +2543,7 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
   const composeInstructions = [row.instructions ?? "", evidenceInstructions].filter(Boolean).join("\n\n");
 
   try {
-    const revised = await reviseOnce(
+    const revised = await reviseUntilFits(
       env, provider, id, doc, layout, previousChecks, profile.structured, targetRoles, composeInstructions, comment,
     );
 
@@ -2512,7 +2574,7 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
       checks: revised.checks,
     });
   } catch (err) {
-    return json({ error: "review_failed", detail: (err as Error).message }, 502);
+    return json({ error: "review_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -2771,7 +2833,7 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
   try {
     built = await buildResumeVersion(env, resumeId, provider, profile.structured, targetRoles, composeInstructions, layout, "");
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 
   // One automatic design-review-and-revise pass before this ever reaches the candidate. This is
@@ -2784,7 +2846,7 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
   let finalChecks = built.checks;
   let critique = "";
   try {
-    const revised = await reviseOnce(
+    const revised = await reviseUntilFits(
       env, provider, resumeId, built.doc, layout, built.checks, profile.structured, targetRoles, composeInstructions, "",
     );
     finalLayout = revised.layout;
@@ -2818,7 +2880,7 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
       .run();
     return json({ id: resumeId, name, template: finalLayout.template, revision: 1, checks: finalChecks, critique, reused: false }, 201);
   } catch (err) {
-    return json({ error: "save_failed", detail: (err as Error).message }, 502);
+    return json({ error: "save_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -2989,7 +3051,7 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
       contactLine,
     );
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 
   const name = profileRow?.label || profile.structured.headline || "Candidate";
@@ -3014,7 +3076,7 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
     // A save failure shouldn't surface as a raw, uncaught exception -- the letter itself composed
     // fine at this point, so a clear error here (rather than a generic Workers error page the
     // frontend can't parse as JSON) is what actually helps track down what went wrong.
-    return json({ error: "save_failed", detail: (err as Error).message }, 502);
+    return json({ error: "save_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -4269,10 +4331,12 @@ const DASHBOARD_PAGE = `<!doctype html>
       return res;
     }
 
+    // A friendly detail (see friendlyMessage() server-side) already reads as a full sentence, so
+    // showing it alone beats prefixing it with the internal error code, e.g. "generation_failed:
+    // Anthropic is out of credits..." When there's no detail, fall back to the bare code.
     function errorMessage(data, fallback) {
-      var msg = (data && data.error) || fallback;
-      if (data && data.detail) msg += ': ' + data.detail;
-      return msg;
+      if (data && data.detail) return data.detail;
+      return (data && data.error) || fallback;
     }
 
     // A failed request should always end up with a readable message, even if the response body
