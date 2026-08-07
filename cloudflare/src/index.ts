@@ -3661,6 +3661,40 @@ const DASHBOARD_PAGE = `<!doctype html>
   .skills-list { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.3rem; }
   .skill-pill { background: var(--bg); border: 1px solid var(--border); border-radius: 999px; padding: 0.2rem 0.65rem; font-size: 0.85rem; }
   hr.divider { border: none; border-top: 1px solid var(--border); margin: 1.25rem 0; }
+
+  /* Touch targets.
+     The controls in this file were sized for a mouse pointer, which is a few pixels wide. A
+     fingertip is not: Apple's HIG puts the minimum at 44x44pt, and on an iPhone this app was
+     shipping row actions at 27px, the notes disclosure at 20px, and primary buttons at 36px. That
+     is the difference between tapping "Remove" and tapping the row above it.
+     Gated on pointer:coarse so it applies where a finger is the primary input and leaves the
+     deliberately dense desktop layout alone -- this is not a phone-width breakpoint, because an
+     iPad in landscape is wide and still touched, while a narrow desktop window is neither.
+     min-height, not height, so anything already taller (a textarea, a button whose label wrapped)
+     keeps the size it worked out for itself. */
+  @media (pointer: coarse) {
+    button,
+    select,
+    input:not([type="checkbox"]):not([type="radio"]),
+    summary {
+      min-height: 44px;
+    }
+    /* Row actions are the worst offenders (27px) and the most likely to be mis-tapped, since they
+       sit inches from a link that navigates away. Widened as well as heightened -- a 44px-tall
+       target 40px wide is still a sliver. */
+    .row-actions button { min-height: 44px; padding-inline: 0.9rem; }
+    /* The tab bar is the primary navigation on a phone; it was ~34px. */
+    nav button, .subtabs button { min-height: 44px; }
+    /* A summary is a flex row so min-height actually centres its text instead of top-aligning it. */
+    summary { display: flex; align-items: center; }
+    /* The box itself stays visually small; the label around it is the real target, so that is what
+       gets the height. :has() is ignored on anything too old to support it, which degrades to
+       today's behaviour rather than breaking. */
+    input[type="checkbox"], input[type="radio"] { min-width: 20px; min-height: 20px; }
+    label:has(> input[type="checkbox"]), label:has(> input[type="radio"]) {
+      min-height: 44px; display: flex; align-items: center; gap: 0.5rem;
+    }
+  }
 </style>
 </head>
 <body>
