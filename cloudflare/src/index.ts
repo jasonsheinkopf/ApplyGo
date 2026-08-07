@@ -19,7 +19,20 @@ import {
   taskRollups,
 } from "./devconsole";
 import {
+  type ReplaySpec,
+  createEvalCase,
+  createEvalRun,
+  getEvalCase,
+  judgeRun,
+  listEvalCases,
+  listEvalRuns,
+  replayTask,
+  updateEvalCase,
+} from "./evals";
+import { taskInfo } from "./tasks";
+import {
   type AtsProvider,
+  COMPANY_LIST_SCHEMA,
   companyNameKey,
   fetchBoardJobs,
   fetchMissingDescriptions,
@@ -31,9 +44,12 @@ import {
   verifyWebsite,
 } from "./companies";
 import {
+  CARE_ABOUT_TOPICS_SCHEMA,
   type CareAboutTopic,
+  FIT_BATCH_SCHEMA,
   FIT_BATCH_SIZE,
   type FitResult,
+  SCREEN_BATCH_SCHEMA,
   SCREEN_BATCH_SIZE,
   assessJobFitBatch,
   buildMatchProfile,
@@ -43,6 +59,7 @@ import {
 } from "./fit";
 import {
   type LayoutSpec,
+  RESUME_DOC_SCHEMA,
   type ResumeCheck,
   type ResumeDoc,
   type StructuredProfile,
@@ -6532,6 +6549,46 @@ function corsHeaders(origin: string): Record<string, string> {
 }
 
 /**
+ * Which JSON Schema (and tool name / token budget) a task's structured call uses, so a saved eval
+ * case's prompt can be resent without duplicating that wiring per case. Kept here rather than in
+ * evals.ts because every schema it needs is already in scope in this file or imported above --
+ * evals.ts staying schema-agnostic avoids a circular import back into index.ts for the four schemas
+ * that are defined here (STRUCTURED_PROFILE_JSON_SCHEMA, RESUME_BASE_SCHEMA, COVER_LETTER_SCHEMA,
+ * MATCH_SCHEMA).
+ *
+ * `resume.design_review` (needs a screenshot, never stored) and `evals.judge` (not a savable case)
+ * fall through to null, matching `replayable: false` in tasks.ts.
+ */
+function replaySpecFor(task: string): ReplaySpec | null {
+  switch (task) {
+    case "fit.screen":
+      return { kind: "structured", schema: SCREEN_BATCH_SCHEMA, toolName: "submit_screen", maxTokens: 4000 };
+    case "fit.assess":
+      return { kind: "structured", schema: FIT_BATCH_SCHEMA, toolName: "submit_fit_assessment", maxTokens: 7000 };
+    case "fit.care_about_topics":
+      return { kind: "structured", schema: CARE_ABOUT_TOPICS_SCHEMA, toolName: "submit_topics", maxTokens: 1200 };
+    case "companies.discover":
+      return { kind: "structured", schema: COMPANY_LIST_SCHEMA, toolName: "submit_companies", maxTokens: 4000 };
+    case "profile.structure":
+      return { kind: "structured", schema: STRUCTURED_PROFILE_JSON_SCHEMA, toolName: "submit_structured_profile", maxTokens: 2000 };
+    case "roles.describe":
+      return { kind: "text" };
+    case "review.question":
+      return { kind: "text" };
+    case "resume.build":
+      return { kind: "structured", schema: RESUME_DOC_SCHEMA, toolName: "submit_resume", maxTokens: 4000 };
+    case "resume.select_base":
+      return { kind: "structured", schema: RESUME_BASE_SCHEMA, toolName: "submit_resume_base", maxTokens: 1000 };
+    case "cover_letter.write":
+      return { kind: "structured", schema: COVER_LETTER_SCHEMA, toolName: "submit_cover_letter", maxTokens: 2000 };
+    case "application.answers":
+      return { kind: "structured", schema: MATCH_SCHEMA, toolName: "submit_application_answers", maxTokens: 3000 };
+    default:
+      return null;
+  }
+}
+
+/**
  * The dev console and its data endpoints.
  *
  * Gated on the same device session as everything else: the traces contain the full text of every
@@ -6544,26 +6601,27 @@ async function devConsole(request: Request, env: Env, url: URL): Promise<Respons
   if (auth instanceof Response) return auth;
 
   const path = url.pathname;
+  const method = request.method;
   const days = Math.min(Math.max(Number(url.searchParams.get("days")) || 7, 1), 90);
 
-  if (path === "/dev") {
+  if (method === "GET" && path === "/dev") {
     return new Response(DEV_PAGE, {
       headers: { "content-type": "text/html; charset=utf-8", "cache-control": "private, no-store" },
     });
   }
-  if (path === "/dev/tasks") {
+  if (method === "GET" && path === "/dev/tasks") {
     return json({ days, tasks: await taskRollups(env.DB, days) });
   }
-  if (path === "/dev/costs") {
+  if (method === "GET" && path === "/dev/costs") {
     return json(await costSummary(env.DB, days));
   }
 
   const traceMatch = path.match(/^\/dev\/traces\/(.+)$/);
-  if (traceMatch) {
+  if (method === "GET" && traceMatch) {
     const trace = await getTrace(env.DB, decodeURIComponent(traceMatch[1]));
     return trace ? json({ trace }) : json({ error: "not_found" }, 404);
   }
-  if (path === "/dev/traces") {
+  if (method === "GET" && path === "/dev/traces") {
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 200);
     return json({
       traces: await listTraces(env.DB, {
@@ -6573,6 +6631,91 @@ async function devConsole(request: Request, env: Env, url: URL): Promise<Respons
       }),
     });
   }
+
+  // --- Eval harness -----------------------------------------------------------------------
+
+  if (method === "GET" && path === "/dev/evals/cases") {
+    return json({ cases: await listEvalCases(env.DB, url.searchParams.get("task") || undefined) });
+  }
+
+  if (method === "POST" && path === "/dev/evals/cases") {
+    const body = (await request.json().catch(() => ({}))) as {
+      task?: string;
+      name?: string;
+      prompt?: string;
+      notes?: string;
+      source_trace_id?: string;
+    };
+    if (!body.task || !replaySpecFor(body.task)) return json({ error: "not_replayable" }, 400);
+    if (!body.name?.trim() || !body.prompt?.trim()) return json({ error: "name_and_prompt_required" }, 400);
+    const id = await createEvalCase(env.DB, {
+      task: body.task,
+      name: body.name.trim(),
+      prompt: body.prompt,
+      notes: body.notes ?? "",
+      sourceTraceId: body.source_trace_id ?? null,
+    });
+    return json({ id });
+  }
+
+  const caseRunsMatch = path.match(/^\/dev\/evals\/cases\/([^/]+)\/runs$/);
+  if (method === "POST" && caseRunsMatch) {
+    const evalCase = await getEvalCase(env.DB, decodeURIComponent(caseRunsMatch[1]));
+    if (!evalCase) return json({ error: "not_found" }, 404);
+    const spec = replaySpecFor(evalCase.task);
+    if (!spec) return json({ error: "not_replayable" }, 400);
+
+    const body = (await request.json().catch(() => ({}))) as { provider?: string; model?: string; prompt?: string };
+    const provider = normalizeProvider(body.provider);
+    const keyError = providerKeyMissing(env, provider);
+    if (keyError) return json({ error: keyError }, 501);
+    const model = (body.model ?? "").trim();
+    if (!model) return json({ error: "model_required" }, 400);
+    const prompt = body.prompt?.trim() ? body.prompt : evalCase.prompt;
+
+    const outcome = await replayTask(env, evalCase.task, spec, provider, model, prompt);
+
+    let judgeScore: number | null = null;
+    let judgeReasoning: string | null = null;
+    if (outcome.ok) {
+      // Judging failure (rate limit, provider hiccup) shouldn't hide a successful replay -- the
+      // run is still worth keeping, just unscored.
+      try {
+        const taskMeta = taskInfo(evalCase.task);
+        const judged = await judgeRun(env, taskMeta?.what ?? evalCase.task, prompt, outcome.response, evalCase.notes);
+        judgeScore = judged.score;
+        judgeReasoning = judged.reasoning;
+      } catch {
+        judgeReasoning = "Judging failed; the run itself succeeded.";
+      }
+    }
+
+    const id = await createEvalRun(env.DB, {
+      caseId: evalCase.id,
+      provider,
+      model,
+      prompt,
+      outcome,
+      judgeScore,
+      judgeReasoning,
+    });
+    return json({ id, outcome, judge_score: judgeScore, judge_reasoning: judgeReasoning });
+  }
+
+  const caseMatch = path.match(/^\/dev\/evals\/cases\/([^/]+)$/);
+  if (method === "GET" && caseMatch) {
+    const evalCase = await getEvalCase(env.DB, decodeURIComponent(caseMatch[1]));
+    if (!evalCase) return json({ error: "not_found" }, 404);
+    return json({ case: evalCase, runs: await listEvalRuns(env.DB, evalCase.id) });
+  }
+  if (method === "PATCH" && caseMatch) {
+    const evalCase = await getEvalCase(env.DB, decodeURIComponent(caseMatch[1]));
+    if (!evalCase) return json({ error: "not_found" }, 404);
+    const body = (await request.json().catch(() => ({}))) as { prompt?: string; name?: string; notes?: string };
+    await updateEvalCase(env.DB, evalCase.id, body);
+    return json({ ok: true });
+  }
+
   return json({ error: "not_found" }, 404);
 }
 
@@ -6604,7 +6747,7 @@ export default {
 async function handle(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   {
     if (request.method === "GET" && url.pathname === "/health") return json({ status: "ok", mode: "cloudflare" });
-    if (request.method === "GET" && url.pathname.startsWith("/dev")) return devConsole(request, env, url);
+    if (url.pathname.startsWith("/dev")) return devConsole(request, env, url);
     if (request.method === "GET" && url.pathname === "/enroll") return enrollPage();
     if (request.method === "GET" && url.pathname === "/") {
       const auth = await requireSession(request, env);

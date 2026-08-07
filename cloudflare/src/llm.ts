@@ -242,10 +242,13 @@ export async function callText(
   provider: Provider,
   task: string,
   prompt: string,
+  /** Bypasses the configured model entirely. Only the eval harness sets this. */
+  modelOverride?: string,
 ): Promise<string> {
   // Free-text calls have always used the reason-tier model directly rather than going through
   // modelFor, so the tier is named explicitly here to keep the trace honest about what ran.
-  const model = provider === "openai" ? env.OPENAI_MODEL || "gpt-4o" : env.ANTHROPIC_MODEL || "claude-sonnet-5";
+  const model =
+    modelOverride ?? (provider === "openai" ? env.OPENAI_MODEL || "gpt-4o" : env.ANTHROPIC_MODEL || "claude-sonnet-5");
 
   return traced(env, { task, provider, model, tier: "reason", prompt }, async () => {
     if (provider === "openai") {
@@ -294,8 +297,10 @@ export async function callStructured<T>(
   toolName: string,
   maxTokens = 4000,
   tier: Tier = "reason",
+  /** Bypasses the configured model entirely. Only the eval harness sets this. */
+  modelOverride?: string,
 ): Promise<T> {
-  const model = modelFor(env, provider, tier);
+  const model = modelOverride ?? modelFor(env, provider, tier);
 
   return traced(env, { task, provider, model, tier, prompt }, async () => {
     if (provider === "openai") {

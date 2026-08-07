@@ -25,14 +25,15 @@ export type LlmTaskId =
   | "resume.design_review"
   | "resume.select_base"
   | "cover_letter.write"
-  | "application.answers";
+  | "application.answers"
+  | "evals.judge";
 
 export type LlmTaskInfo = {
   id: LlmTaskId;
   /** Short human name, for the console's task list. */
   name: string;
   /** Which pipeline stage this belongs to, for grouping. */
-  stage: "Find matches" | "Profile" | "Apply";
+  stage: "Find matches" | "Profile" | "Apply" | "Developer tools";
   tier: Tier;
   /** What the call is asked to do, and what shape comes back. */
   what: string;
@@ -44,6 +45,12 @@ export type LlmTaskInfo = {
    * expensive per call, and the console needs to say which it is showing.
    */
   batched: boolean;
+  /**
+   * Whether this call's prompt is a plain rendered string the eval harness can resend verbatim.
+   * False only for `resume.design_review` (it also sends a screenshot, which traces never store)
+   * and `evals.judge` itself (its prompt is generated from an eval run, not saved as a case).
+   */
+  replayable: boolean;
 };
 
 export const LLM_TASKS: LlmTaskInfo[] = [
@@ -55,6 +62,7 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Title and location only, in batches of 60. Decides which postings are worth reading in full.",
     source: "src/fit.ts -> screenJobsBatch",
     batched: true,
+    replayable: true,
   },
   {
     id: "fit.assess",
@@ -64,6 +72,7 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Whole posting text against the profile, in batches of 8. Produces the 0-100 score, the reason, and the quick facts.",
     source: "src/fit.ts -> assessJobFitBatch",
     batched: true,
+    replayable: true,
   },
   {
     id: "fit.care_about_topics",
@@ -73,6 +82,7 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Turns the free-text field into canonical {label, looking_for} topics. Runs once per save, not per posting.",
     source: "src/fit.ts -> deriveCareAboutTopics",
     batched: false,
+    replayable: true,
   },
   {
     id: "companies.discover",
@@ -82,6 +92,7 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Proposes companies worth watching, given the desired-roles description.",
     source: "src/companies.ts -> discoverCompanies",
     batched: true,
+    replayable: true,
   },
   {
     id: "profile.structure",
@@ -91,6 +102,7 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Turns uploaded documents and notes into the structured candidate profile everything else reads from.",
     source: "src/index.ts -> saveStructuredProfile",
     batched: false,
+    replayable: true,
   },
   {
     id: "roles.describe",
@@ -100,6 +112,7 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Free text. Writes the desired-roles description from loose notes and saved links.",
     source: "src/index.ts -> generateDesiredRoles",
     batched: false,
+    replayable: true,
   },
   {
     id: "review.question",
@@ -109,6 +122,7 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Free text. One conversational question about whatever the posting wants that the profile does not yet cover.",
     source: "src/index.ts -> jobReviewQuestion",
     batched: false,
+    replayable: true,
   },
   {
     id: "resume.build",
@@ -118,6 +132,7 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Writes the resume document for one posting, grounded in stored evidence.",
     source: "src/resume.ts -> buildJobResume",
     batched: false,
+    replayable: true,
   },
   {
     id: "resume.design_review",
@@ -127,6 +142,7 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Looks at a rendered screenshot of the PDF and critiques the layout. The only call that sends an image.",
     source: "src/resume.ts -> reviewResumeDesign",
     batched: false,
+    replayable: false,
   },
   {
     id: "resume.select_base",
@@ -136,6 +152,7 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Chooses which stored resume to tailor from, and notes what to change.",
     source: "src/index.ts -> jobResume",
     batched: false,
+    replayable: true,
   },
   {
     id: "cover_letter.write",
@@ -145,6 +162,7 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Writes the letter body for one posting.",
     source: "src/index.ts -> jobCoverLetter",
     batched: false,
+    replayable: true,
   },
   {
     id: "application.answers",
@@ -154,6 +172,17 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Answers an application form's questions from the saved answer bank and profile.",
     source: "src/index.ts -> matchApplication",
     batched: true,
+    replayable: true,
+  },
+  {
+    id: "evals.judge",
+    name: "Score an eval run",
+    stage: "Developer tools",
+    tier: "reason",
+    what: "Given a task's purpose, the exact prompt sent, and the response it produced, scores 0-100 how well the response satisfies the task.",
+    source: "src/evals.ts -> judgeRun",
+    batched: false,
+    replayable: false,
   },
 ];
 
