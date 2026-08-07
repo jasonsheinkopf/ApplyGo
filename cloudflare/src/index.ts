@@ -3411,6 +3411,25 @@ const DASHBOARD_PAGE = `<!doctype html>
     -webkit-overflow-scrolling: touch; scrollbar-width: none;
   }
   nav::-webkit-scrollbar { display: none; }
+  /* Eleven tabs never fit on a phone, and a hard-cropped label at the edge looks like the end of
+     the list rather than the middle of it. The scrollbar is hidden, so without a fade there is no
+     cue at all that the row continues.
+     Each side fades only when there is actually something that way -- a symmetric always-on mask
+     washes out the first tab when you are already at the start (and the last at the end), which
+     makes the active pill look clipped rather than scrollable. The listener is passive and only
+     toggles two classes, so it costs nothing per frame. */
+  nav.can-scroll-left {
+    -webkit-mask-image: linear-gradient(to right, transparent 0, #000 20px);
+    mask-image: linear-gradient(to right, transparent 0, #000 20px);
+  }
+  nav.can-scroll-right {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent 100%);
+    mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent 100%);
+  }
+  nav.can-scroll-left.can-scroll-right {
+    -webkit-mask-image: linear-gradient(to right, transparent 0, #000 20px, #000 calc(100% - 20px), transparent 100%);
+    mask-image: linear-gradient(to right, transparent 0, #000 20px, #000 calc(100% - 20px), transparent 100%);
+  }
   nav button {
     flex: none; margin: 0; padding: 0.45rem 0.95rem; font-size: 0.875rem; font-weight: 600;
     background: none; border: none; border-radius: 999px; color: var(--text-muted); cursor: pointer;
@@ -3454,6 +3473,18 @@ const DASHBOARD_PAGE = `<!doctype html>
   }
   .row-actions button:hover:not(:disabled) { background: var(--surface-2); color: var(--text); border-color: var(--border-strong); }
   .row-actions button.danger:hover:not(:disabled) { color: var(--error); border-color: var(--error); }
+  /* A step above .danger, and deliberately rare. Most "Remove" buttons drop one row you could add
+     back in seconds, so they stay quiet and only redden on hover. These two -- resetting a whole
+     pipeline stage, deleting an entire collection -- can throw away hours of scanning, and a
+     confirm() dialog that only appears after the click is too late to be the first warning. Same
+     red-outline vocabulary Jindr's "Not for me" already established, so it reads as a known shape
+     rather than a new one. */
+  .row-actions button.destructive {
+    border-color: var(--error); color: var(--error);
+  }
+  .row-actions button.destructive:hover:not(:disabled) {
+    background: var(--error-soft); color: var(--error); border-color: var(--error);
+  }
   /* Control clusters: small inputs sized to their content instead of stretching full width. */
   .controls { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: flex-end; margin-bottom: 0.4rem; }
   .controls > div { display: flex; flex-direction: column; }
@@ -3540,10 +3571,19 @@ const DASHBOARD_PAGE = `<!doctype html>
   /* One-at-a-time review card. touch-action:pan-y leaves vertical scroll to the browser and hands
      horizontal movement to the drag handler; select:none stops a fast swipe from also highlighting
      the card's text on desktop. */
+  /* Jindr is the one screen built around a single decision, so it gets to look like one instead of
+     like a Jobs row that happens to be alone on the page. Capping the section and centring it
+     stops the card stranding itself in the top-left corner of a wide window; the extra padding and
+     larger type inside are what make it read as "look at this one thing" rather than "here is a
+     list of length one". */
+  #jindr-section { max-width: 34rem; margin-inline: auto; }
   .jindr-card {
-    border: 1px solid var(--border); border-radius: var(--radius); padding: 1.1rem;
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 1.6rem 1.5rem;
     background: var(--surface-2); touch-action: pan-y; user-select: none; cursor: grab;
   }
+  .jindr-card .row-title { font-size: 1.25rem; line-height: 1.3; }
+  .jindr-card .row-title-line { gap: 0.55rem; margin-bottom: 0.15rem; }
+  .jindr-card .job-reason { font-size: 0.95rem; margin-top: 0.7rem; }
   .jindr-card.dragging { cursor: grabbing; transition: none; }
   .jindr-facts, .row-facts { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.6rem 0; }
   .row-facts { margin: 0.3rem 0 0; }
@@ -3577,11 +3617,15 @@ const DASHBOARD_PAGE = `<!doctype html>
     text-transform: uppercase; padding: 0.15rem 0.45rem; border-radius: 999px;
     border: 1px solid transparent; background: var(--surface-2); color: var(--text-muted); white-space: nowrap;
   }
-  /* Green = already judged and worth your attention (strong/possible). Yellow = not filtered
-     yet -- don't waste time on it until it's been screened. Red = ruled out. */
-  .badge.jobs, .badge.strong, .badge.possible { background: var(--success-soft); color: var(--success); }
+  /* The badge carries the tier the scorer already decided, so the three tiers get three colors.
+     Green = a strong match (70+). Amber = either a genuine stretch worth a look (possible, 40-69)
+     or a posting not filtered yet -- both mean "read this before trusting it", which is why they
+     share a color. Red = ruled out. Flattening possible into the green tier was the bug here: a
+     55% and a 92% looked equally settled, when the scoring prompt explicitly calls 40-69 "a
+     genuine stretch or a posting too vague to be sure". */
+  .badge.jobs, .badge.strong { background: var(--success-soft); color: var(--success); }
   .badge.warn { background: var(--error-soft); color: var(--error); }
-  .badge.queued { background: var(--warning-soft); color: var(--warning); }
+  .badge.possible, .badge.queued { background: var(--warning-soft); color: var(--warning); }
   .row-title-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
   .company-bio { font-size: 0.85rem; margin: 0.35rem 0 0; line-height: 1.5; }
   .company-why { font-size: 0.82rem; color: var(--text-muted); margin: 0.3rem 0 0; padding-left: 0.55rem; border-left: 2px solid var(--border-strong); }
@@ -3648,7 +3692,11 @@ const DASHBOARD_PAGE = `<!doctype html>
 
   <div id="panel-roles" class="panel active">
     <div class="split">
-      <div>
+      <!-- Sticky because this column is much shorter than the form beside it, so it would otherwise
+           scroll away and leave a tall empty gutter. The notes here are the source material the
+           description on the right is generated from, so keeping them in view while you edit that
+           description is what you actually want anyway. -->
+      <div class="split-sticky">
         <section id="role-signals-section">
           <h2>What are you looking for?</h2>
           <p class="hint">Paste job links, or write loosely about what you want next. The more you add, the better the generated description.</p>
@@ -3741,19 +3789,6 @@ const DASHBOARD_PAGE = `<!doctype html>
           </form>
           <p id="note-status" class="status" role="status" aria-live="polite"></p>
 
-          <hr class="divider">
-
-          <h3 class="subhead">Application answers</h3>
-          <p class="hint">Questions every application form asks (work authorization, veteran status, disability disclosure, notice period). Answered once here or on a form, reused everywhere after. Stored as exact values, never paraphrased.</p>
-          <div id="answers-list"><p class="empty">Loading…</p></div>
-          <form id="answer-form">
-            <label for="answer-question">Question</label>
-            <input id="answer-question" required placeholder="e.g. Are you legally authorized to work in the United States?">
-            <label for="answer-value">Answer</label>
-            <input id="answer-value" required placeholder="e.g. Yes">
-            <button type="submit">Save answer</button>
-          </form>
-          <p id="answer-status" class="status" role="status" aria-live="polite"></p>
         </section>
       </div>
       <div class="split-sticky">
@@ -3776,6 +3811,23 @@ const DASHBOARD_PAGE = `<!doctype html>
         </section>
       </div>
     </div>
+    <!-- Its own section below the split rather than a fourth stacked block inside "Your material".
+         It isn't source material for the structured profile the way documents and notes are -- it's
+         a separate bank of exact answers reused on forms -- and stacking it there made the left
+         column run far longer than the right. -->
+    <section id="answers-section">
+      <h2>Application answers</h2>
+      <p class="hint">Questions every application form asks (work authorization, veteran status, disability disclosure, notice period). Answered once here or on a form, reused everywhere after. Stored as exact values, never paraphrased.</p>
+      <div id="answers-list"><p class="empty">Loading…</p></div>
+      <form id="answer-form">
+        <label for="answer-question">Question</label>
+        <input id="answer-question" required placeholder="e.g. Are you legally authorized to work in the United States?">
+        <label for="answer-value">Answer</label>
+        <input id="answer-value" required placeholder="e.g. Yes">
+        <button type="submit">Save answer</button>
+      </form>
+      <p id="answer-status" class="status" role="status" aria-live="polite"></p>
+    </section>
   </div>
 
   <div id="panel-resume" class="panel">
@@ -4132,8 +4184,29 @@ const DASHBOARD_PAGE = `<!doctype html>
         document.querySelectorAll('.panel').forEach(function (p) { p.classList.remove('active'); });
         tabButton.classList.add('active');
         document.getElementById('panel-' + tabButton.dataset.tab).classList.add('active');
+        // On a phone only three or four of the eleven tabs fit at once, so the tab you just picked
+        // could sit half off-screen -- or, if you reached it by scrolling, leave the bar parked
+        // somewhere that clips a neighbouring label mid-word. Centring the active tab keeps it
+        // fully visible and shows a neighbour on each side, which is also the affordance that
+        // there is more to scroll to.
+        tabButton.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
       });
     });
+
+    // Drives the nav's edge fades (see .can-scroll-* above). Runs on scroll and on resize, plus
+    // once at startup so the initial state is right before anything is touched.
+    (function () {
+      var navEl = document.querySelector('nav');
+      if (!navEl) return;
+      function updateNavFades() {
+        var maxScroll = navEl.scrollWidth - navEl.clientWidth;
+        navEl.classList.toggle('can-scroll-left', navEl.scrollLeft > 1);
+        navEl.classList.toggle('can-scroll-right', navEl.scrollLeft < maxScroll - 1);
+      }
+      navEl.addEventListener('scroll', updateNavFades, { passive: true });
+      window.addEventListener('resize', updateNavFades);
+      updateNavFades();
+    })();
 
     function el(tag, props, children) {
       var node = document.createElement(tag);
@@ -5200,7 +5273,13 @@ const DASHBOARD_PAGE = `<!doctype html>
       if (job.source_url) { titleEl.href = job.source_url; } else { titleEl.removeAttribute('href'); }
 
       var hasScore = job.fit_score !== null && job.fit_score !== undefined;
-      document.getElementById('jindr-score').textContent = hasScore ? job.fit_score + '% match' : 'Not yet scored';
+      var scoreEl = document.getElementById('jindr-score');
+      scoreEl.textContent = hasScore ? job.fit_score + '% match' : 'Not yet scored';
+      // The class was hardcoded to "strong" in the markup, so a 55% here looked exactly as settled
+      // as a 92% -- the same flattening the Jobs rows had. Derive it from the posting's own status
+      // via the shared label table instead.
+      var scoreInfo = FIT_LABELS[job.fit_status] || FIT_LABELS.unassessed;
+      scoreEl.className = ('badge ' + scoreInfo.cls).trim();
 
       document.getElementById('jindr-meta').textContent = [job.company, job.location].filter(Boolean).join(' · ');
 
@@ -5935,7 +6014,9 @@ const DASHBOARD_PAGE = `<!doctype html>
           el('div', { className: 'row-meta', textContent: meta }),
         ];
 
-        var undo = el('button', { type: 'button', textContent: 'Not applied' });
+        // "Not applied" read as a status claim contradicting the "N applications sent" line right
+        // above it. Every other action in the app is an imperative; this one should be too.
+        var undo = el('button', { type: 'button', textContent: 'Mark not applied' });
         undo.addEventListener('click', function () { submitJobFit(job.id, 'unapplied'); });
 
         list.appendChild(el('div', { className: 'row-item' }, [
@@ -6410,7 +6491,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (downstream.length) {
           body.push(el('div', { className: 'row-meta', textContent: 'Also clears: ' + downstream.join(', ') }));
         }
-        var reset = el('button', { className: 'danger', type: 'button', textContent: 'Reset' });
+        var reset = el('button', { className: 'destructive', type: 'button', textContent: 'Reset' });
         reset.addEventListener('click', async function () {
           var warning = downstream.length
             ? 'Reset "' + stage.name + '" and also clear ' + downstream.join(', ') + '?'
@@ -6446,7 +6527,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         { id: 'notes', name: 'Notes', note: 'Freeform notes on the Profile tab.' },
         { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Desired Roles tab.' },
       ].forEach(function (collection) {
-        var del = el('button', { className: 'danger', type: 'button', textContent: 'Delete' });
+        var del = el('button', { className: 'destructive', type: 'button', textContent: 'Delete' });
         del.addEventListener('click', async function () {
           if (!window.confirm('Delete all ' + collection.name.toLowerCase() + '?')) return;
           var statusEl = document.getElementById('data-status');
