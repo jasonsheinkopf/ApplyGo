@@ -456,6 +456,22 @@ Two things that looked like findings were checked and ruled out: the all-caps se
 
 `assert_ui_audit_fixes.mjs` (25 assertions) covers all six, written against the behaviour the audit called out rather than against selectors — the scroll-fade states at both ends and in the middle, the active tab landing fully in view, the two badge tiers resolving to genuinely different computed colors, the Applied label, the answers section living outside `.split`, the column-balance ratio, Jindr's centring and title size, and the destructive treatment applying to Reset/Delete while an ordinary Remove stays quiet. Verified to fail when the badge-color and Applied-label fixes are reverted.
 
+## Touch targets on iPhone
+
+Every control in this file was sized for a mouse pointer, which is a few pixels wide. A fingertip is not. Apple's HIG puts the minimum at 44x44pt, and on an iPhone this app was shipping **row actions at 27px, the "N notes on file" disclosure at 20px, and primary buttons at 36px** — 69 undersized controls across the eleven tabs, at every phone width. That's the difference between tapping "Remove" and tapping the row above it.
+
+The fix is one `@media (pointer: coarse)` block setting `min-height: 44px` on buttons, selects, inputs and summaries, with row actions and the tab bar called out separately (row actions were both the smallest and the most dangerous to mis-tap, sitting inches from a link that navigates away).
+
+Three things about how it's scoped:
+
+- **Gated on pointer type, not width.** An iPad in landscape is wider than a laptop window and still touched; a narrow desktop window is neither. A width breakpoint gets both of those backwards.
+- **`min-height`, not `height`,** so anything already taller — a textarea, a button whose label wrapped to two lines — keeps the size it worked out for itself.
+- **The desktop layout is untouched.** Its density was tuned deliberately; the test asserts the compact controls are still compact under a mouse, so this can't silently leak.
+
+Checkboxes keep their small box and get the height on the surrounding `<label>` instead, since tapping the label is what toggles them. That uses `:has()`, which degrades to current behaviour on anything too old to support it rather than breaking.
+
+`assert_touch_targets.mjs` (11 assertions) measures every control at 320/375/390/430px plus a tablet-landscape touch viewport, and asserts the mouse-pointer desktop keeps its compact sizing. Two measurement traps it deliberately avoids, both of which produced false passes on the way to it: keying findings by tag+class+text collapses four unlabelled checkboxes into one entry (reporting "1 remaining" when there were five), and crediting *every* control with its wrapping label's height passes a 36px select sitting under a two-line caption — only checkboxes and radios get that credit, because only they are actually toggled by a tap on the label.
+
 ## Secrets and credential handling
 
 - `SETUP_SECRET` lives only in Cloudflare's Worker secret store (`wrangler secret put ... --env production`), never in Git, GitHub Actions secrets, or this repository.
