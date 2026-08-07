@@ -274,6 +274,7 @@ export async function composeResumeDoc(
   const doc = await callStructured<ResumeDoc>(
     env,
     provider,
+    "resume.build",
     composePrompt(profile, desiredRoles, instructions, layout, feedback),
     RESUME_DOC_SCHEMA,
     "submit_resume",
@@ -786,6 +787,7 @@ export async function reviewResumeDesign(
   const review = await callStructuredWithImage<DesignReview>(
     env,
     provider,
+    "resume.design_review",
     prompt,
     screenshotBase64,
     DESIGN_REVIEW_SCHEMA,

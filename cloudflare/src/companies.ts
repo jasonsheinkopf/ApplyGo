@@ -234,6 +234,7 @@ export async function proposeCompanies(
   const result = await callStructured<{ companies: CompanyProposal[] }>(
     env,
     provider,
+    "companies.discover",
     prompt,
     COMPANY_LIST_SCHEMA,
     "submit_companies",

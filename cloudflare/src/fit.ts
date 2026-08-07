@@ -232,6 +232,7 @@ export async function deriveCareAboutTopics(
   const { topics } = await callStructured<{ topics: CareAboutTopic[] }>(
     env,
     provider,
+    "fit.care_about_topics",
     prompt,
     CARE_ABOUT_TOPICS_SCHEMA,
     "submit_topics",
@@ -395,6 +396,7 @@ export async function assessJobFitBatch(
   const { results } = await callStructured<{ results: FitResult[] }>(
     env,
     provider,
+    "fit.assess",
     fitPrompt(profileJson, desiredRoles, disqualifiers, customPreferences, careAboutTopics, jobs),
     FIT_BATCH_SCHEMA,
     "submit_fit_assessment",
@@ -501,6 +503,7 @@ export async function screenJobsBatch(
   const { results } = await callStructured<{ results: ScreenResult[] }>(
     env,
     provider,
+    "fit.screen",
     prompt,
     SCREEN_BATCH_SCHEMA,
     "submit_screen",
