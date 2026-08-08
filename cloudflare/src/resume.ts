@@ -20,6 +20,9 @@ import {
   callStructured,
   callStructuredWithImage,
 } from "./llm";
+// Only values flow this way; philosophy.ts takes StructuredProfile back from here as an `import
+// type`, which is erased at compile time, so the two files don't form a runtime cycle.
+import { MASTER_DOCTRINE, RESUME_DOCTRINE } from "./philosophy";
 
 export interface ResumeEnv extends LlmEnv {
   FILES: R2Bucket;
@@ -189,7 +192,12 @@ export const RESUME_DOC_SCHEMA = {
  * from ATS-vendor parsing documentation and from the requirement not to lie; strong defaults come
  * from recruiter research and broad professional convention; the rest are tunable preferences.
  */
-const COMPOSE_RULES = `
+/**
+ * The constraints that hold no matter what the document is for. Split out from COMPOSE_RULES so the
+ * master archive can take these without also taking the selection defaults below -- "be selective",
+ * "3-5 bullets", and "drop irrelevant roles" are exactly what that document must not do.
+ */
+const COMPOSE_RULES_TRUTH_ONLY = `
 ${WRITING_STYLE_RULES}
 
 This document goes to an employer, so the register is formal throughout. No casual phrasing, no
@@ -203,6 +211,10 @@ HARD CONSTRAINTS (never violate):
 - Dates must stay consistent with the profile.
 - No first-person pronouns. No "Responsible for". No sentence-ending periods on fragment bullets is fine,
   but be consistent.
+`.trim();
+
+const COMPOSE_RULES = `
+${COMPOSE_RULES_TRUTH_ONLY}
 
 STRONG DEFAULTS (follow unless the user's instructions override):
 - Reverse chronological. Experience is the dominant section; education is concise for an experienced candidate.
@@ -222,23 +234,55 @@ STRONG DEFAULTS (follow unless the user's instructions override):
   bullets entirely before dropping the role itself.
 `.trim();
 
+/**
+ * Extra shaping for one composition, beyond the profile and the target.
+ *
+ * `master` flips the whole posture: no page budget, no selection, include everything (see
+ * MASTER_DOCTRINE). `planDirective` is the pre-decided per-role feature/include/compress/omit plan
+ * plus the requirement-coverage report, rendered by `renderPlanDirective` -- when present it
+ * outranks the writer's own instincts about what deserves space.
+ */
+export type ComposeOptions = { master?: boolean; planDirective?: string };
+
 function composePrompt(
   profile: StructuredProfile,
   desiredRoles: string,
   instructions: string,
   layout: LayoutSpec,
   feedback: string,
+  options: ComposeOptions,
 ): string {
   const budget =
     layout.max_pages === 1
       ? "This must fit on ONE US Letter page. Be selective -- that is the point of this step."
       : "This may run to two US Letter pages, but only if the second page is genuinely full.";
 
+  if (options.master) {
+    return [
+      "You are building a candidate's master career archive as a resume-shaped document.",
+      "",
+      MASTER_DOCTRINE,
+      "",
+      COMPOSE_RULES_TRUTH_ONLY,
+      "",
+      "Include the summary: write a full narrative one, not a tightened positioning line.",
+      "",
+      instructions ? `USER INSTRUCTIONS:\n${instructions}` : "",
+      feedback ? `\nREVISION FEEDBACK -- address this specifically:\n${feedback}` : "",
+      "",
+      `CANDIDATE PROFILE (the only permitted source of facts):\n${JSON.stringify(profile)}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
   return [
     "You are an experienced professional resume writer preparing one resume version for a candidate.",
     "You are given the candidate's full verified profile as evidence, plus the kinds of roles they are targeting.",
     "Select, order, compress, and rewrite that evidence into resume content. You are not writing prose about them;",
     "you are choosing what belongs on the page and stating it well.",
+    "",
+    RESUME_DOCTRINE,
     "",
     COMPOSE_RULES,
     "",
@@ -247,6 +291,10 @@ function composePrompt(
       ? "Include a short summary."
       : "Omit the summary -- return an empty string for it. The page needs the space.",
     "",
+    // Placed after the doctrine and before the free-text target: the plan is a decision already
+    // made against this specific posting, so it should be read as settled rather than as one more
+    // consideration to weigh against the general guidance above.
+    options.planDirective ? `${options.planDirective}\n` : "",
     desiredRoles
       ? `TARGET ROLES (what this resume should be angled toward):\n${desiredRoles}`
       : "TARGET ROLES: none specified. Produce a strong general-purpose resume for the candidate's evident field.",
@@ -270,15 +318,18 @@ export async function composeResumeDoc(
   instructions: string,
   layout: LayoutSpec,
   feedback = "",
+  options: ComposeOptions = {},
 ): Promise<ResumeDoc> {
   const doc = await callStructured<ResumeDoc>(
     env,
     provider,
     "resume.build",
-    composePrompt(profile, desiredRoles, instructions, layout, feedback),
+    composePrompt(profile, desiredRoles, instructions, layout, feedback, options),
     RESUME_DOC_SCHEMA,
     "submit_resume",
-    4000,
+    // The archive is meant to be exhaustive, so it needs materially more room to come back whole --
+    // a truncated master archive silently loses evidence every later resume is filtered from.
+    options.master ? 16000 : 4000,
   );
   return {
     full_name: doc.full_name ?? "",
@@ -593,11 +644,31 @@ export function renderResumeHtml(doc: ResumeDoc, layout: LayoutSpec): string {
 export type RenderResult = { pdfKey: string; pdfBytes: Uint8Array; screenshotBase64: string };
 
 /**
+ * The Browser Rendering binding caps concurrent/per-minute session creation; a generate followed
+ * immediately by the automatic design-review render can trip that even though nothing is actually
+ * overloaded. A short retry turns that transient 429 into a brief wait instead of a failed
+ * generation -- the raw "Unable to create new browser: code: 429" is not something a candidate
+ * can act on.
+ */
+async function launchBrowser(env: ResumeEnv, attempts = 3) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await puppeteer.launch(env.BROWSER);
+    } catch (err) {
+      const message = (err as Error).message || "";
+      const isRateLimit = /unable to create new browser/i.test(message) && /(429|rate limit)/i.test(message);
+      if (!isRateLimit || attempt >= attempts) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
+    }
+  }
+}
+
+/**
  * One browser session produces both the PDF and the print-media screenshot, so the image the
  * vision reviewer sees is the same rendering the PDF came from.
  */
 export async function renderResumeArtifacts(env: ResumeEnv, resumeId: string, html: string): Promise<RenderResult> {
-  const browser = await puppeteer.launch(env.BROWSER);
+  const browser = await launchBrowser(env);
   try {
     const page = await browser.newPage();
     // 8.5in x 11in at 96dpi, so CSS inches map to the real page.

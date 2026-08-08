@@ -326,7 +326,16 @@ function fitPrompt(
           "",
         ].join("\n")
       : "",
-    desiredRoles ? `TARGET ROLES:\n${desiredRoles}\n` : "",
+    desiredRoles
+      ? [
+          "TARGET ROLES -- the candidate may be open to more than one genuinely different kind of role, listed",
+          "below. A posting only has to be a strong match for ONE of them to be on-target; it is not a mismatch",
+          "just because it doesn't also touch the others, and you should not expect or require a single posting",
+          "to combine several of them at once:",
+          desiredRoles,
+          "",
+        ].join("\n")
+      : "",
     `CANDIDATE PROFILE:\n${profileJson}`,
     "",
     `POSTINGS TO ASSESS:\n${JSON.stringify(
@@ -490,7 +499,9 @@ export async function screenJobsBatch(
     disqualifiers.length
       ? `The candidate has already rejected roles for these reasons:\n${disqualifiers.map((d) => `- ${d}`).join("\n")}\n`
       : "",
-    desiredRoles ? `WANTS: ${desiredRoles.slice(0, 600)}\n` : "",
+    // May list several genuinely different role types the candidate would take any one of, not a
+    // single combined role -- a posting matching just one of them is still a keep.
+    desiredRoles ? `WANTS (any ONE of the following, not all at once): ${desiredRoles.slice(0, 600)}\n` : "",
     `CANDIDATE:\n${matchProfile}`,
     "",
     `POSTINGS:\n${JSON.stringify(jobs.map((j) => ({ id: j.id, title: j.title, location: j.location })))}`,

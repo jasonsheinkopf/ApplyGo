@@ -22,6 +22,8 @@ export type LlmTaskId =
   | "roles.describe"
   | "review.question"
   | "resume.build"
+  | "resume.requirements"
+  | "resume.plan_evidence"
   | "resume.design_review"
   | "resume.select_base"
   | "cover_letter.write"
@@ -131,6 +133,26 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     tier: "reason",
     what: "Writes the resume document for one posting, grounded in stored evidence.",
     source: "src/resume.ts -> buildJobResume",
+    batched: false,
+    replayable: true,
+  },
+  {
+    id: "resume.requirements",
+    name: "Extract job requirements",
+    stage: "Apply",
+    tier: "reason",
+    what: "Breaks one posting into its separate stated requirements, classified as must-have, responsibility, preferred, or competency.",
+    source: "src/philosophy.ts -> extractJobRequirements",
+    batched: false,
+    replayable: true,
+  },
+  {
+    id: "resume.plan_evidence",
+    name: "Plan resume evidence",
+    stage: "Apply",
+    tier: "reason",
+    what: "Decides feature/include/compress/omit per past role against those requirements, and reports which are proven, partial, or unproven.",
+    source: "src/philosophy.ts -> planEvidence",
     batched: false,
     replayable: true,
   },

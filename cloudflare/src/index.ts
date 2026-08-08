@@ -7,6 +7,7 @@ import {
   WRITING_STYLE_RULES,
   callStructured,
   callText,
+  friendlyMessage,
   normalizeProvider,
   providerKeyMissing,
 } from "./llm";
@@ -30,6 +31,16 @@ import {
   updateEvalCase,
 } from "./evals";
 import { taskInfo } from "./tasks";
+import {
+  type EvidencePlan,
+  type JobRequirements,
+  PLAN_SCHEMA,
+  REQUIREMENTS_SCHEMA,
+  coverageSummary,
+  extractJobRequirements,
+  planEvidence,
+  renderPlanDirective,
+} from "./philosophy";
 import {
   type AtsProvider,
   COMPANY_LIST_SCHEMA,
@@ -61,6 +72,7 @@ import {
   type LayoutSpec,
   RESUME_DOC_SCHEMA,
   type ResumeCheck,
+  type ComposeOptions,
   type ResumeDoc,
   type StructuredProfile,
   TEMPLATES,
@@ -224,6 +236,67 @@ function createTraceSink(env: Env): TraceSink {
 function attachTraceSink(env: Env): void {
   if (env.LLM_TRACE === "off" || env.LLM_TRACE_SINK) return;
   env.LLM_TRACE_SINK = createTraceSink(env);
+}
+
+/**
+ * Additive columns this build's code reads, applied at runtime if they aren't there yet.
+ *
+ * The deploy path made this necessary. Pushing to the repo triggers a Cloudflare Workers Build that
+ * runs `wrangler deploy` and nothing else -- it does NOT run `wrangler d1 migrations apply`. Only
+ * the local `npm run release:production` script chains the two. So a commit that adds a migration
+ * and the code that depends on it ships the code to production while the column is still missing,
+ * and every query naming it fails until somebody remembers to run migrations by hand. That is a
+ * loaded footgun: the deploy goes green, and the breakage shows up later as a runtime error on a
+ * feature nobody thought they had touched.
+ *
+ * Restricted to `ADD COLUMN` on purpose. Adding a nullable/defaulted column is backward compatible
+ * in both directions -- older code ignores it, newer code finds it -- so running it early, or twice,
+ * or against a database that already has it, is harmless. Anything destructive or reshaping (drops,
+ * renames, backfills, table rewrites) deliberately does NOT belong here and stays a deliberate
+ * `wrangler d1 migrations apply` step, because those need a human deciding when they happen.
+ *
+ * These statements mirror the `ALTER TABLE ... ADD COLUMN` lines in migrations/. The migration files
+ * remain the canonical schema for provisioning a fresh database; this list is the safety net for
+ * databases that already exist. Any new additive column should be added in both places.
+ */
+const ADDITIVE_COLUMNS = [
+  // 0017_resume_philosophy.sql
+  "ALTER TABLE resumes ADD COLUMN is_master INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE resumes ADD COLUMN plan_json TEXT NOT NULL DEFAULT '{}'",
+  "ALTER TABLE job_postings ADD COLUMN requirements_json TEXT NOT NULL DEFAULT '{}'",
+];
+
+/**
+ * The in-flight or completed guard run for this isolate.
+ *
+ * Deliberately a memoized promise rather than a boolean: with a boolean flag set before the awaits,
+ * a second request arriving while the first is still running its ALTERs would see "already checked"
+ * and proceed against a database that isn't ready yet -- which is precisely the failure this guard
+ * exists to prevent, reintroduced by the guard itself. Every caller awaits the same promise instead.
+ */
+let schemaReady: Promise<void> | null = null;
+
+async function applyAdditiveColumns(env: Env): Promise<void> {
+  for (const statement of ADDITIVE_COLUMNS) {
+    try {
+      await env.DB.prepare(statement).run();
+    } catch {
+      // Already present, which is the expected outcome nearly every time.
+    }
+  }
+}
+
+/**
+ * Applies any missing additive columns, once per isolate.
+ *
+ * D1 has no `ADD COLUMN IF NOT EXISTS`, so each statement is attempted and its "duplicate column"
+ * error swallowed -- on an already-migrated database (the normal case) every statement fails
+ * harmlessly and nothing changes. Failures are never propagated: a schema guard that could take the
+ * whole Worker down would be a worse problem than the one it exists to prevent.
+ */
+function ensureSchema(env: Env): Promise<void> {
+  if (!schemaReady) schemaReady = applyAdditiveColumns(env);
+  return schemaReady;
 }
 
 function randomToken(bytes = 32): string {
@@ -675,8 +748,20 @@ async function generateDesiredRoles(request: Request, env: Env): Promise<Respons
 
   const prompt = [
     "A job candidate has given you loose notes, job links, and preferences about the kind of roles they want next.",
-    "Write a clear, structured description of the roles they are looking for: role families/titles, seniority, domain,",
-    "must-have vs nice-to-have aspects, and anything they explicitly ruled out. Base this only on the notes below.",
+    "Write a clear, structured description of the roles they are looking for, to be used afterward as the filter",
+    "that decides which job postings are even worth showing them.",
+    "",
+    "If the notes point toward more than one genuinely different kind of role -- not just variations on one title,",
+    "but different fields or functions entirely (for example, a former teacher now open to machine learning",
+    "engineering roles, advocacy roles, AND corporate training roles) -- list each one as its own separate entry.",
+    "Do not blend them into a single hybrid role that doesn't actually exist in the job market, like 'ML advocate",
+    "and trainer'. Being open to several different paths is not the same as wanting one job that combines all of",
+    "them, and a posting only has to be a strong match for ONE entry to be worth surfacing, not all of them at once.",
+    "For each entry, give: role family/titles, seniority, domain, must-have vs nice-to-have aspects, and enough",
+    "concrete keywords (actual job titles a posting would use) that a simple keyword match could find it. Note",
+    "anything explicitly ruled out separately, since it applies across every entry unless the notes say otherwise.",
+    "",
+    "Base this only on the notes below.",
     "",
     WRITING_STYLE_RULES,
     "",
@@ -688,7 +773,7 @@ async function generateDesiredRoles(request: Request, env: Env): Promise<Respons
     const draft = await callText(env, provider, "roles.describe", prompt);
     return json({ provider, draft_description: draft });
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -1311,16 +1396,29 @@ async function reviewJobQuestion(request: Request, env: Env, id: string): Promis
 
   const prompt = [
     "You are helping a candidate prepare to apply to a specific job. Find ONE concrete gap between",
-    "what this job asks for and what their profile currently shows evidence of, then ask a single",
-    "short, conversational question that would let them fill that gap in their own words.",
+    "what this job asks for and what their profile currently shows evidence of, then write a single",
+    "short, conversational nudge that helps them fill that gap in their own words.",
+    "",
+    "A bare question makes people freeze on a blank page, even when they have a relevant story --",
+    "they just don't immediately connect it to the ask. So don't only ask; do some of the connecting",
+    "for them. Actually look through the candidate profile below for one or two SPECIFIC, REAL",
+    "things -- a project, a role, an employer, a tool -- that plausibly relate to the gap, name them",
+    "by name, and float them as tentative possibilities: \"maybe something like the X you did at Y?",
+    "Or was it more Z?\" Give them something concrete to react to, correct, or build on, instead of",
+    "an empty prompt. If nothing in the profile plausibly connects, it's fine to ask straight instead",
+    "of forcing a stretch.",
     "",
     WRITING_STYLE_RULES,
     "",
     "Rules:",
+    "- Only name things that actually appear in the candidate profile below. Never invent a project,",
+    "  employer, or skill that isn't there -- a confident wrong guess is worse than no guess at all.",
     "- Ask about something the posting actually states or clearly implies, not a generic prompt.",
-    "- Phrase it the way a friend would, not a form -- e.g. \"This role wants people-management",
-    "  experience, tell me about a specific time you led something.\"",
-    "- One question only, one or two sentences, no preamble or explanation, just the question itself.",
+    "- Phrase it the way a sharp friend prepping you for an interview would, not a form -- e.g. \"This",
+    "  role wants people-management experience -- did leading the migration team at Acme count, or",
+    "  was that more of an individual push?\"",
+    "- Two or three sentences: the question itself, plus the specific thing(s) you're floating. Still",
+    "  no preamble or throat-clearing -- go straight into it.",
     "- If the profile already covers everything the posting asks for well, ask about whichever",
     "  detail would most strengthen an application anyway, rather than inventing a gap.",
     (prior.results ?? []).length
@@ -1340,7 +1438,7 @@ async function reviewJobQuestion(request: Request, env: Env, id: string): Promis
     const question = await callText(env, provider, "review.question", prompt);
     return json({ question: question.trim() });
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -1603,7 +1701,7 @@ async function discoverCompanies(request: Request, env: Env): Promise<Response> 
       desiredLocations,
     );
   } catch (err) {
-    return json({ error: "discovery_failed", detail: (err as Error).message }, 502);
+    return json({ error: "discovery_failed", detail: friendlyMessage(err) }, 502);
   }
 
   const known = new Set(existingNames.map(companyNameKey));
@@ -2268,7 +2366,7 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
     const draft = mergeStructuredProfiles(existingStructured, raw);
     return json({ provider, draft_structured: draft });
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -2313,12 +2411,92 @@ async function buildResumeVersion(
   instructions: string,
   layout: LayoutSpec,
   feedback: string,
+  /** Master mode, and/or the pre-decided evidence plan. See ComposeOptions in resume.ts. */
+  options: ComposeOptions = {},
 ): Promise<{ doc: ResumeDoc; pdfKey: string; screenshotBase64: string; checks: ResumeCheck[] }> {
-  const doc = await composeResumeDoc(env, provider, structured, desiredRoles, instructions, layout, feedback);
+  const doc = await composeResumeDoc(env, provider, structured, desiredRoles, instructions, layout, feedback, options);
   const html = renderResumeHtml(doc, layout);
   const { pdfKey, pdfBytes, screenshotBase64 } = await renderResumeArtifacts(env, resumeId, html);
   const checks = await runAllChecks(pdfBytes, doc, structured, layout);
   return { doc, pdfKey, screenshotBase64, checks };
+}
+
+/**
+ * The master archive: every role, every accomplishment, no selection pressure.
+ *
+ * This is the first step of the architecture the rest of the resume pipeline assumes -- capture
+ * everything, then generate each tailored version by deleting from it. The point is that you cannot
+ * select evidence you never wrote down, so an accomplishment missing here is one that can never
+ * appear on any tailored resume no matter how well it would have fit. It is deliberately far too
+ * long to send anywhere, which is why it is rendered at the 2-page cap for legibility while the
+ * prompt itself is told the page budget does not apply: the PDF is a readable artifact of the
+ * archive, not a document anyone submits.
+ *
+ * There is at most one per profile, replaced in place on regeneration, so "the archive" stays a
+ * single thing rather than accumulating a pile of near-duplicates.
+ */
+async function buildMasterResume(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string };
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const profile = await loadProfileForResume(env);
+  if (profile instanceof Response) return profile;
+
+  const existing = await env.DB.prepare(
+    "SELECT id, revision FROM resumes WHERE profile_id = ? AND is_master = 1 LIMIT 1",
+  )
+    .bind(profile.profileId)
+    .first<{ id: string; revision: number }>();
+
+  const resumeId = existing?.id ?? crypto.randomUUID();
+  const layout = normalizeLayout({ ...defaultLayout("compact"), max_pages: 2 });
+
+  let built;
+  try {
+    built = await buildResumeVersion(
+      env, resumeId, provider, profile.structured, "", "", layout, "", { master: true },
+    );
+  } catch (err) {
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
+  }
+
+  // Deliberately no design-review/page-fit pass. Those exist to make a document fit a page budget,
+  // and this one has none -- running them here would start deleting exactly the evidence the
+  // archive exists to preserve.
+  const name = "Master archive (everything)";
+  const bulletCount = (built.doc.experience ?? []).reduce((n, e) => n + (e.bullets ?? []).length, 0);
+
+  try {
+    if (existing) {
+      await env.DB.prepare(
+        `UPDATE resumes SET name = ?, content_json = ?, pdf_r2_key = ?, template = ?, layout_json = ?,
+         checks_json = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      )
+        .bind(name, JSON.stringify(built.doc), built.pdfKey, layout.template, JSON.stringify(layout), JSON.stringify(built.checks), resumeId)
+        .run();
+      return json({
+        id: resumeId, name, revision: existing.revision + 1, checks: built.checks,
+        roles: (built.doc.experience ?? []).length, bullets: bulletCount, is_master: true,
+      });
+    }
+
+    await env.DB.prepare(
+      `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json, is_master)
+       VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, 1)`,
+    )
+      .bind(resumeId, profile.profileId, name, JSON.stringify(built.doc), built.pdfKey, layout.template, JSON.stringify(layout), JSON.stringify(built.checks))
+      .run();
+    return json({
+      id: resumeId, name, revision: 1, checks: built.checks,
+      roles: (built.doc.experience ?? []).length, bullets: bulletCount, is_master: true,
+    }, 201);
+  } catch (err) {
+    return json({ error: "save_failed", detail: friendlyMessage(err) }, 502);
+  }
 }
 
 async function createResume(request: Request, env: Env): Promise<Response> {
@@ -2357,7 +2535,7 @@ async function createResume(request: Request, env: Env): Promise<Response> {
       "",
     );
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 
   const name = instructions ? instructions.slice(0, 60) : `Resume ${new Date().toISOString().slice(0, 10)}`;
@@ -2431,6 +2609,54 @@ async function reviseOnce(
   };
 }
 
+function pageOverflowCheck(checks: ResumeCheck[]): ResumeCheck | undefined {
+  return checks.find((c) => c.id === "page_count" && c.severity !== "ok");
+}
+
+/**
+ * reviseOnce's design review sometimes tightens spacing or type instead of actually cutting
+ * content, so one pass can come back still over the page target -- the candidate would then have
+ * to click Revise again by hand and type the same "fewer bullets" note themselves. This automates
+ * exactly that: pass a userComment on every retry, since reviseOnce always rebuilds content when
+ * userComment is non-empty regardless of what the vision model itself concluded. It keeps going,
+ * telling it plainly to cut real content rather than shrink type further, until the deterministic
+ * page-count check -- real PDF text extraction, not the model's opinion -- says it fits, or the
+ * attempt budget runs out.
+ */
+async function reviseUntilFits(
+  env: Env,
+  provider: Provider,
+  resumeId: string,
+  doc: ResumeDoc,
+  layout: LayoutSpec,
+  checks: ResumeCheck[],
+  structured: StructuredProfile,
+  targetRoles: string,
+  instructions: string,
+  userComment: string,
+  maxAttempts = 3,
+): Promise<Awaited<ReturnType<typeof reviseOnce>>> {
+  let result = await reviseOnce(env, provider, resumeId, doc, layout, checks, structured, targetRoles, instructions, userComment);
+  for (let attempt = 1; attempt < maxAttempts && pageOverflowCheck(result.checks); attempt++) {
+    const overflow = pageOverflowCheck(result.checks)!;
+    const comment = [
+      overflow.message,
+      "This is a hard constraint, not a suggestion: cut actual content rather than shrinking font or spacing further.",
+      "Remove the least impactful bullet from every role, drop bullets entirely from the oldest or least relevant role first, and tighten any bullet that still runs long. Do not restore anything trimmed in a previous pass.",
+    ].join(" ");
+    result = await reviseOnce(
+      env, provider, resumeId, result.doc, result.layout, result.checks, structured, targetRoles, instructions, comment,
+    );
+  }
+  if (pageOverflowCheck(result.checks)) {
+    result.critique = [
+      result.critique,
+      `Still over the ${layout.max_pages}-page target after ${maxAttempts} automatic tightening passes. There may just be too much career history for the page count -- try dropping an older role, or switch to the 2-page layout.`,
+    ].filter(Boolean).join(" ");
+  }
+  return result;
+}
+
 async function reviewResume(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -2481,7 +2707,7 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
   const composeInstructions = [row.instructions ?? "", evidenceInstructions].filter(Boolean).join("\n\n");
 
   try {
-    const revised = await reviseOnce(
+    const revised = await reviseUntilFits(
       env, provider, id, doc, layout, previousChecks, profile.structured, targetRoles, composeInstructions, comment,
     );
 
@@ -2512,7 +2738,7 @@ async function reviewResume(request: Request, env: Env, id: string): Promise<Res
       checks: revised.checks,
     });
   } catch (err) {
-    return json({ error: "review_failed", detail: (err as Error).message }, 502);
+    return json({ error: "review_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -2692,6 +2918,63 @@ function jobReviewEvidenceInstructions(claims: string[]): string {
  * in place (bumping its revision) rather than accumulating a history, since a job-tailored resume
  * is only ever meant to represent the current best version for that one application.
  */
+/**
+ * Requirements + evidence plan for one posting, reusing the cached requirements when they exist.
+ *
+ * A posting's stated requirements don't change between the first resume and the fourth revision, so
+ * extracting them again per revision buys nothing; the plan itself is re-derived each time, since
+ * that one does depend on the current profile (an answer added on the Ask tab since the last build
+ * can legitimately turn an unproven requirement into a proven one).
+ *
+ * Returns null rather than throwing on failure. This is a refinement over composing straight from
+ * the job description, which is what the app did before and still does fine -- a planner outage
+ * should degrade the resume, not block the candidate from getting one at all.
+ */
+async function loadEvidencePlan(
+  env: Env,
+  provider: Provider,
+  jobId: string,
+  job: { title: string; company: string; raw_description: string; requirements_json?: string },
+  structured: StructuredProfile,
+): Promise<EvidencePlan | null> {
+  try {
+    let requirements: JobRequirements | null = null;
+    try {
+      const cached = JSON.parse(job.requirements_json || "{}") as JobRequirements;
+      if (cached?.requirements?.length) requirements = cached;
+    } catch {
+      // Unparseable cache is the same as no cache.
+    }
+
+    if (!requirements) {
+      requirements = await extractJobRequirements(env, provider, {
+        title: job.title,
+        company: job.company,
+        description: job.raw_description ?? "",
+      });
+      await env.DB.prepare("UPDATE job_postings SET requirements_json = ? WHERE id = ?")
+        .bind(JSON.stringify(requirements), jobId)
+        .run();
+    }
+    if (!requirements.requirements.length) return null;
+
+    return await planEvidence(env, provider, structured, requirements, `${job.title} at ${job.company}`);
+  } catch {
+    return null;
+  }
+}
+
+/** Coverage report from a stored plan_json blob, or null when this version predates planning. */
+function storedCoverage(planJson: string): ({ proven: number; partial: number; unproven: number; items: EvidencePlan["coverage"] }) | null {
+  try {
+    const plan = JSON.parse(planJson || "{}") as EvidencePlan;
+    if (!plan?.coverage?.length) return null;
+    return { ...coverageSummary(plan), items: plan.coverage };
+  } catch {
+    return null;
+  }
+}
+
 async function buildJobResume(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -2700,19 +2983,21 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
   const keyError = providerKeyMissing(env, provider);
   if (keyError) return json({ error: keyError }, 501);
 
-  const job = await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
+  const job = await env.DB.prepare(
+    "SELECT title, company, raw_description, requirements_json FROM job_postings WHERE id = ?",
+  )
     .bind(id)
-    .first<{ title: string; company: string; raw_description: string }>();
+    .first<{ title: string; company: string; raw_description: string; requirements_json: string }>();
   if (!job) return json({ error: "not_found" }, 404);
 
   const profile = await loadProfileForResume(env);
   if (profile instanceof Response) return profile;
 
   const existing = await env.DB.prepare(
-    "SELECT id, name, template, revision, checks_json FROM resumes WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+    "SELECT id, name, template, revision, checks_json, plan_json FROM resumes WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
   )
     .bind(id)
-    .first<{ id: string; name: string; template: string; revision: number; checks_json: string }>();
+    .first<{ id: string; name: string; template: string; revision: number; checks_json: string; plan_json: string }>();
 
   if (existing && !body.regenerate) {
     return json({
@@ -2721,6 +3006,9 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
       template: existing.template,
       revision: existing.revision,
       checks: JSON.parse(existing.checks_json || "[]"),
+      // Read back rather than recomputed: reusing an already-built resume shouldn't spend two model
+      // calls re-deriving a coverage report that was already saved with it.
+      coverage: storedCoverage(existing.plan_json),
       reused: true,
     });
   }
@@ -2767,11 +3055,20 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
   const layout = baseLayout ?? normalizeLayout(defaultLayout());
   const resumeId = existing?.id ?? crypto.randomUUID();
 
+  // Triage before writing: read the posting into discrete requirements, then decide per past role
+  // how much of the page it earns against them. Doing this as its own step is the whole point of
+  // src/philosophy.ts -- folding "which three jobs matter here" into the same call that writes the
+  // bullets is what produces beautifully-written bullets about the wrong roles.
+  const plan = await loadEvidencePlan(env, provider, id, job, profile.structured);
+  const planOptions: ComposeOptions = plan ? { planDirective: renderPlanDirective(plan) } : {};
+
   let built;
   try {
-    built = await buildResumeVersion(env, resumeId, provider, profile.structured, targetRoles, composeInstructions, layout, "");
+    built = await buildResumeVersion(
+      env, resumeId, provider, profile.structured, targetRoles, composeInstructions, layout, "", planOptions,
+    );
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 
   // One automatic design-review-and-revise pass before this ever reaches the candidate. This is
@@ -2784,7 +3081,7 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
   let finalChecks = built.checks;
   let critique = "";
   try {
-    const revised = await reviseOnce(
+    const revised = await reviseUntilFits(
       env, provider, resumeId, built.doc, layout, built.checks, profile.structured, targetRoles, composeInstructions, "",
     );
     finalLayout = revised.layout;
@@ -2798,27 +3095,32 @@ async function buildJobResume(request: Request, env: Env, id: string): Promise<R
   }
 
   const name = `${job.title} @ ${job.company}`.slice(0, 60);
+  const planJson = JSON.stringify(plan ?? {});
+  // The unproven count is the genuinely useful half of this: "here are three things this posting
+  // asks for that your profile can't currently show" is an actionable prompt to go answer a
+  // question on the Ask tab, which is exactly what turns an unproven requirement into a proven one.
+  const coverage = plan ? { ...coverageSummary(plan), items: plan.coverage } : null;
 
   try {
     if (existing) {
       await env.DB.prepare(
         `UPDATE resumes SET name = ?, instructions = ?, content_json = ?, pdf_r2_key = ?, template = ?,
-         layout_json = ?, checks_json = ?, critique = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+         layout_json = ?, checks_json = ?, critique = ?, plan_json = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       )
-        .bind(name, instructions, JSON.stringify(finalDoc), finalPdfKey, finalLayout.template, JSON.stringify(finalLayout), JSON.stringify(finalChecks), critique, resumeId)
+        .bind(name, instructions, JSON.stringify(finalDoc), finalPdfKey, finalLayout.template, JSON.stringify(finalLayout), JSON.stringify(finalChecks), critique, planJson, resumeId)
         .run();
-      return json({ id: resumeId, name, template: finalLayout.template, revision: existing.revision + 1, checks: finalChecks, critique, reused: false });
+      return json({ id: resumeId, name, template: finalLayout.template, revision: existing.revision + 1, checks: finalChecks, critique, coverage, reused: false });
     }
 
     await env.DB.prepare(
-      `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json, critique, job_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json, critique, plan_json, job_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-      .bind(resumeId, profile.profileId, name, instructions, JSON.stringify(finalDoc), finalPdfKey, finalLayout.template, JSON.stringify(finalLayout), JSON.stringify(finalChecks), critique, id)
+      .bind(resumeId, profile.profileId, name, instructions, JSON.stringify(finalDoc), finalPdfKey, finalLayout.template, JSON.stringify(finalLayout), JSON.stringify(finalChecks), critique, planJson, id)
       .run();
-    return json({ id: resumeId, name, template: finalLayout.template, revision: 1, checks: finalChecks, critique, reused: false }, 201);
+    return json({ id: resumeId, name, template: finalLayout.template, revision: 1, checks: finalChecks, critique, coverage, reused: false }, 201);
   } catch (err) {
-    return json({ error: "save_failed", detail: (err as Error).message }, 502);
+    return json({ error: "save_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -2989,7 +3291,7 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
       contactLine,
     );
   } catch (err) {
-    return json({ error: "generation_failed", detail: (err as Error).message }, 502);
+    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 
   const name = profileRow?.label || profile.structured.headline || "Candidate";
@@ -3014,7 +3316,7 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
     // A save failure shouldn't surface as a raw, uncaught exception -- the letter itself composed
     // fine at this point, so a clear error here (rather than a generic Workers error page the
     // frontend can't parse as JSON) is what actually helps track down what went wrong.
-    return json({ error: "save_failed", detail: (err as Error).message }, 502);
+    return json({ error: "save_failed", detail: friendlyMessage(err) }, 502);
   }
 }
 
@@ -3749,6 +4051,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <div class="split-sticky">
         <section id="desired-roles-section">
           <h2>Generated description</h2>
+          <p class="hint">This is what filters which postings you even see. If you'd take more than one genuinely different kind of role (say, machine learning engineering, advocacy work, and corporate training), list them as separate entries rather than one blended role -- a posting only needs to match one of them.</p>
           <label for="desired-roles-provider">Generate using</label>
           <select id="desired-roles-provider">
             <option value="anthropic">Anthropic (Claude)</option>
@@ -3874,6 +4177,13 @@ const DASHBOARD_PAGE = `<!doctype html>
         </section>
       </div>
       <div>
+        <section id="resume-master-section">
+          <h2>Master archive</h2>
+          <p class="hint">Everything you have ever done, in one deliberately oversized document. Every tailored resume is built by cutting this down, so anything missing here can never appear on any of them. Not something you send anywhere.</p>
+          <button id="resume-master-button" class="secondary" type="button">Build master archive</button>
+          <p id="resume-master-status" class="status" role="status" aria-live="polite"></p>
+        </section>
+
         <section id="resume-generate-section">
           <h2>Resume versions</h2>
           <label for="resume-template">Template</label>
@@ -4148,6 +4458,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           <p class="hint">On some phones the preview below can't scroll or show a page break — if that happens, use the link to open the actual PDF instead.</p>
           <a id="interested-resume-open-link" class="row-title" target="_blank" rel="noopener">Open full PDF in a new tab</a>
           <iframe id="interested-resume-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+          <div id="interested-resume-coverage" style="display:none"></div>
           <div id="interested-resume-checks"></div>
           <p id="interested-resume-critique" class="critique" style="display:none"></p>
           <textarea id="interested-resume-comment" placeholder="Optional — steer the revision, e.g. tighten the second bullet, or point out what still doesn't fit"></textarea>
@@ -4269,10 +4580,12 @@ const DASHBOARD_PAGE = `<!doctype html>
       return res;
     }
 
+    // A friendly detail (see friendlyMessage() server-side) already reads as a full sentence, so
+    // showing it alone beats prefixing it with the internal error code, e.g. "generation_failed:
+    // Anthropic is out of credits..." When there's no detail, fall back to the bare code.
     function errorMessage(data, fallback) {
-      var msg = (data && data.error) || fallback;
-      if (data && data.detail) msg += ': ' + data.detail;
-      return msg;
+      if (data && data.detail) return data.detail;
+      return (data && data.error) || fallback;
     }
 
     // A failed request should always end up with a readable message, even if the response body
@@ -4445,6 +4758,30 @@ const DASHBOARD_PAGE = `<!doctype html>
         list.appendChild(el('div', { className: 'row-item' }, [row]));
       });
     }
+
+    document.getElementById('resume-master-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('resume-master-status');
+      statusEl.textContent = 'Writing out everything in your profile… this one takes longer than a normal version.';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/resumes/master', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ provider: document.getElementById('resume-provider').value }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(errorMessage(data, 'generation_failed'));
+        statusEl.textContent =
+          'Archive built: ' + data.roles + ' role' + (data.roles === 1 ? '' : 's') + ', ' +
+          data.bullets + ' accomplishment' + (data.bullets === 1 ? '' : 's') + ' on file.';
+        statusEl.className = 'status success';
+        await loadResumes();
+        showResumePreview(data.id, data.checks, '');
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
 
     document.getElementById('resume-generate-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('resume-generate-status');
@@ -6200,6 +6537,37 @@ const DASHBOARD_PAGE = `<!doctype html>
       critiqueEl.style.display = critique ? 'block' : 'none';
     }
 
+    // What this posting asked for, and which of it your profile can actually back up. The unproven
+    // list is the useful half: each entry is something to go answer on the Ask tab, which is what
+    // turns it into evidence the next revision can use. Deliberately not framed as a score -- an
+    // unproven requirement is a gap to close, not a grade.
+    function renderResumeCoverage(coverage) {
+      var host = document.getElementById('interested-resume-coverage');
+      host.innerHTML = '';
+      if (!coverage || !coverage.items || !coverage.items.length) {
+        host.style.display = 'none';
+        return;
+      }
+      host.style.display = 'block';
+      host.appendChild(el('h4', { textContent: 'What this posting asks for' }));
+      host.appendChild(el('p', {
+        className: 'hint',
+        textContent: coverage.proven + ' backed by your profile, ' + coverage.partial +
+          ' partly, ' + coverage.unproven + ' not yet.',
+      }));
+      var list = el('ul', { className: 'checks' });
+      coverage.items.forEach(function (item) {
+        var mark = item.status === 'proven' ? '✓' : item.status === 'partial' ? '~' : '·';
+        var severity = item.status === 'proven' ? 'ok' : item.status === 'partial' ? 'warning' : 'error';
+        var text = item.requirement + (item.evidence ? ' — ' + item.evidence : '');
+        list.appendChild(el('li', { className: severity }, [
+          el('span', { className: 'mark', textContent: mark }),
+          el('span', { textContent: text }),
+        ]));
+      });
+      host.appendChild(list);
+    }
+
     // Embedded PDF viewers inside an iframe are unreliable on some phones -- notably iOS Safari,
     // which often renders only a static first page with no scrolling and no visible page break.
     // The direct link opens the exact same file as a real navigation, which uses the browser's
@@ -6227,6 +6595,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         document.getElementById('interested-resume-section').style.display = 'block';
         setInterestedResumePreview(data.id);
         renderInterestedResumeChecks(data.checks || []);
+        renderResumeCoverage(data.coverage);
         showInterestedResumeCritique(data.critique);
         statusEl.textContent = data.reused
           ? 'Showing the version already tailored for this job.'
@@ -6692,6 +7061,10 @@ function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "text" };
     case "resume.build":
       return { kind: "structured", schema: RESUME_DOC_SCHEMA, toolName: "submit_resume", maxTokens: 4000 };
+    case "resume.requirements":
+      return { kind: "structured", schema: REQUIREMENTS_SCHEMA, toolName: "submit_requirements", maxTokens: 3000 };
+    case "resume.plan_evidence":
+      return { kind: "structured", schema: PLAN_SCHEMA, toolName: "submit_plan", maxTokens: 4000 };
     case "resume.select_base":
       return { kind: "structured", schema: RESUME_BASE_SCHEMA, toolName: "submit_resume_base", maxTokens: 1000 };
     case "cover_letter.write":
@@ -6844,6 +7217,8 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     attachTraceSink(env);
+    // Costs three failed ALTERs on the first request an isolate serves, and nothing after that.
+    await ensureSchema(env);
 
     const corsOrigin = extensionCorsOrigin(request, url.pathname);
     if (corsOrigin && request.method === "OPTIONS") {
@@ -6925,6 +7300,8 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "POST" && url.pathname === "/desired-roles/generate") return generateDesiredRoles(request, env);
     if (request.method === "GET" && url.pathname === "/resumes") return listResumes(request, env);
     if (request.method === "POST" && url.pathname === "/resumes") return createResume(request, env);
+    // Ahead of the /resumes/:id routes below, which would otherwise capture "master" as an id.
+    if (request.method === "POST" && url.pathname === "/resumes/master") return buildMasterResume(request, env);
     const resumeFileMatch = url.pathname.match(/^\/resumes\/([^/]+)\/file$/);
     if (request.method === "GET" && resumeFileMatch) return getResumeFile(request, env, resumeFileMatch[1]);
     const resumeReviewMatch = url.pathname.match(/^\/resumes\/([^/]+)\/review$/);
