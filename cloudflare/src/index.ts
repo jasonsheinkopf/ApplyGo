@@ -238,6 +238,67 @@ function attachTraceSink(env: Env): void {
   env.LLM_TRACE_SINK = createTraceSink(env);
 }
 
+/**
+ * Additive columns this build's code reads, applied at runtime if they aren't there yet.
+ *
+ * The deploy path made this necessary. Pushing to the repo triggers a Cloudflare Workers Build that
+ * runs `wrangler deploy` and nothing else -- it does NOT run `wrangler d1 migrations apply`. Only
+ * the local `npm run release:production` script chains the two. So a commit that adds a migration
+ * and the code that depends on it ships the code to production while the column is still missing,
+ * and every query naming it fails until somebody remembers to run migrations by hand. That is a
+ * loaded footgun: the deploy goes green, and the breakage shows up later as a runtime error on a
+ * feature nobody thought they had touched.
+ *
+ * Restricted to `ADD COLUMN` on purpose. Adding a nullable/defaulted column is backward compatible
+ * in both directions -- older code ignores it, newer code finds it -- so running it early, or twice,
+ * or against a database that already has it, is harmless. Anything destructive or reshaping (drops,
+ * renames, backfills, table rewrites) deliberately does NOT belong here and stays a deliberate
+ * `wrangler d1 migrations apply` step, because those need a human deciding when they happen.
+ *
+ * These statements mirror the `ALTER TABLE ... ADD COLUMN` lines in migrations/. The migration files
+ * remain the canonical schema for provisioning a fresh database; this list is the safety net for
+ * databases that already exist. Any new additive column should be added in both places.
+ */
+const ADDITIVE_COLUMNS = [
+  // 0017_resume_philosophy.sql
+  "ALTER TABLE resumes ADD COLUMN is_master INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE resumes ADD COLUMN plan_json TEXT NOT NULL DEFAULT '{}'",
+  "ALTER TABLE job_postings ADD COLUMN requirements_json TEXT NOT NULL DEFAULT '{}'",
+];
+
+/**
+ * The in-flight or completed guard run for this isolate.
+ *
+ * Deliberately a memoized promise rather than a boolean: with a boolean flag set before the awaits,
+ * a second request arriving while the first is still running its ALTERs would see "already checked"
+ * and proceed against a database that isn't ready yet -- which is precisely the failure this guard
+ * exists to prevent, reintroduced by the guard itself. Every caller awaits the same promise instead.
+ */
+let schemaReady: Promise<void> | null = null;
+
+async function applyAdditiveColumns(env: Env): Promise<void> {
+  for (const statement of ADDITIVE_COLUMNS) {
+    try {
+      await env.DB.prepare(statement).run();
+    } catch {
+      // Already present, which is the expected outcome nearly every time.
+    }
+  }
+}
+
+/**
+ * Applies any missing additive columns, once per isolate.
+ *
+ * D1 has no `ADD COLUMN IF NOT EXISTS`, so each statement is attempted and its "duplicate column"
+ * error swallowed -- on an already-migrated database (the normal case) every statement fails
+ * harmlessly and nothing changes. Failures are never propagated: a schema guard that could take the
+ * whole Worker down would be a worse problem than the one it exists to prevent.
+ */
+function ensureSchema(env: Env): Promise<void> {
+  if (!schemaReady) schemaReady = applyAdditiveColumns(env);
+  return schemaReady;
+}
+
 function randomToken(bytes = 32): string {
   const value = new Uint8Array(bytes);
   crypto.getRandomValues(value);
@@ -7156,6 +7217,8 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     attachTraceSink(env);
+    // Costs three failed ALTERs on the first request an isolate serves, and nothing after that.
+    await ensureSchema(env);
 
     const corsOrigin = extensionCorsOrigin(request, url.pathname);
     if (corsOrigin && request.method === "OPTIONS") {

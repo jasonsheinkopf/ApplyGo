@@ -509,6 +509,19 @@ Checkboxes keep their small box and get the height on the surrounding `<label>` 
 - No Cloudflare API token, GitHub token, or model-provider key is ever sent to browser JavaScript.
 - Automatic GitHub deployment uses Cloudflare Workers Builds' native Git integration, which does not require storing a Cloudflare API token in GitHub Actions secrets.
 
+### Deploy-before-migrate safety
+
+Pushing to the repo triggers a Cloudflare Workers Build that runs `wrangler deploy` **and nothing else** — it does *not* run `wrangler d1 migrations apply`. Only the local `npm run release:production` script chains the two. That means a commit adding a migration plus the code depending on it ships the code to production while the column is still missing, and every query naming it fails until someone remembers to run migrations by hand. The deploy goes green; the breakage surfaces later as a runtime error on a feature nobody thought they'd touched.
+
+`ensureSchema()` (`src/index.ts`) closes that window. It applies the `ADD COLUMN` statements this build's code depends on, once per isolate, swallowing the duplicate-column errors that are the normal outcome on an already-migrated database.
+
+Two deliberate limits:
+
+- **Additive only.** A nullable/defaulted new column is backward compatible in both directions — older code ignores it, newer code finds it — so running it early, twice, or against a database that already has it is harmless. Anything destructive or reshaping (drops, renames, backfills, table rewrites) does *not* belong here and stays a deliberate `wrangler d1 migrations apply` step, because those need a human deciding when they happen.
+- **Migration files stay canonical.** `migrations/` remains the schema of record for provisioning a fresh database; `ADDITIVE_COLUMNS` is the safety net for databases that already exist. A new additive column goes in both, and `assert_ensure_schema.mjs` fails if anything in the guard is missing from a migration file.
+
+The guard memoizes a *promise*, not a boolean. With a flag set before the awaits, a second request arriving mid-run would see "already checked" and proceed against a database that isn't ready — reintroducing the exact failure the guard exists to prevent. Every caller awaits the same promise instead.
+
 ## Migrations
 
 Migrations in `migrations/` are forward-only and applied with `wrangler d1 migrations apply`, which tracks already-applied migrations per database (in its own ledger table) so each migration file only ever runs once, and never drops or recreates tables. The initial migration uses `CREATE TABLE IF NOT EXISTS`/`CREATE INDEX IF NOT EXISTS` for extra safety; later migrations that add columns (e.g. `0002_structured_profile.sql`'s `ALTER TABLE ... ADD COLUMN`) don't need that — SQLite has no `ADD COLUMN IF NOT EXISTS`, and Wrangler's per-migration tracking already prevents re-running it. Production migrations always run before deploy (`npm run release:production`), whether invoked manually or by Workers Builds.
