@@ -676,8 +676,20 @@ async function generateDesiredRoles(request: Request, env: Env): Promise<Respons
 
   const prompt = [
     "A job candidate has given you loose notes, job links, and preferences about the kind of roles they want next.",
-    "Write a clear, structured description of the roles they are looking for: role families/titles, seniority, domain,",
-    "must-have vs nice-to-have aspects, and anything they explicitly ruled out. Base this only on the notes below.",
+    "Write a clear, structured description of the roles they are looking for, to be used afterward as the filter",
+    "that decides which job postings are even worth showing them.",
+    "",
+    "If the notes point toward more than one genuinely different kind of role -- not just variations on one title,",
+    "but different fields or functions entirely (for example, a former teacher now open to machine learning",
+    "engineering roles, advocacy roles, AND corporate training roles) -- list each one as its own separate entry.",
+    "Do not blend them into a single hybrid role that doesn't actually exist in the job market, like 'ML advocate",
+    "and trainer'. Being open to several different paths is not the same as wanting one job that combines all of",
+    "them, and a posting only has to be a strong match for ONE entry to be worth surfacing, not all of them at once.",
+    "For each entry, give: role family/titles, seniority, domain, must-have vs nice-to-have aspects, and enough",
+    "concrete keywords (actual job titles a posting would use) that a simple keyword match could find it. Note",
+    "anything explicitly ruled out separately, since it applies across every entry unless the notes say otherwise.",
+    "",
+    "Base this only on the notes below.",
     "",
     WRITING_STYLE_RULES,
     "",
@@ -3811,6 +3823,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <div class="split-sticky">
         <section id="desired-roles-section">
           <h2>Generated description</h2>
+          <p class="hint">This is what filters which postings you even see. If you'd take more than one genuinely different kind of role (say, machine learning engineering, advocacy work, and corporate training), list them as separate entries rather than one blended role -- a posting only needs to match one of them.</p>
           <label for="desired-roles-provider">Generate using</label>
           <select id="desired-roles-provider">
             <option value="anthropic">Anthropic (Claude)</option>
