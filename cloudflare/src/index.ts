@@ -101,6 +101,7 @@ interface Env {
   OPENAI_MODEL?: string;
   ANTHROPIC_SCREEN_MODEL?: string;
   OPENAI_SCREEN_MODEL?: string;
+  LOCAL_RENDER_URL?: string;
   /** Set to "off" to stop recording model calls. Anything else (including unset) records them. */
   LLM_TRACE?: string;
   /** Installed once per isolate by the router; see attachTraceSink. */
@@ -1000,6 +1001,8 @@ async function assessRowsBatched(
 
   const errors: string[] = [];
   let assessed = 0;
+  let recommended = 0;
+  let discarded = 0;
   let failed = false;
   await runPooled(
     batches,
@@ -1020,7 +1023,14 @@ async function assessRowsBatched(
       if (!results) return;
       await storeFitResults(env, results);
       assessed += results.length;
-      await emit({ type: "progress", stage: "assess", done: assessed, total });
+      // Same reasoning as the screen stage's emit above: recommended/discarded are real,
+      // just-happened counts for this batch (via the same verdictForScore cutoff storeFitResults
+      // itself used), not a guess derived from done/total.
+      for (const result of results) {
+        if (verdictForScore(result.score) === "reject") discarded += 1;
+        else recommended += 1;
+      }
+      await emit({ type: "progress", stage: "assess", done: assessed, total, recommended, discarded });
     },
   );
   return { assessed, errors };
@@ -1113,7 +1123,18 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
           if (!result.keep) screenedOut += 1;
         }
         screened += results.length;
-        await emit({ type: "progress", stage: "screen", done: screened, total: screenTotal });
+        // screened_in/screened_out here are cumulative within this call, not lifetime totals --
+        // the Search tab's live pipeline diagram uses them as real per-batch deltas (this posting
+        // really was just screened out, right now) rather than inferring a split from done/total,
+        // which carries no accept/reject information at all.
+        await emit({
+          type: "progress",
+          stage: "screen",
+          done: screened,
+          total: screenTotal,
+          screened_in: screened - screenedOut,
+          screened_out: screenedOut,
+        });
       },
     );
 
@@ -1777,7 +1798,7 @@ async function bulkAddCompanies(request: Request, env: Env): Promise<Response> {
  * resolves before trusting it. A model listing employers will occasionally invent or misremember
  * one, so nothing here is taken on faith.
  */
-async function discoverCompanies(request: Request, env: Env): Promise<Response> {
+async function discoverCompanies(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as {
@@ -1806,57 +1827,95 @@ async function discoverCompanies(request: Request, env: Env): Promise<Response> 
 
   const desiredLocations = readDesiredLocations(profileRow?.preferences_json ?? "{}");
   const locationTerms = parseLocationFilter(desiredLocations);
-
   const count = Math.min(Math.max(Number(body.count) || 10, 1), 20);
-  let proposals;
-  try {
-    proposals = await proposeCompanies(
-      env,
-      provider,
-      JSON.stringify(structured),
-      desiredRoles,
-      existingNames,
-      count,
-      (body.focus ?? "").trim(),
-      desiredLocations,
-    );
-  } catch (err) {
-    return json({ error: "discovery_failed", detail: friendlyMessage(err) }, 502);
-  }
+  const focus = (body.focus ?? "").trim();
 
-  const known = new Set(existingNames.map(companyNameKey));
-  const deduped = proposals.filter((p) => {
-    const key = companyNameKey(p.name);
-    if (!key || known.has(key)) return false;
-    known.add(key);
-    return true;
-  });
-
-  // The prompt states the location requirement, but a model treats it as guidance often enough
-  // that it has to be enforced here too rather than trusted.
-  const fresh = deduped.filter((p) => locationMatches(p.location, locationTerms));
-  const offTarget = deduped.length - fresh.length;
-
-  let added = 0;
-  let unreachable = 0;
-  for (const proposal of fresh) {
-    const reachable = await verifyWebsite(proposal.website);
-    if (!reachable) unreachable += 1;
-    const inserted = await addCompanyRow(env, profileId, {
-      ...proposal,
-      status: reachable ? "reachable" : "unreachable",
-      source: "ai",
+  return ndjsonResponse(ctx, async (emit) => {
+    await emit({
+      type: "progress",
+      stage: "propose",
+      message: `Asking the model for ${count} compan${count === 1 ? "y" : "ies"}…`,
     });
-    if (inserted) added += 1;
-  }
 
-  return json({
-    added,
-    proposed: proposals.length,
-    duplicates: proposals.length - deduped.length,
-    off_target: offTarget,
-    unreachable,
-    locations: desiredLocations,
+    let proposals;
+    try {
+      proposals = await proposeCompanies(
+        env,
+        provider,
+        JSON.stringify(structured),
+        desiredRoles,
+        existingNames,
+        count,
+        focus,
+        desiredLocations,
+      );
+    } catch (err) {
+      throw new Error(friendlyMessage(err));
+    }
+
+    const known = new Set(existingNames.map(companyNameKey));
+    const deduped = proposals.filter((p) => {
+      const key = companyNameKey(p.name);
+      if (!key || known.has(key)) return false;
+      known.add(key);
+      return true;
+    });
+
+    // The prompt states the location requirement, but a model treats it as guidance often enough
+    // that it has to be enforced here too rather than trusted.
+    const fresh = deduped.filter((p) => locationMatches(p.location, locationTerms));
+    const offTarget = deduped.length - fresh.length;
+
+    await emit({
+      type: "progress",
+      stage: "verify",
+      done: 0,
+      total: fresh.length,
+      proposed: proposals.length,
+      duplicates: proposals.length - deduped.length,
+      off_target: offTarget,
+    });
+
+    let added = 0;
+    let unreachable = 0;
+    let checked = 0;
+    // Verifying a website is one fetch with no LLM cost -- almost all wall-clock time is spent
+    // waiting on the network, not CPU. Running several at once instead of one after another is
+    // what turns "up to 20 sequential 8s timeouts" into a few seconds, and emitting after each one
+    // settles is what gives the candidate something to actually watch happen instead of one static
+    // "please wait" for the whole batch.
+    await runPooled(
+      fresh,
+      6,
+      async (proposal) => verifyWebsite(proposal.website),
+      async (proposal, reachable) => {
+        checked += 1;
+        if (!reachable) unreachable += 1;
+        const inserted = await addCompanyRow(env, profileId, {
+          ...proposal,
+          status: reachable ? "reachable" : "unreachable",
+          source: "ai",
+        });
+        if (inserted) added += 1;
+        await emit({
+          type: "progress",
+          stage: "verify",
+          done: checked,
+          total: fresh.length,
+          company: proposal.name,
+          reachable,
+        });
+      },
+    );
+
+    return {
+      added,
+      proposed: proposals.length,
+      duplicates: proposals.length - deduped.length,
+      off_target: offTarget,
+      unreachable,
+      locations: desiredLocations,
+    };
   });
 }
 
@@ -1986,7 +2045,7 @@ async function scanOneCompany(
   let token = company.ats_token;
 
   if (!provider || provider === "none") {
-    const resolved = await resolveBoard(company.website, company.careers_url, budget);
+    const resolved = await resolveBoard(company.website, company.careers_url, company.name, budget);
     if (!resolved) {
       await env.DB.prepare(
         `UPDATE companies SET ats_provider = 'none', scan_note = ?, last_scanned_at = CURRENT_TIMESTAMP,
@@ -2195,6 +2254,21 @@ async function uploadDocument(request: Request, env: Env): Promise<Response> {
 
   const bytes = await file.arrayBuffer();
   const sha = await digestHex(bytes);
+
+  // Uploaded to R2 before any text extraction runs, deliberately -- pdf.js (via unpdf) parses
+  // through a worker and transfers the ArrayBuffer it's given rather than copying it, which
+  // detaches the original buffer (byteLength becomes 0) once parsing succeeds. That used to run
+  // before the R2 write and shared the exact same `bytes` buffer, so a PDF that extracted
+  // cleanly would silently upload as a zero-byte object -- the write succeeded, the document
+  // listed fine, and the file was simply gone the moment you tried to open it. Saving the
+  // artifact first means a bug in any extraction library can degrade `extracted_text`, the
+  // best-effort part, but can never again take the upload itself down with it.
+  const key = `documents/${crypto.randomUUID()}`;
+  await env.FILES.put(key, bytes, {
+    httpMetadata: { contentType: mediaType },
+    customMetadata: { originalName: file.name, uploadedByDevice: auth.id },
+  });
+
   let extractedText = "";
   if (mediaType === "text/plain" || mediaType === "text/markdown") {
     extractedText = new TextDecoder().decode(bytes);
@@ -2215,11 +2289,6 @@ async function uploadDocument(request: Request, env: Env): Promise<Response> {
       extractedText = "";
     }
   }
-  const key = `documents/${crypto.randomUUID()}`;
-  await env.FILES.put(key, bytes, {
-    httpMetadata: { contentType: mediaType },
-    customMetadata: { originalName: file.name, uploadedByDevice: auth.id },
-  });
 
   const profileId = await getOrCreateProfileId(env);
   const id = crypto.randomUUID();
@@ -2251,7 +2320,10 @@ async function getDocumentFile(request: Request, env: Env, id: string): Promise<
   if (!doc) return json({ error: "not_found" }, 404);
   // PDF viewers (Adobe's plugin especially) fetch large files in chunks via Range requests;
   // without honoring those and replying 206/Content-Range, some viewers fail to load entirely.
-  const object = await env.FILES.get(doc.r2_key, { range: request.headers });
+  const rangeHeader = request.headers.get("range");
+  const object = rangeHeader
+    ? await env.FILES.get(doc.r2_key, { range: request.headers })
+    : await env.FILES.get(doc.r2_key);
   if (!object) return json({ error: "not_found" }, 404);
   const headers = new Headers();
   object.writeHttpMetadata(headers);
@@ -4007,18 +4079,33 @@ const DASHBOARD_PAGE = `<!doctype html>
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
     clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
   }
-  /* Pipeline flow diagram (Search tab) -- a small sankey of where scanned postings currently sit:
-     not yet screened, screened out, awaiting the detailed pass, matched, or ruled out. Node bars
-     and link ribbons are sized in JS from the live counts; this just fixes the constant look --
-     stroke widths, gaps, label type -- shared by both the left-to-right and stacked-rows layouts. */
-  #jobs-pipeline { margin: 0.6rem 0 1rem; max-width: 640px; }
+  /* Pipeline flow diagram (Search tab) -- shows where scanned postings currently sit: not yet
+     screened, screened out, awaiting the detailed pass, ruled out on fit, or recommended. Node
+     heights and ribbon thickness are real counts from jobPipelineCounts, eased smoothly toward
+     whatever the current numbers are on every animation frame -- an initial load and a live
+     per-batch update during Scan/Find my matches both just change the target, so the diagram
+     visibly moves instead of only ever replacing a static number. Not-interested/Interested/
+     Applied aren't shown here -- this page is about finding matches, not the review funnel after. */
+  #jobs-pipeline { margin: 0.6rem 0 1rem; }
   #jobs-pipeline svg { display: block; width: 100%; height: auto; overflow: visible; }
-  .pf-node-value { font-size: 11px; font-weight: 700; fill: var(--text); }
-  .pf-node-sub { font-size: 8.5px; fill: var(--text-muted); }
-  .pf-link { opacity: 0.55; }
-  .pf-node-rect { stroke: var(--surface); stroke-width: 2; }
+  .pf-stage-title { font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; fill: var(--text-muted); text-transform: uppercase; }
+  .pf-node-rect { stroke-width: 1.4; }
+  .pf-node-label { font-size: 12px; font-weight: 600; fill: var(--text); }
+  .pf-node-count { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12px; font-weight: 700; }
+  .pf-node-pct { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 10px; fill: var(--text-muted); }
+  /* fill and fill-opacity are set per-edge in JS (by flow kind); nothing to fix here. */
   .pf-dot { filter: drop-shadow(0 0 2px rgba(0,0,0,0.25)); }
   @media (prefers-reduced-motion: reduce) { .pf-dot { display: none; } }
+  .pf-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: var(--text-muted); margin-top: 0.4rem; }
+  .pf-legend-item { display: flex; align-items: center; gap: 6px; }
+  .pf-swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .pf-progress-track { margin-top: 0.6rem; height: 3px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .pf-progress-fill { height: 100%; width: 0%; background: var(--accent); transition: width 0.4s ease; }
+  .pf-stat-row {
+    display: flex; flex-wrap: wrap; gap: 20px; margin-top: 0.5rem; font-size: 12px; color: var(--text-muted);
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  }
+  .pf-stat-row b { color: var(--text); font-weight: 700; }
   .template-choices { display: grid; gap: 0.5rem; margin-bottom: 0.9rem; }
   @media (min-width: 560px) { .template-choices { grid-template-columns: repeat(3, 1fr); } }
   .template-card {
@@ -4103,6 +4190,10 @@ const DASHBOARD_PAGE = `<!doctype html>
   .location-chip {
     font-size: 0.8rem; padding: 0.2rem 0.5rem; border: 1px solid var(--border);
     border-radius: 999px; background: transparent; color: inherit; cursor: pointer;
+  }
+  .text-link {
+    font: inherit; padding: 0; margin: 0; border: none; background: none; color: var(--accent);
+    text-decoration: underline; cursor: pointer;
   }
   .checkbox-label {
     display: flex; align-items: center; gap: 0.45rem; font-size: 0.85rem; color: var(--text-muted);
@@ -4190,7 +4281,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     <button class="tab" data-tab="interested" type="button">Interested</button>
     <button class="tab" data-tab="applied" type="button">Applied</button>
     <button class="tab" data-tab="devices" type="button">Devices</button>
-    <button class="tab" data-tab="data" type="button">Data</button>
+    <button class="tab" data-tab="data" type="button">Database</button>
   </nav>
 
   <div id="panel-roles" class="panel active">
@@ -4471,7 +4562,22 @@ const DASHBOARD_PAGE = `<!doctype html>
       <h2>2. Filter for your best matches</h2>
       <p class="hint">Screens new listings against your profile in two passes — a quick check, then a closer look at anything that survives it — so you only spend real attention on postings worth reading.</p>
       <p id="jobs-pipeline-summary" class="sr-only" aria-live="polite"></p>
-      <div id="jobs-pipeline" aria-hidden="true"><p class="empty">Loading…</p></div>
+      <div id="jobs-pipeline" aria-hidden="true">
+        <svg id="pf-svg" preserveAspectRatio="xMidYMid meet"></svg>
+        <div class="pf-legend">
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--text-muted)"></span>Scanned / passed screening</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--warning)"></span>Waiting</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--error)"></span>Dropped</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--success)"></span>Recommended</span>
+        </div>
+        <div class="pf-progress-track"><div class="pf-progress-fill" id="pfProgressFill"></div></div>
+        <div class="pf-stat-row">
+          <span>Scanned: <b id="pfStatScanned">0</b></span>
+          <span>Recommended: <b id="pfStatRecommended">0</b></span>
+          <span>Screen accept rate: <b id="pfStatScreenRate">—</b></span>
+          <span>Fully processed: <b id="pfStatProcessed">0%</b></span>
+        </div>
+      </div>
       <div class="controls">
         <div>
           <label for="jobs-provider">Filter using</label>
@@ -4655,6 +4761,29 @@ const DASHBOARD_PAGE = `<!doctype html>
   </div>
 
   <div id="panel-data" class="panel">
+    <section id="runtime-mode-section">
+      <h2>Where ApplyGo runs</h2>
+      <p class="hint">Local is the default: your database, files, and browser work stay on this computer. Cloudflare is optional and adds access from your phone through infrastructure you own.</p>
+      <div class="row-item">
+        <div class="row">
+          <div>
+            <div class="row-title">Local computer</div>
+            <div class="row-meta">Default · no Cloudflare account · available while this computer is running</div>
+          </div>
+          <span class="badge jobs">Current local session</span>
+        </div>
+      </div>
+      <div class="row-item">
+        <div class="row">
+          <div>
+            <div class="row-title">Personal Cloudflare</div>
+            <div class="row-meta">Optional phone access · requires a user-owned account, D1 database, R2 bucket, and Worker deployment</div>
+          </div>
+          <span class="badge queued">Setup requires local launcher</span>
+        </div>
+      </div>
+      <p class="hint">Cloudflare credentials cannot be entered into this web page: a deployed Worker must not receive or store the API token capable of deploying itself. The local launcher will collect that token on the computer, store it in a private OS-backed credential store, provision the deployment, and then expose the mode switch here.</p>
+    </section>
     <section id="data-stored-section">
       <h2>What's stored</h2>
       <p class="hint">Everything ApplyGo keeps about you and your search, and how much space the bulky parts take.</p>
@@ -4760,9 +4889,33 @@ const DASHBOARD_PAGE = `<!doctype html>
     // isn't valid JSON (a raw platform error page, a network-level failure) -- res.json() throwing
     // there would otherwise surface as an opaque parse error instead of anything actionable.
     async function errorMessageFromResponse(res, fallback) {
+      var body = '';
+      try { body = await res.text(); } catch (e) { body = ''; }
+      if (body) {
+        try { return errorMessage(JSON.parse(body), fallback + ' (HTTP ' + res.status + ')'); }
+        catch (e) {
+          // Cloudflare platform failures are plain text (often "Your worker..."). Preserve that
+          // useful explanation instead of hiding it behind an "Unexpected token" JSON error.
+          return body.replace(/\s+/g, ' ').trim().slice(0, 500);
+        }
+      }
+      return fallback + ' (HTTP ' + res.status + ')';
+    }
+
+    async function requireJsonResponse(res, fallback) {
+      var body = '';
+      try { body = await res.text(); } catch (e) { body = ''; }
       var data = null;
-      try { data = await res.json(); } catch (e) { data = null; }
-      return errorMessage(data, fallback + ' (HTTP ' + res.status + ')');
+      if (body) {
+        try { data = JSON.parse(body); }
+        catch (e) {
+          var platformMessage = body.replace(/\s+/g, ' ').trim().slice(0, 500);
+          throw new Error(platformMessage || fallback + ' (HTTP ' + res.status + ')');
+        }
+      }
+      if (!res.ok) throw new Error(errorMessage(data, fallback + ' (HTTP ' + res.status + ')'));
+      if (!data) throw new Error(fallback + ': empty response');
+      return data;
     }
 
     // Reads a newline-delimited-JSON response as it arrives, calling onEvent for each line as
@@ -5084,15 +5237,14 @@ const DASHBOARD_PAGE = `<!doctype html>
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ provider: provider }),
         });
-        var profileData = await profileRes.json();
-        if (!profileRes.ok) throw new Error(errorMessage(profileData, 'profile_generation_failed'));
+        var profileData = await requireJsonResponse(profileRes, 'profile_generation_failed');
 
         var saveRes = await api('/profile/structured', {
           method: 'PUT',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ structured: profileData.draft_structured }),
         });
-        if (!saveRes.ok) throw new Error(errorMessage(await saveRes.json(), 'profile_save_failed'));
+        await requireJsonResponse(saveRes, 'profile_save_failed');
         renderStructuredProfileView('resume-profile-view', profileData.draft_structured);
         statusEl.textContent = 'Profile ready. Rendering the master resume…';
 
@@ -5101,8 +5253,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ provider: provider }),
         });
-        var data = await res.json();
-        if (!res.ok) throw new Error(errorMessage(data, 'generation_failed'));
+        var data = await requireJsonResponse(res, 'master_resume_generation_failed');
         statusEl.textContent =
           'Archive built: ' + data.roles + ' role' + (data.roles === 1 ? '' : 's') + ', ' +
           data.bullets + ' accomplishment' + (data.bullets === 1 ? '' : 's') + ' on file.';
@@ -5429,7 +5580,6 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     var allCompanies = [];
     var allJobs = [];
-    var pfLastCounts = null;
 
     function matchesFilter(haystack, needle) {
       if (!needle) return true;
@@ -5589,19 +5739,35 @@ const DASHBOARD_PAGE = `<!doctype html>
       var withJobs = allCompanies.filter(function (c) { return c.open_jobs > 0; }).length;
       var unscannableCount = allCompanies.filter(isUnscannable).length;
       document.getElementById('companies-summary').innerHTML = '';
-      document.getElementById('companies-summary').appendChild(
-        el('span', {}, [
-          el('strong', { textContent: String(allCompanies.length) }),
-          // "not scanned yet" = board-check hasn't run on it; "can't be scanned" = it ran (or the
-          // site never resolved) and there's nothing to read. Kept as separate counts since only
-          // the first one means "scanning again would help."
-          el('span', { textContent: ' compan' + (allCompanies.length === 1 ? 'y' : 'ies') +
-            ' · ' + withJobs + ' with open roles · ' + (data.unscanned || 0) + ' not scanned yet' +
-            (unscannableCount ? ' · ' + unscannableCount + " can't be scanned" : '') +
-            (data.off_target ? ' · ' + data.off_target + ' outside your locations' : '') +
-            (data.desired_locations ? ' · limited to ' + data.desired_locations : ' · no location limit set') }),
-        ]),
-      );
+      var summaryChildren = [
+        el('strong', { textContent: String(allCompanies.length) }),
+        // "not scanned yet" = board-check hasn't run on it; "can't be scanned" = it ran (or the
+        // site never resolved) and there's nothing to read. Kept as separate counts since only
+        // the first one means "scanning again would help."
+        el('span', { textContent: ' compan' + (allCompanies.length === 1 ? 'y' : 'ies') +
+          ' · ' + withJobs + ' with open roles · ' + (data.unscanned || 0) + ' not scanned yet · ' }),
+      ];
+      if (unscannableCount) {
+        // The count alone isn't actionable -- it just names a number with no way to act on it from
+        // here, which is worse than not saying it at all. Make it do the thing you'd otherwise have
+        // to scroll up and find a checkbox for.
+        var unscannableLink = el('button', {
+          className: 'text-link', type: 'button',
+          textContent: unscannableCount + " can't be scanned",
+        });
+        unscannableLink.addEventListener('click', function () {
+          var toggle = document.getElementById('companies-show-unscannable');
+          toggle.checked = true;
+          renderCompanies();
+          toggle.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+        summaryChildren.push(unscannableLink);
+        summaryChildren.push(el('span', { textContent: ' · ' }));
+      }
+      summaryChildren.push(el('span', { textContent:
+        (data.off_target ? data.off_target + ' outside your locations · ' : '') +
+        (data.desired_locations ? 'limited to ' + data.desired_locations : 'no location limit set') }));
+      document.getElementById('companies-summary').appendChild(el('span', {}, summaryChildren));
       renderCompanyLocations();
       renderCompanies();
       renderScanSummary();
@@ -5632,7 +5798,9 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     document.getElementById('companies-discover-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('companies-discover-status');
-      statusEl.textContent = 'Searching and checking each site resolves… this takes a moment.';
+      var button = this;
+      button.disabled = true;
+      statusEl.textContent = 'Starting…';
       statusEl.className = 'status';
       try {
         var res = await api('/companies/discover', {
@@ -5644,8 +5812,25 @@ const DASHBOARD_PAGE = `<!doctype html>
             focus: document.getElementById('company-focus').value,
           }),
         });
-        var data = await res.json();
-        if (!res.ok) throw new Error(errorMessage(data, 'discovery_failed'));
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'discovery_failed'));
+        var data = await readNdjson(res, function (event) {
+          if (event.stage === 'propose') {
+            statusEl.textContent = event.message;
+            return;
+          }
+          // The first 'verify' event (done=0) carries the propose/dedupe/location breakdown before
+          // any site check has even started -- showing it immediately is what answers "why so few"
+          // without waiting for the slowest part (the website checks) to finish first.
+          var prefix = 'Proposed ' + event.proposed + '.' +
+            (event.duplicates ? ' ' + event.duplicates + ' already on your list.' : '') +
+            (event.off_target ? ' ' + event.off_target + ' outside your locations.' : '');
+          if (!event.total) {
+            statusEl.textContent = prefix + (event.proposed ? ' Nothing new left to check.' : '');
+            return;
+          }
+          statusEl.textContent = prefix + ' Checking ' + event.done + ' of ' + event.total +
+            (event.company ? ' (' + event.company + (event.done ? (event.reachable ? ', reachable' : ", couldn't be reached") : '') + ')' : '') + '…';
+        });
         var parts = ['Added ' + data.added + ' new.'];
         if (data.duplicates) parts.push(data.duplicates + ' already on your list.');
         if (data.off_target) {
@@ -5658,6 +5843,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
       }
     });
 
@@ -5692,6 +5879,10 @@ const DASHBOARD_PAGE = `<!doctype html>
               (round > 1 ? 'Round ' + round + ': ' : '') +
               'Scanning… ' + event.done + ' of ' + event.total + ' compan' + (event.total === 1 ? 'y' : 'ies') +
               ' (' + event.company + (event.new_jobs ? ', ' + event.new_jobs + ' new' : '') + ')';
+            // New listings land as unassessed the moment they're inserted -- grow the Search tab's
+            // pipeline diagram live as each company's board read completes, not only after this
+            // whole (possibly multi-round) scan finishes.
+            pfBumpScanned(event.new_jobs);
           });
           totalScanned += data.scanned;
           totalNew += data.new_listings;
@@ -6153,6 +6344,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       button.disabled = true;
       statusEl.textContent = 'Screening listings, then assessing the ones worth a closer look…';
       statusEl.className = 'status';
+      pfBeginRun();
       try {
         var res = await api('/jobs/process', {
           method: 'POST',
@@ -6164,7 +6356,14 @@ const DASHBOARD_PAGE = `<!doctype html>
           statusEl.textContent = (event.stage === 'screen'
             ? 'Step 1 of 2 — quick screen: '
             : 'Step 2 of 2 — detailed scoring: ') + event.done + ' of ' + event.total;
+          // Real per-batch accept/reject counts, not a guess from done/total -- see
+          // pfApplyRunEvent. This is what makes the pipeline diagram move live, batch by batch,
+          // while this run is still in flight rather than only jumping once at the very end.
+          pfApplyRunEvent(event);
         });
+        // The server's own authoritative counts, reconciling away any drift the live per-batch
+        // deltas above might have accumulated.
+        setPfCounts(data.counts || {});
         var counts = data.counts || {};
         var left = (counts.unassessed || 0) + (counts.screened_in || 0);
         var parts = [];
@@ -6185,249 +6384,321 @@ const DASHBOARD_PAGE = `<!doctype html>
     });
 
     // ---- Pipeline flow diagram (Search tab) --------------------------------------------------
-    // A small sankey of where scanned postings currently sit. Two real split points -- the cheap
-    // screen, then the detailed pass -- so this is two branch levels, not a generic n-level sankey:
-    // col0 is a single "all scanned postings" root; col1 is what the screen did with them (not
-    // screened yet / screened out / passed); col2 is what the detailed pass did with whatever
-    // passed (still queued / matched / ruled out). Hand-laying-out two fixed branch points is far
-    // simpler and more robust than a general sankey-layout algorithm for a shape this small.
-    var PF_GAP = 10;
-    var PF_BAR = 14;
-    var PF_COLOR = { good: 'var(--success)', bad: 'var(--error)', pending: 'var(--warning)', neutral: 'var(--text-muted)' };
+    // A live sankey of where scanned postings currently sit, built once as persistent SVG nodes
+    // and then only ever mutated -- not rebuilt from scratch on every update -- so a change can be
+    // eased smoothly instead of jumping. Two real branch points: the cheap screen (screened out /
+    // screened in), then the detailed pass on whatever passed it (ruled out / recommended).
+    // Not-interested/Interested/Applied aren't shown -- this page is about finding matches, not
+    // the human review funnel after it; Interested/Applied postings are folded into "Recommended"
+    // here since that's still what they were found as.
+    //
+    // setPfCounts() is the single entry point, same idea as a real-events-call-decideNext design:
+    // it's called with the authoritative shape jobPipelineCounts() returns (every full /jobs load
+    // reconciles from it), and nudged with real per-batch deltas while a scan or a Find-my-matches
+    // run is actively in flight, via pfBumpScanned() and pfApplyRunEvent() below. No probability or
+    // random weighting is needed anywhere here, unlike a simulation that has to guess outcomes in
+    // advance -- the real split is already known by the time a batch finishes, so it's just assigned.
+    var PF_NODES = [
+      { id: 'scanned', label: 'Scanned postings', stage: 0, kind: 'neutral' },
+      { id: 'screen_pending', label: 'Not screened yet', stage: 1, kind: 'pending' },
+      { id: 'screen_rejected', label: 'Screened out', stage: 1, kind: 'reject' },
+      { id: 'screen_accepted', label: 'Passed screening', stage: 1, kind: 'neutral' },
+      { id: 'fit_pending', label: 'Awaiting review', stage: 2, kind: 'pending' },
+      { id: 'fit_rejected', label: 'Ruled out', stage: 2, kind: 'reject' },
+      { id: 'fit_recommended', label: 'Recommended', stage: 2, kind: 'success' },
+    ];
+    var PF_BRANCHES = {
+      scanned: ['screen_pending', 'screen_rejected', 'screen_accepted'],
+      screen_accepted: ['fit_pending', 'fit_rejected', 'fit_recommended'],
+    };
+    var PF_STAGE_TITLES = ['Scanned', 'Screening', 'Fit review'];
+    var PF_KIND_COLOR = { neutral: 'var(--text-muted)', pending: 'var(--warning)', reject: 'var(--error)', success: 'var(--success)' };
 
-    function pfFlowData(counts) {
-      var notScreened = counts.unassessed || 0;
-      var screenedOut = counts.screened_out || 0;
-      var waiting = counts.screened_in || 0;
-      var matches = (counts.strong || 0) + (counts.possible || 0);
-      var ruledOut = counts.reject || 0;
-      var passedScreen = waiting + matches + ruledOut;
-      var total = notScreened + screenedOut + passedScreen;
-      if (!total) return null;
-      var col1 = [
-        { id: 'notScreened', label: 'Not screened yet', value: notScreened, kind: 'pending' },
-        { id: 'screenedOut', label: 'Screened out', value: screenedOut, kind: 'bad' },
-        { id: 'passedScreen', label: 'Passed screening', value: passedScreen, kind: 'neutral' },
-      ].filter(function (n) { return n.value > 0; });
-      var col2 = [
-        { id: 'waiting', label: 'Awaiting review', value: waiting, kind: 'pending' },
-        { id: 'matches', label: 'Matches', value: matches, kind: 'good' },
-        { id: 'ruledOut', label: 'Ruled out', value: ruledOut, kind: 'bad' },
-      ].filter(function (n) { return n.value > 0; });
-      return { total: total, root: { id: 'total', label: 'Scanned postings', value: total, kind: 'neutral' }, col1: col1, col2: col2 };
-    }
+    var PF_VB_W = 900, PF_VB_H = 340;
+    var PF_MARGIN_TOP = 26, PF_MARGIN_BOTTOM = 8;
+    var PF_USABLE_H = PF_VB_H - PF_MARGIN_TOP - PF_MARGIN_BOTTOM;
+    var PF_NODE_W = 10;
+    var PF_MIN_H = 6;
+    var PF_ROW_GAP = 26; // generous on purpose: each node's 2-line label needs real clearance from its neighbors, not just its own (possibly tiny) bar height
+    var PF_SOURCE_HEIGHT = 200; // the fixed 100% reference height "Scanned postings" renders at
+    var PF_COL_MARGIN = 14;
+    var PF_COL_STEP = 300;
+    var PF_SMOOTH_RATE = 6;
 
-    // Positions every node along a single "main axis" (0..mainAvail), independent of whether that
-    // axis ends up drawn as screen Y (left-to-right layout) or screen X (stacked-rows layout) --
-    // the SVG builder below is the only thing that knows which. A ribbon's thickness at its PARENT
-    // end is a proportional slice of the parent's own rendered length (so sibling ribbons exactly
-    // tile the parent with no gap); at its CHILD end it's the child's own bar length. Those two
-    // don't have to match -- col2 has its own gap overhead from being 1-3 separately spaced bars,
-    // so its scale is derived from the span passedScreen actually occupies in col1, not reused
-    // wholesale from col0/col1's scale. A tapering ribbon is normal sankey behavior, not a bug.
-    function pfLayout(flow, mainAvail) {
-      var maxGaps = Math.max(flow.col1.length - 1, flow.col2.length - 1, 0);
-      var scale = (mainAvail - PF_GAP * maxGaps) / flow.total;
-      if (!isFinite(scale) || scale <= 0) scale = mainAvail / flow.total;
+    var pfNodeMap = {};
+    PF_NODES.forEach(function (n) {
+      pfNodeMap[n.id] = n;
+      n.x = PF_COL_MARGIN + n.stage * PF_COL_STEP;
+      n.width = PF_NODE_W;
+      n.dispHeight = PF_MIN_H;
+      n.y = PF_MARGIN_TOP; n.cy = PF_MARGIN_TOP;
+    });
+    var pfStageGroups = [[], [], []];
+    PF_NODES.forEach(function (n) { pfStageGroups[n.stage].push(n.id); });
 
-      function stack(nodes, avail) {
-        var lenSum = 0, i;
-        for (i = 0; i < nodes.length; i++) lenSum += nodes[i].value * scale;
-        var span = lenSum + PF_GAP * (nodes.length - 1);
-        var cursor = (avail - span) / 2;
-        for (i = 0; i < nodes.length; i++) {
-          nodes[i].mainLen = nodes[i].value * scale;
-          nodes[i].mainStart = cursor;
-          cursor += nodes[i].mainLen + PF_GAP;
-        }
-      }
-
-      var root = flow.root;
-      root.mainLen = root.value * scale;
-      root.mainStart = (mainAvail - root.mainLen) / 2;
-      stack(flow.col1, mainAvail);
-
-      var passedNode = null, i;
-      for (i = 0; i < flow.col1.length; i++) { if (flow.col1[i].id === 'passedScreen') passedNode = flow.col1[i]; }
-      if (passedNode && flow.col2.length) {
-        var scale2 = (passedNode.mainLen - PF_GAP * (flow.col2.length - 1)) / passedNode.value;
-        if (!isFinite(scale2) || scale2 <= 0) scale2 = passedNode.mainLen / passedNode.value;
-        var cursor2 = passedNode.mainStart;
-        for (i = 0; i < flow.col2.length; i++) {
-          flow.col2[i].mainLen = flow.col2[i].value * scale2;
-          flow.col2[i].mainStart = cursor2;
-          cursor2 += flow.col2[i].mainLen + PF_GAP;
-        }
-      }
-
-      var links = [], cursorSrc = root.mainStart;
-      for (i = 0; i < flow.col1.length; i++) {
-        var n = flow.col1[i], thick = n.value * scale;
-        links.push({ target: n, fromCol: 0, toCol: 1, kind: n.kind, srcStart: cursorSrc, srcLen: thick, dstStart: n.mainStart, dstLen: n.mainLen });
-        cursorSrc += thick;
-      }
-      if (passedNode) {
-        var cursorSrc2 = passedNode.mainStart;
-        for (i = 0; i < flow.col2.length; i++) {
-          var n2 = flow.col2[i], thick2 = n2.value * scale;
-          links.push({ target: n2, fromCol: 1, toCol: 2, kind: n2.kind, srcStart: cursorSrc2, srcLen: thick2, dstStart: n2.mainStart, dstLen: n2.mainLen });
-          cursorSrc2 += thick2;
-        }
-      }
-      return links;
-    }
-
-    function pfEsc(s) {
-      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
-    function pfCount(n) {
-      return n >= 10000 ? Math.round(n / 1000) + 'k' : n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
-    }
-    // A background halo behind every label -- small labels sit right next to (sometimes over) a
-    // ribbon curve in a diagram this compact, and a solid halo keeps them readable regardless of
-    // what's underneath, rather than trying to keep every label clear of every ribbon by hand.
-    function pfLabelHalo(cx, top, lines, anchor) {
-      var w = 0, i;
-      for (i = 0; i < lines.length; i++) w = Math.max(w, lines[i].text.length * lines[i].size * 0.58);
-      var h = lines.length === 2 ? 24 : 13;
-      var x = anchor === 'middle' ? cx - w / 2 - 4 : anchor === 'end' ? cx - w - 4 : cx - 4;
-      return '<rect class="pf-halo" x="' + x + '" y="' + (top - 2) + '" width="' + (w + 8) + '" height="' + h + '" rx="3" fill="var(--surface)" fill-opacity="0.82"></rect>';
-    }
-    // At an extreme value imbalance (a 1-vs-999 split), a node's bar can be a sliver sitting right
-    // at the edge of the diagram -- its label, centered on that sliver, would then extend past the
-    // edge and get clipped. clampBounds (when given) nudges the label's anchor coordinate inward
-    // by half its own estimated footprint so the whole label always stays inside the viewBox,
-    // rather than clipping (per the "measure first, a label never gets clipped" rule).
-    function pfLabelText(cx, midY, node, anchor, clampBounds) {
-      var lines = [
-        { text: pfCount(node.value), size: 11, cls: 'pf-node-value' },
-        { text: node.label, size: 8.5, cls: 'pf-node-sub' },
-      ];
-      if (clampBounds) {
-        var maxLineW = 0, li;
-        for (li = 0; li < lines.length; li++) maxLineW = Math.max(maxLineW, lines[li].text.length * lines[li].size * 0.58);
-        if (clampBounds.axis === 'x') {
-          var halfW = maxLineW / 2 + 4;
-          cx = Math.max(clampBounds.min + halfW, Math.min(clampBounds.max - halfW, cx));
-        } else {
-          var halfH = 14;
-          midY = Math.max(clampBounds.min + halfH, Math.min(clampBounds.max - halfH, midY));
-        }
-      }
-      var halo = pfLabelHalo(cx, midY - 12, lines, anchor);
-      var text = '<text x="' + cx + '" y="' + (midY - 1) + '" text-anchor="' + anchor + '" class="pf-node-value">' + pfEsc(lines[0].text) +
-        '</text><text x="' + cx + '" y="' + (midY + 10) + '" text-anchor="' + anchor + '" class="pf-node-sub">' + pfEsc(lines[1].text) + '</text>';
-      return halo + text;
-    }
-
-    function pfRibbon(orientation, cross, link) {
-      var d, cd, id = 'pf-link-' + link.target.id;
-      if (orientation === 'h') {
-        var xA = cross[link.fromCol] + PF_BAR, xB = cross[link.toCol];
-        var ay0 = link.srcStart, ay1 = link.srcStart + link.srcLen, by0 = link.dstStart, by1 = link.dstStart + link.dstLen;
-        var mx = (xA + xB) / 2;
-        d = 'M' + xA + ',' + ay0 + ' C' + mx + ',' + ay0 + ' ' + mx + ',' + by0 + ' ' + xB + ',' + by0 +
-          ' L' + xB + ',' + by1 + ' C' + mx + ',' + by1 + ' ' + mx + ',' + ay1 + ' ' + xA + ',' + ay1 + ' Z';
-        cd = 'M' + xA + ',' + ((ay0 + ay1) / 2) + ' C' + mx + ',' + ((ay0 + ay1) / 2) + ' ' + mx + ',' + ((by0 + by1) / 2) + ' ' + xB + ',' + ((by0 + by1) / 2);
-      } else {
-        var yA = cross[link.fromCol] + PF_BAR, yB = cross[link.toCol];
-        var ax0 = link.srcStart, ax1 = link.srcStart + link.srcLen, bx0 = link.dstStart, bx1 = link.dstStart + link.dstLen;
-        var my = (yA + yB) / 2;
-        d = 'M' + ax0 + ',' + yA + ' C' + ax0 + ',' + my + ' ' + bx0 + ',' + my + ' ' + bx0 + ',' + yB +
-          ' L' + bx1 + ',' + yB + ' C' + bx1 + ',' + my + ' ' + ax1 + ',' + my + ' ' + ax1 + ',' + yA + ' Z';
-        cd = 'M' + ((ax0 + ax1) / 2) + ',' + yA + ' C' + ((ax0 + ax1) / 2) + ',' + my + ' ' + ((bx0 + bx1) / 2) + ',' + my + ' ' + ((bx0 + bx1) / 2) + ',' + yB;
-      }
-      var color = PF_COLOR[link.kind];
-      var dur = (2.4 + (link.dstStart % 3) * 0.3).toFixed(2);
-      var out = '<path d="' + d + '" fill="' + color + '" class="pf-link"></path>';
-      out += '<path id="' + id + '" d="' + cd + '" fill="none" stroke="none"></path>';
-      out += '<circle r="2.6" fill="' + color + '" class="pf-dot"><animateMotion dur="' + dur + 's" repeatCount="indefinite" begin="0s"><mpath href="#' + id + '" xlink:href="#' + id + '"></mpath></animateMotion></circle>';
-      out += '<circle r="2.6" fill="' + color + '" class="pf-dot"><animateMotion dur="' + dur + 's" repeatCount="indefinite" begin="-' + (dur / 2) + 's"><mpath href="#' + id + '" xlink:href="#' + id + '"></mpath></animateMotion></circle>';
-      return out;
-    }
-
-    function pfBuildSvg(counts, containerWidth) {
-      var flow = pfFlowData(counts);
-      if (!flow) return null;
-      var vertical = containerWidth < 480;
-      var body = '', W, H, cross;
-
-      if (!vertical) {
-        W = containerWidth;
-        var MARGIN = 18, SIDE = 10;
-        H = 232;
-        var mainAvail = H - MARGIN * 2;
-        var links = pfLayout(flow, mainAvail);
-        // Three columns need three label gaps, not two -- one after each bar, including the last
-        // (its label reads to the right of it, same as the other two, and needs its own reserved
-        // room rather than sharing the right-hand margin).
-        var labelGap = (W - SIDE * 2 - 3 * PF_BAR) / 3;
-        cross = [SIDE, SIDE + PF_BAR + labelGap, SIDE + 2 * (PF_BAR + labelGap)];
-
-        var nodesByCol = [[flow.root], flow.col1, flow.col2];
-        var i, j;
-        for (i = 0; i < links.length; i++) body += pfRibbon('h', cross, links[i]);
-        for (i = 0; i < 3; i++) {
-          for (j = 0; j < nodesByCol[i].length; j++) {
-            var n = nodesByCol[i][j];
-            var x = cross[i], y = MARGIN + n.mainStart;
-            body += '<rect class="pf-node-rect" x="' + x + '" y="' + y + '" width="' + PF_BAR + '" height="' + n.mainLen + '" rx="3" fill="' + PF_COLOR[n.kind] + '"></rect>';
-            body += pfLabelText(x + PF_BAR + 6, y + n.mainLen / 2, n, 'start', { axis: 'y', min: 0, max: H });
-          }
-        }
-      } else {
-        W = containerWidth;
-        var MARGINv = 10;
-        var mainAvailV = W - MARGINv * 2;
-        var ROW_GAP = 54, LABEL_H = 30;
-        var row0Y = MARGINv, row1Y = row0Y + PF_BAR + ROW_GAP, row2Y = row1Y + PF_BAR + ROW_GAP;
-        H = row2Y + PF_BAR + LABEL_H + MARGINv;
-        cross = [row0Y, row1Y, row2Y];
-        var linksV = pfLayout(flow, mainAvailV);
-        var nodesByColV = [[flow.root], flow.col1, flow.col2];
-        var ii, jj;
-        for (ii = 0; ii < linksV.length; ii++) body += pfRibbon('v', cross, linksV[ii]);
-        for (ii = 0; ii < 3; ii++) {
-          for (jj = 0; jj < nodesByColV[ii].length; jj++) {
-            var nv = nodesByColV[ii][jj];
-            var nx = MARGINv + nv.mainStart, ny = cross[ii];
-            body += '<rect class="pf-node-rect" x="' + nx + '" y="' + ny + '" width="' + nv.mainLen + '" height="' + PF_BAR + '" rx="3" fill="' + PF_COLOR[nv.kind] + '"></rect>';
-            body += pfLabelText(nx + nv.mainLen / 2, ny + PF_BAR + 16, nv, 'middle', { axis: 'x', min: 0, max: W });
-          }
-        }
-      }
-      return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg">' + body + '</svg>';
-    }
-
-    function renderPipelineDiagram() {
-      var host = document.getElementById('jobs-pipeline');
-      if (!host || !pfLastCounts) return;
-      var svg = pfBuildSvg(pfLastCounts, host.clientWidth || 360);
-      host.innerHTML = svg || '<p class="empty">Scan companies and click "Find my matches" to see your pipeline here.</p>';
-    }
-
-    var pfResizeTimer = null;
-    window.addEventListener('resize', function () {
-      clearTimeout(pfResizeTimer);
-      pfResizeTimer = setTimeout(renderPipelineDiagram, 150);
+    var pfEdges = {};
+    var pfChildEdges = {}; var pfParentEdges = {};
+    PF_NODES.forEach(function (n) { pfChildEdges[n.id] = []; pfParentEdges[n.id] = []; });
+    Object.keys(PF_BRANCHES).forEach(function (source) {
+      PF_BRANCHES[source].forEach(function (target) {
+        var edge = { source: source, target: target, committed: 0, sy0: 0, sy1: 0, ty0: 0, ty1: 0 };
+        pfEdges[source + '->' + target] = edge;
+        pfChildEdges[source].push(edge);
+        pfParentEdges[target].push(edge);
+      });
     });
 
-    function renderJobPipeline(counts) {
-      pfLastCounts = counts;
-      var matches = (counts.strong || 0) + (counts.possible || 0);
-      var queued = (counts.unassessed || 0) + (counts.screened_in || 0);
-      document.getElementById('jobs-pipeline-summary').textContent =
-        matches + ' match' + (matches === 1 ? '' : 'es') +
-        ', ' + queued + ' waiting to be filtered' +
-        ', ' + (counts.screened_out || 0) + ' dropped in screening' +
-        ', ' + (counts.reject || 0) + ' ruled out.';
-      renderPipelineDiagram();
+    var pfSourceTotal = 0;
+    var pfLastCountsPayload = null;
+    var pfAnimating = false;
+    var pfLastFrame = 0;
+
+    function pfDerivedTotal(nodeId) {
+      if (nodeId === 'scanned') return pfSourceTotal;
+      var edges = pfParentEdges[nodeId], sum = 0;
+      for (var i = 0; i < edges.length; i++) sum += edges[i].committed;
+      return sum;
+    }
+    function pfTargetHeight(n) {
+      if (n.id === 'scanned') return PF_SOURCE_HEIGHT;
+      return Math.max(PF_MIN_H, (pfDerivedTotal(n.id) / Math.max(1, pfSourceTotal)) * PF_SOURCE_HEIGHT);
     }
 
-    // The Search tab isn't the active panel on first load (Roles is), so the very first
-    // renderPipelineDiagram() call above measures a hidden (0-width) container and draws nothing
-    // useful. Re-measure and redraw once the panel actually becomes visible.
-    document.querySelector('[data-tab="search"]').addEventListener('click', renderPipelineDiagram);
+    function setPfCounts(counts) {
+      pfLastCountsPayload = counts;
+      var unassessed = counts.unassessed || 0;
+      var screenedOut = counts.screened_out || 0;
+      var screenedIn = counts.screened_in || 0;
+      var reject = counts.reject || 0;
+      var recommended = (counts.strong || 0) + (counts.possible || 0) + (counts.interested || 0) + (counts.applied || 0);
+      var screenAccepted = screenedIn + reject + recommended;
+
+      pfSourceTotal = unassessed + screenedOut + screenAccepted;
+      pfEdges['scanned->screen_pending'].committed = unassessed;
+      pfEdges['scanned->screen_rejected'].committed = screenedOut;
+      pfEdges['scanned->screen_accepted'].committed = screenAccepted;
+      pfEdges['screen_accepted->fit_pending'].committed = screenedIn;
+      pfEdges['screen_accepted->fit_rejected'].committed = reject;
+      pfEdges['screen_accepted->fit_recommended'].committed = recommended;
+
+      document.getElementById('jobs-pipeline-summary').textContent =
+        recommended + ' match' + (recommended === 1 ? '' : 'es') +
+        ', ' + (unassessed + screenedIn) + ' waiting to be filtered' +
+        ', ' + screenedOut + ' dropped in screening' +
+        ', ' + reject + ' ruled out.';
+      document.getElementById('pfStatScanned').textContent = String(pfSourceTotal);
+      document.getElementById('pfStatRecommended').textContent = String(recommended);
+      var totalScreened = screenedOut + screenAccepted;
+      document.getElementById('pfStatScreenRate').textContent = totalScreened ? Math.round(100 * screenAccepted / totalScreened) + '%' : '—';
+      var processed = pfSourceTotal ? Math.round(100 * (pfSourceTotal - unassessed - screenedIn) / pfSourceTotal) : 0;
+      document.getElementById('pfStatProcessed').textContent = processed + '%';
+      document.getElementById('pfProgressFill').style.width = processed + '%';
+
+      pfWake();
+    }
+
+    // Freezes the counts as of the moment a Find-my-matches run starts, so live per-batch deltas
+    // during that run (see pfApplyRunEvent) have a stable base to add onto rather than drifting
+    // against whatever setPfCounts happened to see last.
+    var pfRunSnapshot = null;
+    var pfRunAssessBase = null;
+    function pfBeginRun() {
+      pfRunSnapshot = pfLastCountsPayload
+        ? Object.assign({}, pfLastCountsPayload)
+        : { unassessed: 0, screened_out: 0, screened_in: 0, reject: 0, strong: 0, possible: 0, interested: 0, applied: 0 };
+      pfRunAssessBase = null;
+    }
+    function pfApplyRunEvent(event) {
+      if (!pfRunSnapshot) return;
+      var next = Object.assign({}, pfLastCountsPayload || pfRunSnapshot);
+      if (event.stage === 'screen') {
+        next.unassessed = Math.max(0, pfRunSnapshot.unassessed - event.done);
+        next.screened_out = pfRunSnapshot.screened_out + (event.screened_out || 0);
+        next.screened_in = pfRunSnapshot.screened_in + (event.screened_in || 0);
+      } else if (event.stage === 'assess') {
+        // Frozen the instant assess events start, from whatever screened_in ended up at when the
+        // screen stage (above) finished -- not the pre-run snapshot, which would still include
+        // postings this same run only just moved out of "not screened yet".
+        if (pfRunAssessBase === null) pfRunAssessBase = next.screened_in;
+        next.screened_in = Math.max(0, pfRunAssessBase - event.done);
+        next.reject = pfRunSnapshot.reject + (event.discarded || 0);
+        next.possible = pfRunSnapshot.possible + (event.recommended || 0);
+      }
+      setPfCounts(next);
+    }
+    // Scanning company boards finds new postings before any screening happens -- they land
+    // straight in "not screened yet", growing the Scanned total live as each company's board read
+    // completes, same idea as the assess-run deltas above but simpler (only one bucket changes).
+    function pfBumpScanned(newJobs) {
+      if (!newJobs) return;
+      var base = pfLastCountsPayload || { unassessed: 0, screened_out: 0, screened_in: 0, reject: 0, strong: 0, possible: 0, interested: 0, applied: 0 };
+      var next = Object.assign({}, base);
+      next.unassessed = (base.unassessed || 0) + newJobs;
+      setPfCounts(next);
+    }
+
+    function pfLayoutColumns() {
+      pfStageGroups.forEach(function (ids) {
+        var totalH = 0;
+        ids.forEach(function (id) { totalH += pfNodeMap[id].dispHeight; });
+        totalH += PF_ROW_GAP * (ids.length - 1);
+        var y = PF_MARGIN_TOP + (PF_USABLE_H - totalH) / 2;
+        ids.forEach(function (id) {
+          var n = pfNodeMap[id];
+          n.y = y; n.cy = y + n.dispHeight / 2;
+          y += n.dispHeight + PF_ROW_GAP;
+        });
+      });
+    }
+    function pfRecomputeEdgeSlices() {
+      PF_NODES.forEach(function (n) {
+        var outs = pfChildEdges[n.id].slice().sort(function (a, b) { return pfNodeMap[a.target].cy - pfNodeMap[b.target].cy; });
+        var outDenom = 0; outs.forEach(function (e) { outDenom += e.committed; }); outDenom = Math.max(1, outDenom);
+        var cum = 0;
+        outs.forEach(function (e) {
+          var h = (e.committed / outDenom) * n.dispHeight;
+          e.sy0 = n.y + cum; e.sy1 = e.sy0 + h; cum += h;
+        });
+        var ins = pfParentEdges[n.id].slice().sort(function (a, b) { return pfNodeMap[a.source].cy - pfNodeMap[b.source].cy; });
+        var inDenom = 0; ins.forEach(function (e) { inDenom += e.committed; }); inDenom = Math.max(1, inDenom);
+        cum = 0;
+        ins.forEach(function (e) {
+          var h = (e.committed / inDenom) * n.dispHeight;
+          e.ty0 = n.y + cum; e.ty1 = e.ty0 + h; cum += h;
+        });
+      });
+    }
+
+    var PF_SVG_NS = 'http://www.w3.org/2000/svg';
+    var PF_XLINK_NS = 'http://www.w3.org/1999/xlink';
+    function pfEl(tag, attrs) {
+      var e = document.createElementNS(PF_SVG_NS, tag);
+      for (var k in attrs) e.setAttribute(k, attrs[k]);
+      return e;
+    }
+
+    var pfSvg = document.getElementById('pf-svg');
+    pfSvg.setAttribute('viewBox', '0 0 ' + PF_VB_W + ' ' + PF_VB_H);
+    PF_STAGE_TITLES.forEach(function (title, i) {
+      var t = pfEl('text', { x: PF_COL_MARGIN + i * PF_COL_STEP + PF_NODE_W / 2, y: PF_MARGIN_TOP - 12, 'text-anchor': 'middle', class: 'pf-stage-title' });
+      t.textContent = title;
+      pfSvg.appendChild(t);
+    });
+
+    var pfFlowLayer = pfEl('g', {});
+    pfSvg.appendChild(pfFlowLayer);
+    var pfPathByKey = {}, pfGuideByKey = {}, pfDotsByKey = {};
+    Object.keys(pfEdges).forEach(function (key) {
+      var edge = pfEdges[key];
+      var safeId = 'pf-guide-' + key.replace(/[^a-zA-Z0-9]/g, '-');
+      var path = pfEl('path', { class: 'pf-link', d: '' });
+      var guide = pfEl('path', { id: safeId, d: '', fill: 'none', stroke: 'none' });
+      pfFlowLayer.appendChild(path);
+      pfFlowLayer.appendChild(guide);
+      pfPathByKey[key] = path;
+      pfGuideByKey[key] = guide;
+
+      // Two small dots per edge, riding a native SVG animateMotion along the guide path --
+      // decorative ("flow is happening here"), not one particle per real posting: with real
+      // counts running into the hundreds or thousands, a dot per item would be both meaningless
+      // on screen and slow. Native SMIL animation also means this never needs the JS frame loop
+      // to keep running just to keep dots moving. Hidden (in pfRender) whenever this edge's real
+      // count is zero, so an empty branch doesn't show phantom motion that never happened.
+      var dots = [];
+      for (var d = 0; d < 2; d++) {
+        var dur = (2.6 + d * 0.4).toFixed(2);
+        var dot = pfEl('circle', { r: 2.4, class: 'pf-dot', fill: PF_KIND_COLOR[pfNodeMap[edge.target].kind] || 'var(--text-muted)' });
+        var anim = pfEl('animateMotion', { dur: dur + 's', repeatCount: 'indefinite', begin: (d * dur / 2) + 's' });
+        var mpath = pfEl('mpath', {});
+        mpath.setAttributeNS(PF_XLINK_NS, 'href', '#' + safeId);
+        mpath.setAttribute('href', '#' + safeId);
+        anim.appendChild(mpath);
+        dot.appendChild(anim);
+        pfFlowLayer.appendChild(dot);
+        dots.push(dot);
+      }
+      pfDotsByKey[key] = dots;
+    });
+
+    var pfNodeLayer = pfEl('g', {});
+    pfSvg.appendChild(pfNodeLayer);
+    var pfNodeVisuals = {};
+    PF_NODES.forEach(function (n) {
+      var rect = pfEl('rect', { class: 'pf-node-rect', x: n.x, y: n.y, width: n.width, height: n.dispHeight, rx: 2, fill: 'var(--surface-2)', stroke: PF_KIND_COLOR[n.kind] });
+      var tx = n.x + n.width + 8;
+      // A label can end up sitting inside a wide ribbon (e.g. "Scanned postings", dead center of
+      // the diagram, with three stacked col1 ribbons passing directly behind it) -- a halo behind
+      // the text keeps it legible regardless of what color is behind it, rather than hoping every
+      // ribbon stays out of the way.
+      var halo = pfEl('rect', { class: 'pf-label-halo', x: tx - 4, y: n.cy - 14, width: 90, height: 30, rx: 3, fill: 'var(--surface)', 'fill-opacity': 0.85 });
+      var label = pfEl('text', { x: tx, y: n.cy - 2, class: 'pf-node-label' });
+      label.textContent = n.label;
+      var meta = pfEl('text', { x: tx, y: n.cy + 12, class: 'pf-node-count', fill: PF_KIND_COLOR[n.kind] });
+      meta.textContent = '0';
+      pfNodeLayer.appendChild(halo); pfNodeLayer.appendChild(rect); pfNodeLayer.appendChild(label); pfNodeLayer.appendChild(meta);
+      pfNodeVisuals[n.id] = { rect: rect, halo: halo, label: label, meta: meta };
+    });
+
+    function pfRender() {
+      PF_NODES.forEach(function (n) {
+        var v = pfNodeVisuals[n.id];
+        v.rect.setAttribute('y', n.y);
+        v.rect.setAttribute('height', n.dispHeight);
+        v.halo.setAttribute('y', n.cy - 14);
+        v.label.setAttribute('y', n.cy - 2);
+        v.meta.setAttribute('y', n.cy + 12);
+        var total = Math.round(pfDerivedTotal(n.id));
+        var pct = n.id === 'scanned' ? 'total' : (pfSourceTotal ? (100 * total / pfSourceTotal).toFixed(1) + '%' : '0%');
+        v.meta.textContent = total + ' · ' + pct;
+      });
+      Object.keys(pfEdges).forEach(function (key) {
+        var e = pfEdges[key];
+        var s = pfNodeMap[e.source], t = pfNodeMap[e.target];
+        var x0 = s.x + s.width, x1 = t.x, midX = (x0 + x1) / 2;
+        var d = 'M' + x0 + ',' + e.sy0 + ' C' + midX + ',' + e.sy0 + ' ' + midX + ',' + e.ty0 + ' ' + x1 + ',' + e.ty0 +
+          ' L' + x1 + ',' + e.ty1 + ' C' + midX + ',' + e.ty1 + ' ' + midX + ',' + e.sy1 + ' ' + x0 + ',' + e.sy1 + ' Z';
+        pfPathByKey[key].setAttribute('d', d);
+        pfPathByKey[key].setAttribute('fill', PF_KIND_COLOR[t.kind] || 'var(--text-muted)');
+        pfPathByKey[key].setAttribute('fill-opacity', 0.4);
+        var gy0 = (e.sy0 + e.sy1) / 2, gy1 = (e.ty0 + e.ty1) / 2;
+        pfGuideByKey[key].setAttribute('d', 'M' + x0 + ',' + gy0 + ' C' + midX + ',' + gy0 + ' ' + midX + ',' + gy1 + ' ' + x1 + ',' + gy1);
+        // No real flow on this branch yet -- don't show particles pretending there is.
+        var display = e.committed > 0 ? '' : 'none';
+        pfDotsByKey[key].forEach(function (dot) { dot.style.display = display; });
+      });
+    }
+
+    function pfFrame(now) {
+      var dt = Math.min(0.1, (now - pfLastFrame) / 1000);
+      pfLastFrame = now;
+      var settled = true;
+      PF_NODES.forEach(function (n) {
+        var target = pfTargetHeight(n);
+        if (Math.abs(target - n.dispHeight) > 0.3) settled = false;
+        var alpha = 1 - Math.exp(-dt * PF_SMOOTH_RATE);
+        n.dispHeight += (target - n.dispHeight) * alpha;
+      });
+      pfLayoutColumns();
+      pfRecomputeEdgeSlices();
+      pfRender();
+      if (settled) { pfAnimating = false; return; }
+      requestAnimationFrame(pfFrame);
+    }
+    function pfWake() {
+      if (pfAnimating) return;
+      pfAnimating = true;
+      pfLastFrame = performance.now();
+      requestAnimationFrame(pfFrame);
+    }
+
+    function renderJobPipeline(counts) {
+      setPfCounts(counts);
+    }
+
+    // rAF keeps running while a background tab is (mostly) inactive, but some browsers throttle
+    // it heavily -- waking it explicitly when the Search tab becomes visible again catches up any
+    // easing that stalled while it was hidden.
+    document.querySelector('[data-tab="search"]').addEventListener('click', pfWake);
 
     async function loadJobs() {
       var res = await api('/jobs');
@@ -7464,7 +7735,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "GET" && url.pathname === "/companies") return listCompanies(request, env);
     if (request.method === "POST" && url.pathname === "/companies") return createCompany(request, env);
     if (request.method === "POST" && url.pathname === "/companies/bulk") return bulkAddCompanies(request, env);
-    if (request.method === "POST" && url.pathname === "/companies/discover") return discoverCompanies(request, env);
+    if (request.method === "POST" && url.pathname === "/companies/discover") return discoverCompanies(request, env, ctx);
     if (request.method === "POST" && url.pathname === "/companies/scan") return scanCompanies(request, env, ctx);
     const companyMatch = url.pathname.match(/^\/companies\/([^/]+)$/);
     if (request.method === "PATCH" && companyMatch) return updateCompany(request, env, companyMatch[1]);

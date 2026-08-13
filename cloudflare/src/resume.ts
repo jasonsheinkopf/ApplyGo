@@ -27,6 +27,7 @@ import { MASTER_DOCTRINE, RESUME_DOCTRINE } from "./philosophy";
 export interface ResumeEnv extends LlmEnv {
   FILES: R2Bucket;
   BROWSER: BrowserWorker;
+  LOCAL_RENDER_URL?: string;
 }
 
 /** The candidate evidence model: everything a resume may draw on, and nothing it may invent. */
@@ -663,37 +664,76 @@ async function launchBrowser(env: ResumeEnv, attempts = 3) {
   }
 }
 
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/**
+ * Local development does not require a Cloudflare account. `npm run dev` starts a tiny companion
+ * renderer that drives the machine's installed Chrome directly. Miniflare's Browser binding is
+ * still tried first, but if its bundled browser cannot spawn we hand the same HTML to that local
+ * renderer. Production has no LOCAL_RENDER_URL and therefore continues to use Cloudflare only.
+ */
+async function renderWithLocalChrome(env: ResumeEnv, html: string): Promise<Omit<RenderResult, "pdfKey">> {
+  if (!env.LOCAL_RENDER_URL) throw new Error("local_renderer_not_configured");
+  const response = await fetch(`${env.LOCAL_RENDER_URL.replace(/\/$/, "")}/render`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ html }),
+  });
+  const raw = await response.text();
+  let data: { pdf_base64?: string; screenshot_base64?: string; error?: string } = {};
+  try { data = JSON.parse(raw); } catch { /* handled below */ }
+  if (!response.ok || !data.pdf_base64 || !data.screenshot_base64) {
+    throw new Error(data.error || raw || `local_renderer_http_${response.status}`);
+  }
+  return { pdfBytes: base64ToBytes(data.pdf_base64), screenshotBase64: data.screenshot_base64 };
+}
+
 /**
  * One browser session produces both the PDF and the print-media screenshot, so the image the
  * vision reviewer sees is the same rendering the PDF came from.
  */
 export async function renderResumeArtifacts(env: ResumeEnv, resumeId: string, html: string): Promise<RenderResult> {
-  const browser = await launchBrowser(env);
+  let artifacts: Omit<RenderResult, "pdfKey">;
   try {
-    const page = await browser.newPage();
-    // 8.5in x 11in at 96dpi, so CSS inches map to the real page.
-    await page.setViewport({ width: 816, height: 1056 });
-    await page.setContent(html, { waitUntil: "networkidle0" });
-    await page.emulateMediaType("print");
-
-    // page.pdf() returns a length-known buffer; createPDFStream() does not, and R2 rejects
-    // a stream whose length it can't determine up front.
-    const pdf = await page.pdf({
-      format: "letter",
-      printBackground: true,
-      margin: { top: "0in", bottom: "0in", left: "0in", right: "0in" },
-    });
-    const pdfBytes = new Uint8Array(pdf);
-
-    const shot = await page.screenshot({ type: "jpeg", quality: 80, fullPage: true });
-    const screenshotBase64 = bytesToBase64(new Uint8Array(shot));
-
-    const pdfKey = `resumes/${resumeId}.pdf`;
-    await env.FILES.put(pdfKey, pdfBytes, { httpMetadata: { contentType: "application/pdf" } });
-    return { pdfKey, pdfBytes, screenshotBase64 };
-  } finally {
-    await browser.close();
+    const browser = await launchBrowser(env);
+    try {
+      const page = await browser.newPage();
+      // 8.5in x 11in at 96dpi, so CSS inches map to the real page.
+      await page.setViewport({ width: 816, height: 1056 });
+      await page.setContent(html, { waitUntil: "networkidle0" });
+      await page.emulateMediaType("print");
+      const pdf = await page.pdf({
+        format: "letter",
+        printBackground: true,
+        margin: { top: "0in", bottom: "0in", left: "0in", right: "0in" },
+      });
+      const shot = await page.screenshot({ type: "jpeg", quality: 80, fullPage: true });
+      artifacts = {
+        pdfBytes: new Uint8Array(pdf),
+        screenshotBase64: bytesToBase64(new Uint8Array(shot)),
+      };
+    } finally {
+      await browser.close();
+    }
+  } catch (cloudflareError) {
+    try {
+      artifacts = await renderWithLocalChrome(env, html);
+    } catch (localError) {
+      throw new Error(
+        `Cloudflare browser failed: ${(cloudflareError as Error).message}. ` +
+        `Local Chrome fallback failed: ${(localError as Error).message}`,
+      );
+    }
   }
+
+  const pdfKey = `resumes/${resumeId}.pdf`;
+  await env.FILES.put(pdfKey, artifacts.pdfBytes, { httpMetadata: { contentType: "application/pdf" } });
+  return { pdfKey, ...artifacts };
 }
 
 /**

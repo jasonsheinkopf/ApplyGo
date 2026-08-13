@@ -25,7 +25,8 @@
     "enabled": true
   },
   "vars": {
-    "SESSION_DAYS": "90"
+    "SESSION_DAYS": "90",
+    "LOCAL_RENDER_URL": "http://127.0.0.1:8788"
   },
   // Jason's production deployment. Deployed and managed via `--env production`
   // (or Cloudflare Workers Builds, which is configured to use this env) so that

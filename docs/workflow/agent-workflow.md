@@ -11,168 +11,143 @@ application, monitor messages, or model interviews, offers, or an accepted job.
 
 ## End-to-end workflow
 
+Database cylinders are intentionally repeated beside the step that reads or writes them. Every
+cylinder with the same label is the **same underlying store**, not a copy or a new database. This
+local-reference convention keeps persistence explicit without routing long database arrows across
+the workflow. A detailed table-to-field map remains below the diagram.
+
 ```mermaid
 flowchart TD
-    START[User starts or revises a search]:::agent
-    HUMAN_PROFILE[/Human: upload source documents, edit structured profile,<br/>add role signals, preferences, locations, dealbreakers, care-about text/]:::human
-    PROFILE_EXTRACT[LLM_PROFILE_EXTRACT<br/>profile.structure]:::llm
-    ROLE_DRAFT[LLM_ROLE_ANALYSIS<br/>roles.analyze]:::llm
-    TOPIC_DERIVE[LLM_CARE_TOPICS<br/>fit.care_about_topics]:::llm
-    MATCH_PROFILE[Deterministic buildMatchProfile<br/>structured_json to match_profile]:::code
-    PROFILE_DB[(D1 profile/evidence store<br/>candidate_profiles<br/>source_documents<br/>candidate_evidence<br/>application_answers)]:::db
-
-    COMPANY_TRIGGER{Human starts company discovery<br/>or adds companies manually}:::human
+    START[Start or revise search]:::agent
+    SOURCES[/Human uploads documents and adds notes/]:::human
+    PROFILE_LLM[LLM_PROFILE_EXTRACT<br/>profile.structure]:::llm
+    MATCH_PROFILE[buildMatchProfile]:::code
+    ROLES_LLM[LLM_ROLE_ANALYSIS<br/>roles.analyze]:::llm
     COMPANY_LLM[LLM_COMPANY_DISCOVERY<br/>companies.discover]:::llm
-    COMPANY_CHECK[Deterministic validation<br/>normalize URL and name; dedupe;<br/>locationMatches; verifyWebsite]:::code
-    COMPANY_DB[(D1 companies<br/>durable watch list and scan metadata)]:::db
-
-    SCAN_TRIGGER{Human starts board scan<br/>daily guard unless force=true}:::human
-    BOARD_RESOLVE[Deterministic resolveBoard<br/>detect supported ATS and token]:::code
-    ATS[(Official company ATS APIs<br/>Greenhouse, Lever, Ashby,<br/>SmartRecruiters)]:::external
-    FETCH_JOBS[Deterministic fetchBoardJobs<br/>and fetchMissingDescriptions]:::code
-    PRE_FILTER[Deterministic prefilter<br/>locationMatches and filterJobsByRoles]:::code
-    DEDUPE{Unique company_id + external_id<br/>already stored?}:::code
-    JOB_DB[(D1 job_postings<br/>listing, description, fit fields,<br/>human pipeline overrides)]:::db
-
-    ASSESS_TRIGGER{Human clicks assess jobs}:::human
-    QUICK_LLM[LLM_JOB_SCREEN<br/>fit.screen, cheap model, batches]:::llm
-    QUICK_DECISION{screenJobsBatch result}:::code
-    STRONG_LLM[LLM_JOB_FIT<br/>fit.assess, strong model, batches]:::llm
-    FIT_MAP[Deterministic verdictForScore<br/>score to strong / possible / reject]:::code
-    RECOMMENDED[Jobs UI: strong and possible<br/>score, reason, missing evidence, facts]:::agent
-    HUMAN_JOB{Human review<br/>Interested or Reject}:::human
-    FEEDBACK_DB[(D1 job_feedback<br/>only explicit user-written rejection reasons)]:::db
-    REJECTED("REJECTED STATE<br/>Status: reject<br/>Score: 0<br/>Reason: human reason or Not a fit.<br/>Missing: retained<br/>Fit facts: retained<br/>Screened at: retained or null<br/>Assessed at: now<br/>Interested at: null<br/>Requirements: retained or none<br/>Resume ID: none<br/>Cover letter ID: none<br/>Applied at: null<br/>Outcome: rejected"):::terminal
-
-    INTERESTED[Interested job<br/>fit_status=interested; original fit retained]:::agent
-    GAP_QUESTION[LLM_REVIEW_QUESTION<br/>review.question]:::llm
-    HUMAN_GAP[/Human answers job-specific gap question/]:::human
+    COMPANY_CHECK[Validate website, location, and duplicate name]:::code
+    SCAN{Human starts company-board scan}:::human
+    subgraph BOARD_STORAGE_ROW[ ]
+      direction LR
+      BOARD[Resolve ATS and fetch official board jobs]:::code
+      C_UPDATE[(COMPANY STORE)]:::db
+      BOARD -->|write scan metadata| C_UPDATE
+    end
+    subgraph ATS_OFFSET_COLUMN[ ]
+      direction TB
+      ATS_SPACER[ ]:::spacer
+      ATS[(Official company ATS APIs)]:::external
+      ATS_SPACER ~~~ ATS
+    end
+    subgraph PREFILTER_STORAGE_ROW[ ]
+      direction RL
+      P_PREFILTER[(PROFILE STORE)]:::db
+      PREFILTER[Location and role prefilter]:::code
+      P_PREFILTER -->|roles + locations| PREFILTER
+    end
+    DEDUPE{company_id + external_id already seen?}:::code
+    ASSESS{Human starts job assessment}:::human
+    SCREEN_LLM[LLM_JOB_SCREEN<br/>fit.screen]:::llm
+    SCREEN_RESULT{Keep?}:::code
+    subgraph FIT_INPUT_ROW[ ]
+      direction LR
+      P_FIT[(PROFILE STORE)]:::db
+      FIT_LLM[LLM_JOB_FIT<br/>fit.assess]:::llm
+      J_FIT_PIPE[(JOB STORE)]:::db
+      P_FIT -->|profile + preferences| FIT_LLM
+      J_FIT_PIPE -->|screened_in jobs| FIT_LLM
+    end
+    subgraph SCORE_REJECT_COLUMN[ ]
+      direction TB
+      SCORE[Map score to strong, possible, or reject]:::code
+      REJECTED("REJECTED STATE<br/>Status: reject<br/>Score: 0 or model score<br/>Reason: saved<br/>Missing: retained<br/>Fit facts: retained<br/>Screened at: retained<br/>Assessed at: now<br/>Interested at: null<br/>Requirements: none<br/>Resume ID: none<br/>Cover letter ID: none<br/>Applied at: null<br/>Outcome: rejected"):::terminal
+      SCORE -->|reject| REJECTED
+    end
+    REVIEW{Human reviews recommended job}:::human
+    INTERESTED[Interested job]:::agent
+    GAP_LLM[LLM_REVIEW_QUESTION<br/>review.question]:::llm
+    GAP_ANSWER[/Human answers job-specific question/]:::human
     REQUIREMENTS_LLM[LLM_REQUIREMENTS<br/>resume.requirements]:::llm
     BASE_LLM[LLM_RESUME_BASE<br/>resume.select_base]:::llm
     PLAN_LLM[LLM_EVIDENCE_PLAN<br/>resume.plan_evidence]:::llm
     RESUME_LLM[LLM_RESUME_COMPOSE<br/>resume.build]:::llm
-    RESUME_RENDER[Deterministic grounding/layout checks<br/>HTML and PDF render to R2]:::code
-    DESIGN_LLM[LLM_RESUME_DESIGN_REVIEW<br/>resume.design_review, image input]:::llm
-    RESUME_DB[(D1 resumes + R2 PDF<br/>content, plan, checks, critique,<br/>layout, job_id)]:::db
+    RENDER[Render, check, and revise layout]:::code
+    DESIGN_LLM[LLM_RESUME_DESIGN_REVIEW<br/>resume.design_review]:::llm
     LETTER_LLM[LLM_COVER_LETTER<br/>cover_letter.write]:::llm
-    LETTER_DB[(D1 cover_letters<br/>one generated HTML letter per job)]:::db
-
-    MATERIAL_REVIEW{Human reviews generated<br/>resume and cover letter}:::human
-    LIVE_FORM[/Human opens an application form<br/>with ApplyGo browser extension/]:::human
-    FORM_MATCH[LLM_APPLICATION_MATCH<br/>application.answers]:::llm
-    ANSWER_EXACT[Deterministic exact-answer reuse<br/>then extension fills matched fields]:::code
-    SUBMIT_APPROVAL{Human reviews fields,<br/>sensitive answers, CAPTCHA,<br/>and submits on employer site}:::human
-    EMPLOYER_ATS[(Employer application site)]:::external
-    MARK_APPLIED{Human clicks Mark applied}:::human
+    MATERIAL_REVIEW{Human reviews application materials}:::human
+    FORM[/Human opens employer application form/]:::human
+    FORM_LLM[LLM_APPLICATION_MATCH<br/>application.answers]:::llm
+    FILL[Fill supported fields; leave unknowns to human]:::code
+    SUBMIT{Human reviews and submits}:::human
+    EMPLOYER[(Employer application site)]:::external
+    MARK{Human marks job applied}:::human
     APPLIED("APPLIED STATE<br/>Status: applied<br/>Score: retained<br/>Reason: retained<br/>Missing: retained<br/>Fit facts: retained<br/>Screened at: retained<br/>Assessed at: retained<br/>Interested at: retained<br/>Requirements: retained or none<br/>Resume ID: present or none<br/>Cover letter ID: present or none<br/>Applied at: now<br/>Outcome: applied"):::terminal
-
-    APP_HISTORY[(Planned application record,<br/>artifacts, submission receipt,<br/>status history)]:::planned
-    STATUS_SYNC[Planned communication and<br/>application-status monitoring]:::planned
-    INTERVIEW{Planned human-recorded or<br/>detected interview}:::planned
-    OFFER{Planned offer outcome}:::planned
+    FUTURE[Planned status monitoring, interviews, and offers]:::planned
     ACCEPTED([Planned accepted job]):::plannedTerminal
-    CLOSED([Planned closed / rejected / withdrawn]):::plannedTerminal
 
-    START --> HUMAN_PROFILE
-    HUMAN_PROFILE -->|PDF/TXT/MD source file| PROFILE_DB
-    HUMAN_PROFILE -->|source text + notes| PROFILE_EXTRACT
-    PROFILE_EXTRACT -->|StructuredProfile draft; human saves| MATCH_PROFILE
-    HUMAN_PROFILE -->|role_signal claims| PROFILE_DB
-    PROFILE_DB -->|role_signal claims + match_profile<br/>+ desired_locations + dealbreakers + care_about| ROLE_DRAFT
-    ROLE_DRAFT -->|summary + distinct roles;<br/>saved directly, no draft/approve step| PROFILE_DB
-    HUMAN_PROFILE -->|care_about| TOPIC_DERIVE
-    TOPIC_DERIVE -->|care_about_topics| PROFILE_DB
-    MATCH_PROFILE -->|structured_json + summary + match_profile| PROFILE_DB
-    PROFILE_DB -->|profile + preferences| COMPANY_TRIGGER
+    START --> SOURCES --> PROFILE_LLM --> MATCH_PROFILE --> ROLES_LLM
+    COMPANY_LLM --> COMPANY_CHECK --> SCAN --> BOARD
+    C_UPDATE ~~~ ATS_SPACER
+    BOARD <-->|board jobs| ATS
+    BOARD --> PREFILTER --> DEDUPE
+    DEDUPE -->|insert new job or backfill description| J_WRITE
+    J_WRITE -->|unassessed jobs| ASSESS
+    ASSESS --> SCREEN_LLM --> SCREEN_RESULT
+    FIT_LLM --> SCORE -->|strong or possible| REVIEW
+    SCREEN_RESULT ~~~ REVIEW
+    SCREEN_RESULT -->|no| REJECTED
+    REVIEW -->|Reject| REJECTED
+    REVIEW -->|Interested| INTERESTED
+    INTERESTED --> GAP_LLM --> GAP_ANSWER --> REQUIREMENTS_LLM --> PLAN_LLM --> RESUME_LLM --> RENDER
+    INTERESTED --> BASE_LLM --> PLAN_LLM
+    RENDER --> DESIGN_LLM -->|layout or wording revision| RENDER
+    INTERESTED --> LETTER_LLM
+    RENDER --> MATERIAL_REVIEW
+    LETTER_LLM --> MATERIAL_REVIEW
+    MATERIAL_REVIEW --> FORM --> FORM_LLM --> FILL --> SUBMIT --> EMPLOYER --> MARK --> APPLIED
+    APPLIED -.-> FUTURE -.-> ACCEPTED
 
-    COMPANY_TRIGGER -->|manual company_record| COMPANY_CHECK
-    COMPANY_TRIGGER -->|structured_json + desired_roles + desired_locations<br/>+ existing company names + focus + count| COMPANY_LLM
-    COMPANY_LLM -->|"CompanyProposal[]"| COMPANY_CHECK
-    COMPANY_CHECK -->|reachable / unreachable company rows| COMPANY_DB
-    COMPANY_DB -->|eligible companies not scanned today| SCAN_TRIGGER
-    SCAN_TRIGGER -->|website + careers_url + cached ATS fields| BOARD_RESOLVE
-    BOARD_RESOLVE -->|provider + token| FETCH_JOBS
-    FETCH_JOBS <-->|public board JSON / job descriptions| ATS
-    FETCH_JOBS -->|"ScannedJob[]"| PRE_FILTER
-    PROFILE_DB -->|desired_roles + desired_locations| PRE_FILTER
-    PRE_FILTER -->|relevant jobs with external_id| DEDUPE
-    DEDUPE -->|new raw job: fit_status defaults unassessed| JOB_DB
-    DEDUPE -->|seen job: skip insert; only backfill longer description| JOB_DB
-    FETCH_JOBS -->|ATS provider/token, open_jobs,<br/>scan_note, last_scanned_at| COMPANY_DB
+    P_WRITE[(PROFILE STORE<br/>candidate_profiles, source_documents,<br/>candidate_evidence, application_answers)]:::db
+    P_RESUME[(PROFILE STORE)]:::db
+    P_FORM[(PROFILE STORE)]:::db
+    C_WRITE[(COMPANY STORE<br/>companies)]:::db
+    J_WRITE[(JOB STORE<br/>job_postings)]:::db
+    J_REVIEW[(JOB STORE)]:::db
+    J_RESUME[(JOB STORE)]:::db
+    J_REQUIREMENTS_SAVE[(JOB STORE)]:::db
+    J_FORM[(JOB STORE)]:::db
+    J_APPLIED[(JOB STORE)]:::db
+    F_WRITE[(FEEDBACK STORE<br/>job_feedback)]:::db
+    F_SCREEN[(FEEDBACK STORE)]:::db
+    R_READ[(RESUME STORE<br/>resumes + R2 PDFs)]:::db
+    R_WRITE[(RESUME STORE)]:::db
+    R_FORM[(RESUME STORE)]:::db
+    L_WRITE[(COVER LETTER STORE<br/>cover_letters)]:::db
+    L_FORM[(COVER LETTER STORE)]:::db
 
-    JOB_DB -->|unassessed jobs| ASSESS_TRIGGER
-    PROFILE_DB -->|match_profile + desired_roles<br/>+ confirmed job_feedback reasons| QUICK_LLM
-    ASSESS_TRIGGER -->|job id, title, company, location, description| QUICK_LLM
-    QUICK_LLM -->|ScreenResult: id, keep, note| QUICK_DECISION
-    QUICK_DECISION -->|keep=false: screened_out + note + screened_at| JOB_DB
-    QUICK_DECISION -->|keep=true: screened_in + note + screened_at| JOB_DB
-    JOB_DB -->|screened_in jobs| STRONG_LLM
-    PROFILE_DB -->|structured profile + desired_roles + dealbreakers<br/>+ care_about_topics + confirmed disqualifiers| STRONG_LLM
-    STRONG_LLM -->|FitResult: score, reason, missing, facts| FIT_MAP
-    FIT_MAP -->|fit_score + fit_status + fit_reason<br/>+ fit_missing_json + fit_detail_json + assessed_at| JOB_DB
-    JOB_DB -->|strong and possible rows| RECOMMENDED
-    RECOMMENDED --> HUMAN_JOB
-    HUMAN_JOB -->|Reject; optional typed reason| REJECTED
-    HUMAN_JOB -->|fit_status=reject; score=0; reason| JOB_DB
-    HUMAN_JOB -->|typed reason only| FEEDBACK_DB
-    FEEDBACK_DB -->|future confirmed disqualifiers| QUICK_LLM
-    FEEDBACK_DB -->|future confirmed disqualifiers| STRONG_LLM
-    HUMAN_JOB -->|Interested| INTERESTED
-    INTERESTED -->|fit_status=interested + interested_at| JOB_DB
-
-    INTERESTED -->|job description + structured profile + prior answers| GAP_QUESTION
-    GAP_QUESTION -->|one question; not persisted yet| HUMAN_GAP
-    HUMAN_GAP -->|category=job_review claim linked by job_id| PROFILE_DB
-    INTERESTED --> REQUIREMENTS_LLM
-    JOB_DB -->|raw_description or cached requirements_json| REQUIREMENTS_LLM
-    REQUIREMENTS_LLM -->|JobRequirements cached as requirements_json| JOB_DB
-    INTERESTED --> BASE_LLM
-    PROFILE_DB -->|profile and candidate evidence| BASE_LLM
-    RESUME_DB -->|candidate base resume metadata| BASE_LLM
-    BASE_LLM -->|base_resume_id + tailoring_notes| PLAN_LLM
-    JOB_DB -->|JobRequirements| PLAN_LLM
-    PROFILE_DB -->|StructuredProfile + job_review evidence| PLAN_LLM
-    PLAN_LLM -->|EvidencePlan: role decisions + coverage| RESUME_LLM
-    RESUME_DB -->|selected base resume content/layout| RESUME_LLM
-    RESUME_LLM -->|ResumeDoc| RESUME_RENDER
-    RESUME_RENDER -->|rendered page image + checks| DESIGN_LLM
-    DESIGN_LLM -->|critique + layout adjustments| RESUME_RENDER
-    RESUME_RENDER -->|job-tailored artifacts| RESUME_DB
-    INTERESTED -->|job + profile + job_review evidence<br/>+ optional tailored-resume contact line| LETTER_LLM
-    LETTER_LLM -->|letter_body| LETTER_DB
-    RESUME_DB --> MATERIAL_REVIEW
-    LETTER_DB --> MATERIAL_REVIEW
-    MATERIAL_REVIEW -->|revise/regenerate loop| RESUME_LLM
-    MATERIAL_REVIEW -->|approved materials| LIVE_FORM
-    LIVE_FORM -->|field names, labels, types, options, required flags| FORM_MATCH
-    PROFILE_DB -->|structured profile + stored exact application_answers| FORM_MATCH
-    JOB_DB -->|job context| FORM_MATCH
-    RESUME_DB -->|tailored ResumeDoc when present| FORM_MATCH
-    LETTER_DB -->|cover-letter HTML when present| FORM_MATCH
-    FORM_MATCH -->|generated field answers; unsupported fields stay missing| ANSWER_EXACT
-    ANSWER_EXACT -->|filled form; unresolved fields left for human| SUBMIT_APPROVAL
-    SUBMIT_APPROVAL -->|human-authorized submission| EMPLOYER_ATS
-    SUBMIT_APPROVAL -->|reusable exact answers saved explicitly| PROFILE_DB
-    EMPLOYER_ATS -->|confirmation observed by human| MARK_APPLIED
-    MARK_APPLIED -->|fit_status=applied + applied_at| JOB_DB
-    MARK_APPLIED --> APPLIED
-    APPLIED -->|Unapply returns to interested| INTERESTED
-
-    APPLIED -.->|planned: create application + receipt| APP_HISTORY
-    APP_HISTORY -.-> STATUS_SYNC
-    STATUS_SYNC -.->|response / status event| APP_HISTORY
-    STATUS_SYNC -.-> INTERVIEW
-    INTERVIEW -.->|interview outcome| APP_HISTORY
-    INTERVIEW -.-> OFFER
-    INTERVIEW -.-> CLOSED
-    OFFER -.->|decline / expire| CLOSED
-    OFFER -.->|human accepts| ACCEPTED
-    APP_HISTORY -.->|outcomes inform future preferences| HUMAN_PROFILE
-
-    COMPANY_DB -->|manual repeat scan or next-day eligible scan| SCAN_TRIGGER
-    JOB_DB -->|unassessed backlog persists between runs| ASSESS_TRIGGER
-    REJECTED -->|Restore explicitly resets to unassessed| ASSESS_TRIGGER
-    HUMAN_PROFILE -->|profile/preference changes affect future runs;<br/>Reassess explicitly requeues scored jobs| ASSESS_TRIGGER
+    SOURCES -->|write files and notes| P_WRITE
+    MATCH_PROFILE -->|write structured profile + match profile| P_WRITE
+    P_WRITE -->|profile + preferences| ROLES_LLM
+    ROLES_LLM -->|write role analysis + desired roles| P_WRITE
+    P_WRITE -->|profile + target roles| COMPANY_LLM
+    COMPANY_CHECK -->|write verified company| C_WRITE
+    C_WRITE -->|companies due to scan| SCAN
+    F_SCREEN -->|confirmed rejection reasons| SCREEN_LLM
+    SCREEN_RESULT -->|write screened_in or screened_out| J_FIT_PIPE
+    SCORE -->|write score, reason, missing, facts| J_FIT_PIPE
+    J_REVIEW -->|recommended jobs| REVIEW
+    REVIEW -->|write interested or reject| J_REVIEW
+    REVIEW -->|typed rejection reason| F_WRITE
+    GAP_ANSWER -->|write job_review evidence| P_RESUME
+    J_RESUME -->|job description + requirements| REQUIREMENTS_LLM
+    REQUIREMENTS_LLM -->|cache parsed requirements| J_REQUIREMENTS_SAVE
+    R_READ -->|base resume| BASE_LLM
+    RENDER -->|write resume JSON, checks, and PDF| R_WRITE
+    LETTER_LLM -->|write letter HTML| L_WRITE
+    P_FORM -->|profile + saved exact answers| FORM_LLM
+    J_FORM -->|job context| FORM_LLM
+    R_FORM -->|tailored resume| FORM_LLM
+    L_FORM -->|cover letter| FORM_LLM
+    MARK -->|write applied status and time| J_APPLIED
 
     classDef human fill:#fff4cc,stroke:#9a6b00,color:#2b2100,stroke-width:2px;
     classDef agent fill:#e9f2ff,stroke:#3569a8,color:#102a43;
@@ -183,6 +158,12 @@ flowchart TD
     classDef terminal fill:#dff5df,stroke:#267326,color:#123d12,stroke-width:2px,text-align:left;
     classDef planned fill:#fff,stroke:#777,color:#555,stroke-dasharray:5 5;
     classDef plannedTerminal fill:#fff,stroke:#267326,color:#267326,stroke-width:2px,stroke-dasharray:5 5;
+    style BOARD_STORAGE_ROW fill:transparent,stroke:transparent
+    style PREFILTER_STORAGE_ROW fill:transparent,stroke:transparent
+    style ATS_OFFSET_COLUMN fill:transparent,stroke:transparent
+    style FIT_INPUT_ROW fill:transparent,stroke:transparent
+    style SCORE_REJECT_COLUMN fill:transparent,stroke:transparent
+    classDef spacer fill:transparent,stroke:transparent,color:transparent,width:1px,height:14px;
 ```
 
 ## Diagram shape and color key
@@ -198,7 +179,7 @@ The visual vocabulary is consistent across both diagrams in this document.
 | Gray rectangle | `[...]`, `code` | Deterministic code, transformation, validation, rendering, or filtering. |
 | Gray diamond | `{...}`, `code` | Deterministic branch or threshold. |
 | Pale-green cylinder | `[(...)]`, `external` | External system or authoritative company/ATS source. |
-| Blue-gray cylinder | `[(...)]`, `db` | Current persistent D1 or R2 storage. |
+| Blue-gray cylinder | `[(...)]`, `db` | Local reference to current persistent D1 or R2 storage. Repeated cylinders with the same store name are the same database, placed near each reader/writer to avoid crossed lines. |
 | Green rounded rectangle | `(...)`, `terminal` or `row` | Complete workflow-state snapshot. Every green state card uses the fixed state order below. |
 | White dashed shape | `planned`, `plannedRow`, or `plannedTerminal` | Planned behavior or storage that is not operational today. Shape meaning otherwise follows the rows above. |
 | Solid arrow | `-->` | Current control flow or data movement. Edge text names the data or transition. |
