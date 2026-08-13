@@ -14,11 +14,13 @@
     "migrate:remote": "wrangler d1 migrations apply applygo --remote --env=\"\"",
     "migrate:remote:production": "wrangler d1 migrations apply applygo-prod-db --remote --env production",
     "release:production": "npm run migrate:remote:production && npm run deploy:production",
-    "enroll": "node scripts/create-enrollment.mjs"
+    "enroll": "node scripts/create-enrollment.mjs",
+    "enroll:local": "node scripts/create-local-enrollment.mjs"
   },
   "dependencies": {
+    "@cloudflare/puppeteer": "latest",
     "unpdf": "latest",
-    "@cloudflare/puppeteer": "latest"
+    "word-extractor": "^1.0.4"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "latest",

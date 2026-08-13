@@ -19,7 +19,7 @@ export type LlmTaskId =
   | "fit.care_about_topics"
   | "companies.discover"
   | "profile.structure"
-  | "roles.describe"
+  | "roles.analyze"
   | "review.question"
   | "resume.build"
   | "resume.requirements"
@@ -107,12 +107,12 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     replayable: true,
   },
   {
-    id: "roles.describe",
-    name: "Draft desired roles",
+    id: "roles.analyze",
+    name: "Analyze suitable roles",
     stage: "Profile",
     tier: "reason",
-    what: "Free text. Writes the desired-roles description from loose notes and saved links.",
-    source: "src/index.ts -> generateDesiredRoles",
+    what: "Structured. Reads notes, locations, dealbreakers, criteria, and the structured profile; writes a non-role-specific summary plus a list of distinct role types the candidate is suited for.",
+    source: "src/index.ts -> analyzeDesiredRoles",
     batched: false,
     replayable: true,
   },

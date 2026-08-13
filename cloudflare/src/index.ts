@@ -1,4 +1,5 @@
 import { extractText, getDocumentProxy } from "unpdf";
+import WordExtractor from "word-extractor";
 import { type BrowserWorker } from "@cloudflare/puppeteer";
 import {
   type LlmTrace,
@@ -545,6 +546,35 @@ async function ensureCareAboutTopics(
   }
 }
 
+/** One distinct role family the analysis thinks the candidate is suited for. */
+type RoleAnalysisEntry = { title: string; description: string };
+
+/**
+ * The structured output of `roles.analyze`: a non-role-specific summary (location, what to avoid,
+ * what matters) plus the distinct role types it identified. Regenerated wholesale by Reanalyze --
+ * there's no per-field merge, since re-deriving from the current notes/preferences is the point.
+ */
+type RoleAnalysis = { summary: string; roles: RoleAnalysisEntry[] };
+
+function readRoleAnalysis(preferencesJson: string): RoleAnalysis | null {
+  try {
+    const analysis = (JSON.parse(preferencesJson || "{}") as { role_analysis?: RoleAnalysis }).role_analysis;
+    return analysis && Array.isArray(analysis.roles) ? analysis : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Renders the structured analysis back into the same kind of plain-text block the fit/screen/resume
+ * prompts have always taken as `desiredRoles` -- one heading + description per distinct role family.
+ * Keeps every downstream consumer of that string unchanged while the candidate-facing side of this
+ * became structured.
+ */
+function flattenRoleAnalysis(analysis: RoleAnalysis): string {
+  return analysis.roles.map((r) => `## ${r.title}\n${r.description}`).join("\n\n");
+}
+
 function readStructuredProfile(structuredJson: string): StructuredProfile | null {
   try {
     const parsed = JSON.parse(structuredJson || "{}");
@@ -602,6 +632,7 @@ async function getProfile(request: Request, env: Env): Promise<Response> {
       dealbreakers: readDealbreakers(profile?.preferences_json ?? "{}"),
       care_about: readCareAbout(profile?.preferences_json ?? "{}"),
       care_about_topics: readCareAboutTopics(profile?.preferences_json ?? "{}"),
+      role_analysis: readRoleAnalysis(profile?.preferences_json ?? "{}"),
       structured: readStructuredProfile(profile?.structured_json ?? "{}"),
     },
   });
@@ -631,17 +662,20 @@ async function saveStructuredProfile(request: Request, env: Env): Promise<Respon
   return json({ structured, match_profile: buildMatchProfile(structured) });
 }
 
+/**
+ * Saves the three raw preference inputs -- locations, dealbreakers, criteria -- that feed both
+ * scoring and the roles analysis. `desired_roles` itself is not accepted here: it's system-derived
+ * output from `analyzeDesiredRoles`, not something typed directly, so this endpoint never touches it.
+ */
 async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as {
-    desired_roles?: string;
     desired_locations?: string;
     dealbreakers?: string;
     care_about?: string;
     provider?: string;
   };
-  const desiredRoles = (body.desired_roles ?? "").trim();
   const desiredLocations = (body.desired_locations ?? "").trim();
   const dealbreakers = (body.dealbreakers ?? "").trim();
   const careAbout = (body.care_about ?? "").trim();
@@ -676,7 +710,6 @@ async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  prefs.desired_roles = desiredRoles;
   prefs.desired_locations = desiredLocations;
   prefs.dealbreakers = dealbreakers;
   prefs.care_about = careAbout;
@@ -685,7 +718,6 @@ async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
     .bind(JSON.stringify(prefs), profileId)
     .run();
   return json({
-    desired_roles: desiredRoles,
     desired_locations: desiredLocations,
     dealbreakers,
     care_about: careAbout,
@@ -730,51 +762,139 @@ async function deleteRoleSignal(request: Request, env: Env, id: string): Promise
   return json({ deleted: result.meta.changes > 0 });
 }
 
-async function generateDesiredRoles(request: Request, env: Env): Promise<Response> {
+const ROLE_ANALYSIS_SCHEMA = {
+  type: "object",
+  properties: {
+    summary: {
+      type: "string",
+      description:
+        "One short paragraph covering only what matters to this candidate independent of any specific role -- " +
+        "location constraints, what to avoid, what to prioritize. Never names a job title here.",
+    },
+    roles: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "A short, concrete job title a posting would actually use (e.g. 'Applied AI Engineer'), not a sentence.",
+          },
+          description: {
+            type: "string",
+            description:
+              "Role family/titles, seniority, domain, must-have vs nice-to-have aspects, and enough concrete " +
+              "keywords that a simple keyword match could find it.",
+          },
+        },
+        required: ["title", "description"],
+      },
+      description:
+        "Each genuinely distinct role family the candidate should be shown -- not variations on one title. Do " +
+        "not blend different fields into one hybrid role that doesn't exist in the job market; a posting only " +
+        "has to match ONE entry to be worth surfacing.",
+    },
+  },
+  required: ["summary", "roles"],
+} as const;
+
+/**
+ * Replaces the old free-text draft-then-paste flow: reanalyzes in one shot from every current input
+ * (role-signal notes, the structured profile, locations, dealbreakers, criteria) and saves directly --
+ * there's no draft to review first, since a candidate who wants to react to it can just Reanalyze
+ * again. `desired_roles`, the flat string every scoring/resume prompt actually reads, is regenerated
+ * from the result rather than typed, so it can never drift from what Analysis is showing.
+ */
+async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as { provider?: string };
   const provider = normalizeProvider(body.provider);
-  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
-  if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
 
   const profileId = await getOrCreateProfileId(env);
-  const signals = await env.DB.prepare(
-    "SELECT claim FROM candidate_evidence WHERE profile_id = ? AND category = 'role_signal' ORDER BY created_at ASC",
-  )
-    .bind(profileId)
-    .all<{ claim: string }>();
-  if (signals.results.length === 0) return json({ error: "no_source_material" }, 400);
+  const [profileRow, signals] = await Promise.all([
+    env.DB.prepare("SELECT preferences_json, match_profile FROM candidate_profiles WHERE id = ?")
+      .bind(profileId)
+      .first<{ preferences_json: string; match_profile: string }>(),
+    env.DB.prepare(
+      "SELECT claim FROM candidate_evidence WHERE profile_id = ? AND category = 'role_signal' ORDER BY created_at ASC",
+    )
+      .bind(profileId)
+      .all<{ claim: string }>(),
+  ]);
+
+  const matchProfile = (profileRow?.match_profile ?? "").trim();
+  const notes = signals.results.map((s) => s.claim);
+  if (!notes.length && !matchProfile) return json({ error: "no_source_material" }, 400);
+
+  const preferencesJson = profileRow?.preferences_json ?? "{}";
+  const desiredLocations = readDesiredLocations(preferencesJson);
+  const dealbreakers = readDealbreakers(preferencesJson);
+  const careAbout = readCareAbout(preferencesJson);
 
   const prompt = [
-    "A job candidate has given you loose notes, job links, and preferences about the kind of roles they want next.",
-    "Write a clear, structured description of the roles they are looking for, to be used afterward as the filter",
-    "that decides which job postings are even worth showing them.",
+    "A job candidate wants two things from you: what matters to them in a search regardless of role, and which",
+    "distinct kinds of roles their background and stated interests actually support.",
     "",
-    "If the notes point toward more than one genuinely different kind of role -- not just variations on one title,",
-    "but different fields or functions entirely (for example, a former teacher now open to machine learning",
-    "engineering roles, advocacy roles, AND corporate training roles) -- list each one as its own separate entry.",
-    "Do not blend them into a single hybrid role that doesn't actually exist in the job market, like 'ML advocate",
-    "and trainer'. Being open to several different paths is not the same as wanting one job that combines all of",
-    "them, and a posting only has to be a strong match for ONE entry to be worth surfacing, not all of them at once.",
-    "For each entry, give: role family/titles, seniority, domain, must-have vs nice-to-have aspects, and enough",
-    "concrete keywords (actual job titles a posting would use) that a simple keyword match could find it. Note",
-    "anything explicitly ruled out separately, since it applies across every entry unless the notes say otherwise.",
+    "SUMMARY: one short paragraph covering only things that apply no matter what role they're looking at --",
+    "location constraints, what to avoid, what to prioritize. Do not name specific job titles here.",
     "",
-    "Base this only on the notes below.",
+    "ROLES: each genuinely distinct role family they should be shown -- not variations on one title, but",
+    "different fields or functions entirely (for example, a former teacher now open to machine learning",
+    "engineering roles, advocacy roles, AND corporate training roles). Do not blend them into a single hybrid",
+    "role that doesn't actually exist in the job market, like 'ML advocate and trainer'. Being open to several",
+    "different paths is not the same as wanting one job that combines all of them, and a posting only has to be",
+    "a strong match for ONE entry to be worth surfacing, not all of them at once. For each entry, give a short",
+    "concrete title plus a description covering role family/titles, seniority, domain, must-have vs nice-to-have",
+    "aspects, and enough concrete keywords (actual job titles a posting would use) that a simple keyword match",
+    "could find it.",
+    "",
+    "Ground both in the candidate's actual background below, not just their notes -- a role their experience",
+    "doesn't support isn't a good entry even if a note mentions interest in it.",
     "",
     WRITING_STYLE_RULES,
     "",
-    "Notes:",
-    ...signals.results.map((s) => `- ${s.claim}`),
-  ].join("\n\n");
+    matchProfile ? `CANDIDATE BACKGROUND:\n${matchProfile}` : "",
+    notes.length ? `NOTES AND LINKS:\n${notes.map((c) => `- ${c}`).join("\n")}` : "",
+    desiredLocations ? `LOCATIONS THEY'LL WORK IN:\n${desiredLocations}` : "",
+    dealbreakers ? `DEALBREAKERS:\n${dealbreakers}` : "",
+    careAbout ? `WHAT THEY SAID THEY CARE ABOUT:\n${careAbout}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
+  let analysis: RoleAnalysis;
   try {
-    const draft = await callText(env, provider, "roles.describe", prompt);
-    return json({ provider, draft_description: draft });
+    analysis = await callStructured<RoleAnalysis>(
+      env,
+      provider,
+      "roles.analyze",
+      prompt,
+      ROLE_ANALYSIS_SCHEMA,
+      "submit_role_analysis",
+      3000,
+    );
   } catch (err) {
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
+
+  let prefs: Record<string, unknown> = {};
+  try {
+    prefs = JSON.parse(preferencesJson || "{}");
+  } catch {
+    prefs = {};
+  }
+  const desiredRoles = flattenRoleAnalysis(analysis);
+  prefs.role_analysis = analysis;
+  prefs.desired_roles = desiredRoles;
+  await env.DB.prepare("UPDATE candidate_profiles SET preferences_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(JSON.stringify(prefs), profileId)
+    .run();
+
+  return json({ provider, role_analysis: analysis, desired_roles: desiredRoles });
 }
 
 async function upsertProfile(request: Request, env: Env): Promise<Response> {
@@ -2032,7 +2152,23 @@ async function getOrCreateProfileId(env: Env): Promise<string> {
   return id;
 }
 
-const DOCUMENT_TYPES = new Set(["application/pdf", "text/plain", "text/markdown"]);
+const DOCUMENT_TYPES = new Set([
+  "application/pdf",
+  "text/plain",
+  "text/markdown",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+]);
+
+function documentMediaType(file: File): string {
+  const extension = file.name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
+  if (extension === ".doc") return "application/msword";
+  if (extension === ".docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (extension === ".md") return "text/markdown";
+  if (extension === ".txt") return "text/plain";
+  if (extension === ".pdf") return "application/pdf";
+  return file.type;
+}
 
 async function listDocuments(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
@@ -2054,14 +2190,15 @@ async function uploadDocument(request: Request, env: Env): Promise<Response> {
   const file = form.get("file");
   if (!(file instanceof File)) return json({ error: "file_required" }, 400);
   if (file.size > 15 * 1024 * 1024) return json({ error: "file_too_large" }, 413);
-  if (!DOCUMENT_TYPES.has(file.type)) return json({ error: "unsupported_media_type" }, 415);
+  const mediaType = documentMediaType(file);
+  if (!DOCUMENT_TYPES.has(mediaType)) return json({ error: "unsupported_media_type" }, 415);
 
   const bytes = await file.arrayBuffer();
   const sha = await digestHex(bytes);
   let extractedText = "";
-  if (file.type === "text/plain" || file.type === "text/markdown") {
+  if (mediaType === "text/plain" || mediaType === "text/markdown") {
     extractedText = new TextDecoder().decode(bytes);
-  } else if (file.type === "application/pdf") {
+  } else if (mediaType === "application/pdf") {
     try {
       const pdf = await getDocumentProxy(new Uint8Array(bytes));
       const { text } = await extractText(pdf, { mergePages: true });
@@ -2069,10 +2206,18 @@ async function uploadDocument(request: Request, env: Env): Promise<Response> {
     } catch {
       extractedText = "";
     }
+  } else if (mediaType === "application/msword" || mediaType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+    try {
+      const extractor = new WordExtractor();
+      const document = await extractor.extract(Buffer.from(bytes));
+      extractedText = document.getBody().trim();
+    } catch {
+      extractedText = "";
+    }
   }
   const key = `documents/${crypto.randomUUID()}`;
   await env.FILES.put(key, bytes, {
-    httpMetadata: { contentType: file.type },
+    httpMetadata: { contentType: mediaType },
     customMetadata: { originalName: file.name, uploadedByDevice: auth.id },
   });
 
@@ -2082,9 +2227,9 @@ async function uploadDocument(request: Request, env: Env): Promise<Response> {
     `INSERT INTO source_documents (id, profile_id, original_name, r2_key, media_type, sha256, extracted_text)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(id, profileId, file.name, key, file.type, sha, extractedText)
+    .bind(id, profileId, file.name, key, mediaType, sha, extractedText)
     .run();
-  return json({ id, original_name: file.name, media_type: file.type, has_text: extractedText.length > 0 }, 201);
+  return json({ id, original_name: file.name, media_type: mediaType, has_text: extractedText.length > 0 }, 201);
 }
 
 async function renameDocument(request: Request, env: Env, id: string): Promise<Response> {
@@ -2375,7 +2520,7 @@ async function listResumes(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
   const profileId = await getOrCreateProfileId(env);
   const rows = await env.DB.prepare(
-    `SELECT id, name, instructions, template, revision, checks_json, critique, created_at
+    `SELECT id, name, instructions, template, revision, checks_json, critique, is_master, created_at
      FROM resumes WHERE profile_id = ? ORDER BY created_at DESC`,
   )
     .bind(profileId)
@@ -3741,6 +3886,29 @@ const DASHBOARD_PAGE = `<!doctype html>
   nav button.active { background: var(--accent); color: var(--accent-contrast); }
   .panel { display: none; }
   .panel.active { display: block; }
+  /* Same look as nav/.panel, namespaced separately so the sub-tab buttons never get picked up by
+     the top-level 'nav .tab' click handler that switches main panels. */
+  .subnav {
+    display: flex; gap: 0.2rem; overflow-x: auto; padding: 0.25rem; margin-bottom: 1.1rem;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 999px; width: fit-content;
+    -webkit-overflow-scrolling: touch;
+  }
+  .subnav button {
+    flex: none; margin: 0; padding: 0.45rem 0.95rem; font-size: 0.85rem; font-weight: 600;
+    background: none; border: none; border-radius: 999px; color: var(--text-muted); cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+  .subnav button:hover { color: var(--text); }
+  .subnav button.active { background: var(--accent); color: var(--accent-contrast); }
+  .subpanel { display: none; }
+  .subpanel.active { display: block; }
+  .role-analysis-roles { display: flex; flex-direction: column; gap: 0.7rem; margin-top: 0.6rem; }
+  .role-analysis-role {
+    padding: 0.7rem 0.9rem; background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .role-analysis-role strong { display: block; margin-bottom: 0.25rem; font-size: 0.92rem; }
+  .role-analysis-role p { margin: 0; font-size: 0.85rem; color: var(--text-muted); line-height: 1.45; }
   section {
     margin: 0 0 1.1rem; padding: 1.15rem 1.25rem; background: var(--surface);
     border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
@@ -4013,8 +4181,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   </header>
 
   <nav>
-    <button class="tab active" data-tab="roles" type="button">Desired Roles</button>
-    <button class="tab" data-tab="profile" type="button">Profile</button>
+    <button class="tab active" data-tab="roles" type="button">Roles</button>
     <button class="tab" data-tab="resume" type="button">Resume</button>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="search" type="button">Search</button>
@@ -4027,163 +4194,156 @@ const DASHBOARD_PAGE = `<!doctype html>
   </nav>
 
   <div id="panel-roles" class="panel active">
-    <div class="split">
-      <!-- Sticky because this column is much shorter than the form beside it, so it would otherwise
-           scroll away and leave a tall empty gutter. The notes here are the source material the
-           description on the right is generated from, so keeping them in view while you edit that
-           description is what you actually want anyway. -->
-      <div class="split-sticky">
-        <section id="role-signals-section">
-          <h2>What are you looking for?</h2>
-          <p class="hint">Paste job links, or write loosely about what you want next. The more you add, the better the generated description.</p>
-          <details id="role-signals-details" class="disclosure">
-            <summary id="role-signals-summary">Notes on file</summary>
-            <div id="role-signals-list"><p class="empty">Loading…</p></div>
-          </details>
-          <form id="role-signal-form">
-            <label for="role-signal-text">Add a note or link</label>
-            <textarea id="role-signal-text" required placeholder="e.g. a link to a posting, or 'I want senior IC roles in applied AI, remote-friendly, not pure infra'"></textarea>
-            <button type="submit">Add</button>
-          </form>
-          <p id="role-signal-status" class="status" role="status" aria-live="polite"></p>
-        </section>
-      </div>
-      <div class="split-sticky">
-        <section id="desired-roles-section">
-          <h2>Generated description</h2>
-          <p class="hint">This is what filters which postings you even see. If you'd take more than one genuinely different kind of role (say, machine learning engineering, advocacy work, and corporate training), list them as separate entries rather than one blended role -- a posting only needs to match one of them.</p>
-          <label for="desired-roles-provider">Generate using</label>
-          <select id="desired-roles-provider">
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI</option>
-          </select>
-          <button id="desired-roles-generate-button" class="secondary" type="button">Generate description</button>
-          <p id="desired-roles-generate-status" class="status" role="status" aria-live="polite"></p>
-          <div id="desired-roles-draft-block" style="display:none">
-            <label for="desired-roles-draft">Draft (review, then use or discard)</label>
-            <textarea id="desired-roles-draft" readonly style="min-height:8rem"></textarea>
-            <button id="desired-roles-use-draft" type="button">Use this draft</button>
-          </div>
-          <label for="desired-roles-description">Saved description</label>
-          <textarea id="desired-roles-description" style="min-height:8rem" placeholder="What roles are you targeting?"></textarea>
-          <label for="desired-locations">Locations you'll work in</label>
-          <input id="desired-locations" placeholder="e.g. California, or Bay Area, Seattle, Remote">
-          <p class="hint">Enforced as a hard filter: company discovery won't add employers outside these, and board scans skip postings elsewhere. Leave blank for no location limit.</p>
-          <label for="dealbreakers">Dealbreakers (optional)</label>
-          <textarea id="dealbreakers" placeholder="e.g. Reject anything requiring 5+ years of experience for a technical role. 3-4 years is fine."></textarea>
-          <p class="hint">Enforced during scoring (the detailed pass on postings that survive the quick screen) as a binding rule, the same weight as a stated hard requirement -- write down whatever you don't want to see, in your own words.</p>
-          <label for="care-about">What do you care about? (optional)</label>
-          <textarea id="care-about" placeholder="e.g. Salary, years of experience required, remote or in office, typical hours"></textarea>
-          <p class="hint">Write it however you'd say it out loud -- saving reads what you meant and turns it into the fact columns below, so you don't have to phrase it as labels. These are the topics you want at a glance for every posting, not targets to filter on (dealbreakers above is where you rule things out), and they never affect the score.</p>
-          <div id="care-about-topics" class="row-facts"></div>
-          <button id="desired-roles-save-button" type="button">Save</button>
-          <p id="desired-roles-save-status" class="status" role="status" aria-live="polite"></p>
-          <h3 class="subhead">Already have matches?</h3>
-          <p class="hint">Re-score your existing top matches against whatever you just saved above, without re-running the whole pipeline from scratch.</p>
-          <div class="controls">
-            <div>
-              <label for="reassess-min-score">Minimum score to re-check</label>
-              <input id="reassess-min-score" type="number" min="0" max="100" value="70">
-            </div>
-            <button id="reassess-button" type="button">Re-check my top matches</button>
-          </div>
-          <p id="reassess-status" class="status" role="status" aria-live="polite"></p>
-        </section>
-      </div>
+    <div class="subnav">
+      <button class="subtab active" data-subtab="notes" type="button">Notes</button>
+      <button class="subtab" data-subtab="locations" type="button">Locations</button>
+      <button class="subtab" data-subtab="dealbreakers" type="button">Dealbreakers</button>
+      <button class="subtab" data-subtab="criteria" type="button">Criteria</button>
+      <button class="subtab" data-subtab="analysis" type="button">Analysis</button>
     </div>
-  </div>
 
-  <div id="panel-profile" class="panel">
-    <div class="split">
-      <div>
-        <section id="material-section">
-          <h2>Your material</h2>
-          <p class="hint">Upload files or add notes — this feeds the structured profile on the right.</p>
-          <label for="profile-label">Name</label>
-          <input id="profile-label" required placeholder="e.g. Jason Sheinkopf">
-          <button id="save-name-button" class="secondary" type="button">Save name</button>
-          <p id="profile-status" class="status" role="status" aria-live="polite"></p>
-
-          <hr class="divider">
-
-          <h3 class="subhead">Documents</h3>
-          <div id="documents-list"><p class="empty">Loading…</p></div>
-          <form id="document-form">
-            <label for="document-file">Upload resume or notes file (PDF, plain text, or Markdown)</label>
-            <input id="document-file" type="file" accept=".pdf,.txt,.md,application/pdf,text/plain,text/markdown" required>
-            <button type="submit">Upload</button>
-          </form>
-          <p id="document-status" class="status" role="status" aria-live="polite"></p>
-
-          <hr class="divider">
-
-          <h3 class="subhead">Notes about yourself</h3>
-          <div id="notes-list"><p class="empty">Loading…</p></div>
-          <form id="note-form">
-            <label for="note-text">Add unstructured text (accomplishments, goals, background — anything)</label>
-            <textarea id="note-text" required placeholder="Write freely; this feeds the profile generator"></textarea>
-            <button type="submit">Add note</button>
-          </form>
-          <p id="note-status" class="status" role="status" aria-live="polite"></p>
-
-        </section>
-      </div>
-      <div class="split-sticky">
-        <section id="structured-profile-section">
-          <h2>Your structured profile</h2>
-          <label for="generate-provider">Generate from documents &amp; notes using</label>
-          <select id="generate-provider">
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI</option>
-          </select>
-          <button id="generate-button" type="button">Generate structured profile</button>
-          <p id="generate-status" class="status" role="status" aria-live="polite"></p>
-          <div id="structured-draft-block" style="display:none">
-            <h3 class="subhead">Draft — review, then save or discard</h3>
-            <div id="structured-draft-view"></div>
-            <button id="use-structured-draft" type="button">Save this</button>
-            <button id="discard-structured-draft" class="secondary" type="button">Discard</button>
-          </div>
-          <div id="structured-profile-view"><p class="empty">No structured profile yet — add material on the left and generate.</p></div>
-        </section>
-      </div>
+    <div id="subpanel-notes" class="subpanel active">
+      <section id="role-signals-section">
+        <h2>What are you looking for?</h2>
+        <p class="hint">Paste job links, or write loosely about what you want next. The more you add, the better the analysis on the Analysis tab.</p>
+        <details id="role-signals-details" class="disclosure">
+          <summary id="role-signals-summary">Notes on file</summary>
+          <div id="role-signals-list"><p class="empty">Loading…</p></div>
+        </details>
+        <form id="role-signal-form">
+          <label for="role-signal-text">Add a note or link</label>
+          <textarea id="role-signal-text" required placeholder="e.g. a link to a posting, or 'I want senior IC roles in applied AI, remote-friendly, not pure infra'"></textarea>
+          <button type="submit">Add</button>
+        </form>
+        <p id="role-signal-status" class="status" role="status" aria-live="polite"></p>
+      </section>
     </div>
-    <!-- Its own section below the split rather than a fourth stacked block inside "Your material".
-         It isn't source material for the structured profile the way documents and notes are -- it's
-         a separate bank of exact answers reused on forms -- and stacking it there made the left
-         column run far longer than the right. -->
-    <section id="answers-section">
-      <h2>Application answers</h2>
-      <p class="hint">Questions every application form asks (work authorization, veteran status, disability disclosure, notice period). Answered once here or on a form, reused everywhere after. Stored as exact values, never paraphrased.</p>
-      <div id="answers-list"><p class="empty">Loading…</p></div>
-      <form id="answer-form">
-        <label for="answer-question">Question</label>
-        <input id="answer-question" required placeholder="e.g. Are you legally authorized to work in the United States?">
-        <label for="answer-value">Answer</label>
-        <input id="answer-value" required placeholder="e.g. Yes">
-        <button type="submit">Save answer</button>
-      </form>
-      <p id="answer-status" class="status" role="status" aria-live="polite"></p>
-    </section>
+
+    <div id="subpanel-locations" class="subpanel">
+      <section id="locations-section">
+        <h2>Locations you'll work in</h2>
+        <p class="hint">Enforced as a hard filter: company discovery won't add employers outside these, and board scans skip postings elsewhere. Leave blank for no location limit.</p>
+        <label for="desired-locations">Locations</label>
+        <input id="desired-locations" placeholder="e.g. California, or Bay Area, Seattle, Remote">
+        <button id="locations-save-button" type="button">Save</button>
+        <p id="locations-save-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="subpanel-dealbreakers" class="subpanel">
+      <section id="dealbreakers-section">
+        <h2>Dealbreakers</h2>
+        <p class="hint">Enforced during scoring (the detailed pass on postings that survive the quick screen) as a binding rule, the same weight as a stated hard requirement -- write down whatever you don't want to see, in your own words.</p>
+        <label for="dealbreakers">Dealbreakers (optional)</label>
+        <textarea id="dealbreakers" placeholder="e.g. Reject anything requiring 5+ years of experience for a technical role. 3-4 years is fine."></textarea>
+        <button id="dealbreakers-save-button" type="button">Save</button>
+        <p id="dealbreakers-save-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="subpanel-criteria" class="subpanel">
+      <section id="criteria-section">
+        <h2>Criteria</h2>
+        <p class="hint">What do you care about? Write it however you'd say it out loud -- saving reads what you meant and turns it into the fact columns below, so you don't have to phrase it as labels. These are the topics you want at a glance for every posting, not targets to filter on (Dealbreakers is where you rule things out), and they never affect the score.</p>
+        <label for="care-about">What do you care about? (optional)</label>
+        <textarea id="care-about" placeholder="e.g. Salary, years of experience required, remote or in office, typical hours"></textarea>
+        <div id="care-about-topics" class="row-facts"></div>
+        <button id="criteria-save-button" type="button">Save</button>
+        <p id="criteria-save-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="subpanel-analysis" class="subpanel">
+      <section id="role-analysis-section">
+        <h2>Analysis</h2>
+        <p class="hint">What the model thinks you're suited for, based on your notes, your profile, and the Locations/Dealbreakers/Criteria tabs. This is what filters which postings you even see. Editing the other tabs and switching away reanalyzes automatically; use Reanalyze to force a fresh pass right now.</p>
+        <label for="role-analysis-provider">Analyze using</label>
+        <select id="role-analysis-provider">
+          <option value="anthropic">Anthropic (Claude)</option>
+          <option value="openai">OpenAI</option>
+        </select>
+        <button id="role-analysis-button" class="secondary" type="button">Reanalyze</button>
+        <p id="role-analysis-status" class="status" role="status" aria-live="polite"></p>
+        <div id="role-analysis-view"><p class="empty">Not analyzed yet -- click Reanalyze, or add a note on the Notes tab and switch tabs.</p></div>
+        <h3 class="subhead">Already have matches?</h3>
+        <p class="hint">Re-score your existing top matches against the current analysis, without re-running the whole pipeline from scratch.</p>
+        <div class="controls">
+          <div>
+            <label for="reassess-min-score">Minimum score to re-check</label>
+            <input id="reassess-min-score" type="number" min="0" max="100" value="70">
+          </div>
+          <button id="reassess-button" type="button">Re-check my top matches</button>
+        </div>
+        <p id="reassess-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
   </div>
 
   <div id="panel-resume" class="panel">
-    <div class="split">
-      <div class="split-sticky">
-        <section id="resume-reference-section">
-          <h2>Your profile</h2>
-          <p class="hint">Read-only — edit this on the Profile tab. Every resume version is built from it.</p>
-          <div id="resume-profile-view"><p class="empty">No structured profile yet — build one on the Profile tab first.</p></div>
-        </section>
-      </div>
-      <div>
+    <div class="subnav" aria-label="Resume sections">
+      <button class="active" data-resume-subtab="documents" type="button">Documents</button>
+      <button data-resume-subtab="notes" type="button">Notes</button>
+      <button data-resume-subtab="master" type="button">Master</button>
+      <button data-resume-subtab="versions" type="button">Resumes</button>
+    </div>
+
+    <div id="resume-subpanel-documents" class="subpanel active">
+      <section id="material-section">
+        <h2>Documents</h2>
+        <p class="hint">Upload resumes, cover letters, or other career material. PDF, Word (.doc and .docx), plain text, and Markdown are supported.</p>
+        <div id="documents-list"><p class="empty">Loading…</p></div>
+        <form id="document-form">
+          <label for="document-file">Choose a document</label>
+          <input id="document-file" type="file" accept=".pdf,.doc,.docx,.txt,.md,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown" required>
+          <button type="submit">Upload</button>
+        </form>
+        <p id="document-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="resume-subpanel-notes" class="subpanel">
+      <section id="notes-section">
+        <h2>Notes</h2>
+        <p class="hint">Paste a complete resume, or add accomplishments, updates, context, and experience that may not appear in your formal documents.</p>
+        <div id="notes-list"><p class="empty">Loading…</p></div>
+        <form id="note-form">
+          <label for="note-text">Paste resume text or add a note</label>
+          <textarea id="note-text" required style="min-height:14rem" placeholder="Paste plain-text resume content, or write anything the master resume should know about…"></textarea>
+          <button type="submit">Add</button>
+        </form>
+        <p id="note-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="resume-subpanel-master" class="subpanel">
+      <div class="split">
+        <div>
         <section id="resume-master-section">
-          <h2>Master archive</h2>
-          <p class="hint">Everything you have ever done, in one deliberately oversized document. Every tailored resume is built by cutting this down, so anything missing here can never appear on any of them. Not something you send anywhere.</p>
-          <button id="resume-master-button" class="secondary" type="button">Build master archive</button>
+          <h2>Master resume</h2>
+          <p class="hint">Builds a structured profile from all Documents and Notes, then creates one deliberately oversized resume containing everything. This is the source for future tailored versions, not a document to submit.</p>
+          <label for="resume-provider">Build using</label>
+          <select id="resume-provider">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI</option>
+          </select>
+          <button id="resume-master-button" type="button">Build or update master</button>
           <p id="resume-master-status" class="status" role="status" aria-live="polite"></p>
         </section>
+        <section id="master-profile-section">
+          <h2>Structured source</h2>
+          <p class="hint">Generated automatically as part of the master build and used by matching and tailored resumes.</p>
+          <div id="resume-profile-view"><p class="empty">Build the master resume to create this source.</p></div>
+        </section>
+        </div>
+        <section id="master-preview-section" style="display:none">
+          <h2>Master preview</h2>
+          <iframe id="master-preview-frame" style="width:100%; min-height:75vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+          <div id="master-checks"></div>
+        </section>
+      </div>
+    </div>
 
+    <div id="resume-subpanel-versions" class="subpanel">
         <section id="resume-generate-section">
           <h2>Resume versions</h2>
           <label for="resume-template">Template</label>
@@ -4194,11 +4354,6 @@ const DASHBOARD_PAGE = `<!doctype html>
           <select id="resume-pages">
             <option value="1">One page</option>
             <option value="2">Up to two pages</option>
-          </select>
-          <label for="resume-provider">Generate using</label>
-          <select id="resume-provider">
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI</option>
           </select>
           <button id="resume-generate-button" type="button">Generate new version</button>
           <p id="resume-generate-status" class="status" role="status" aria-live="polite"></p>
@@ -4221,7 +4376,6 @@ const DASHBOARD_PAGE = `<!doctype html>
           <button id="resume-review-button" type="button">Revise this version</button>
           <p id="resume-review-status" class="status" role="status" aria-live="polite"></p>
         </section>
-      </div>
     </div>
   </div>
 
@@ -4525,16 +4679,30 @@ const DASHBOARD_PAGE = `<!doctype html>
   <script>
     document.querySelectorAll('nav .tab').forEach(function (tabButton) {
       tabButton.addEventListener('click', function () {
+        // Leaving the Roles tab with unsaved edits (or having never analyzed at all) is exactly
+        // when a stale/missing analysis would otherwise silently sit there -- see maybeReanalyzeRoles.
+        var leavingRolesDirty = tabButton.dataset.tab !== 'roles'
+          && document.getElementById('panel-roles').classList.contains('active');
         document.querySelectorAll('nav .tab').forEach(function (b) { b.classList.remove('active'); });
         document.querySelectorAll('.panel').forEach(function (p) { p.classList.remove('active'); });
         tabButton.classList.add('active');
         document.getElementById('panel-' + tabButton.dataset.tab).classList.add('active');
-        // On a phone only three or four of the eleven tabs fit at once, so the tab you just picked
+        if (leavingRolesDirty) maybeReanalyzeRoles();
+        // On a phone only three or four top-level tabs fit at once, so the tab you just picked
         // could sit half off-screen -- or, if you reached it by scrolling, leave the bar parked
         // somewhere that clips a neighbouring label mid-word. Centring the active tab keeps it
         // fully visible and shows a neighbour on each side, which is also the affordance that
         // there is more to scroll to.
         tabButton.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+      });
+    });
+
+    document.querySelectorAll('[data-resume-subtab]').forEach(function (subtabButton) {
+      subtabButton.addEventListener('click', function () {
+        document.querySelectorAll('[data-resume-subtab]').forEach(function (button) { button.classList.remove('active'); });
+        document.querySelectorAll('#panel-resume > .subpanel').forEach(function (panel) { panel.classList.remove('active'); });
+        subtabButton.classList.add('active');
+        document.getElementById('resume-subpanel-' + subtabButton.dataset.resumeSubtab).classList.add('active');
       });
     });
 
@@ -4640,18 +4808,152 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
     }
 
+    // --- Roles page: sub-tabs, the three raw preference inputs, and the derived analysis ---
+
+    document.querySelectorAll('#panel-roles .subnav .subtab').forEach(function (subtabButton) {
+      subtabButton.addEventListener('click', function () {
+        document.querySelectorAll('#panel-roles .subnav .subtab').forEach(function (b) { b.classList.remove('active'); });
+        document.querySelectorAll('#panel-roles .subpanel').forEach(function (p) { p.classList.remove('active'); });
+        subtabButton.classList.add('active');
+        document.getElementById('subpanel-' + subtabButton.dataset.subtab).classList.add('active');
+        if (subtabButton.dataset.subtab === 'analysis') maybeReanalyzeRoles();
+      });
+    });
+
+    // Set whenever a note is added/removed or the Locations/Dealbreakers/Criteria text changes,
+    // so maybeReanalyzeRoles knows a fresh pass is actually worth running.
+    var rolesInputsDirty = false;
+    function markRolesDirty() { rolesInputsDirty = true; }
+    ['desired-locations', 'dealbreakers', 'care-about'].forEach(function (id) {
+      document.getElementById(id).addEventListener('input', markRolesDirty);
+    });
+
+    async function savePreferences() {
+      var res = await api('/desired-roles', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          desired_locations: document.getElementById('desired-locations').value,
+          dealbreakers: document.getElementById('dealbreakers').value,
+          care_about: document.getElementById('care-about').value,
+          provider: document.getElementById('role-analysis-provider').value,
+        }),
+      });
+      var saved = await res.json();
+      if (!res.ok) throw new Error(errorMessage(saved, 'save_failed'));
+      renderCareAboutTopics(saved.care_about_topics);
+      return saved;
+    }
+
+    [
+      ['locations-save-button', 'locations-save-status'],
+      ['dealbreakers-save-button', 'dealbreakers-save-status'],
+      ['criteria-save-button', 'criteria-save-status'],
+    ].forEach(function (pair) {
+      document.getElementById(pair[0]).addEventListener('click', async function () {
+        var statusEl = document.getElementById(pair[1]);
+        statusEl.textContent = 'Saving…';
+        statusEl.className = 'status';
+        try {
+          await savePreferences();
+          rolesInputsDirty = false;
+          statusEl.textContent = 'Saved.';
+          statusEl.className = 'status success';
+        } catch (err) {
+          statusEl.textContent = 'Error: ' + err.message;
+          statusEl.className = 'status error';
+        }
+      });
+    });
+
+    // Non-null only once an analysis with at least one role exists -- both the never-analyzed-yet
+    // empty state and the auto-trigger conditions below key off this.
+    var currentRoleAnalysis = null;
+
+    function renderRoleAnalysis(analysis) {
+      currentRoleAnalysis = analysis && analysis.roles && analysis.roles.length ? analysis : null;
+      var host = document.getElementById('role-analysis-view');
+      host.innerHTML = '';
+      if (!currentRoleAnalysis) {
+        host.appendChild(el('p', { className: 'empty', textContent: 'Not analyzed yet -- click Reanalyze, or add a note on the Notes tab and switch tabs.' }));
+        return;
+      }
+      host.appendChild(el('p', { textContent: currentRoleAnalysis.summary }));
+      var list = el('div', { className: 'role-analysis-roles' });
+      currentRoleAnalysis.roles.forEach(function (role) {
+        var card = el('div', { className: 'role-analysis-role' });
+        card.appendChild(el('strong', { textContent: role.title }));
+        card.appendChild(el('p', { textContent: role.description }));
+        list.appendChild(card);
+      });
+      host.appendChild(list);
+    }
+
+    // 'silent' is set by every auto-trigger path (page load, leaving the Roles tab, opening the
+    // Analysis tab for the first time) so a background pass never overwrites status text the
+    // candidate is actively looking at, and never surfaces "no source material yet" as an error
+    // before they've written a single note. The explicit Reanalyze button always runs loud.
+    async function runRoleAnalysis(silent) {
+      var statusEl = document.getElementById('role-analysis-status');
+      var button = document.getElementById('role-analysis-button');
+      if (!silent) {
+        button.disabled = true;
+        statusEl.textContent = 'Analyzing…';
+        statusEl.className = 'status';
+      }
+      try {
+        var res = await api('/desired-roles/analyze', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ provider: document.getElementById('role-analysis-provider').value }),
+        });
+        var data = await res.json();
+        if (!res.ok) {
+          if (data.error === 'no_source_material') return;
+          throw new Error(errorMessage(data, 'generation_failed'));
+        }
+        renderRoleAnalysis(data.role_analysis);
+        if (!silent) {
+          statusEl.textContent = 'Analyzed just now.';
+          statusEl.className = 'status success';
+        }
+      } catch (err) {
+        if (!silent) {
+          statusEl.textContent = 'Error: ' + err.message;
+          statusEl.className = 'status error';
+        }
+      } finally {
+        if (!silent) button.disabled = false;
+      }
+    }
+
+    document.getElementById('role-analysis-button').addEventListener('click', function () { runRoleAnalysis(false); });
+
+    // The auto-reanalyze rule: nothing changed and an analysis already exists -> skip. Otherwise
+    // save whatever's dirty (best-effort -- the explicit Save buttons remain the reliable path)
+    // and run a silent analysis pass, covering both "made changes and clicked away" and "never
+    // analyzed at all yet".
+    async function maybeReanalyzeRoles() {
+      if (!rolesInputsDirty && currentRoleAnalysis) return;
+      var wasDirty = rolesInputsDirty;
+      rolesInputsDirty = false;
+      if (wasDirty) {
+        try { await savePreferences(); } catch (err) { /* best-effort; Save buttons remain available */ }
+      }
+      await runRoleAnalysis(true);
+    }
+
     async function loadProfile() {
       var res = await api('/profile');
       var data = await res.json();
       if (data.profile) {
-        document.getElementById('profile-label').value = data.profile.label || '';
-        document.getElementById('desired-roles-description').value = data.profile.desired_roles || '';
         document.getElementById('desired-locations').value = data.profile.desired_locations || '';
         document.getElementById('dealbreakers').value = data.profile.dealbreakers || '';
         document.getElementById('care-about').value = data.profile.care_about || '';
         renderCareAboutTopics(data.profile.care_about_topics);
-        renderStructuredProfileView('structured-profile-view', data.profile.structured);
+        renderRoleAnalysis(data.profile.role_analysis);
         renderStructuredProfileView('resume-profile-view', data.profile.structured);
+        maybeReanalyzeRoles();
       }
     }
 
@@ -4677,8 +4979,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
     }
 
-    function renderChecks(checks) {
-      var host = document.getElementById('resume-checks');
+    function renderChecks(checks, containerId) {
+      var host = document.getElementById(containerId || 'resume-checks');
       host.innerHTML = '';
       if (!checks || !checks.length) return;
       var list = el('ul', { className: 'checks' });
@@ -4712,11 +5014,21 @@ const DASHBOARD_PAGE = `<!doctype html>
       if (data.templates) renderTemplateChoices(data.templates);
       var list = document.getElementById('resumes-list');
       list.innerHTML = '';
-      if (!data.resumes.length) {
+      var master = data.resumes.find(function (resume) { return Boolean(resume.is_master); });
+      var versions = data.resumes.filter(function (resume) { return !resume.is_master; });
+      if (master) {
+        document.getElementById('master-preview-section').style.display = 'block';
+        document.getElementById('master-preview-frame').src =
+          '/resumes/' + encodeURIComponent(master.id) + '/file?v=' + Date.now();
+        var masterChecks = [];
+        try { masterChecks = JSON.parse(master.checks_json || '[]'); } catch (e) { masterChecks = []; }
+        renderChecks(masterChecks, 'master-checks');
+      }
+      if (!versions.length) {
         list.appendChild(el('p', { className: 'empty', textContent: 'No resume versions yet — generate one above.' }));
         return;
       }
-      data.resumes.forEach(function (resume) {
+      versions.forEach(function (resume) {
         var preview = el('a', {
           className: 'row-title',
           href: '/resumes/' + encodeURIComponent(resume.id) + '/file',
@@ -4761,13 +5073,33 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     document.getElementById('resume-master-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('resume-master-status');
-      statusEl.textContent = 'Writing out everything in your profile… this one takes longer than a normal version.';
+      var provider = document.getElementById('resume-provider').value;
+      var button = this;
+      button.disabled = true;
+      statusEl.textContent = 'Reading your documents and notes, then building the master resume…';
       statusEl.className = 'status';
       try {
+        var profileRes = await api('/profile/generate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ provider: provider }),
+        });
+        var profileData = await profileRes.json();
+        if (!profileRes.ok) throw new Error(errorMessage(profileData, 'profile_generation_failed'));
+
+        var saveRes = await api('/profile/structured', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ structured: profileData.draft_structured }),
+        });
+        if (!saveRes.ok) throw new Error(errorMessage(await saveRes.json(), 'profile_save_failed'));
+        renderStructuredProfileView('resume-profile-view', profileData.draft_structured);
+        statusEl.textContent = 'Profile ready. Rendering the master resume…';
+
         var res = await api('/resumes/master', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ provider: document.getElementById('resume-provider').value }),
+          body: JSON.stringify({ provider: provider }),
         });
         var data = await res.json();
         if (!res.ok) throw new Error(errorMessage(data, 'generation_failed'));
@@ -4776,10 +5108,15 @@ const DASHBOARD_PAGE = `<!doctype html>
           data.bullets + ' accomplishment' + (data.bullets === 1 ? '' : 's') + ' on file.';
         statusEl.className = 'status success';
         await loadResumes();
-        showResumePreview(data.id, data.checks, '');
+        document.getElementById('master-preview-section').style.display = 'block';
+        document.getElementById('master-preview-frame').src =
+          '/resumes/' + encodeURIComponent(data.id) + '/file?v=' + Date.now();
+        renderChecks(data.checks, 'master-checks');
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
       }
     });
 
@@ -4926,6 +5263,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         count === 1 ? '1 note on file' : count + ' notes on file';
       renderCollapsibleList('role-signals-list', data.role_signals, 'Nothing added yet.', function (s) { return s.claim; }, async function (s) {
         await api('/role-signals/' + encodeURIComponent(s.id), { method: 'DELETE' });
+        markRolesDirty();
         loadRoleSignals();
       });
     }
@@ -4946,67 +5284,8 @@ const DASHBOARD_PAGE = `<!doctype html>
         statusEl.textContent = 'Added.';
         statusEl.className = 'status success';
         document.getElementById('role-signal-form').reset();
+        markRolesDirty();
         loadRoleSignals();
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      }
-    });
-
-    document.getElementById('desired-roles-generate-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('desired-roles-generate-status');
-      var draftBlock = document.getElementById('desired-roles-draft-block');
-      statusEl.textContent = 'Generating…';
-      statusEl.className = 'status';
-      draftBlock.style.display = 'none';
-      try {
-        var res = await api('/desired-roles/generate', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ provider: document.getElementById('desired-roles-provider').value }),
-        });
-        var data = await res.json();
-        if (!res.ok) throw new Error(errorMessage(data, 'generation_failed'));
-        document.getElementById('desired-roles-draft').value = data.draft_description;
-        draftBlock.style.display = 'block';
-        statusEl.textContent = 'Draft ready below. Review before using it.';
-        statusEl.className = 'status success';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      }
-    });
-
-    document.getElementById('desired-roles-use-draft').addEventListener('click', function () {
-      document.getElementById('desired-roles-description').value = document.getElementById('desired-roles-draft').value;
-      document.getElementById('desired-roles-draft-block').style.display = 'none';
-      document.getElementById('desired-roles-generate-status').textContent = 'Draft copied below — click Save to keep it.';
-    });
-
-    document.getElementById('desired-roles-save-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('desired-roles-save-status');
-      statusEl.textContent = 'Saving…';
-      statusEl.className = 'status';
-      try {
-        var res = await api('/desired-roles', {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            desired_roles: document.getElementById('desired-roles-description').value,
-            desired_locations: document.getElementById('desired-locations').value,
-            dealbreakers: document.getElementById('dealbreakers').value,
-            care_about: document.getElementById('care-about').value,
-            provider: document.getElementById('desired-roles-provider').value,
-          }),
-        });
-        if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
-        var saved = await res.json();
-        renderCareAboutTopics(saved.care_about_topics);
-        var topicCount = (saved.care_about_topics || []).length;
-        statusEl.textContent = topicCount
-          ? 'Saved. Reading "what do you care about" gave these ' + topicCount + ' fact columns -- they show on every posting after the next re-check.'
-          : 'Saved.';
-        statusEl.className = 'status success';
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
@@ -5041,78 +5320,6 @@ const DASHBOARD_PAGE = `<!doctype html>
       } finally {
         button.disabled = false;
       }
-    });
-
-    document.getElementById('save-name-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('profile-status');
-      statusEl.textContent = 'Saving…';
-      statusEl.className = 'status';
-      try {
-        var res = await api('/profile', {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ label: document.getElementById('profile-label').value }),
-        });
-        if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
-        statusEl.textContent = 'Saved.';
-        statusEl.className = 'status success';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      }
-    });
-
-    var latestStructuredDraft = null;
-
-    document.getElementById('generate-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('generate-status');
-      var draftBlock = document.getElementById('structured-draft-block');
-      statusEl.textContent = 'Generating… this can take a little while.';
-      statusEl.className = 'status';
-      draftBlock.style.display = 'none';
-      try {
-        var res = await api('/profile/generate', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ provider: document.getElementById('generate-provider').value }),
-        });
-        var data = await res.json();
-        if (!res.ok) throw new Error(errorMessage(data, 'generation_failed'));
-        latestStructuredDraft = data.draft_structured;
-        renderStructuredProfileView('structured-draft-view', latestStructuredDraft);
-        draftBlock.style.display = 'block';
-        statusEl.textContent = 'Draft ready below. Review before saving it.';
-        statusEl.className = 'status success';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      }
-    });
-
-    document.getElementById('use-structured-draft').addEventListener('click', async function () {
-      var statusEl = document.getElementById('generate-status');
-      if (!latestStructuredDraft) return;
-      try {
-        var res = await api('/profile/structured', {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ structured: latestStructuredDraft }),
-        });
-        if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
-        document.getElementById('structured-draft-block').style.display = 'none';
-        renderStructuredProfileView('structured-profile-view', latestStructuredDraft);
-        statusEl.textContent = 'Saved.';
-        statusEl.className = 'status success';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      }
-    });
-
-    document.getElementById('discard-structured-draft').addEventListener('click', function () {
-      latestStructuredDraft = null;
-      document.getElementById('structured-draft-block').style.display = 'none';
-      document.getElementById('generate-status').textContent = 'Discarded.';
     });
 
     function renderDocuments(docs) {
@@ -5792,7 +5999,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         ].filter(Boolean).join(' · ');
 
         var body = [el('div', { className: 'row-title-line' }, titleLine), el('div', { className: 'row-meta', textContent: meta })];
-        // Whatever the candidate said they care about (Desired Roles tab) -- one chip per fact, on
+        // Whatever the candidate said they care about (Roles tab, Criteria) -- one chip per fact, on
         // its own line so a long value wraps instead of forcing the title line to overflow.
         var facts = (fitDetail.facts || []).map(factChip).filter(Boolean);
         if (facts.length) body.push(el('div', { className: 'row-facts' }, facts));
@@ -6217,7 +6424,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       renderPipelineDiagram();
     }
 
-    // The Search tab isn't the active panel on first load (Desired Roles is), so the very first
+    // The Search tab isn't the active panel on first load (Roles is), so the very first
     // renderPipelineDiagram() call above measures a hidden (0-width) container and draws nothing
     // useful. Re-measure and redraw once the panel actually becomes visible.
     document.querySelector('[data-tab="search"]').addEventListener('click', renderPipelineDiagram);
@@ -6720,6 +6927,10 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     function renderAnswers() {
       var list = document.getElementById('answers-list');
+      if (!list) {
+        renderApplyReadiness();
+        return;
+      }
       list.innerHTML = '';
       if (!applicationAnswers.length) {
         list.appendChild(el('p', {
@@ -6755,7 +6966,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       renderApplyReadiness();
     }
 
-    document.getElementById('answer-form').addEventListener('submit', async function (event) {
+    var answerForm = document.getElementById('answer-form');
+    if (answerForm) answerForm.addEventListener('submit', async function (event) {
       event.preventDefault();
       var statusEl = document.getElementById('answer-status');
       statusEl.textContent = 'Saving…';
@@ -6927,8 +7139,8 @@ const DASHBOARD_PAGE = `<!doctype html>
         { id: 'feedback', name: 'Rejection reasons', note: 'What you taught the filter by rejecting postings with a reason.' },
         { id: 'resumes', name: 'Resume versions', note: 'Generated resumes and their PDFs.' },
         { id: 'cover_letters', name: 'Cover letters', note: 'Generated cover letters for interested jobs.' },
-        { id: 'notes', name: 'Notes', note: 'Freeform notes on the Profile tab.' },
-        { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Desired Roles tab.' },
+        { id: 'notes', name: 'Notes', note: 'Freeform and pasted resume text on Resume > Notes.' },
+        { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Roles tab (Notes sub-tab).' },
       ].forEach(function (collection) {
         var del = el('button', { className: 'destructive', type: 'button', textContent: 'Delete' });
         del.addEventListener('click', async function () {
@@ -7055,8 +7267,8 @@ function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "structured", schema: COMPANY_LIST_SCHEMA, toolName: "submit_companies", maxTokens: 4000 };
     case "profile.structure":
       return { kind: "structured", schema: STRUCTURED_PROFILE_JSON_SCHEMA, toolName: "submit_structured_profile", maxTokens: 2000 };
-    case "roles.describe":
-      return { kind: "text" };
+    case "roles.analyze":
+      return { kind: "structured", schema: ROLE_ANALYSIS_SCHEMA, toolName: "submit_role_analysis", maxTokens: 3000 };
     case "review.question":
       return { kind: "text" };
     case "resume.build":
@@ -7237,7 +7449,9 @@ export default {
 async function handle(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   {
     if (request.method === "GET" && url.pathname === "/health") return json({ status: "ok", mode: "cloudflare" });
-    if (url.pathname.startsWith("/dev")) return devConsole(request, env, url);
+    // Not `startsWith("/dev")` -- that also matches "/devices" and "/devices/:id/revoke",
+    // which shadowed the real device-management routes below and 404'd the Devices tab.
+    if (url.pathname === "/dev" || url.pathname.startsWith("/dev/")) return devConsole(request, env, url);
     if (request.method === "GET" && url.pathname === "/enroll") return enrollPage();
     if (request.method === "GET" && url.pathname === "/") {
       const auth = await requireSession(request, env);
@@ -7297,7 +7511,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     const roleSignalMatch = url.pathname.match(/^\/role-signals\/([^/]+)$/);
     if (request.method === "DELETE" && roleSignalMatch) return deleteRoleSignal(request, env, roleSignalMatch[1]);
     if (request.method === "PUT" && url.pathname === "/desired-roles") return saveDesiredRoles(request, env);
-    if (request.method === "POST" && url.pathname === "/desired-roles/generate") return generateDesiredRoles(request, env);
+    if (request.method === "POST" && url.pathname === "/desired-roles/analyze") return analyzeDesiredRoles(request, env);
     if (request.method === "GET" && url.pathname === "/resumes") return listResumes(request, env);
     if (request.method === "POST" && url.pathname === "/resumes") return createResume(request, env);
     // Ahead of the /resumes/:id routes below, which would otherwise capture "master" as an id.
