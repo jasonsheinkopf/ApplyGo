@@ -58,7 +58,12 @@ const METRO_ALIASES: Record<string, string[]> = {
   "sf bay area": ["california", "san francisco", "san jose", "palo alto", "mountain view", "sunnyvale", "oakland", "santa clara", "menlo park", "cupertino"],
   "silicon valley": ["california", "san jose", "palo alto", "mountain view", "sunnyvale", "santa clara", "cupertino", "menlo park"],
   sf: ["san francisco", "california"],
-  socal: ["california", "los angeles", "san diego", "irvine", "pasadena", "santa monica"],
+  socal: ["california", "los angeles", "san diego", "irvine", "pasadena", "santa monica", "orange county", "anaheim", "santa ana", "long beach"],
+  "southern california": ["california", "los angeles", "san diego", "irvine", "pasadena", "santa monica", "orange county", "anaheim", "santa ana", "long beach"],
+  "orange county": ["california", "irvine", "anaheim", "santa ana", "costa mesa", "newport beach", "huntington beach", "orange"],
+  "northern california": ["california", "san francisco", "san jose", "oakland", "sacramento", "berkeley"],
+  "north california": ["california", "san francisco", "san jose", "oakland", "sacramento", "berkeley"],
+  norcal: ["california", "san francisco", "san jose", "oakland", "sacramento", "berkeley"],
   la: ["los angeles", "california"],
   nyc: ["new york"],
   "new york city": ["new york"],
@@ -72,11 +77,18 @@ function normalizeLocationText(value: string): string {
   return String(value ?? "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
+// People listing acceptable-but-not-required places naturally tack on a qualifier -- "Orange
+// County preferred", "North California also" -- that isn't part of the place name. Left in, it
+// turns a real, matchable place into a literal string no company's address will ever contain,
+// silently rejecting every proposal from that term instead of just weighting it any differently
+// (this doesn't affect ranking today; it only prevents a real place from becoming unmatchable).
+const TRAILING_QUALIFIER = /\s+(preferred|ideally|especially|also|fine|ok|okay|too)$/;
+
 /** Splits a free-text location preference into individual acceptable places. */
 export function parseLocationFilter(text: string): string[] {
   return String(text ?? "")
     .split(/[,;\n]|\bor\b|\band\b|\//gi)
-    .map((part) => normalizeLocationText(part))
+    .map((part) => normalizeLocationText(part).replace(TRAILING_QUALIFIER, "").trim())
     .filter((part) => part.length > 1);
 }
 
@@ -283,12 +295,20 @@ export async function verifyWebsite(website: string): Promise<boolean> {
 // Finding that link gives us the board token without guessing.
 const ATS_PATTERNS: { provider: AtsProvider; pattern: RegExp }[] = [
   { provider: "greenhouse", pattern: /(?:boards|job-boards)\.greenhouse\.io\/(?:embed\/job_board\?for=)?([a-z0-9_-]+)/i },
+  // A careers page that renders its board client-side often still names the org slug in an inline
+  // script that calls the API domain directly, rather than linking to the public board page at all
+  // -- e.g. anduril.com's careers page never links boards.greenhouse.io anywhere in its HTML, but
+  // does reference boards-api.greenhouse.io for its own embedded widget to call.
+  { provider: "greenhouse", pattern: /boards-api\.greenhouse\.io\/v1\/boards\/([a-z0-9_-]+)/i },
   { provider: "lever", pattern: /jobs\.(?:eu\.)?lever\.co\/([a-z0-9_-]+)/i },
   { provider: "ashby", pattern: /jobs\.ashbyhq\.com\/([a-z0-9_.-]+)/i },
   { provider: "smartrecruiters", pattern: /careers\.smartrecruiters\.com\/([a-z0-9_-]+)/i },
 ];
 
-const CAREERS_PATHS = ["/careers", "/jobs", "/careers/", "/about/careers", "/company/careers"];
+const CAREERS_PATHS = [
+  "/careers", "/jobs", "/careers/", "/about/careers", "/company/careers",
+  "/open-roles", "/join-us", "/join", "/work-with-us", "/positions",
+];
 
 function boardApiUrl(provider: AtsProvider, token: string): string {
   switch (provider) {
@@ -315,13 +335,47 @@ function detectAtsInHtml(html: string): { provider: AtsProvider; token: string }
 export type BoardResolution = { provider: AtsProvider; token: string } | null;
 
 /**
+ * A handful of plausible ATS org slugs derived from the company's display name, since a company
+ * as often registers its full name as its bare domain label -- Anduril Industries' actual
+ * Greenhouse slug is "andurilindustries", which `slugFromWebsite("anduril.com")` ("anduril") never
+ * produces. Deduplicated by the caller against the domain-derived guess.
+ */
+function slugsFromName(name: string): string[] {
+  const words = String(name ?? "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9 ]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!words.length) return [];
+  return Array.from(new Set([words.join(""), words.join("-")])).filter((s) => s.length > 1);
+}
+
+/**
+ * SmartRecruiters is the one provider of the four that answers 200 for an org slug that doesn't
+ * exist at all (an empty result set), rather than 404 like the other three -- res.ok already rules
+ * those out, so this only has to cover SmartRecruiters' case, and it also means a real org with
+ * zero current openings reads the same as "not found" here. That's an acceptable miss: a company
+ * with nothing open isn't useful to register a guessed token for anyway.
+ */
+function boardHasListings(provider: AtsProvider, body: string): boolean {
+  if (provider === "smartrecruiters") return !body.includes('"totalFound":0');
+  return body.trim() !== "[]" && !body.includes('"jobs":[]');
+}
+
+/**
  * Resolves a company's job board: read the careers page for an ATS link first, and if that finds
- * nothing, try the company's own slug as a token against each provider. The slug guess is cheap
- * and correct surprisingly often, because most companies register their own name on their ATS.
+ * nothing, try plausible org slugs (from the domain and from the company's name) against every
+ * provider. The slug guess is cheap and correct surprisingly often, because most companies
+ * register either their bare domain name or their full display name as their ATS token -- and it's
+ * the only thing that can work at all for a careers page that renders its board client-side, since
+ * the real link then never appears in the static HTML this fetches to begin with.
  */
 export async function resolveBoard(
   website: string,
   careersUrl: string,
+  name: string,
   budget: { remaining: number },
 ): Promise<BoardResolution> {
   const pages = [careersUrl, ...CAREERS_PATHS.map((p) => safeJoin(website, p))].filter(Boolean);
@@ -343,15 +397,16 @@ export async function resolveBoard(
     if (fromFinalUrl) return fromFinalUrl;
   }
 
-  const slug = slugFromWebsite(website);
-  if (!slug) return null;
-  for (const provider of ["greenhouse", "lever", "ashby"] as AtsProvider[]) {
-    if (budget.remaining <= 0) return null;
-    budget.remaining -= 1;
-    const res = await fetchWithTimeout(boardApiUrl(provider, slug), 8000);
-    if (res && res.ok) {
-      const body = await res.text().catch(() => "");
-      if (body && body.trim() !== "[]" && !body.includes('"jobs":[]')) return { provider, token: slug };
+  const slugs = Array.from(new Set([slugFromWebsite(website), ...slugsFromName(name)].filter(Boolean)));
+  for (const slug of slugs) {
+    for (const provider of ["greenhouse", "lever", "ashby", "smartrecruiters"] as AtsProvider[]) {
+      if (budget.remaining <= 0) return null;
+      budget.remaining -= 1;
+      const res = await fetchWithTimeout(boardApiUrl(provider, slug), 8000);
+      if (res && res.ok) {
+        const body = await res.text().catch(() => "");
+        if (body && boardHasListings(provider, body)) return { provider, token: slug };
+      }
     }
   }
   return null;

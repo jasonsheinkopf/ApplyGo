@@ -1,4 +1,5 @@
 import { extractText, getDocumentProxy } from "unpdf";
+import WordExtractor from "word-extractor";
 import { type BrowserWorker } from "@cloudflare/puppeteer";
 import {
   type LlmTrace,
@@ -100,6 +101,7 @@ interface Env {
   OPENAI_MODEL?: string;
   ANTHROPIC_SCREEN_MODEL?: string;
   OPENAI_SCREEN_MODEL?: string;
+  LOCAL_RENDER_URL?: string;
   /** Set to "off" to stop recording model calls. Anything else (including unset) records them. */
   LLM_TRACE?: string;
   /** Installed once per isolate by the router; see attachTraceSink. */
@@ -545,6 +547,35 @@ async function ensureCareAboutTopics(
   }
 }
 
+/** One distinct role family the analysis thinks the candidate is suited for. */
+type RoleAnalysisEntry = { title: string; description: string };
+
+/**
+ * The structured output of `roles.analyze`: a non-role-specific summary (location, what to avoid,
+ * what matters) plus the distinct role types it identified. Regenerated wholesale by Reanalyze --
+ * there's no per-field merge, since re-deriving from the current notes/preferences is the point.
+ */
+type RoleAnalysis = { summary: string; roles: RoleAnalysisEntry[] };
+
+function readRoleAnalysis(preferencesJson: string): RoleAnalysis | null {
+  try {
+    const analysis = (JSON.parse(preferencesJson || "{}") as { role_analysis?: RoleAnalysis }).role_analysis;
+    return analysis && Array.isArray(analysis.roles) ? analysis : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Renders the structured analysis back into the same kind of plain-text block the fit/screen/resume
+ * prompts have always taken as `desiredRoles` -- one heading + description per distinct role family.
+ * Keeps every downstream consumer of that string unchanged while the candidate-facing side of this
+ * became structured.
+ */
+function flattenRoleAnalysis(analysis: RoleAnalysis): string {
+  return analysis.roles.map((r) => `## ${r.title}\n${r.description}`).join("\n\n");
+}
+
 function readStructuredProfile(structuredJson: string): StructuredProfile | null {
   try {
     const parsed = JSON.parse(structuredJson || "{}");
@@ -602,6 +633,7 @@ async function getProfile(request: Request, env: Env): Promise<Response> {
       dealbreakers: readDealbreakers(profile?.preferences_json ?? "{}"),
       care_about: readCareAbout(profile?.preferences_json ?? "{}"),
       care_about_topics: readCareAboutTopics(profile?.preferences_json ?? "{}"),
+      role_analysis: readRoleAnalysis(profile?.preferences_json ?? "{}"),
       structured: readStructuredProfile(profile?.structured_json ?? "{}"),
     },
   });
@@ -631,17 +663,20 @@ async function saveStructuredProfile(request: Request, env: Env): Promise<Respon
   return json({ structured, match_profile: buildMatchProfile(structured) });
 }
 
+/**
+ * Saves the three raw preference inputs -- locations, dealbreakers, criteria -- that feed both
+ * scoring and the roles analysis. `desired_roles` itself is not accepted here: it's system-derived
+ * output from `analyzeDesiredRoles`, not something typed directly, so this endpoint never touches it.
+ */
 async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as {
-    desired_roles?: string;
     desired_locations?: string;
     dealbreakers?: string;
     care_about?: string;
     provider?: string;
   };
-  const desiredRoles = (body.desired_roles ?? "").trim();
   const desiredLocations = (body.desired_locations ?? "").trim();
   const dealbreakers = (body.dealbreakers ?? "").trim();
   const careAbout = (body.care_about ?? "").trim();
@@ -676,7 +711,6 @@ async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  prefs.desired_roles = desiredRoles;
   prefs.desired_locations = desiredLocations;
   prefs.dealbreakers = dealbreakers;
   prefs.care_about = careAbout;
@@ -685,7 +719,6 @@ async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
     .bind(JSON.stringify(prefs), profileId)
     .run();
   return json({
-    desired_roles: desiredRoles,
     desired_locations: desiredLocations,
     dealbreakers,
     care_about: careAbout,
@@ -730,51 +763,139 @@ async function deleteRoleSignal(request: Request, env: Env, id: string): Promise
   return json({ deleted: result.meta.changes > 0 });
 }
 
-async function generateDesiredRoles(request: Request, env: Env): Promise<Response> {
+const ROLE_ANALYSIS_SCHEMA = {
+  type: "object",
+  properties: {
+    summary: {
+      type: "string",
+      description:
+        "One short paragraph covering only what matters to this candidate independent of any specific role -- " +
+        "location constraints, what to avoid, what to prioritize. Never names a job title here.",
+    },
+    roles: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "A short, concrete job title a posting would actually use (e.g. 'Applied AI Engineer'), not a sentence.",
+          },
+          description: {
+            type: "string",
+            description:
+              "Role family/titles, seniority, domain, must-have vs nice-to-have aspects, and enough concrete " +
+              "keywords that a simple keyword match could find it.",
+          },
+        },
+        required: ["title", "description"],
+      },
+      description:
+        "Each genuinely distinct role family the candidate should be shown -- not variations on one title. Do " +
+        "not blend different fields into one hybrid role that doesn't exist in the job market; a posting only " +
+        "has to match ONE entry to be worth surfacing.",
+    },
+  },
+  required: ["summary", "roles"],
+} as const;
+
+/**
+ * Replaces the old free-text draft-then-paste flow: reanalyzes in one shot from every current input
+ * (role-signal notes, the structured profile, locations, dealbreakers, criteria) and saves directly --
+ * there's no draft to review first, since a candidate who wants to react to it can just Reanalyze
+ * again. `desired_roles`, the flat string every scoring/resume prompt actually reads, is regenerated
+ * from the result rather than typed, so it can never drift from what Analysis is showing.
+ */
+async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as { provider?: string };
   const provider = normalizeProvider(body.provider);
-  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
-  if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
 
   const profileId = await getOrCreateProfileId(env);
-  const signals = await env.DB.prepare(
-    "SELECT claim FROM candidate_evidence WHERE profile_id = ? AND category = 'role_signal' ORDER BY created_at ASC",
-  )
-    .bind(profileId)
-    .all<{ claim: string }>();
-  if (signals.results.length === 0) return json({ error: "no_source_material" }, 400);
+  const [profileRow, signals] = await Promise.all([
+    env.DB.prepare("SELECT preferences_json, match_profile FROM candidate_profiles WHERE id = ?")
+      .bind(profileId)
+      .first<{ preferences_json: string; match_profile: string }>(),
+    env.DB.prepare(
+      "SELECT claim FROM candidate_evidence WHERE profile_id = ? AND category = 'role_signal' ORDER BY created_at ASC",
+    )
+      .bind(profileId)
+      .all<{ claim: string }>(),
+  ]);
+
+  const matchProfile = (profileRow?.match_profile ?? "").trim();
+  const notes = signals.results.map((s) => s.claim);
+  if (!notes.length && !matchProfile) return json({ error: "no_source_material" }, 400);
+
+  const preferencesJson = profileRow?.preferences_json ?? "{}";
+  const desiredLocations = readDesiredLocations(preferencesJson);
+  const dealbreakers = readDealbreakers(preferencesJson);
+  const careAbout = readCareAbout(preferencesJson);
 
   const prompt = [
-    "A job candidate has given you loose notes, job links, and preferences about the kind of roles they want next.",
-    "Write a clear, structured description of the roles they are looking for, to be used afterward as the filter",
-    "that decides which job postings are even worth showing them.",
+    "A job candidate wants two things from you: what matters to them in a search regardless of role, and which",
+    "distinct kinds of roles their background and stated interests actually support.",
     "",
-    "If the notes point toward more than one genuinely different kind of role -- not just variations on one title,",
-    "but different fields or functions entirely (for example, a former teacher now open to machine learning",
-    "engineering roles, advocacy roles, AND corporate training roles) -- list each one as its own separate entry.",
-    "Do not blend them into a single hybrid role that doesn't actually exist in the job market, like 'ML advocate",
-    "and trainer'. Being open to several different paths is not the same as wanting one job that combines all of",
-    "them, and a posting only has to be a strong match for ONE entry to be worth surfacing, not all of them at once.",
-    "For each entry, give: role family/titles, seniority, domain, must-have vs nice-to-have aspects, and enough",
-    "concrete keywords (actual job titles a posting would use) that a simple keyword match could find it. Note",
-    "anything explicitly ruled out separately, since it applies across every entry unless the notes say otherwise.",
+    "SUMMARY: one short paragraph covering only things that apply no matter what role they're looking at --",
+    "location constraints, what to avoid, what to prioritize. Do not name specific job titles here.",
     "",
-    "Base this only on the notes below.",
+    "ROLES: each genuinely distinct role family they should be shown -- not variations on one title, but",
+    "different fields or functions entirely (for example, a former teacher now open to machine learning",
+    "engineering roles, advocacy roles, AND corporate training roles). Do not blend them into a single hybrid",
+    "role that doesn't actually exist in the job market, like 'ML advocate and trainer'. Being open to several",
+    "different paths is not the same as wanting one job that combines all of them, and a posting only has to be",
+    "a strong match for ONE entry to be worth surfacing, not all of them at once. For each entry, give a short",
+    "concrete title plus a description covering role family/titles, seniority, domain, must-have vs nice-to-have",
+    "aspects, and enough concrete keywords (actual job titles a posting would use) that a simple keyword match",
+    "could find it.",
+    "",
+    "Ground both in the candidate's actual background below, not just their notes -- a role their experience",
+    "doesn't support isn't a good entry even if a note mentions interest in it.",
     "",
     WRITING_STYLE_RULES,
     "",
-    "Notes:",
-    ...signals.results.map((s) => `- ${s.claim}`),
-  ].join("\n\n");
+    matchProfile ? `CANDIDATE BACKGROUND:\n${matchProfile}` : "",
+    notes.length ? `NOTES AND LINKS:\n${notes.map((c) => `- ${c}`).join("\n")}` : "",
+    desiredLocations ? `LOCATIONS THEY'LL WORK IN:\n${desiredLocations}` : "",
+    dealbreakers ? `DEALBREAKERS:\n${dealbreakers}` : "",
+    careAbout ? `WHAT THEY SAID THEY CARE ABOUT:\n${careAbout}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
+  let analysis: RoleAnalysis;
   try {
-    const draft = await callText(env, provider, "roles.describe", prompt);
-    return json({ provider, draft_description: draft });
+    analysis = await callStructured<RoleAnalysis>(
+      env,
+      provider,
+      "roles.analyze",
+      prompt,
+      ROLE_ANALYSIS_SCHEMA,
+      "submit_role_analysis",
+      3000,
+    );
   } catch (err) {
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
+
+  let prefs: Record<string, unknown> = {};
+  try {
+    prefs = JSON.parse(preferencesJson || "{}");
+  } catch {
+    prefs = {};
+  }
+  const desiredRoles = flattenRoleAnalysis(analysis);
+  prefs.role_analysis = analysis;
+  prefs.desired_roles = desiredRoles;
+  await env.DB.prepare("UPDATE candidate_profiles SET preferences_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(JSON.stringify(prefs), profileId)
+    .run();
+
+  return json({ provider, role_analysis: analysis, desired_roles: desiredRoles });
 }
 
 async function upsertProfile(request: Request, env: Env): Promise<Response> {
@@ -880,6 +1001,8 @@ async function assessRowsBatched(
 
   const errors: string[] = [];
   let assessed = 0;
+  let recommended = 0;
+  let discarded = 0;
   let failed = false;
   await runPooled(
     batches,
@@ -900,7 +1023,14 @@ async function assessRowsBatched(
       if (!results) return;
       await storeFitResults(env, results);
       assessed += results.length;
-      await emit({ type: "progress", stage: "assess", done: assessed, total });
+      // Same reasoning as the screen stage's emit above: recommended/discarded are real,
+      // just-happened counts for this batch (via the same verdictForScore cutoff storeFitResults
+      // itself used), not a guess derived from done/total.
+      for (const result of results) {
+        if (verdictForScore(result.score) === "reject") discarded += 1;
+        else recommended += 1;
+      }
+      await emit({ type: "progress", stage: "assess", done: assessed, total, recommended, discarded });
     },
   );
   return { assessed, errors };
@@ -993,7 +1123,18 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
           if (!result.keep) screenedOut += 1;
         }
         screened += results.length;
-        await emit({ type: "progress", stage: "screen", done: screened, total: screenTotal });
+        // screened_in/screened_out here are cumulative within this call, not lifetime totals --
+        // the Search tab's live pipeline diagram uses them as real per-batch deltas (this posting
+        // really was just screened out, right now) rather than inferring a split from done/total,
+        // which carries no accept/reject information at all.
+        await emit({
+          type: "progress",
+          stage: "screen",
+          done: screened,
+          total: screenTotal,
+          screened_in: screened - screenedOut,
+          screened_out: screenedOut,
+        });
       },
     );
 
@@ -1657,7 +1798,7 @@ async function bulkAddCompanies(request: Request, env: Env): Promise<Response> {
  * resolves before trusting it. A model listing employers will occasionally invent or misremember
  * one, so nothing here is taken on faith.
  */
-async function discoverCompanies(request: Request, env: Env): Promise<Response> {
+async function discoverCompanies(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as {
@@ -1686,57 +1827,95 @@ async function discoverCompanies(request: Request, env: Env): Promise<Response> 
 
   const desiredLocations = readDesiredLocations(profileRow?.preferences_json ?? "{}");
   const locationTerms = parseLocationFilter(desiredLocations);
-
   const count = Math.min(Math.max(Number(body.count) || 10, 1), 20);
-  let proposals;
-  try {
-    proposals = await proposeCompanies(
-      env,
-      provider,
-      JSON.stringify(structured),
-      desiredRoles,
-      existingNames,
-      count,
-      (body.focus ?? "").trim(),
-      desiredLocations,
-    );
-  } catch (err) {
-    return json({ error: "discovery_failed", detail: friendlyMessage(err) }, 502);
-  }
+  const focus = (body.focus ?? "").trim();
 
-  const known = new Set(existingNames.map(companyNameKey));
-  const deduped = proposals.filter((p) => {
-    const key = companyNameKey(p.name);
-    if (!key || known.has(key)) return false;
-    known.add(key);
-    return true;
-  });
-
-  // The prompt states the location requirement, but a model treats it as guidance often enough
-  // that it has to be enforced here too rather than trusted.
-  const fresh = deduped.filter((p) => locationMatches(p.location, locationTerms));
-  const offTarget = deduped.length - fresh.length;
-
-  let added = 0;
-  let unreachable = 0;
-  for (const proposal of fresh) {
-    const reachable = await verifyWebsite(proposal.website);
-    if (!reachable) unreachable += 1;
-    const inserted = await addCompanyRow(env, profileId, {
-      ...proposal,
-      status: reachable ? "reachable" : "unreachable",
-      source: "ai",
+  return ndjsonResponse(ctx, async (emit) => {
+    await emit({
+      type: "progress",
+      stage: "propose",
+      message: `Asking the model for ${count} compan${count === 1 ? "y" : "ies"}…`,
     });
-    if (inserted) added += 1;
-  }
 
-  return json({
-    added,
-    proposed: proposals.length,
-    duplicates: proposals.length - deduped.length,
-    off_target: offTarget,
-    unreachable,
-    locations: desiredLocations,
+    let proposals;
+    try {
+      proposals = await proposeCompanies(
+        env,
+        provider,
+        JSON.stringify(structured),
+        desiredRoles,
+        existingNames,
+        count,
+        focus,
+        desiredLocations,
+      );
+    } catch (err) {
+      throw new Error(friendlyMessage(err));
+    }
+
+    const known = new Set(existingNames.map(companyNameKey));
+    const deduped = proposals.filter((p) => {
+      const key = companyNameKey(p.name);
+      if (!key || known.has(key)) return false;
+      known.add(key);
+      return true;
+    });
+
+    // The prompt states the location requirement, but a model treats it as guidance often enough
+    // that it has to be enforced here too rather than trusted.
+    const fresh = deduped.filter((p) => locationMatches(p.location, locationTerms));
+    const offTarget = deduped.length - fresh.length;
+
+    await emit({
+      type: "progress",
+      stage: "verify",
+      done: 0,
+      total: fresh.length,
+      proposed: proposals.length,
+      duplicates: proposals.length - deduped.length,
+      off_target: offTarget,
+    });
+
+    let added = 0;
+    let unreachable = 0;
+    let checked = 0;
+    // Verifying a website is one fetch with no LLM cost -- almost all wall-clock time is spent
+    // waiting on the network, not CPU. Running several at once instead of one after another is
+    // what turns "up to 20 sequential 8s timeouts" into a few seconds, and emitting after each one
+    // settles is what gives the candidate something to actually watch happen instead of one static
+    // "please wait" for the whole batch.
+    await runPooled(
+      fresh,
+      6,
+      async (proposal) => verifyWebsite(proposal.website),
+      async (proposal, reachable) => {
+        checked += 1;
+        if (!reachable) unreachable += 1;
+        const inserted = await addCompanyRow(env, profileId, {
+          ...proposal,
+          status: reachable ? "reachable" : "unreachable",
+          source: "ai",
+        });
+        if (inserted) added += 1;
+        await emit({
+          type: "progress",
+          stage: "verify",
+          done: checked,
+          total: fresh.length,
+          company: proposal.name,
+          reachable,
+        });
+      },
+    );
+
+    return {
+      added,
+      proposed: proposals.length,
+      duplicates: proposals.length - deduped.length,
+      off_target: offTarget,
+      unreachable,
+      locations: desiredLocations,
+    };
   });
 }
 
@@ -1866,7 +2045,7 @@ async function scanOneCompany(
   let token = company.ats_token;
 
   if (!provider || provider === "none") {
-    const resolved = await resolveBoard(company.website, company.careers_url, budget);
+    const resolved = await resolveBoard(company.website, company.careers_url, company.name, budget);
     if (!resolved) {
       await env.DB.prepare(
         `UPDATE companies SET ats_provider = 'none', scan_note = ?, last_scanned_at = CURRENT_TIMESTAMP,
@@ -2032,7 +2211,23 @@ async function getOrCreateProfileId(env: Env): Promise<string> {
   return id;
 }
 
-const DOCUMENT_TYPES = new Set(["application/pdf", "text/plain", "text/markdown"]);
+const DOCUMENT_TYPES = new Set([
+  "application/pdf",
+  "text/plain",
+  "text/markdown",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+]);
+
+function documentMediaType(file: File): string {
+  const extension = file.name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
+  if (extension === ".doc") return "application/msword";
+  if (extension === ".docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (extension === ".md") return "text/markdown";
+  if (extension === ".txt") return "text/plain";
+  if (extension === ".pdf") return "application/pdf";
+  return file.type;
+}
 
 async function listDocuments(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
@@ -2054,14 +2249,30 @@ async function uploadDocument(request: Request, env: Env): Promise<Response> {
   const file = form.get("file");
   if (!(file instanceof File)) return json({ error: "file_required" }, 400);
   if (file.size > 15 * 1024 * 1024) return json({ error: "file_too_large" }, 413);
-  if (!DOCUMENT_TYPES.has(file.type)) return json({ error: "unsupported_media_type" }, 415);
+  const mediaType = documentMediaType(file);
+  if (!DOCUMENT_TYPES.has(mediaType)) return json({ error: "unsupported_media_type" }, 415);
 
   const bytes = await file.arrayBuffer();
   const sha = await digestHex(bytes);
+
+  // Uploaded to R2 before any text extraction runs, deliberately -- pdf.js (via unpdf) parses
+  // through a worker and transfers the ArrayBuffer it's given rather than copying it, which
+  // detaches the original buffer (byteLength becomes 0) once parsing succeeds. That used to run
+  // before the R2 write and shared the exact same `bytes` buffer, so a PDF that extracted
+  // cleanly would silently upload as a zero-byte object -- the write succeeded, the document
+  // listed fine, and the file was simply gone the moment you tried to open it. Saving the
+  // artifact first means a bug in any extraction library can degrade `extracted_text`, the
+  // best-effort part, but can never again take the upload itself down with it.
+  const key = `documents/${crypto.randomUUID()}`;
+  await env.FILES.put(key, bytes, {
+    httpMetadata: { contentType: mediaType },
+    customMetadata: { originalName: file.name, uploadedByDevice: auth.id },
+  });
+
   let extractedText = "";
-  if (file.type === "text/plain" || file.type === "text/markdown") {
+  if (mediaType === "text/plain" || mediaType === "text/markdown") {
     extractedText = new TextDecoder().decode(bytes);
-  } else if (file.type === "application/pdf") {
+  } else if (mediaType === "application/pdf") {
     try {
       const pdf = await getDocumentProxy(new Uint8Array(bytes));
       const { text } = await extractText(pdf, { mergePages: true });
@@ -2069,12 +2280,15 @@ async function uploadDocument(request: Request, env: Env): Promise<Response> {
     } catch {
       extractedText = "";
     }
+  } else if (mediaType === "application/msword" || mediaType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+    try {
+      const extractor = new WordExtractor();
+      const document = await extractor.extract(Buffer.from(bytes));
+      extractedText = document.getBody().trim();
+    } catch {
+      extractedText = "";
+    }
   }
-  const key = `documents/${crypto.randomUUID()}`;
-  await env.FILES.put(key, bytes, {
-    httpMetadata: { contentType: file.type },
-    customMetadata: { originalName: file.name, uploadedByDevice: auth.id },
-  });
 
   const profileId = await getOrCreateProfileId(env);
   const id = crypto.randomUUID();
@@ -2082,9 +2296,9 @@ async function uploadDocument(request: Request, env: Env): Promise<Response> {
     `INSERT INTO source_documents (id, profile_id, original_name, r2_key, media_type, sha256, extracted_text)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(id, profileId, file.name, key, file.type, sha, extractedText)
+    .bind(id, profileId, file.name, key, mediaType, sha, extractedText)
     .run();
-  return json({ id, original_name: file.name, media_type: file.type, has_text: extractedText.length > 0 }, 201);
+  return json({ id, original_name: file.name, media_type: mediaType, has_text: extractedText.length > 0 }, 201);
 }
 
 async function renameDocument(request: Request, env: Env, id: string): Promise<Response> {
@@ -2106,7 +2320,10 @@ async function getDocumentFile(request: Request, env: Env, id: string): Promise<
   if (!doc) return json({ error: "not_found" }, 404);
   // PDF viewers (Adobe's plugin especially) fetch large files in chunks via Range requests;
   // without honoring those and replying 206/Content-Range, some viewers fail to load entirely.
-  const object = await env.FILES.get(doc.r2_key, { range: request.headers });
+  const rangeHeader = request.headers.get("range");
+  const object = rangeHeader
+    ? await env.FILES.get(doc.r2_key, { range: request.headers })
+    : await env.FILES.get(doc.r2_key);
   if (!object) return json({ error: "not_found" }, 404);
   const headers = new Headers();
   object.writeHttpMetadata(headers);
@@ -2375,7 +2592,7 @@ async function listResumes(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
   const profileId = await getOrCreateProfileId(env);
   const rows = await env.DB.prepare(
-    `SELECT id, name, instructions, template, revision, checks_json, critique, created_at
+    `SELECT id, name, instructions, template, revision, checks_json, critique, is_master, created_at
      FROM resumes WHERE profile_id = ? ORDER BY created_at DESC`,
   )
     .bind(profileId)
@@ -3741,6 +3958,29 @@ const DASHBOARD_PAGE = `<!doctype html>
   nav button.active { background: var(--accent); color: var(--accent-contrast); }
   .panel { display: none; }
   .panel.active { display: block; }
+  /* Same look as nav/.panel, namespaced separately so the sub-tab buttons never get picked up by
+     the top-level 'nav .tab' click handler that switches main panels. */
+  .subnav {
+    display: flex; gap: 0.2rem; overflow-x: auto; padding: 0.25rem; margin-bottom: 1.1rem;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 999px; width: fit-content;
+    -webkit-overflow-scrolling: touch;
+  }
+  .subnav button {
+    flex: none; margin: 0; padding: 0.45rem 0.95rem; font-size: 0.85rem; font-weight: 600;
+    background: none; border: none; border-radius: 999px; color: var(--text-muted); cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+  .subnav button:hover { color: var(--text); }
+  .subnav button.active { background: var(--accent); color: var(--accent-contrast); }
+  .subpanel { display: none; }
+  .subpanel.active { display: block; }
+  .role-analysis-roles { display: flex; flex-direction: column; gap: 0.7rem; margin-top: 0.6rem; }
+  .role-analysis-role {
+    padding: 0.7rem 0.9rem; background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .role-analysis-role strong { display: block; margin-bottom: 0.25rem; font-size: 0.92rem; }
+  .role-analysis-role p { margin: 0; font-size: 0.85rem; color: var(--text-muted); line-height: 1.45; }
   section {
     margin: 0 0 1.1rem; padding: 1.15rem 1.25rem; background: var(--surface);
     border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
@@ -3839,18 +4079,33 @@ const DASHBOARD_PAGE = `<!doctype html>
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
     clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
   }
-  /* Pipeline flow diagram (Search tab) -- a small sankey of where scanned postings currently sit:
-     not yet screened, screened out, awaiting the detailed pass, matched, or ruled out. Node bars
-     and link ribbons are sized in JS from the live counts; this just fixes the constant look --
-     stroke widths, gaps, label type -- shared by both the left-to-right and stacked-rows layouts. */
-  #jobs-pipeline { margin: 0.6rem 0 1rem; max-width: 640px; }
+  /* Pipeline flow diagram (Search tab) -- shows where scanned postings currently sit: not yet
+     screened, screened out, awaiting the detailed pass, ruled out on fit, or recommended. Node
+     heights and ribbon thickness are real counts from jobPipelineCounts, eased smoothly toward
+     whatever the current numbers are on every animation frame -- an initial load and a live
+     per-batch update during Scan/Find my matches both just change the target, so the diagram
+     visibly moves instead of only ever replacing a static number. Not-interested/Interested/
+     Applied aren't shown here -- this page is about finding matches, not the review funnel after. */
+  #jobs-pipeline { margin: 0.6rem 0 1rem; }
   #jobs-pipeline svg { display: block; width: 100%; height: auto; overflow: visible; }
-  .pf-node-value { font-size: 11px; font-weight: 700; fill: var(--text); }
-  .pf-node-sub { font-size: 8.5px; fill: var(--text-muted); }
-  .pf-link { opacity: 0.55; }
-  .pf-node-rect { stroke: var(--surface); stroke-width: 2; }
+  .pf-stage-title { font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; fill: var(--text-muted); text-transform: uppercase; }
+  .pf-node-rect { stroke-width: 1.4; }
+  .pf-node-label { font-size: 12px; font-weight: 600; fill: var(--text); }
+  .pf-node-count { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12px; font-weight: 700; }
+  .pf-node-pct { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 10px; fill: var(--text-muted); }
+  /* fill and fill-opacity are set per-edge in JS (by flow kind); nothing to fix here. */
   .pf-dot { filter: drop-shadow(0 0 2px rgba(0,0,0,0.25)); }
   @media (prefers-reduced-motion: reduce) { .pf-dot { display: none; } }
+  .pf-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: var(--text-muted); margin-top: 0.4rem; }
+  .pf-legend-item { display: flex; align-items: center; gap: 6px; }
+  .pf-swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .pf-progress-track { margin-top: 0.6rem; height: 3px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .pf-progress-fill { height: 100%; width: 0%; background: var(--accent); transition: width 0.4s ease; }
+  .pf-stat-row {
+    display: flex; flex-wrap: wrap; gap: 20px; margin-top: 0.5rem; font-size: 12px; color: var(--text-muted);
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  }
+  .pf-stat-row b { color: var(--text); font-weight: 700; }
   .template-choices { display: grid; gap: 0.5rem; margin-bottom: 0.9rem; }
   @media (min-width: 560px) { .template-choices { grid-template-columns: repeat(3, 1fr); } }
   .template-card {
@@ -3936,6 +4191,10 @@ const DASHBOARD_PAGE = `<!doctype html>
     font-size: 0.8rem; padding: 0.2rem 0.5rem; border: 1px solid var(--border);
     border-radius: 999px; background: transparent; color: inherit; cursor: pointer;
   }
+  .text-link {
+    font: inherit; padding: 0; margin: 0; border: none; background: none; color: var(--accent);
+    text-decoration: underline; cursor: pointer;
+  }
   .checkbox-label {
     display: flex; align-items: center; gap: 0.45rem; font-size: 0.85rem; color: var(--text-muted);
     margin: 0.6rem 0 0.2rem; cursor: pointer; font-weight: 500;
@@ -4013,8 +4272,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   </header>
 
   <nav>
-    <button class="tab active" data-tab="roles" type="button">Desired Roles</button>
-    <button class="tab" data-tab="profile" type="button">Profile</button>
+    <button class="tab active" data-tab="roles" type="button">Roles</button>
     <button class="tab" data-tab="resume" type="button">Resume</button>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="search" type="button">Search</button>
@@ -4023,167 +4281,160 @@ const DASHBOARD_PAGE = `<!doctype html>
     <button class="tab" data-tab="interested" type="button">Interested</button>
     <button class="tab" data-tab="applied" type="button">Applied</button>
     <button class="tab" data-tab="devices" type="button">Devices</button>
-    <button class="tab" data-tab="data" type="button">Data</button>
+    <button class="tab" data-tab="data" type="button">Database</button>
   </nav>
 
   <div id="panel-roles" class="panel active">
-    <div class="split">
-      <!-- Sticky because this column is much shorter than the form beside it, so it would otherwise
-           scroll away and leave a tall empty gutter. The notes here are the source material the
-           description on the right is generated from, so keeping them in view while you edit that
-           description is what you actually want anyway. -->
-      <div class="split-sticky">
-        <section id="role-signals-section">
-          <h2>What are you looking for?</h2>
-          <p class="hint">Paste job links, or write loosely about what you want next. The more you add, the better the generated description.</p>
-          <details id="role-signals-details" class="disclosure">
-            <summary id="role-signals-summary">Notes on file</summary>
-            <div id="role-signals-list"><p class="empty">Loading…</p></div>
-          </details>
-          <form id="role-signal-form">
-            <label for="role-signal-text">Add a note or link</label>
-            <textarea id="role-signal-text" required placeholder="e.g. a link to a posting, or 'I want senior IC roles in applied AI, remote-friendly, not pure infra'"></textarea>
-            <button type="submit">Add</button>
-          </form>
-          <p id="role-signal-status" class="status" role="status" aria-live="polite"></p>
-        </section>
-      </div>
-      <div class="split-sticky">
-        <section id="desired-roles-section">
-          <h2>Generated description</h2>
-          <p class="hint">This is what filters which postings you even see. If you'd take more than one genuinely different kind of role (say, machine learning engineering, advocacy work, and corporate training), list them as separate entries rather than one blended role -- a posting only needs to match one of them.</p>
-          <label for="desired-roles-provider">Generate using</label>
-          <select id="desired-roles-provider">
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI</option>
-          </select>
-          <button id="desired-roles-generate-button" class="secondary" type="button">Generate description</button>
-          <p id="desired-roles-generate-status" class="status" role="status" aria-live="polite"></p>
-          <div id="desired-roles-draft-block" style="display:none">
-            <label for="desired-roles-draft">Draft (review, then use or discard)</label>
-            <textarea id="desired-roles-draft" readonly style="min-height:8rem"></textarea>
-            <button id="desired-roles-use-draft" type="button">Use this draft</button>
-          </div>
-          <label for="desired-roles-description">Saved description</label>
-          <textarea id="desired-roles-description" style="min-height:8rem" placeholder="What roles are you targeting?"></textarea>
-          <label for="desired-locations">Locations you'll work in</label>
-          <input id="desired-locations" placeholder="e.g. California, or Bay Area, Seattle, Remote">
-          <p class="hint">Enforced as a hard filter: company discovery won't add employers outside these, and board scans skip postings elsewhere. Leave blank for no location limit.</p>
-          <label for="dealbreakers">Dealbreakers (optional)</label>
-          <textarea id="dealbreakers" placeholder="e.g. Reject anything requiring 5+ years of experience for a technical role. 3-4 years is fine."></textarea>
-          <p class="hint">Enforced during scoring (the detailed pass on postings that survive the quick screen) as a binding rule, the same weight as a stated hard requirement -- write down whatever you don't want to see, in your own words.</p>
-          <label for="care-about">What do you care about? (optional)</label>
-          <textarea id="care-about" placeholder="e.g. Salary, years of experience required, remote or in office, typical hours"></textarea>
-          <p class="hint">Write it however you'd say it out loud -- saving reads what you meant and turns it into the fact columns below, so you don't have to phrase it as labels. These are the topics you want at a glance for every posting, not targets to filter on (dealbreakers above is where you rule things out), and they never affect the score.</p>
-          <div id="care-about-topics" class="row-facts"></div>
-          <button id="desired-roles-save-button" type="button">Save</button>
-          <p id="desired-roles-save-status" class="status" role="status" aria-live="polite"></p>
-          <h3 class="subhead">Already have matches?</h3>
-          <p class="hint">Re-score your existing top matches against whatever you just saved above, without re-running the whole pipeline from scratch.</p>
-          <div class="controls">
-            <div>
-              <label for="reassess-min-score">Minimum score to re-check</label>
-              <input id="reassess-min-score" type="number" min="0" max="100" value="70">
-            </div>
-            <button id="reassess-button" type="button">Re-check my top matches</button>
-          </div>
-          <p id="reassess-status" class="status" role="status" aria-live="polite"></p>
-        </section>
-      </div>
+    <div class="subnav">
+      <button class="subtab active" data-subtab="notes" type="button">Notes</button>
+      <button class="subtab" data-subtab="locations" type="button">Locations</button>
+      <button class="subtab" data-subtab="dealbreakers" type="button">Dealbreakers</button>
+      <button class="subtab" data-subtab="criteria" type="button">Criteria</button>
+      <button class="subtab" data-subtab="analysis" type="button">Analysis</button>
     </div>
-  </div>
 
-  <div id="panel-profile" class="panel">
-    <div class="split">
-      <div>
-        <section id="material-section">
-          <h2>Your material</h2>
-          <p class="hint">Upload files or add notes — this feeds the structured profile on the right.</p>
-          <label for="profile-label">Name</label>
-          <input id="profile-label" required placeholder="e.g. Jason Sheinkopf">
-          <button id="save-name-button" class="secondary" type="button">Save name</button>
-          <p id="profile-status" class="status" role="status" aria-live="polite"></p>
-
-          <hr class="divider">
-
-          <h3 class="subhead">Documents</h3>
-          <div id="documents-list"><p class="empty">Loading…</p></div>
-          <form id="document-form">
-            <label for="document-file">Upload resume or notes file (PDF, plain text, or Markdown)</label>
-            <input id="document-file" type="file" accept=".pdf,.txt,.md,application/pdf,text/plain,text/markdown" required>
-            <button type="submit">Upload</button>
-          </form>
-          <p id="document-status" class="status" role="status" aria-live="polite"></p>
-
-          <hr class="divider">
-
-          <h3 class="subhead">Notes about yourself</h3>
-          <div id="notes-list"><p class="empty">Loading…</p></div>
-          <form id="note-form">
-            <label for="note-text">Add unstructured text (accomplishments, goals, background — anything)</label>
-            <textarea id="note-text" required placeholder="Write freely; this feeds the profile generator"></textarea>
-            <button type="submit">Add note</button>
-          </form>
-          <p id="note-status" class="status" role="status" aria-live="polite"></p>
-
-        </section>
-      </div>
-      <div class="split-sticky">
-        <section id="structured-profile-section">
-          <h2>Your structured profile</h2>
-          <label for="generate-provider">Generate from documents &amp; notes using</label>
-          <select id="generate-provider">
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI</option>
-          </select>
-          <button id="generate-button" type="button">Generate structured profile</button>
-          <p id="generate-status" class="status" role="status" aria-live="polite"></p>
-          <div id="structured-draft-block" style="display:none">
-            <h3 class="subhead">Draft — review, then save or discard</h3>
-            <div id="structured-draft-view"></div>
-            <button id="use-structured-draft" type="button">Save this</button>
-            <button id="discard-structured-draft" class="secondary" type="button">Discard</button>
-          </div>
-          <div id="structured-profile-view"><p class="empty">No structured profile yet — add material on the left and generate.</p></div>
-        </section>
-      </div>
+    <div id="subpanel-notes" class="subpanel active">
+      <section id="role-signals-section">
+        <h2>What are you looking for?</h2>
+        <p class="hint">Paste job links, or write loosely about what you want next. The more you add, the better the analysis on the Analysis tab.</p>
+        <details id="role-signals-details" class="disclosure">
+          <summary id="role-signals-summary">Notes on file</summary>
+          <div id="role-signals-list"><p class="empty">Loading…</p></div>
+        </details>
+        <form id="role-signal-form">
+          <label for="role-signal-text">Add a note or link</label>
+          <textarea id="role-signal-text" required placeholder="e.g. a link to a posting, or 'I want senior IC roles in applied AI, remote-friendly, not pure infra'"></textarea>
+          <button type="submit">Add</button>
+        </form>
+        <p id="role-signal-status" class="status" role="status" aria-live="polite"></p>
+      </section>
     </div>
-    <!-- Its own section below the split rather than a fourth stacked block inside "Your material".
-         It isn't source material for the structured profile the way documents and notes are -- it's
-         a separate bank of exact answers reused on forms -- and stacking it there made the left
-         column run far longer than the right. -->
-    <section id="answers-section">
-      <h2>Application answers</h2>
-      <p class="hint">Questions every application form asks (work authorization, veteran status, disability disclosure, notice period). Answered once here or on a form, reused everywhere after. Stored as exact values, never paraphrased.</p>
-      <div id="answers-list"><p class="empty">Loading…</p></div>
-      <form id="answer-form">
-        <label for="answer-question">Question</label>
-        <input id="answer-question" required placeholder="e.g. Are you legally authorized to work in the United States?">
-        <label for="answer-value">Answer</label>
-        <input id="answer-value" required placeholder="e.g. Yes">
-        <button type="submit">Save answer</button>
-      </form>
-      <p id="answer-status" class="status" role="status" aria-live="polite"></p>
-    </section>
+
+    <div id="subpanel-locations" class="subpanel">
+      <section id="locations-section">
+        <h2>Locations you'll work in</h2>
+        <p class="hint">Enforced as a hard filter: company discovery won't add employers outside these, and board scans skip postings elsewhere. Leave blank for no location limit.</p>
+        <label for="desired-locations">Locations</label>
+        <input id="desired-locations" placeholder="e.g. California, or Bay Area, Seattle, Remote">
+        <button id="locations-save-button" type="button">Save</button>
+        <p id="locations-save-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="subpanel-dealbreakers" class="subpanel">
+      <section id="dealbreakers-section">
+        <h2>Dealbreakers</h2>
+        <p class="hint">Enforced during scoring (the detailed pass on postings that survive the quick screen) as a binding rule, the same weight as a stated hard requirement -- write down whatever you don't want to see, in your own words.</p>
+        <label for="dealbreakers">Dealbreakers (optional)</label>
+        <textarea id="dealbreakers" placeholder="e.g. Reject anything requiring 5+ years of experience for a technical role. 3-4 years is fine."></textarea>
+        <button id="dealbreakers-save-button" type="button">Save</button>
+        <p id="dealbreakers-save-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="subpanel-criteria" class="subpanel">
+      <section id="criteria-section">
+        <h2>Criteria</h2>
+        <p class="hint">What do you care about? Write it however you'd say it out loud -- saving reads what you meant and turns it into the fact columns below, so you don't have to phrase it as labels. These are the topics you want at a glance for every posting, not targets to filter on (Dealbreakers is where you rule things out), and they never affect the score.</p>
+        <label for="care-about">What do you care about? (optional)</label>
+        <textarea id="care-about" placeholder="e.g. Salary, years of experience required, remote or in office, typical hours"></textarea>
+        <div id="care-about-topics" class="row-facts"></div>
+        <button id="criteria-save-button" type="button">Save</button>
+        <p id="criteria-save-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="subpanel-analysis" class="subpanel">
+      <section id="role-analysis-section">
+        <h2>Analysis</h2>
+        <p class="hint">What the model thinks you're suited for, based on your notes, your profile, and the Locations/Dealbreakers/Criteria tabs. This is what filters which postings you even see. Editing the other tabs and switching away reanalyzes automatically; use Reanalyze to force a fresh pass right now.</p>
+        <label for="role-analysis-provider">Analyze using</label>
+        <select id="role-analysis-provider">
+          <option value="anthropic">Anthropic (Claude)</option>
+          <option value="openai">OpenAI</option>
+        </select>
+        <button id="role-analysis-button" class="secondary" type="button">Reanalyze</button>
+        <p id="role-analysis-status" class="status" role="status" aria-live="polite"></p>
+        <div id="role-analysis-view"><p class="empty">Not analyzed yet -- click Reanalyze, or add a note on the Notes tab and switch tabs.</p></div>
+        <h3 class="subhead">Already have matches?</h3>
+        <p class="hint">Re-score your existing top matches against the current analysis, without re-running the whole pipeline from scratch.</p>
+        <div class="controls">
+          <div>
+            <label for="reassess-min-score">Minimum score to re-check</label>
+            <input id="reassess-min-score" type="number" min="0" max="100" value="70">
+          </div>
+          <button id="reassess-button" type="button">Re-check my top matches</button>
+        </div>
+        <p id="reassess-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
   </div>
 
   <div id="panel-resume" class="panel">
-    <div class="split">
-      <div class="split-sticky">
-        <section id="resume-reference-section">
-          <h2>Your profile</h2>
-          <p class="hint">Read-only — edit this on the Profile tab. Every resume version is built from it.</p>
-          <div id="resume-profile-view"><p class="empty">No structured profile yet — build one on the Profile tab first.</p></div>
-        </section>
-      </div>
-      <div>
+    <div class="subnav" aria-label="Resume sections">
+      <button class="active" data-resume-subtab="documents" type="button">Documents</button>
+      <button data-resume-subtab="notes" type="button">Notes</button>
+      <button data-resume-subtab="master" type="button">Master</button>
+      <button data-resume-subtab="versions" type="button">Resumes</button>
+    </div>
+
+    <div id="resume-subpanel-documents" class="subpanel active">
+      <section id="material-section">
+        <h2>Documents</h2>
+        <p class="hint">Upload resumes, cover letters, or other career material. PDF, Word (.doc and .docx), plain text, and Markdown are supported.</p>
+        <div id="documents-list"><p class="empty">Loading…</p></div>
+        <form id="document-form">
+          <label for="document-file">Choose a document</label>
+          <input id="document-file" type="file" accept=".pdf,.doc,.docx,.txt,.md,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown" required>
+          <button type="submit">Upload</button>
+        </form>
+        <p id="document-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="resume-subpanel-notes" class="subpanel">
+      <section id="notes-section">
+        <h2>Notes</h2>
+        <p class="hint">Paste a complete resume, or add accomplishments, updates, context, and experience that may not appear in your formal documents.</p>
+        <div id="notes-list"><p class="empty">Loading…</p></div>
+        <form id="note-form">
+          <label for="note-text">Paste resume text or add a note</label>
+          <textarea id="note-text" required style="min-height:14rem" placeholder="Paste plain-text resume content, or write anything the master resume should know about…"></textarea>
+          <button type="submit">Add</button>
+        </form>
+        <p id="note-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="resume-subpanel-master" class="subpanel">
+      <div class="split">
+        <div>
         <section id="resume-master-section">
-          <h2>Master archive</h2>
-          <p class="hint">Everything you have ever done, in one deliberately oversized document. Every tailored resume is built by cutting this down, so anything missing here can never appear on any of them. Not something you send anywhere.</p>
-          <button id="resume-master-button" class="secondary" type="button">Build master archive</button>
+          <h2>Master resume</h2>
+          <p class="hint">Builds a structured profile from all Documents and Notes, then creates one deliberately oversized resume containing everything. This is the source for future tailored versions, not a document to submit.</p>
+          <label for="resume-provider">Build using</label>
+          <select id="resume-provider">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI</option>
+          </select>
+          <button id="resume-master-button" type="button">Build or update master</button>
           <p id="resume-master-status" class="status" role="status" aria-live="polite"></p>
         </section>
+        <section id="master-profile-section">
+          <h2>Structured source</h2>
+          <p class="hint">Generated automatically as part of the master build and used by matching and tailored resumes.</p>
+          <div id="resume-profile-view"><p class="empty">Build the master resume to create this source.</p></div>
+        </section>
+        </div>
+        <section id="master-preview-section" style="display:none">
+          <h2>Master preview</h2>
+          <iframe id="master-preview-frame" style="width:100%; min-height:75vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+          <div id="master-checks"></div>
+        </section>
+      </div>
+    </div>
 
+    <div id="resume-subpanel-versions" class="subpanel">
         <section id="resume-generate-section">
           <h2>Resume versions</h2>
           <label for="resume-template">Template</label>
@@ -4194,11 +4445,6 @@ const DASHBOARD_PAGE = `<!doctype html>
           <select id="resume-pages">
             <option value="1">One page</option>
             <option value="2">Up to two pages</option>
-          </select>
-          <label for="resume-provider">Generate using</label>
-          <select id="resume-provider">
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI</option>
           </select>
           <button id="resume-generate-button" type="button">Generate new version</button>
           <p id="resume-generate-status" class="status" role="status" aria-live="polite"></p>
@@ -4221,7 +4467,6 @@ const DASHBOARD_PAGE = `<!doctype html>
           <button id="resume-review-button" type="button">Revise this version</button>
           <p id="resume-review-status" class="status" role="status" aria-live="polite"></p>
         </section>
-      </div>
     </div>
   </div>
 
@@ -4317,7 +4562,22 @@ const DASHBOARD_PAGE = `<!doctype html>
       <h2>2. Filter for your best matches</h2>
       <p class="hint">Screens new listings against your profile in two passes — a quick check, then a closer look at anything that survives it — so you only spend real attention on postings worth reading.</p>
       <p id="jobs-pipeline-summary" class="sr-only" aria-live="polite"></p>
-      <div id="jobs-pipeline" aria-hidden="true"><p class="empty">Loading…</p></div>
+      <div id="jobs-pipeline" aria-hidden="true">
+        <svg id="pf-svg" preserveAspectRatio="xMidYMid meet"></svg>
+        <div class="pf-legend">
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--text-muted)"></span>Scanned / passed screening</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--warning)"></span>Waiting</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--error)"></span>Dropped</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--success)"></span>Recommended</span>
+        </div>
+        <div class="pf-progress-track"><div class="pf-progress-fill" id="pfProgressFill"></div></div>
+        <div class="pf-stat-row">
+          <span>Scanned: <b id="pfStatScanned">0</b></span>
+          <span>Recommended: <b id="pfStatRecommended">0</b></span>
+          <span>Screen accept rate: <b id="pfStatScreenRate">—</b></span>
+          <span>Fully processed: <b id="pfStatProcessed">0%</b></span>
+        </div>
+      </div>
       <div class="controls">
         <div>
           <label for="jobs-provider">Filter using</label>
@@ -4501,6 +4761,29 @@ const DASHBOARD_PAGE = `<!doctype html>
   </div>
 
   <div id="panel-data" class="panel">
+    <section id="runtime-mode-section">
+      <h2>Where ApplyGo runs</h2>
+      <p class="hint">Local is the default: your database, files, and browser work stay on this computer. Cloudflare is optional and adds access from your phone through infrastructure you own.</p>
+      <div class="row-item">
+        <div class="row">
+          <div>
+            <div class="row-title">Local computer</div>
+            <div class="row-meta">Default · no Cloudflare account · available while this computer is running</div>
+          </div>
+          <span class="badge jobs">Current local session</span>
+        </div>
+      </div>
+      <div class="row-item">
+        <div class="row">
+          <div>
+            <div class="row-title">Personal Cloudflare</div>
+            <div class="row-meta">Optional phone access · requires a user-owned account, D1 database, R2 bucket, and Worker deployment</div>
+          </div>
+          <span class="badge queued">Setup requires local launcher</span>
+        </div>
+      </div>
+      <p class="hint">Cloudflare credentials cannot be entered into this web page: a deployed Worker must not receive or store the API token capable of deploying itself. The local launcher will collect that token on the computer, store it in a private OS-backed credential store, provision the deployment, and then expose the mode switch here.</p>
+    </section>
     <section id="data-stored-section">
       <h2>What's stored</h2>
       <p class="hint">Everything ApplyGo keeps about you and your search, and how much space the bulky parts take.</p>
@@ -4525,16 +4808,30 @@ const DASHBOARD_PAGE = `<!doctype html>
   <script>
     document.querySelectorAll('nav .tab').forEach(function (tabButton) {
       tabButton.addEventListener('click', function () {
+        // Leaving the Roles tab with unsaved edits (or having never analyzed at all) is exactly
+        // when a stale/missing analysis would otherwise silently sit there -- see maybeReanalyzeRoles.
+        var leavingRolesDirty = tabButton.dataset.tab !== 'roles'
+          && document.getElementById('panel-roles').classList.contains('active');
         document.querySelectorAll('nav .tab').forEach(function (b) { b.classList.remove('active'); });
         document.querySelectorAll('.panel').forEach(function (p) { p.classList.remove('active'); });
         tabButton.classList.add('active');
         document.getElementById('panel-' + tabButton.dataset.tab).classList.add('active');
-        // On a phone only three or four of the eleven tabs fit at once, so the tab you just picked
+        if (leavingRolesDirty) maybeReanalyzeRoles();
+        // On a phone only three or four top-level tabs fit at once, so the tab you just picked
         // could sit half off-screen -- or, if you reached it by scrolling, leave the bar parked
         // somewhere that clips a neighbouring label mid-word. Centring the active tab keeps it
         // fully visible and shows a neighbour on each side, which is also the affordance that
         // there is more to scroll to.
         tabButton.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+      });
+    });
+
+    document.querySelectorAll('[data-resume-subtab]').forEach(function (subtabButton) {
+      subtabButton.addEventListener('click', function () {
+        document.querySelectorAll('[data-resume-subtab]').forEach(function (button) { button.classList.remove('active'); });
+        document.querySelectorAll('#panel-resume > .subpanel').forEach(function (panel) { panel.classList.remove('active'); });
+        subtabButton.classList.add('active');
+        document.getElementById('resume-subpanel-' + subtabButton.dataset.resumeSubtab).classList.add('active');
       });
     });
 
@@ -4592,9 +4889,33 @@ const DASHBOARD_PAGE = `<!doctype html>
     // isn't valid JSON (a raw platform error page, a network-level failure) -- res.json() throwing
     // there would otherwise surface as an opaque parse error instead of anything actionable.
     async function errorMessageFromResponse(res, fallback) {
+      var body = '';
+      try { body = await res.text(); } catch (e) { body = ''; }
+      if (body) {
+        try { return errorMessage(JSON.parse(body), fallback + ' (HTTP ' + res.status + ')'); }
+        catch (e) {
+          // Cloudflare platform failures are plain text (often "Your worker..."). Preserve that
+          // useful explanation instead of hiding it behind an "Unexpected token" JSON error.
+          return body.replace(/\s+/g, ' ').trim().slice(0, 500);
+        }
+      }
+      return fallback + ' (HTTP ' + res.status + ')';
+    }
+
+    async function requireJsonResponse(res, fallback) {
+      var body = '';
+      try { body = await res.text(); } catch (e) { body = ''; }
       var data = null;
-      try { data = await res.json(); } catch (e) { data = null; }
-      return errorMessage(data, fallback + ' (HTTP ' + res.status + ')');
+      if (body) {
+        try { data = JSON.parse(body); }
+        catch (e) {
+          var platformMessage = body.replace(/\s+/g, ' ').trim().slice(0, 500);
+          throw new Error(platformMessage || fallback + ' (HTTP ' + res.status + ')');
+        }
+      }
+      if (!res.ok) throw new Error(errorMessage(data, fallback + ' (HTTP ' + res.status + ')'));
+      if (!data) throw new Error(fallback + ': empty response');
+      return data;
     }
 
     // Reads a newline-delimited-JSON response as it arrives, calling onEvent for each line as
@@ -4640,18 +4961,152 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
     }
 
+    // --- Roles page: sub-tabs, the three raw preference inputs, and the derived analysis ---
+
+    document.querySelectorAll('#panel-roles .subnav .subtab').forEach(function (subtabButton) {
+      subtabButton.addEventListener('click', function () {
+        document.querySelectorAll('#panel-roles .subnav .subtab').forEach(function (b) { b.classList.remove('active'); });
+        document.querySelectorAll('#panel-roles .subpanel').forEach(function (p) { p.classList.remove('active'); });
+        subtabButton.classList.add('active');
+        document.getElementById('subpanel-' + subtabButton.dataset.subtab).classList.add('active');
+        if (subtabButton.dataset.subtab === 'analysis') maybeReanalyzeRoles();
+      });
+    });
+
+    // Set whenever a note is added/removed or the Locations/Dealbreakers/Criteria text changes,
+    // so maybeReanalyzeRoles knows a fresh pass is actually worth running.
+    var rolesInputsDirty = false;
+    function markRolesDirty() { rolesInputsDirty = true; }
+    ['desired-locations', 'dealbreakers', 'care-about'].forEach(function (id) {
+      document.getElementById(id).addEventListener('input', markRolesDirty);
+    });
+
+    async function savePreferences() {
+      var res = await api('/desired-roles', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          desired_locations: document.getElementById('desired-locations').value,
+          dealbreakers: document.getElementById('dealbreakers').value,
+          care_about: document.getElementById('care-about').value,
+          provider: document.getElementById('role-analysis-provider').value,
+        }),
+      });
+      var saved = await res.json();
+      if (!res.ok) throw new Error(errorMessage(saved, 'save_failed'));
+      renderCareAboutTopics(saved.care_about_topics);
+      return saved;
+    }
+
+    [
+      ['locations-save-button', 'locations-save-status'],
+      ['dealbreakers-save-button', 'dealbreakers-save-status'],
+      ['criteria-save-button', 'criteria-save-status'],
+    ].forEach(function (pair) {
+      document.getElementById(pair[0]).addEventListener('click', async function () {
+        var statusEl = document.getElementById(pair[1]);
+        statusEl.textContent = 'Saving…';
+        statusEl.className = 'status';
+        try {
+          await savePreferences();
+          rolesInputsDirty = false;
+          statusEl.textContent = 'Saved.';
+          statusEl.className = 'status success';
+        } catch (err) {
+          statusEl.textContent = 'Error: ' + err.message;
+          statusEl.className = 'status error';
+        }
+      });
+    });
+
+    // Non-null only once an analysis with at least one role exists -- both the never-analyzed-yet
+    // empty state and the auto-trigger conditions below key off this.
+    var currentRoleAnalysis = null;
+
+    function renderRoleAnalysis(analysis) {
+      currentRoleAnalysis = analysis && analysis.roles && analysis.roles.length ? analysis : null;
+      var host = document.getElementById('role-analysis-view');
+      host.innerHTML = '';
+      if (!currentRoleAnalysis) {
+        host.appendChild(el('p', { className: 'empty', textContent: 'Not analyzed yet -- click Reanalyze, or add a note on the Notes tab and switch tabs.' }));
+        return;
+      }
+      host.appendChild(el('p', { textContent: currentRoleAnalysis.summary }));
+      var list = el('div', { className: 'role-analysis-roles' });
+      currentRoleAnalysis.roles.forEach(function (role) {
+        var card = el('div', { className: 'role-analysis-role' });
+        card.appendChild(el('strong', { textContent: role.title }));
+        card.appendChild(el('p', { textContent: role.description }));
+        list.appendChild(card);
+      });
+      host.appendChild(list);
+    }
+
+    // 'silent' is set by every auto-trigger path (page load, leaving the Roles tab, opening the
+    // Analysis tab for the first time) so a background pass never overwrites status text the
+    // candidate is actively looking at, and never surfaces "no source material yet" as an error
+    // before they've written a single note. The explicit Reanalyze button always runs loud.
+    async function runRoleAnalysis(silent) {
+      var statusEl = document.getElementById('role-analysis-status');
+      var button = document.getElementById('role-analysis-button');
+      if (!silent) {
+        button.disabled = true;
+        statusEl.textContent = 'Analyzing…';
+        statusEl.className = 'status';
+      }
+      try {
+        var res = await api('/desired-roles/analyze', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ provider: document.getElementById('role-analysis-provider').value }),
+        });
+        var data = await res.json();
+        if (!res.ok) {
+          if (data.error === 'no_source_material') return;
+          throw new Error(errorMessage(data, 'generation_failed'));
+        }
+        renderRoleAnalysis(data.role_analysis);
+        if (!silent) {
+          statusEl.textContent = 'Analyzed just now.';
+          statusEl.className = 'status success';
+        }
+      } catch (err) {
+        if (!silent) {
+          statusEl.textContent = 'Error: ' + err.message;
+          statusEl.className = 'status error';
+        }
+      } finally {
+        if (!silent) button.disabled = false;
+      }
+    }
+
+    document.getElementById('role-analysis-button').addEventListener('click', function () { runRoleAnalysis(false); });
+
+    // The auto-reanalyze rule: nothing changed and an analysis already exists -> skip. Otherwise
+    // save whatever's dirty (best-effort -- the explicit Save buttons remain the reliable path)
+    // and run a silent analysis pass, covering both "made changes and clicked away" and "never
+    // analyzed at all yet".
+    async function maybeReanalyzeRoles() {
+      if (!rolesInputsDirty && currentRoleAnalysis) return;
+      var wasDirty = rolesInputsDirty;
+      rolesInputsDirty = false;
+      if (wasDirty) {
+        try { await savePreferences(); } catch (err) { /* best-effort; Save buttons remain available */ }
+      }
+      await runRoleAnalysis(true);
+    }
+
     async function loadProfile() {
       var res = await api('/profile');
       var data = await res.json();
       if (data.profile) {
-        document.getElementById('profile-label').value = data.profile.label || '';
-        document.getElementById('desired-roles-description').value = data.profile.desired_roles || '';
         document.getElementById('desired-locations').value = data.profile.desired_locations || '';
         document.getElementById('dealbreakers').value = data.profile.dealbreakers || '';
         document.getElementById('care-about').value = data.profile.care_about || '';
         renderCareAboutTopics(data.profile.care_about_topics);
-        renderStructuredProfileView('structured-profile-view', data.profile.structured);
+        renderRoleAnalysis(data.profile.role_analysis);
         renderStructuredProfileView('resume-profile-view', data.profile.structured);
+        maybeReanalyzeRoles();
       }
     }
 
@@ -4677,8 +5132,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
     }
 
-    function renderChecks(checks) {
-      var host = document.getElementById('resume-checks');
+    function renderChecks(checks, containerId) {
+      var host = document.getElementById(containerId || 'resume-checks');
       host.innerHTML = '';
       if (!checks || !checks.length) return;
       var list = el('ul', { className: 'checks' });
@@ -4712,11 +5167,21 @@ const DASHBOARD_PAGE = `<!doctype html>
       if (data.templates) renderTemplateChoices(data.templates);
       var list = document.getElementById('resumes-list');
       list.innerHTML = '';
-      if (!data.resumes.length) {
+      var master = data.resumes.find(function (resume) { return Boolean(resume.is_master); });
+      var versions = data.resumes.filter(function (resume) { return !resume.is_master; });
+      if (master) {
+        document.getElementById('master-preview-section').style.display = 'block';
+        document.getElementById('master-preview-frame').src =
+          '/resumes/' + encodeURIComponent(master.id) + '/file?v=' + Date.now();
+        var masterChecks = [];
+        try { masterChecks = JSON.parse(master.checks_json || '[]'); } catch (e) { masterChecks = []; }
+        renderChecks(masterChecks, 'master-checks');
+      }
+      if (!versions.length) {
         list.appendChild(el('p', { className: 'empty', textContent: 'No resume versions yet — generate one above.' }));
         return;
       }
-      data.resumes.forEach(function (resume) {
+      versions.forEach(function (resume) {
         var preview = el('a', {
           className: 'row-title',
           href: '/resumes/' + encodeURIComponent(resume.id) + '/file',
@@ -4761,25 +5226,48 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     document.getElementById('resume-master-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('resume-master-status');
-      statusEl.textContent = 'Writing out everything in your profile… this one takes longer than a normal version.';
+      var provider = document.getElementById('resume-provider').value;
+      var button = this;
+      button.disabled = true;
+      statusEl.textContent = 'Reading your documents and notes, then building the master resume…';
       statusEl.className = 'status';
       try {
+        var profileRes = await api('/profile/generate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ provider: provider }),
+        });
+        var profileData = await requireJsonResponse(profileRes, 'profile_generation_failed');
+
+        var saveRes = await api('/profile/structured', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ structured: profileData.draft_structured }),
+        });
+        await requireJsonResponse(saveRes, 'profile_save_failed');
+        renderStructuredProfileView('resume-profile-view', profileData.draft_structured);
+        statusEl.textContent = 'Profile ready. Rendering the master resume…';
+
         var res = await api('/resumes/master', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ provider: document.getElementById('resume-provider').value }),
+          body: JSON.stringify({ provider: provider }),
         });
-        var data = await res.json();
-        if (!res.ok) throw new Error(errorMessage(data, 'generation_failed'));
+        var data = await requireJsonResponse(res, 'master_resume_generation_failed');
         statusEl.textContent =
           'Archive built: ' + data.roles + ' role' + (data.roles === 1 ? '' : 's') + ', ' +
           data.bullets + ' accomplishment' + (data.bullets === 1 ? '' : 's') + ' on file.';
         statusEl.className = 'status success';
         await loadResumes();
-        showResumePreview(data.id, data.checks, '');
+        document.getElementById('master-preview-section').style.display = 'block';
+        document.getElementById('master-preview-frame').src =
+          '/resumes/' + encodeURIComponent(data.id) + '/file?v=' + Date.now();
+        renderChecks(data.checks, 'master-checks');
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
       }
     });
 
@@ -4926,6 +5414,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         count === 1 ? '1 note on file' : count + ' notes on file';
       renderCollapsibleList('role-signals-list', data.role_signals, 'Nothing added yet.', function (s) { return s.claim; }, async function (s) {
         await api('/role-signals/' + encodeURIComponent(s.id), { method: 'DELETE' });
+        markRolesDirty();
         loadRoleSignals();
       });
     }
@@ -4946,67 +5435,8 @@ const DASHBOARD_PAGE = `<!doctype html>
         statusEl.textContent = 'Added.';
         statusEl.className = 'status success';
         document.getElementById('role-signal-form').reset();
+        markRolesDirty();
         loadRoleSignals();
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      }
-    });
-
-    document.getElementById('desired-roles-generate-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('desired-roles-generate-status');
-      var draftBlock = document.getElementById('desired-roles-draft-block');
-      statusEl.textContent = 'Generating…';
-      statusEl.className = 'status';
-      draftBlock.style.display = 'none';
-      try {
-        var res = await api('/desired-roles/generate', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ provider: document.getElementById('desired-roles-provider').value }),
-        });
-        var data = await res.json();
-        if (!res.ok) throw new Error(errorMessage(data, 'generation_failed'));
-        document.getElementById('desired-roles-draft').value = data.draft_description;
-        draftBlock.style.display = 'block';
-        statusEl.textContent = 'Draft ready below. Review before using it.';
-        statusEl.className = 'status success';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      }
-    });
-
-    document.getElementById('desired-roles-use-draft').addEventListener('click', function () {
-      document.getElementById('desired-roles-description').value = document.getElementById('desired-roles-draft').value;
-      document.getElementById('desired-roles-draft-block').style.display = 'none';
-      document.getElementById('desired-roles-generate-status').textContent = 'Draft copied below — click Save to keep it.';
-    });
-
-    document.getElementById('desired-roles-save-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('desired-roles-save-status');
-      statusEl.textContent = 'Saving…';
-      statusEl.className = 'status';
-      try {
-        var res = await api('/desired-roles', {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            desired_roles: document.getElementById('desired-roles-description').value,
-            desired_locations: document.getElementById('desired-locations').value,
-            dealbreakers: document.getElementById('dealbreakers').value,
-            care_about: document.getElementById('care-about').value,
-            provider: document.getElementById('desired-roles-provider').value,
-          }),
-        });
-        if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
-        var saved = await res.json();
-        renderCareAboutTopics(saved.care_about_topics);
-        var topicCount = (saved.care_about_topics || []).length;
-        statusEl.textContent = topicCount
-          ? 'Saved. Reading "what do you care about" gave these ' + topicCount + ' fact columns -- they show on every posting after the next re-check.'
-          : 'Saved.';
-        statusEl.className = 'status success';
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
@@ -5041,78 +5471,6 @@ const DASHBOARD_PAGE = `<!doctype html>
       } finally {
         button.disabled = false;
       }
-    });
-
-    document.getElementById('save-name-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('profile-status');
-      statusEl.textContent = 'Saving…';
-      statusEl.className = 'status';
-      try {
-        var res = await api('/profile', {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ label: document.getElementById('profile-label').value }),
-        });
-        if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
-        statusEl.textContent = 'Saved.';
-        statusEl.className = 'status success';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      }
-    });
-
-    var latestStructuredDraft = null;
-
-    document.getElementById('generate-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('generate-status');
-      var draftBlock = document.getElementById('structured-draft-block');
-      statusEl.textContent = 'Generating… this can take a little while.';
-      statusEl.className = 'status';
-      draftBlock.style.display = 'none';
-      try {
-        var res = await api('/profile/generate', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ provider: document.getElementById('generate-provider').value }),
-        });
-        var data = await res.json();
-        if (!res.ok) throw new Error(errorMessage(data, 'generation_failed'));
-        latestStructuredDraft = data.draft_structured;
-        renderStructuredProfileView('structured-draft-view', latestStructuredDraft);
-        draftBlock.style.display = 'block';
-        statusEl.textContent = 'Draft ready below. Review before saving it.';
-        statusEl.className = 'status success';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      }
-    });
-
-    document.getElementById('use-structured-draft').addEventListener('click', async function () {
-      var statusEl = document.getElementById('generate-status');
-      if (!latestStructuredDraft) return;
-      try {
-        var res = await api('/profile/structured', {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ structured: latestStructuredDraft }),
-        });
-        if (!res.ok) throw new Error((await res.json()).error || 'save_failed');
-        document.getElementById('structured-draft-block').style.display = 'none';
-        renderStructuredProfileView('structured-profile-view', latestStructuredDraft);
-        statusEl.textContent = 'Saved.';
-        statusEl.className = 'status success';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      }
-    });
-
-    document.getElementById('discard-structured-draft').addEventListener('click', function () {
-      latestStructuredDraft = null;
-      document.getElementById('structured-draft-block').style.display = 'none';
-      document.getElementById('generate-status').textContent = 'Discarded.';
     });
 
     function renderDocuments(docs) {
@@ -5222,7 +5580,6 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     var allCompanies = [];
     var allJobs = [];
-    var pfLastCounts = null;
 
     function matchesFilter(haystack, needle) {
       if (!needle) return true;
@@ -5382,19 +5739,35 @@ const DASHBOARD_PAGE = `<!doctype html>
       var withJobs = allCompanies.filter(function (c) { return c.open_jobs > 0; }).length;
       var unscannableCount = allCompanies.filter(isUnscannable).length;
       document.getElementById('companies-summary').innerHTML = '';
-      document.getElementById('companies-summary').appendChild(
-        el('span', {}, [
-          el('strong', { textContent: String(allCompanies.length) }),
-          // "not scanned yet" = board-check hasn't run on it; "can't be scanned" = it ran (or the
-          // site never resolved) and there's nothing to read. Kept as separate counts since only
-          // the first one means "scanning again would help."
-          el('span', { textContent: ' compan' + (allCompanies.length === 1 ? 'y' : 'ies') +
-            ' · ' + withJobs + ' with open roles · ' + (data.unscanned || 0) + ' not scanned yet' +
-            (unscannableCount ? ' · ' + unscannableCount + " can't be scanned" : '') +
-            (data.off_target ? ' · ' + data.off_target + ' outside your locations' : '') +
-            (data.desired_locations ? ' · limited to ' + data.desired_locations : ' · no location limit set') }),
-        ]),
-      );
+      var summaryChildren = [
+        el('strong', { textContent: String(allCompanies.length) }),
+        // "not scanned yet" = board-check hasn't run on it; "can't be scanned" = it ran (or the
+        // site never resolved) and there's nothing to read. Kept as separate counts since only
+        // the first one means "scanning again would help."
+        el('span', { textContent: ' compan' + (allCompanies.length === 1 ? 'y' : 'ies') +
+          ' · ' + withJobs + ' with open roles · ' + (data.unscanned || 0) + ' not scanned yet · ' }),
+      ];
+      if (unscannableCount) {
+        // The count alone isn't actionable -- it just names a number with no way to act on it from
+        // here, which is worse than not saying it at all. Make it do the thing you'd otherwise have
+        // to scroll up and find a checkbox for.
+        var unscannableLink = el('button', {
+          className: 'text-link', type: 'button',
+          textContent: unscannableCount + " can't be scanned",
+        });
+        unscannableLink.addEventListener('click', function () {
+          var toggle = document.getElementById('companies-show-unscannable');
+          toggle.checked = true;
+          renderCompanies();
+          toggle.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+        summaryChildren.push(unscannableLink);
+        summaryChildren.push(el('span', { textContent: ' · ' }));
+      }
+      summaryChildren.push(el('span', { textContent:
+        (data.off_target ? data.off_target + ' outside your locations · ' : '') +
+        (data.desired_locations ? 'limited to ' + data.desired_locations : 'no location limit set') }));
+      document.getElementById('companies-summary').appendChild(el('span', {}, summaryChildren));
       renderCompanyLocations();
       renderCompanies();
       renderScanSummary();
@@ -5425,7 +5798,9 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     document.getElementById('companies-discover-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('companies-discover-status');
-      statusEl.textContent = 'Searching and checking each site resolves… this takes a moment.';
+      var button = this;
+      button.disabled = true;
+      statusEl.textContent = 'Starting…';
       statusEl.className = 'status';
       try {
         var res = await api('/companies/discover', {
@@ -5437,8 +5812,25 @@ const DASHBOARD_PAGE = `<!doctype html>
             focus: document.getElementById('company-focus').value,
           }),
         });
-        var data = await res.json();
-        if (!res.ok) throw new Error(errorMessage(data, 'discovery_failed'));
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'discovery_failed'));
+        var data = await readNdjson(res, function (event) {
+          if (event.stage === 'propose') {
+            statusEl.textContent = event.message;
+            return;
+          }
+          // The first 'verify' event (done=0) carries the propose/dedupe/location breakdown before
+          // any site check has even started -- showing it immediately is what answers "why so few"
+          // without waiting for the slowest part (the website checks) to finish first.
+          var prefix = 'Proposed ' + event.proposed + '.' +
+            (event.duplicates ? ' ' + event.duplicates + ' already on your list.' : '') +
+            (event.off_target ? ' ' + event.off_target + ' outside your locations.' : '');
+          if (!event.total) {
+            statusEl.textContent = prefix + (event.proposed ? ' Nothing new left to check.' : '');
+            return;
+          }
+          statusEl.textContent = prefix + ' Checking ' + event.done + ' of ' + event.total +
+            (event.company ? ' (' + event.company + (event.done ? (event.reachable ? ', reachable' : ", couldn't be reached") : '') + ')' : '') + '…';
+        });
         var parts = ['Added ' + data.added + ' new.'];
         if (data.duplicates) parts.push(data.duplicates + ' already on your list.');
         if (data.off_target) {
@@ -5451,6 +5843,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
       }
     });
 
@@ -5485,6 +5879,10 @@ const DASHBOARD_PAGE = `<!doctype html>
               (round > 1 ? 'Round ' + round + ': ' : '') +
               'Scanning… ' + event.done + ' of ' + event.total + ' compan' + (event.total === 1 ? 'y' : 'ies') +
               ' (' + event.company + (event.new_jobs ? ', ' + event.new_jobs + ' new' : '') + ')';
+            // New listings land as unassessed the moment they're inserted -- grow the Search tab's
+            // pipeline diagram live as each company's board read completes, not only after this
+            // whole (possibly multi-round) scan finishes.
+            pfBumpScanned(event.new_jobs);
           });
           totalScanned += data.scanned;
           totalNew += data.new_listings;
@@ -5792,7 +6190,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         ].filter(Boolean).join(' · ');
 
         var body = [el('div', { className: 'row-title-line' }, titleLine), el('div', { className: 'row-meta', textContent: meta })];
-        // Whatever the candidate said they care about (Desired Roles tab) -- one chip per fact, on
+        // Whatever the candidate said they care about (Roles tab, Criteria) -- one chip per fact, on
         // its own line so a long value wraps instead of forcing the title line to overflow.
         var facts = (fitDetail.facts || []).map(factChip).filter(Boolean);
         if (facts.length) body.push(el('div', { className: 'row-facts' }, facts));
@@ -5946,6 +6344,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       button.disabled = true;
       statusEl.textContent = 'Screening listings, then assessing the ones worth a closer look…';
       statusEl.className = 'status';
+      pfBeginRun();
       try {
         var res = await api('/jobs/process', {
           method: 'POST',
@@ -5957,7 +6356,14 @@ const DASHBOARD_PAGE = `<!doctype html>
           statusEl.textContent = (event.stage === 'screen'
             ? 'Step 1 of 2 — quick screen: '
             : 'Step 2 of 2 — detailed scoring: ') + event.done + ' of ' + event.total;
+          // Real per-batch accept/reject counts, not a guess from done/total -- see
+          // pfApplyRunEvent. This is what makes the pipeline diagram move live, batch by batch,
+          // while this run is still in flight rather than only jumping once at the very end.
+          pfApplyRunEvent(event);
         });
+        // The server's own authoritative counts, reconciling away any drift the live per-batch
+        // deltas above might have accumulated.
+        setPfCounts(data.counts || {});
         var counts = data.counts || {};
         var left = (counts.unassessed || 0) + (counts.screened_in || 0);
         var parts = [];
@@ -5978,249 +6384,321 @@ const DASHBOARD_PAGE = `<!doctype html>
     });
 
     // ---- Pipeline flow diagram (Search tab) --------------------------------------------------
-    // A small sankey of where scanned postings currently sit. Two real split points -- the cheap
-    // screen, then the detailed pass -- so this is two branch levels, not a generic n-level sankey:
-    // col0 is a single "all scanned postings" root; col1 is what the screen did with them (not
-    // screened yet / screened out / passed); col2 is what the detailed pass did with whatever
-    // passed (still queued / matched / ruled out). Hand-laying-out two fixed branch points is far
-    // simpler and more robust than a general sankey-layout algorithm for a shape this small.
-    var PF_GAP = 10;
-    var PF_BAR = 14;
-    var PF_COLOR = { good: 'var(--success)', bad: 'var(--error)', pending: 'var(--warning)', neutral: 'var(--text-muted)' };
+    // A live sankey of where scanned postings currently sit, built once as persistent SVG nodes
+    // and then only ever mutated -- not rebuilt from scratch on every update -- so a change can be
+    // eased smoothly instead of jumping. Two real branch points: the cheap screen (screened out /
+    // screened in), then the detailed pass on whatever passed it (ruled out / recommended).
+    // Not-interested/Interested/Applied aren't shown -- this page is about finding matches, not
+    // the human review funnel after it; Interested/Applied postings are folded into "Recommended"
+    // here since that's still what they were found as.
+    //
+    // setPfCounts() is the single entry point, same idea as a real-events-call-decideNext design:
+    // it's called with the authoritative shape jobPipelineCounts() returns (every full /jobs load
+    // reconciles from it), and nudged with real per-batch deltas while a scan or a Find-my-matches
+    // run is actively in flight, via pfBumpScanned() and pfApplyRunEvent() below. No probability or
+    // random weighting is needed anywhere here, unlike a simulation that has to guess outcomes in
+    // advance -- the real split is already known by the time a batch finishes, so it's just assigned.
+    var PF_NODES = [
+      { id: 'scanned', label: 'Scanned postings', stage: 0, kind: 'neutral' },
+      { id: 'screen_pending', label: 'Not screened yet', stage: 1, kind: 'pending' },
+      { id: 'screen_rejected', label: 'Screened out', stage: 1, kind: 'reject' },
+      { id: 'screen_accepted', label: 'Passed screening', stage: 1, kind: 'neutral' },
+      { id: 'fit_pending', label: 'Awaiting review', stage: 2, kind: 'pending' },
+      { id: 'fit_rejected', label: 'Ruled out', stage: 2, kind: 'reject' },
+      { id: 'fit_recommended', label: 'Recommended', stage: 2, kind: 'success' },
+    ];
+    var PF_BRANCHES = {
+      scanned: ['screen_pending', 'screen_rejected', 'screen_accepted'],
+      screen_accepted: ['fit_pending', 'fit_rejected', 'fit_recommended'],
+    };
+    var PF_STAGE_TITLES = ['Scanned', 'Screening', 'Fit review'];
+    var PF_KIND_COLOR = { neutral: 'var(--text-muted)', pending: 'var(--warning)', reject: 'var(--error)', success: 'var(--success)' };
 
-    function pfFlowData(counts) {
-      var notScreened = counts.unassessed || 0;
-      var screenedOut = counts.screened_out || 0;
-      var waiting = counts.screened_in || 0;
-      var matches = (counts.strong || 0) + (counts.possible || 0);
-      var ruledOut = counts.reject || 0;
-      var passedScreen = waiting + matches + ruledOut;
-      var total = notScreened + screenedOut + passedScreen;
-      if (!total) return null;
-      var col1 = [
-        { id: 'notScreened', label: 'Not screened yet', value: notScreened, kind: 'pending' },
-        { id: 'screenedOut', label: 'Screened out', value: screenedOut, kind: 'bad' },
-        { id: 'passedScreen', label: 'Passed screening', value: passedScreen, kind: 'neutral' },
-      ].filter(function (n) { return n.value > 0; });
-      var col2 = [
-        { id: 'waiting', label: 'Awaiting review', value: waiting, kind: 'pending' },
-        { id: 'matches', label: 'Matches', value: matches, kind: 'good' },
-        { id: 'ruledOut', label: 'Ruled out', value: ruledOut, kind: 'bad' },
-      ].filter(function (n) { return n.value > 0; });
-      return { total: total, root: { id: 'total', label: 'Scanned postings', value: total, kind: 'neutral' }, col1: col1, col2: col2 };
-    }
+    var PF_VB_W = 900, PF_VB_H = 340;
+    var PF_MARGIN_TOP = 26, PF_MARGIN_BOTTOM = 8;
+    var PF_USABLE_H = PF_VB_H - PF_MARGIN_TOP - PF_MARGIN_BOTTOM;
+    var PF_NODE_W = 10;
+    var PF_MIN_H = 6;
+    var PF_ROW_GAP = 26; // generous on purpose: each node's 2-line label needs real clearance from its neighbors, not just its own (possibly tiny) bar height
+    var PF_SOURCE_HEIGHT = 200; // the fixed 100% reference height "Scanned postings" renders at
+    var PF_COL_MARGIN = 14;
+    var PF_COL_STEP = 300;
+    var PF_SMOOTH_RATE = 6;
 
-    // Positions every node along a single "main axis" (0..mainAvail), independent of whether that
-    // axis ends up drawn as screen Y (left-to-right layout) or screen X (stacked-rows layout) --
-    // the SVG builder below is the only thing that knows which. A ribbon's thickness at its PARENT
-    // end is a proportional slice of the parent's own rendered length (so sibling ribbons exactly
-    // tile the parent with no gap); at its CHILD end it's the child's own bar length. Those two
-    // don't have to match -- col2 has its own gap overhead from being 1-3 separately spaced bars,
-    // so its scale is derived from the span passedScreen actually occupies in col1, not reused
-    // wholesale from col0/col1's scale. A tapering ribbon is normal sankey behavior, not a bug.
-    function pfLayout(flow, mainAvail) {
-      var maxGaps = Math.max(flow.col1.length - 1, flow.col2.length - 1, 0);
-      var scale = (mainAvail - PF_GAP * maxGaps) / flow.total;
-      if (!isFinite(scale) || scale <= 0) scale = mainAvail / flow.total;
+    var pfNodeMap = {};
+    PF_NODES.forEach(function (n) {
+      pfNodeMap[n.id] = n;
+      n.x = PF_COL_MARGIN + n.stage * PF_COL_STEP;
+      n.width = PF_NODE_W;
+      n.dispHeight = PF_MIN_H;
+      n.y = PF_MARGIN_TOP; n.cy = PF_MARGIN_TOP;
+    });
+    var pfStageGroups = [[], [], []];
+    PF_NODES.forEach(function (n) { pfStageGroups[n.stage].push(n.id); });
 
-      function stack(nodes, avail) {
-        var lenSum = 0, i;
-        for (i = 0; i < nodes.length; i++) lenSum += nodes[i].value * scale;
-        var span = lenSum + PF_GAP * (nodes.length - 1);
-        var cursor = (avail - span) / 2;
-        for (i = 0; i < nodes.length; i++) {
-          nodes[i].mainLen = nodes[i].value * scale;
-          nodes[i].mainStart = cursor;
-          cursor += nodes[i].mainLen + PF_GAP;
-        }
-      }
-
-      var root = flow.root;
-      root.mainLen = root.value * scale;
-      root.mainStart = (mainAvail - root.mainLen) / 2;
-      stack(flow.col1, mainAvail);
-
-      var passedNode = null, i;
-      for (i = 0; i < flow.col1.length; i++) { if (flow.col1[i].id === 'passedScreen') passedNode = flow.col1[i]; }
-      if (passedNode && flow.col2.length) {
-        var scale2 = (passedNode.mainLen - PF_GAP * (flow.col2.length - 1)) / passedNode.value;
-        if (!isFinite(scale2) || scale2 <= 0) scale2 = passedNode.mainLen / passedNode.value;
-        var cursor2 = passedNode.mainStart;
-        for (i = 0; i < flow.col2.length; i++) {
-          flow.col2[i].mainLen = flow.col2[i].value * scale2;
-          flow.col2[i].mainStart = cursor2;
-          cursor2 += flow.col2[i].mainLen + PF_GAP;
-        }
-      }
-
-      var links = [], cursorSrc = root.mainStart;
-      for (i = 0; i < flow.col1.length; i++) {
-        var n = flow.col1[i], thick = n.value * scale;
-        links.push({ target: n, fromCol: 0, toCol: 1, kind: n.kind, srcStart: cursorSrc, srcLen: thick, dstStart: n.mainStart, dstLen: n.mainLen });
-        cursorSrc += thick;
-      }
-      if (passedNode) {
-        var cursorSrc2 = passedNode.mainStart;
-        for (i = 0; i < flow.col2.length; i++) {
-          var n2 = flow.col2[i], thick2 = n2.value * scale;
-          links.push({ target: n2, fromCol: 1, toCol: 2, kind: n2.kind, srcStart: cursorSrc2, srcLen: thick2, dstStart: n2.mainStart, dstLen: n2.mainLen });
-          cursorSrc2 += thick2;
-        }
-      }
-      return links;
-    }
-
-    function pfEsc(s) {
-      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
-    function pfCount(n) {
-      return n >= 10000 ? Math.round(n / 1000) + 'k' : n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
-    }
-    // A background halo behind every label -- small labels sit right next to (sometimes over) a
-    // ribbon curve in a diagram this compact, and a solid halo keeps them readable regardless of
-    // what's underneath, rather than trying to keep every label clear of every ribbon by hand.
-    function pfLabelHalo(cx, top, lines, anchor) {
-      var w = 0, i;
-      for (i = 0; i < lines.length; i++) w = Math.max(w, lines[i].text.length * lines[i].size * 0.58);
-      var h = lines.length === 2 ? 24 : 13;
-      var x = anchor === 'middle' ? cx - w / 2 - 4 : anchor === 'end' ? cx - w - 4 : cx - 4;
-      return '<rect class="pf-halo" x="' + x + '" y="' + (top - 2) + '" width="' + (w + 8) + '" height="' + h + '" rx="3" fill="var(--surface)" fill-opacity="0.82"></rect>';
-    }
-    // At an extreme value imbalance (a 1-vs-999 split), a node's bar can be a sliver sitting right
-    // at the edge of the diagram -- its label, centered on that sliver, would then extend past the
-    // edge and get clipped. clampBounds (when given) nudges the label's anchor coordinate inward
-    // by half its own estimated footprint so the whole label always stays inside the viewBox,
-    // rather than clipping (per the "measure first, a label never gets clipped" rule).
-    function pfLabelText(cx, midY, node, anchor, clampBounds) {
-      var lines = [
-        { text: pfCount(node.value), size: 11, cls: 'pf-node-value' },
-        { text: node.label, size: 8.5, cls: 'pf-node-sub' },
-      ];
-      if (clampBounds) {
-        var maxLineW = 0, li;
-        for (li = 0; li < lines.length; li++) maxLineW = Math.max(maxLineW, lines[li].text.length * lines[li].size * 0.58);
-        if (clampBounds.axis === 'x') {
-          var halfW = maxLineW / 2 + 4;
-          cx = Math.max(clampBounds.min + halfW, Math.min(clampBounds.max - halfW, cx));
-        } else {
-          var halfH = 14;
-          midY = Math.max(clampBounds.min + halfH, Math.min(clampBounds.max - halfH, midY));
-        }
-      }
-      var halo = pfLabelHalo(cx, midY - 12, lines, anchor);
-      var text = '<text x="' + cx + '" y="' + (midY - 1) + '" text-anchor="' + anchor + '" class="pf-node-value">' + pfEsc(lines[0].text) +
-        '</text><text x="' + cx + '" y="' + (midY + 10) + '" text-anchor="' + anchor + '" class="pf-node-sub">' + pfEsc(lines[1].text) + '</text>';
-      return halo + text;
-    }
-
-    function pfRibbon(orientation, cross, link) {
-      var d, cd, id = 'pf-link-' + link.target.id;
-      if (orientation === 'h') {
-        var xA = cross[link.fromCol] + PF_BAR, xB = cross[link.toCol];
-        var ay0 = link.srcStart, ay1 = link.srcStart + link.srcLen, by0 = link.dstStart, by1 = link.dstStart + link.dstLen;
-        var mx = (xA + xB) / 2;
-        d = 'M' + xA + ',' + ay0 + ' C' + mx + ',' + ay0 + ' ' + mx + ',' + by0 + ' ' + xB + ',' + by0 +
-          ' L' + xB + ',' + by1 + ' C' + mx + ',' + by1 + ' ' + mx + ',' + ay1 + ' ' + xA + ',' + ay1 + ' Z';
-        cd = 'M' + xA + ',' + ((ay0 + ay1) / 2) + ' C' + mx + ',' + ((ay0 + ay1) / 2) + ' ' + mx + ',' + ((by0 + by1) / 2) + ' ' + xB + ',' + ((by0 + by1) / 2);
-      } else {
-        var yA = cross[link.fromCol] + PF_BAR, yB = cross[link.toCol];
-        var ax0 = link.srcStart, ax1 = link.srcStart + link.srcLen, bx0 = link.dstStart, bx1 = link.dstStart + link.dstLen;
-        var my = (yA + yB) / 2;
-        d = 'M' + ax0 + ',' + yA + ' C' + ax0 + ',' + my + ' ' + bx0 + ',' + my + ' ' + bx0 + ',' + yB +
-          ' L' + bx1 + ',' + yB + ' C' + bx1 + ',' + my + ' ' + ax1 + ',' + my + ' ' + ax1 + ',' + yA + ' Z';
-        cd = 'M' + ((ax0 + ax1) / 2) + ',' + yA + ' C' + ((ax0 + ax1) / 2) + ',' + my + ' ' + ((bx0 + bx1) / 2) + ',' + my + ' ' + ((bx0 + bx1) / 2) + ',' + yB;
-      }
-      var color = PF_COLOR[link.kind];
-      var dur = (2.4 + (link.dstStart % 3) * 0.3).toFixed(2);
-      var out = '<path d="' + d + '" fill="' + color + '" class="pf-link"></path>';
-      out += '<path id="' + id + '" d="' + cd + '" fill="none" stroke="none"></path>';
-      out += '<circle r="2.6" fill="' + color + '" class="pf-dot"><animateMotion dur="' + dur + 's" repeatCount="indefinite" begin="0s"><mpath href="#' + id + '" xlink:href="#' + id + '"></mpath></animateMotion></circle>';
-      out += '<circle r="2.6" fill="' + color + '" class="pf-dot"><animateMotion dur="' + dur + 's" repeatCount="indefinite" begin="-' + (dur / 2) + 's"><mpath href="#' + id + '" xlink:href="#' + id + '"></mpath></animateMotion></circle>';
-      return out;
-    }
-
-    function pfBuildSvg(counts, containerWidth) {
-      var flow = pfFlowData(counts);
-      if (!flow) return null;
-      var vertical = containerWidth < 480;
-      var body = '', W, H, cross;
-
-      if (!vertical) {
-        W = containerWidth;
-        var MARGIN = 18, SIDE = 10;
-        H = 232;
-        var mainAvail = H - MARGIN * 2;
-        var links = pfLayout(flow, mainAvail);
-        // Three columns need three label gaps, not two -- one after each bar, including the last
-        // (its label reads to the right of it, same as the other two, and needs its own reserved
-        // room rather than sharing the right-hand margin).
-        var labelGap = (W - SIDE * 2 - 3 * PF_BAR) / 3;
-        cross = [SIDE, SIDE + PF_BAR + labelGap, SIDE + 2 * (PF_BAR + labelGap)];
-
-        var nodesByCol = [[flow.root], flow.col1, flow.col2];
-        var i, j;
-        for (i = 0; i < links.length; i++) body += pfRibbon('h', cross, links[i]);
-        for (i = 0; i < 3; i++) {
-          for (j = 0; j < nodesByCol[i].length; j++) {
-            var n = nodesByCol[i][j];
-            var x = cross[i], y = MARGIN + n.mainStart;
-            body += '<rect class="pf-node-rect" x="' + x + '" y="' + y + '" width="' + PF_BAR + '" height="' + n.mainLen + '" rx="3" fill="' + PF_COLOR[n.kind] + '"></rect>';
-            body += pfLabelText(x + PF_BAR + 6, y + n.mainLen / 2, n, 'start', { axis: 'y', min: 0, max: H });
-          }
-        }
-      } else {
-        W = containerWidth;
-        var MARGINv = 10;
-        var mainAvailV = W - MARGINv * 2;
-        var ROW_GAP = 54, LABEL_H = 30;
-        var row0Y = MARGINv, row1Y = row0Y + PF_BAR + ROW_GAP, row2Y = row1Y + PF_BAR + ROW_GAP;
-        H = row2Y + PF_BAR + LABEL_H + MARGINv;
-        cross = [row0Y, row1Y, row2Y];
-        var linksV = pfLayout(flow, mainAvailV);
-        var nodesByColV = [[flow.root], flow.col1, flow.col2];
-        var ii, jj;
-        for (ii = 0; ii < linksV.length; ii++) body += pfRibbon('v', cross, linksV[ii]);
-        for (ii = 0; ii < 3; ii++) {
-          for (jj = 0; jj < nodesByColV[ii].length; jj++) {
-            var nv = nodesByColV[ii][jj];
-            var nx = MARGINv + nv.mainStart, ny = cross[ii];
-            body += '<rect class="pf-node-rect" x="' + nx + '" y="' + ny + '" width="' + nv.mainLen + '" height="' + PF_BAR + '" rx="3" fill="' + PF_COLOR[nv.kind] + '"></rect>';
-            body += pfLabelText(nx + nv.mainLen / 2, ny + PF_BAR + 16, nv, 'middle', { axis: 'x', min: 0, max: W });
-          }
-        }
-      }
-      return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg">' + body + '</svg>';
-    }
-
-    function renderPipelineDiagram() {
-      var host = document.getElementById('jobs-pipeline');
-      if (!host || !pfLastCounts) return;
-      var svg = pfBuildSvg(pfLastCounts, host.clientWidth || 360);
-      host.innerHTML = svg || '<p class="empty">Scan companies and click "Find my matches" to see your pipeline here.</p>';
-    }
-
-    var pfResizeTimer = null;
-    window.addEventListener('resize', function () {
-      clearTimeout(pfResizeTimer);
-      pfResizeTimer = setTimeout(renderPipelineDiagram, 150);
+    var pfEdges = {};
+    var pfChildEdges = {}; var pfParentEdges = {};
+    PF_NODES.forEach(function (n) { pfChildEdges[n.id] = []; pfParentEdges[n.id] = []; });
+    Object.keys(PF_BRANCHES).forEach(function (source) {
+      PF_BRANCHES[source].forEach(function (target) {
+        var edge = { source: source, target: target, committed: 0, sy0: 0, sy1: 0, ty0: 0, ty1: 0 };
+        pfEdges[source + '->' + target] = edge;
+        pfChildEdges[source].push(edge);
+        pfParentEdges[target].push(edge);
+      });
     });
 
-    function renderJobPipeline(counts) {
-      pfLastCounts = counts;
-      var matches = (counts.strong || 0) + (counts.possible || 0);
-      var queued = (counts.unassessed || 0) + (counts.screened_in || 0);
-      document.getElementById('jobs-pipeline-summary').textContent =
-        matches + ' match' + (matches === 1 ? '' : 'es') +
-        ', ' + queued + ' waiting to be filtered' +
-        ', ' + (counts.screened_out || 0) + ' dropped in screening' +
-        ', ' + (counts.reject || 0) + ' ruled out.';
-      renderPipelineDiagram();
+    var pfSourceTotal = 0;
+    var pfLastCountsPayload = null;
+    var pfAnimating = false;
+    var pfLastFrame = 0;
+
+    function pfDerivedTotal(nodeId) {
+      if (nodeId === 'scanned') return pfSourceTotal;
+      var edges = pfParentEdges[nodeId], sum = 0;
+      for (var i = 0; i < edges.length; i++) sum += edges[i].committed;
+      return sum;
+    }
+    function pfTargetHeight(n) {
+      if (n.id === 'scanned') return PF_SOURCE_HEIGHT;
+      return Math.max(PF_MIN_H, (pfDerivedTotal(n.id) / Math.max(1, pfSourceTotal)) * PF_SOURCE_HEIGHT);
     }
 
-    // The Search tab isn't the active panel on first load (Desired Roles is), so the very first
-    // renderPipelineDiagram() call above measures a hidden (0-width) container and draws nothing
-    // useful. Re-measure and redraw once the panel actually becomes visible.
-    document.querySelector('[data-tab="search"]').addEventListener('click', renderPipelineDiagram);
+    function setPfCounts(counts) {
+      pfLastCountsPayload = counts;
+      var unassessed = counts.unassessed || 0;
+      var screenedOut = counts.screened_out || 0;
+      var screenedIn = counts.screened_in || 0;
+      var reject = counts.reject || 0;
+      var recommended = (counts.strong || 0) + (counts.possible || 0) + (counts.interested || 0) + (counts.applied || 0);
+      var screenAccepted = screenedIn + reject + recommended;
+
+      pfSourceTotal = unassessed + screenedOut + screenAccepted;
+      pfEdges['scanned->screen_pending'].committed = unassessed;
+      pfEdges['scanned->screen_rejected'].committed = screenedOut;
+      pfEdges['scanned->screen_accepted'].committed = screenAccepted;
+      pfEdges['screen_accepted->fit_pending'].committed = screenedIn;
+      pfEdges['screen_accepted->fit_rejected'].committed = reject;
+      pfEdges['screen_accepted->fit_recommended'].committed = recommended;
+
+      document.getElementById('jobs-pipeline-summary').textContent =
+        recommended + ' match' + (recommended === 1 ? '' : 'es') +
+        ', ' + (unassessed + screenedIn) + ' waiting to be filtered' +
+        ', ' + screenedOut + ' dropped in screening' +
+        ', ' + reject + ' ruled out.';
+      document.getElementById('pfStatScanned').textContent = String(pfSourceTotal);
+      document.getElementById('pfStatRecommended').textContent = String(recommended);
+      var totalScreened = screenedOut + screenAccepted;
+      document.getElementById('pfStatScreenRate').textContent = totalScreened ? Math.round(100 * screenAccepted / totalScreened) + '%' : '—';
+      var processed = pfSourceTotal ? Math.round(100 * (pfSourceTotal - unassessed - screenedIn) / pfSourceTotal) : 0;
+      document.getElementById('pfStatProcessed').textContent = processed + '%';
+      document.getElementById('pfProgressFill').style.width = processed + '%';
+
+      pfWake();
+    }
+
+    // Freezes the counts as of the moment a Find-my-matches run starts, so live per-batch deltas
+    // during that run (see pfApplyRunEvent) have a stable base to add onto rather than drifting
+    // against whatever setPfCounts happened to see last.
+    var pfRunSnapshot = null;
+    var pfRunAssessBase = null;
+    function pfBeginRun() {
+      pfRunSnapshot = pfLastCountsPayload
+        ? Object.assign({}, pfLastCountsPayload)
+        : { unassessed: 0, screened_out: 0, screened_in: 0, reject: 0, strong: 0, possible: 0, interested: 0, applied: 0 };
+      pfRunAssessBase = null;
+    }
+    function pfApplyRunEvent(event) {
+      if (!pfRunSnapshot) return;
+      var next = Object.assign({}, pfLastCountsPayload || pfRunSnapshot);
+      if (event.stage === 'screen') {
+        next.unassessed = Math.max(0, pfRunSnapshot.unassessed - event.done);
+        next.screened_out = pfRunSnapshot.screened_out + (event.screened_out || 0);
+        next.screened_in = pfRunSnapshot.screened_in + (event.screened_in || 0);
+      } else if (event.stage === 'assess') {
+        // Frozen the instant assess events start, from whatever screened_in ended up at when the
+        // screen stage (above) finished -- not the pre-run snapshot, which would still include
+        // postings this same run only just moved out of "not screened yet".
+        if (pfRunAssessBase === null) pfRunAssessBase = next.screened_in;
+        next.screened_in = Math.max(0, pfRunAssessBase - event.done);
+        next.reject = pfRunSnapshot.reject + (event.discarded || 0);
+        next.possible = pfRunSnapshot.possible + (event.recommended || 0);
+      }
+      setPfCounts(next);
+    }
+    // Scanning company boards finds new postings before any screening happens -- they land
+    // straight in "not screened yet", growing the Scanned total live as each company's board read
+    // completes, same idea as the assess-run deltas above but simpler (only one bucket changes).
+    function pfBumpScanned(newJobs) {
+      if (!newJobs) return;
+      var base = pfLastCountsPayload || { unassessed: 0, screened_out: 0, screened_in: 0, reject: 0, strong: 0, possible: 0, interested: 0, applied: 0 };
+      var next = Object.assign({}, base);
+      next.unassessed = (base.unassessed || 0) + newJobs;
+      setPfCounts(next);
+    }
+
+    function pfLayoutColumns() {
+      pfStageGroups.forEach(function (ids) {
+        var totalH = 0;
+        ids.forEach(function (id) { totalH += pfNodeMap[id].dispHeight; });
+        totalH += PF_ROW_GAP * (ids.length - 1);
+        var y = PF_MARGIN_TOP + (PF_USABLE_H - totalH) / 2;
+        ids.forEach(function (id) {
+          var n = pfNodeMap[id];
+          n.y = y; n.cy = y + n.dispHeight / 2;
+          y += n.dispHeight + PF_ROW_GAP;
+        });
+      });
+    }
+    function pfRecomputeEdgeSlices() {
+      PF_NODES.forEach(function (n) {
+        var outs = pfChildEdges[n.id].slice().sort(function (a, b) { return pfNodeMap[a.target].cy - pfNodeMap[b.target].cy; });
+        var outDenom = 0; outs.forEach(function (e) { outDenom += e.committed; }); outDenom = Math.max(1, outDenom);
+        var cum = 0;
+        outs.forEach(function (e) {
+          var h = (e.committed / outDenom) * n.dispHeight;
+          e.sy0 = n.y + cum; e.sy1 = e.sy0 + h; cum += h;
+        });
+        var ins = pfParentEdges[n.id].slice().sort(function (a, b) { return pfNodeMap[a.source].cy - pfNodeMap[b.source].cy; });
+        var inDenom = 0; ins.forEach(function (e) { inDenom += e.committed; }); inDenom = Math.max(1, inDenom);
+        cum = 0;
+        ins.forEach(function (e) {
+          var h = (e.committed / inDenom) * n.dispHeight;
+          e.ty0 = n.y + cum; e.ty1 = e.ty0 + h; cum += h;
+        });
+      });
+    }
+
+    var PF_SVG_NS = 'http://www.w3.org/2000/svg';
+    var PF_XLINK_NS = 'http://www.w3.org/1999/xlink';
+    function pfEl(tag, attrs) {
+      var e = document.createElementNS(PF_SVG_NS, tag);
+      for (var k in attrs) e.setAttribute(k, attrs[k]);
+      return e;
+    }
+
+    var pfSvg = document.getElementById('pf-svg');
+    pfSvg.setAttribute('viewBox', '0 0 ' + PF_VB_W + ' ' + PF_VB_H);
+    PF_STAGE_TITLES.forEach(function (title, i) {
+      var t = pfEl('text', { x: PF_COL_MARGIN + i * PF_COL_STEP + PF_NODE_W / 2, y: PF_MARGIN_TOP - 12, 'text-anchor': 'middle', class: 'pf-stage-title' });
+      t.textContent = title;
+      pfSvg.appendChild(t);
+    });
+
+    var pfFlowLayer = pfEl('g', {});
+    pfSvg.appendChild(pfFlowLayer);
+    var pfPathByKey = {}, pfGuideByKey = {}, pfDotsByKey = {};
+    Object.keys(pfEdges).forEach(function (key) {
+      var edge = pfEdges[key];
+      var safeId = 'pf-guide-' + key.replace(/[^a-zA-Z0-9]/g, '-');
+      var path = pfEl('path', { class: 'pf-link', d: '' });
+      var guide = pfEl('path', { id: safeId, d: '', fill: 'none', stroke: 'none' });
+      pfFlowLayer.appendChild(path);
+      pfFlowLayer.appendChild(guide);
+      pfPathByKey[key] = path;
+      pfGuideByKey[key] = guide;
+
+      // Two small dots per edge, riding a native SVG animateMotion along the guide path --
+      // decorative ("flow is happening here"), not one particle per real posting: with real
+      // counts running into the hundreds or thousands, a dot per item would be both meaningless
+      // on screen and slow. Native SMIL animation also means this never needs the JS frame loop
+      // to keep running just to keep dots moving. Hidden (in pfRender) whenever this edge's real
+      // count is zero, so an empty branch doesn't show phantom motion that never happened.
+      var dots = [];
+      for (var d = 0; d < 2; d++) {
+        var dur = (2.6 + d * 0.4).toFixed(2);
+        var dot = pfEl('circle', { r: 2.4, class: 'pf-dot', fill: PF_KIND_COLOR[pfNodeMap[edge.target].kind] || 'var(--text-muted)' });
+        var anim = pfEl('animateMotion', { dur: dur + 's', repeatCount: 'indefinite', begin: (d * dur / 2) + 's' });
+        var mpath = pfEl('mpath', {});
+        mpath.setAttributeNS(PF_XLINK_NS, 'href', '#' + safeId);
+        mpath.setAttribute('href', '#' + safeId);
+        anim.appendChild(mpath);
+        dot.appendChild(anim);
+        pfFlowLayer.appendChild(dot);
+        dots.push(dot);
+      }
+      pfDotsByKey[key] = dots;
+    });
+
+    var pfNodeLayer = pfEl('g', {});
+    pfSvg.appendChild(pfNodeLayer);
+    var pfNodeVisuals = {};
+    PF_NODES.forEach(function (n) {
+      var rect = pfEl('rect', { class: 'pf-node-rect', x: n.x, y: n.y, width: n.width, height: n.dispHeight, rx: 2, fill: 'var(--surface-2)', stroke: PF_KIND_COLOR[n.kind] });
+      var tx = n.x + n.width + 8;
+      // A label can end up sitting inside a wide ribbon (e.g. "Scanned postings", dead center of
+      // the diagram, with three stacked col1 ribbons passing directly behind it) -- a halo behind
+      // the text keeps it legible regardless of what color is behind it, rather than hoping every
+      // ribbon stays out of the way.
+      var halo = pfEl('rect', { class: 'pf-label-halo', x: tx - 4, y: n.cy - 14, width: 90, height: 30, rx: 3, fill: 'var(--surface)', 'fill-opacity': 0.85 });
+      var label = pfEl('text', { x: tx, y: n.cy - 2, class: 'pf-node-label' });
+      label.textContent = n.label;
+      var meta = pfEl('text', { x: tx, y: n.cy + 12, class: 'pf-node-count', fill: PF_KIND_COLOR[n.kind] });
+      meta.textContent = '0';
+      pfNodeLayer.appendChild(halo); pfNodeLayer.appendChild(rect); pfNodeLayer.appendChild(label); pfNodeLayer.appendChild(meta);
+      pfNodeVisuals[n.id] = { rect: rect, halo: halo, label: label, meta: meta };
+    });
+
+    function pfRender() {
+      PF_NODES.forEach(function (n) {
+        var v = pfNodeVisuals[n.id];
+        v.rect.setAttribute('y', n.y);
+        v.rect.setAttribute('height', n.dispHeight);
+        v.halo.setAttribute('y', n.cy - 14);
+        v.label.setAttribute('y', n.cy - 2);
+        v.meta.setAttribute('y', n.cy + 12);
+        var total = Math.round(pfDerivedTotal(n.id));
+        var pct = n.id === 'scanned' ? 'total' : (pfSourceTotal ? (100 * total / pfSourceTotal).toFixed(1) + '%' : '0%');
+        v.meta.textContent = total + ' · ' + pct;
+      });
+      Object.keys(pfEdges).forEach(function (key) {
+        var e = pfEdges[key];
+        var s = pfNodeMap[e.source], t = pfNodeMap[e.target];
+        var x0 = s.x + s.width, x1 = t.x, midX = (x0 + x1) / 2;
+        var d = 'M' + x0 + ',' + e.sy0 + ' C' + midX + ',' + e.sy0 + ' ' + midX + ',' + e.ty0 + ' ' + x1 + ',' + e.ty0 +
+          ' L' + x1 + ',' + e.ty1 + ' C' + midX + ',' + e.ty1 + ' ' + midX + ',' + e.sy1 + ' ' + x0 + ',' + e.sy1 + ' Z';
+        pfPathByKey[key].setAttribute('d', d);
+        pfPathByKey[key].setAttribute('fill', PF_KIND_COLOR[t.kind] || 'var(--text-muted)');
+        pfPathByKey[key].setAttribute('fill-opacity', 0.4);
+        var gy0 = (e.sy0 + e.sy1) / 2, gy1 = (e.ty0 + e.ty1) / 2;
+        pfGuideByKey[key].setAttribute('d', 'M' + x0 + ',' + gy0 + ' C' + midX + ',' + gy0 + ' ' + midX + ',' + gy1 + ' ' + x1 + ',' + gy1);
+        // No real flow on this branch yet -- don't show particles pretending there is.
+        var display = e.committed > 0 ? '' : 'none';
+        pfDotsByKey[key].forEach(function (dot) { dot.style.display = display; });
+      });
+    }
+
+    function pfFrame(now) {
+      var dt = Math.min(0.1, (now - pfLastFrame) / 1000);
+      pfLastFrame = now;
+      var settled = true;
+      PF_NODES.forEach(function (n) {
+        var target = pfTargetHeight(n);
+        if (Math.abs(target - n.dispHeight) > 0.3) settled = false;
+        var alpha = 1 - Math.exp(-dt * PF_SMOOTH_RATE);
+        n.dispHeight += (target - n.dispHeight) * alpha;
+      });
+      pfLayoutColumns();
+      pfRecomputeEdgeSlices();
+      pfRender();
+      if (settled) { pfAnimating = false; return; }
+      requestAnimationFrame(pfFrame);
+    }
+    function pfWake() {
+      if (pfAnimating) return;
+      pfAnimating = true;
+      pfLastFrame = performance.now();
+      requestAnimationFrame(pfFrame);
+    }
+
+    function renderJobPipeline(counts) {
+      setPfCounts(counts);
+    }
+
+    // rAF keeps running while a background tab is (mostly) inactive, but some browsers throttle
+    // it heavily -- waking it explicitly when the Search tab becomes visible again catches up any
+    // easing that stalled while it was hidden.
+    document.querySelector('[data-tab="search"]').addEventListener('click', pfWake);
 
     async function loadJobs() {
       var res = await api('/jobs');
@@ -6720,6 +7198,10 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     function renderAnswers() {
       var list = document.getElementById('answers-list');
+      if (!list) {
+        renderApplyReadiness();
+        return;
+      }
       list.innerHTML = '';
       if (!applicationAnswers.length) {
         list.appendChild(el('p', {
@@ -6755,7 +7237,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       renderApplyReadiness();
     }
 
-    document.getElementById('answer-form').addEventListener('submit', async function (event) {
+    var answerForm = document.getElementById('answer-form');
+    if (answerForm) answerForm.addEventListener('submit', async function (event) {
       event.preventDefault();
       var statusEl = document.getElementById('answer-status');
       statusEl.textContent = 'Saving…';
@@ -6927,8 +7410,8 @@ const DASHBOARD_PAGE = `<!doctype html>
         { id: 'feedback', name: 'Rejection reasons', note: 'What you taught the filter by rejecting postings with a reason.' },
         { id: 'resumes', name: 'Resume versions', note: 'Generated resumes and their PDFs.' },
         { id: 'cover_letters', name: 'Cover letters', note: 'Generated cover letters for interested jobs.' },
-        { id: 'notes', name: 'Notes', note: 'Freeform notes on the Profile tab.' },
-        { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Desired Roles tab.' },
+        { id: 'notes', name: 'Notes', note: 'Freeform and pasted resume text on Resume > Notes.' },
+        { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Roles tab (Notes sub-tab).' },
       ].forEach(function (collection) {
         var del = el('button', { className: 'destructive', type: 'button', textContent: 'Delete' });
         del.addEventListener('click', async function () {
@@ -7055,8 +7538,8 @@ function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "structured", schema: COMPANY_LIST_SCHEMA, toolName: "submit_companies", maxTokens: 4000 };
     case "profile.structure":
       return { kind: "structured", schema: STRUCTURED_PROFILE_JSON_SCHEMA, toolName: "submit_structured_profile", maxTokens: 2000 };
-    case "roles.describe":
-      return { kind: "text" };
+    case "roles.analyze":
+      return { kind: "structured", schema: ROLE_ANALYSIS_SCHEMA, toolName: "submit_role_analysis", maxTokens: 3000 };
     case "review.question":
       return { kind: "text" };
     case "resume.build":
@@ -7237,7 +7720,9 @@ export default {
 async function handle(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   {
     if (request.method === "GET" && url.pathname === "/health") return json({ status: "ok", mode: "cloudflare" });
-    if (url.pathname.startsWith("/dev")) return devConsole(request, env, url);
+    // Not `startsWith("/dev")` -- that also matches "/devices" and "/devices/:id/revoke",
+    // which shadowed the real device-management routes below and 404'd the Devices tab.
+    if (url.pathname === "/dev" || url.pathname.startsWith("/dev/")) return devConsole(request, env, url);
     if (request.method === "GET" && url.pathname === "/enroll") return enrollPage();
     if (request.method === "GET" && url.pathname === "/") {
       const auth = await requireSession(request, env);
@@ -7250,7 +7735,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "GET" && url.pathname === "/companies") return listCompanies(request, env);
     if (request.method === "POST" && url.pathname === "/companies") return createCompany(request, env);
     if (request.method === "POST" && url.pathname === "/companies/bulk") return bulkAddCompanies(request, env);
-    if (request.method === "POST" && url.pathname === "/companies/discover") return discoverCompanies(request, env);
+    if (request.method === "POST" && url.pathname === "/companies/discover") return discoverCompanies(request, env, ctx);
     if (request.method === "POST" && url.pathname === "/companies/scan") return scanCompanies(request, env, ctx);
     const companyMatch = url.pathname.match(/^\/companies\/([^/]+)$/);
     if (request.method === "PATCH" && companyMatch) return updateCompany(request, env, companyMatch[1]);
@@ -7297,7 +7782,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     const roleSignalMatch = url.pathname.match(/^\/role-signals\/([^/]+)$/);
     if (request.method === "DELETE" && roleSignalMatch) return deleteRoleSignal(request, env, roleSignalMatch[1]);
     if (request.method === "PUT" && url.pathname === "/desired-roles") return saveDesiredRoles(request, env);
-    if (request.method === "POST" && url.pathname === "/desired-roles/generate") return generateDesiredRoles(request, env);
+    if (request.method === "POST" && url.pathname === "/desired-roles/analyze") return analyzeDesiredRoles(request, env);
     if (request.method === "GET" && url.pathname === "/resumes") return listResumes(request, env);
     if (request.method === "POST" && url.pathname === "/resumes") return createResume(request, env);
     // Ahead of the /resumes/:id routes below, which would otherwise capture "master" as an id.
