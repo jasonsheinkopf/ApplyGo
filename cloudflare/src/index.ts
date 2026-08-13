@@ -1037,12 +1037,17 @@ async function assessRowsBatched(
 }
 
 /**
- * Runs the filtering pipeline: cheap screen first, strong assessment only on what survives.
+ * Runs the filtering pipeline: cheap screen, then strong assessment on whatever has survived it
+ * (from this round or an earlier one).
  *
- * Both tiers run in one request, bounded by a shared call budget, and the response reports what
- * is left at each stage so the dashboard can simply ask again. Doing the cheap pass first is the
- * whole point -- most scraped postings are obvious misses, and paying strong-model rates to
- * discover that is the expensive way to run this.
+ * Both tiers run in one request, bounded by a shared call budget split roughly evenly between
+ * them, and the response reports what is left at each stage so the dashboard can simply ask
+ * again. A posting still has to be screened before it's ever eligible for assessment -- that
+ * dependency is real and unavoidable -- but the two tiers' *backlogs* are worked down together
+ * each round rather than one strictly first: an all-screen-then-leftover-to-assess split let a
+ * large enough raw backlog claim the entire budget round after round, leaving screened_in
+ * postings sitting there fully paid for and unassessed for as long as new raw postings kept
+ * outnumbering the shared budget.
  */
 async function processJobs(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const auth = await requireSession(request, env);
@@ -1081,20 +1086,34 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
     // "screened 50 of 243" stays meaningful across however many clicks it takes to clear it.
     const screenTotal = (await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'unassessed'").first<{ n: number }>())?.n ?? 0;
 
-    // Tier 1: cheap bulk screen over everything untouched. Every batch this round's budget can
-    // afford is fetched up front and split into disjoint chunks (so concurrent calls never see
+    // The shared budget is split up front rather than handed to tier 1 first-come-first-served:
+    // a large enough raw backlog (screening 60 at a time) can otherwise consume the entire budget
+    // every single round, leaving tier 2 permanently at zero calls even though postings are
+    // already sitting there screened_in, already paid for, waiting on the one step that actually
+    // produces a verdict. Reserving half for assessment up front means a screened_in backlog
+    // always gets worked down alongside the raw one, not only after it's entirely gone -- and
+    // whichever tier doesn't need its full half (because there simply isn't that much of it left)
+    // gives the unused portion back to the other rather than leaving it idle.
+    const assessShare = Math.floor(budget.remaining / 2);
+    const screenShare = budget.remaining - assessShare;
+
+    // Tier 1: cheap bulk screen over everything untouched. Every batch this round's screen share
+    // can afford is fetched up front and split into disjoint chunks (so concurrent calls never see
     // overlapping rows), then fired at once -- batches don't depend on each other, so there's no
     // reason to wait for one to finish before starting the next.
     const screenRows = await env.DB.prepare(
       `SELECT id, title, company, location, raw_description FROM job_postings
        WHERE fit_status = 'unassessed' ORDER BY created_at ASC LIMIT ?`,
     )
-      .bind(budget.remaining * SCREEN_BATCH_SIZE)
+      .bind(screenShare * SCREEN_BATCH_SIZE)
       .all<JobRow>();
     const screenItems = toAssessable(screenRows.results ?? []);
     const screenBatches: (typeof screenItems)[] = [];
     for (let i = 0; i < screenItems.length; i += SCREEN_BATCH_SIZE) screenBatches.push(screenItems.slice(i, i + SCREEN_BATCH_SIZE));
-    budget.remaining -= screenBatches.length;
+    // Tier 2 below reads budget.remaining, so any of the screen share left unused (the raw
+    // backlog ran out before using its whole half) rolls forward into assessment's share instead
+    // of just being dropped on the floor for this round.
+    budget.remaining = assessShare + (screenShare - screenBatches.length);
 
     let screenFailed = false;
     await runPooled(
@@ -6346,34 +6365,56 @@ const DASHBOARD_PAGE = `<!doctype html>
       statusEl.className = 'status';
       pfBeginRun();
       try {
-        var res = await api('/jobs/process', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ provider: document.getElementById('jobs-provider').value }),
-        });
-        if (!res.ok) throw new Error(errorMessage(await res.json(), 'process_failed'));
-        var data = await readNdjson(res, function (event) {
-          statusEl.textContent = (event.stage === 'screen'
-            ? 'Step 1 of 2 — quick screen: '
-            : 'Step 2 of 2 — detailed scoring: ') + event.done + ' of ' + event.total;
-          // Real per-batch accept/reject counts, not a guess from done/total -- see
-          // pfApplyRunEvent. This is what makes the pipeline diagram move live, batch by batch,
-          // while this run is still in flight rather than only jumping once at the very end.
-          pfApplyRunEvent(event);
-        });
-        // The server's own authoritative counts, reconciling away any drift the live per-batch
-        // deltas above might have accumulated.
-        setPfCounts(data.counts || {});
+        var totalScreened = 0, totalScreenedOut = 0, totalAssessed = 0, allErrors = [];
+        var round = 0;
+        var data;
+        // Same reasoning as "Scan company boards": one request only gets through as much of the
+        // backlog as the server's own per-call budget safely allows, so it re-fires on your
+        // behalf until nothing's left rather than making you click through a big backlog by
+        // hand -- capped so a real server problem, or a backlog that genuinely stops shrinking,
+        // can't spin forever.
+        do {
+          round += 1;
+          var res = await api('/jobs/process', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ provider: document.getElementById('jobs-provider').value }),
+          });
+          if (!res.ok) throw new Error(errorMessage(await res.json(), 'process_failed'));
+          data = await readNdjson(res, function (event) {
+            statusEl.textContent = (round > 1 ? 'Round ' + round + ': ' : '') + (event.stage === 'screen'
+              ? 'Step 1 of 2 — quick screen: '
+              : 'Step 2 of 2 — detailed scoring: ') + event.done + ' of ' + event.total;
+            // Real per-batch accept/reject counts, not a guess from done/total -- see
+            // pfApplyRunEvent. This is what makes the pipeline diagram move live, batch by batch,
+            // while this run is still in flight rather than only jumping once at the very end.
+            pfApplyRunEvent(event);
+          });
+          // The server's own authoritative counts, reconciling away any drift the live per-batch
+          // deltas above might have accumulated.
+          setPfCounts(data.counts || {});
+          totalScreened += data.screened || 0;
+          totalScreenedOut += data.screened_out || 0;
+          totalAssessed += data.assessed || 0;
+          if ((data.errors || []).length) allErrors.push.apply(allErrors, data.errors);
+        } while (
+          !allErrors.length && round < 25 &&
+          ((data.counts || {}).unassessed > 0 || (data.counts || {}).screened_in > 0) &&
+          (data.screened || data.assessed)
+        );
+
         var counts = data.counts || {};
         var left = (counts.unassessed || 0) + (counts.screened_in || 0);
         var parts = [];
-        if (data.screened) parts.push('Screened ' + data.screened + ', dropped ' + data.screened_out + ' as clear misses.');
-        if (data.assessed) parts.push('Assessed ' + data.assessed + ' in detail.');
+        if (totalScreened) parts.push('Screened ' + totalScreened + ', dropped ' + totalScreenedOut + ' as clear misses.');
+        if (totalAssessed) parts.push('Assessed ' + totalAssessed + ' in detail.');
         if (!parts.length) parts.push('Nothing left to process.');
+        // Only reachable if the loop stopped without actually clearing the backlog: a real error,
+        // the round cap, or a round that made no progress at all -- genuinely worth a click to retry.
         parts.push(left ? left + ' still queued — click again to continue.' : 'All caught up.');
-        if ((data.errors || []).length) parts.push('Some batches failed: ' + data.errors.join('; '));
+        if (allErrors.length) parts.push('Some batches failed: ' + allErrors.join('; '));
         statusEl.textContent = parts.join(' ');
-        statusEl.className = (data.errors || []).length ? 'status error' : 'status success';
+        statusEl.className = allErrors.length ? 'status error' : 'status success';
         await loadJobs();
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
@@ -6464,7 +6505,17 @@ const DASHBOARD_PAGE = `<!doctype html>
       return Math.max(PF_MIN_H, (pfDerivedTotal(n.id) / Math.max(1, pfSourceTotal)) * PF_SOURCE_HEIGHT);
     }
 
+    // The one entry point that actually moves the diagram, and the one place bursts get decided:
+    // whatever edge's committed count just went UP compared to last time gets a burst proportional
+    // to that increase, so motion only ever appears at the instant new real numbers land, not as
+    // constant ambient looping. The very first call (page load) is deliberately silent -- that's
+    // the starting state, not an update, and bursting the entire existing backlog on load would be
+    // both meaningless and overwhelming.
     function setPfCounts(counts) {
+      var isFirstLoad = pfLastCountsPayload === null;
+      var prevCommitted = {};
+      Object.keys(pfEdges).forEach(function (key) { prevCommitted[key] = pfEdges[key].committed; });
+
       pfLastCountsPayload = counts;
       var unassessed = counts.unassessed || 0;
       var screenedOut = counts.screened_out || 0;
@@ -6480,6 +6531,13 @@ const DASHBOARD_PAGE = `<!doctype html>
       pfEdges['screen_accepted->fit_pending'].committed = screenedIn;
       pfEdges['screen_accepted->fit_rejected'].committed = reject;
       pfEdges['screen_accepted->fit_recommended'].committed = recommended;
+
+      if (!isFirstLoad) {
+        Object.keys(pfEdges).forEach(function (key) {
+          var delta = pfEdges[key].committed - prevCommitted[key];
+          if (delta > 0) pfBurst(key, delta);
+        });
+      }
 
       document.getElementById('jobs-pipeline-summary').textContent =
         recommended + ' match' + (recommended === 1 ? '' : 'es') +
@@ -6570,7 +6628,6 @@ const DASHBOARD_PAGE = `<!doctype html>
     }
 
     var PF_SVG_NS = 'http://www.w3.org/2000/svg';
-    var PF_XLINK_NS = 'http://www.w3.org/1999/xlink';
     function pfEl(tag, attrs) {
       var e = document.createElementNS(PF_SVG_NS, tag);
       for (var k in attrs) e.setAttribute(k, attrs[k]);
@@ -6587,38 +6644,48 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     var pfFlowLayer = pfEl('g', {});
     pfSvg.appendChild(pfFlowLayer);
-    var pfPathByKey = {}, pfGuideByKey = {}, pfDotsByKey = {};
+    var pfPathByKey = {};
     Object.keys(pfEdges).forEach(function (key) {
-      var edge = pfEdges[key];
-      var safeId = 'pf-guide-' + key.replace(/[^a-zA-Z0-9]/g, '-');
       var path = pfEl('path', { class: 'pf-link', d: '' });
-      var guide = pfEl('path', { id: safeId, d: '', fill: 'none', stroke: 'none' });
       pfFlowLayer.appendChild(path);
-      pfFlowLayer.appendChild(guide);
       pfPathByKey[key] = path;
-      pfGuideByKey[key] = guide;
+    });
 
-      // Two small dots per edge, riding a native SVG animateMotion along the guide path --
-      // decorative ("flow is happening here"), not one particle per real posting: with real
-      // counts running into the hundreds or thousands, a dot per item would be both meaningless
-      // on screen and slow. Native SMIL animation also means this never needs the JS frame loop
-      // to keep running just to keep dots moving. Hidden (in pfRender) whenever this edge's real
-      // count is zero, so an empty branch doesn't show phantom motion that never happened.
-      var dots = [];
-      for (var d = 0; d < 2; d++) {
-        var dur = (2.6 + d * 0.4).toFixed(2);
-        var dot = pfEl('circle', { r: 2.4, class: 'pf-dot', fill: PF_KIND_COLOR[pfNodeMap[edge.target].kind] || 'var(--text-muted)' });
-        var anim = pfEl('animateMotion', { dur: dur + 's', repeatCount: 'indefinite', begin: (d * dur / 2) + 's' });
-        var mpath = pfEl('mpath', {});
-        mpath.setAttributeNS(PF_XLINK_NS, 'href', '#' + safeId);
-        mpath.setAttribute('href', '#' + safeId);
-        anim.appendChild(mpath);
+    var PF_BURST_MAX = 18; // visual cap -- a real delta can be up to a full batch (60 for screen),
+                            // and 60 individual dots at once reads as noise, not motion.
+    var PF_BURST_DUR_MIN = 0.8, PF_BURST_DUR_RANGE = 0.5;
+    var PF_BURST_STAGGER = 0.06; // seconds between each dot's start, so a burst arrives as a
+                                  // trickle rather than a single-frame pop of simultaneous dots.
+
+    // Fires once per real increase (see setPfCounts), never on a timer or a loop: a handful of
+    // dots -- proportional to, capped at a readable count of, exactly how much this specific edge
+    // just grew by -- ride their OWN random path across the current ribbon band (computed fresh
+    // from the edge's live sy0/sy1/ty0/ty1, so a burst mid-transition still starts and ends on the
+    // ribbon as it actually is right now) and are discarded once they land. No shared guide path
+    // or indefinite animation needed -- SMIL's animateMotion takes a path directly.
+    function pfBurst(key, delta) {
+      var e = pfEdges[key];
+      if (!e) return;
+      var s = pfNodeMap[e.source], t = pfNodeMap[e.target];
+      var x0 = s.x + s.width, x1 = t.x, midX = (x0 + x1) / 2;
+      var n = Math.max(1, Math.min(PF_BURST_MAX, Math.round(delta)));
+      var color = PF_KIND_COLOR[t.kind] || 'var(--text-muted)';
+      for (var i = 0; i < n; i++) {
+        // One random vertical fraction per dot, reused at both ends, so each dot cuts its own
+        // straight-ish diagonal through the band instead of every dot sharing one centerline.
+        var frac = Math.random();
+        var y0 = e.sy0 + frac * (e.sy1 - e.sy0);
+        var y1 = e.ty0 + frac * (e.ty1 - e.ty0);
+        var d = 'M' + x0 + ',' + y0 + ' C' + midX + ',' + y0 + ' ' + midX + ',' + y1 + ' ' + x1 + ',' + y1;
+        var dur = PF_BURST_DUR_MIN + Math.random() * PF_BURST_DUR_RANGE;
+        var begin = i * PF_BURST_STAGGER + Math.random() * (PF_BURST_STAGGER / 2);
+        var dot = pfEl('circle', { r: 2.6, class: 'pf-dot', fill: color });
+        var anim = pfEl('animateMotion', { path: d, dur: dur + 's', begin: begin + 's', fill: 'freeze' });
         dot.appendChild(anim);
         pfFlowLayer.appendChild(dot);
-        dots.push(dot);
+        (function (el, life) { setTimeout(function () { el.remove(); }, life * 1000); })(dot, begin + dur + 0.15);
       }
-      pfDotsByKey[key] = dots;
-    });
+    }
 
     var pfNodeLayer = pfEl('g', {});
     pfSvg.appendChild(pfNodeLayer);
@@ -6660,11 +6727,6 @@ const DASHBOARD_PAGE = `<!doctype html>
         pfPathByKey[key].setAttribute('d', d);
         pfPathByKey[key].setAttribute('fill', PF_KIND_COLOR[t.kind] || 'var(--text-muted)');
         pfPathByKey[key].setAttribute('fill-opacity', 0.4);
-        var gy0 = (e.sy0 + e.sy1) / 2, gy1 = (e.ty0 + e.ty1) / 2;
-        pfGuideByKey[key].setAttribute('d', 'M' + x0 + ',' + gy0 + ' C' + midX + ',' + gy0 + ' ' + midX + ',' + gy1 + ' ' + x1 + ',' + gy1);
-        // No real flow on this branch yet -- don't show particles pretending there is.
-        var display = e.committed > 0 ? '' : 'none';
-        pfDotsByKey[key].forEach(function (dot) { dot.style.display = display; });
       });
     }
 
