@@ -7,13 +7,14 @@
 // models" would mean re-deriving what was actually sent, which is exactly the guesswork tracing
 // exists to remove.
 //
-// Replay deliberately does NOT go through the router's normal trace sink. An eval run is not
-// production spend in the ordinary sense -- it's the developer testing a hypothesis -- and letting
-// it write into llm_traces would quietly inflate the Cost tab's totals with experimentation nobody
-// asked the app to do. Instead each replay installs a local, throwaway sink for the duration of one
-// call, captures what it recorded, and discards the sink. The judge call is the one exception: it
-// runs through the real env and is traced normally under its own "evals.judge" task, because
-// judging genuinely costs money and the user should see that cost like any other.
+// Replay deliberately does NOT go through the router's normal trace sink, and for the same reason
+// does not send to Langfuse either: an eval run is not production spend in the ordinary sense --
+// it's the developer testing a hypothesis -- and letting it write into llm_traces (or a Langfuse
+// project a candidate is watching) would quietly inflate both with experimentation nobody asked the
+// app to do. Instead each replay installs a local, throwaway sink for the duration of one call and
+// strips the Langfuse keys, captures what it recorded, and discards the sink. The judge call is the
+// one exception: it runs through the real env and is traced normally under its own "evals.judge"
+// task, because judging genuinely costs money and the user should see that cost like any other.
 
 import { type LlmEnv, type Provider, type LlmTrace, callStructured, callText } from "./llm";
 
@@ -45,6 +46,8 @@ export async function replayTask(
   let captured: LlmTrace | null = null;
   const isolatedEnv: LlmEnv = {
     ...env,
+    LANGFUSE_PUBLIC_KEY: undefined,
+    LANGFUSE_SECRET_KEY: undefined,
     LLM_TRACE_SINK: async (trace) => {
       captured = trace;
     },

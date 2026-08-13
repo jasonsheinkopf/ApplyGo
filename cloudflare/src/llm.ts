@@ -4,9 +4,13 @@
 // This is also the single choke point every model call passes through, which is why tracing lives
 // here rather than at the call sites: there is exactly one place to instrument, and a new call site
 // cannot forget to opt in. Each call records what was sent, what came back, what it cost, and how
-// long it took, so the prompts can be inspected and compared rather than guessed at.
+// long it took, so the prompts can be inspected and compared rather than guessed at. It's also why
+// Langfuse (see langfuse.ts) is wired in here instead of in the D1 trace sink downstream -- every
+// call gets a Langfuse trace for free, with no per-call-site opt-in possible to forget.
 
-export interface LlmEnv {
+import { type LangfuseEnv, sendToLangfuse } from "./langfuse";
+
+export interface LlmEnv extends LangfuseEnv {
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
   ANTHROPIC_MODEL?: string;
@@ -37,6 +41,8 @@ export type LlmTrace = {
   latencyMs: number;
   ok: boolean;
   error: string | null;
+  /** Set when this call was also sent to Langfuse -- lets the D1 trace sink store the link. */
+  langfuseTraceId: string | null;
 };
 
 export type TraceSink = (trace: LlmTrace) => Promise<void>;
@@ -106,11 +112,17 @@ export function pricedModels(): { model: string; in: number; out: number }[] {
 /**
  * Records a call, then gets out of the way. Tracing is observability, not business logic, so a
  * failure to write the trace must never turn a working model call into a failed one.
+ *
+ * Langfuse is sent to unconditionally (sendToLangfuse no-ops when unconfigured), independent of
+ * whether a D1 sink is attached -- the two are separate observability backends, not a fallback
+ * chain. Langfuse runs first so its trace id, if any, can be folded into what the D1 sink stores,
+ * which is what lets the dev console link straight into the matching Langfuse trace.
  */
-async function record(env: LlmEnv, trace: LlmTrace): Promise<void> {
+async function record(env: LlmEnv, trace: Omit<LlmTrace, "langfuseTraceId">): Promise<void> {
+  const langfuseTraceId = await sendToLangfuse(env, trace);
   if (!env.LLM_TRACE_SINK) return;
   try {
-    await env.LLM_TRACE_SINK(trace);
+    await env.LLM_TRACE_SINK({ ...trace, langfuseTraceId });
   } catch {
     // Deliberately swallowed.
   }

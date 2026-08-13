@@ -458,6 +458,38 @@ The motivation is concrete. The description-capture problem survived five rounds
 
 `assert_dev_console.mjs` covers the price maths (including the introductory-rate boundary and the unknown-model case), the console itself, and — most importantly — parses the real source to assert that every call site's task id exists in the registry and every registered task is wired to a call site. A task id is a positional string, so a typo files traces under a name the console never shows: silent, and invisible from the UI. That check was verified to fail when a call site's id is altered.
 
+## Langfuse tracing (optional, richer than `/dev`)
+
+The `/dev` console above is a homegrown tool: enough to read a prompt and its cost, not a full observability product. [Langfuse](https://langfuse.com) is that product — a proper trace timeline per call, cost and latency dashboards that slice by model/task/day, and (the reason it's worth wiring in) **no-code LLM-as-judge evaluators** that grade live traces automatically, none of which `/dev` tries to build. It has a generous free tier, so this is "on by default once you set two secrets," not a paid upgrade.
+
+**How it's wired.** `src/langfuse.ts` sends every model call to Langfuse, automatically, for every task and either provider (Anthropic or OpenAI) — it hooks into `llm.ts`'s `record()`, the same single choke point that already writes to `llm_traces`, so there was no call site to remember to opt in. One LLM call becomes one Langfuse **trace** with one **generation** inside it: name, prompt, response, model, tokens, cost, latency, and ok/error, shaped straight from the `LlmTrace` object the local sink already builds. Batched calls (`screenJobsBatch`, `assessJobFitBatch`) already cover many postings per call, so this granularity is naturally "one thing that happened" without threading a request-scoped session id through a dozen call sites.
+
+Deliberately raw `fetch` against Langfuse's documented ingestion endpoint (`POST /api/public/ingestion`), not the `langfuse` npm package. The published SDK is marked deprecated in favor of a v4/v5 rewrite built on OpenTelemetry, and wiring a general-purpose OTEL SDK correctly inside a Cloudflare Workers isolate — where a naive setup can leak span context across concurrent requests sharing the same isolate — is a real correctness hazard this codebase already reasons carefully about elsewhere (see `attachTraceSink` in `index.ts`). A single stateless POST per call sidesteps that hazard entirely and matches how every other provider in this file is already called.
+
+**Setup.**
+
+1. Create a free account at [cloud.langfuse.com](https://cloud.langfuse.com) (EU region) or [us.cloud.langfuse.com](https://us.cloud.langfuse.com) (US region) and a project inside it.
+2. Project Settings → API Keys → create a new key pair.
+3. Set the two secrets (and the host, only if you picked the US region or you're self-hosting Langfuse):
+   ```
+   npx wrangler secret put LANGFUSE_PUBLIC_KEY --env production
+   npx wrangler secret put LANGFUSE_SECRET_KEY --env production
+   npx wrangler secret put LANGFUSE_HOST --env production   # only for the US region or self-hosting; defaults to the EU cloud
+   ```
+4. For local development, add the same three lines to `.dev.vars` (gitignored, never committed).
+
+That's the entire setup — no other config, no schema to define on the Langfuse side. The next model call this app makes shows up in your project's Traces tab.
+
+**Viewing it.** Open your Langfuse project's Traces tab: every call, filterable by name (the task id, e.g. `resume.build`, `fit.assess`), model, or whether it errored, each with the full prompt/response and a cost/latency breakdown. This runs *alongside* `/dev`, not instead of it — `/dev` still works with zero setup and is faster for a quick look; Langfuse is where you go to actually dig in, compare, or set up automated grading.
+
+**Dev console integration.** The `/dev` header shows whether Langfuse is configured, with a link to open it. Every trace detail that made it to Langfuse also gets an "Open in Langfuse" link, straight to that specific trace — `langfuseTraceUrl()` in `langfuse.ts` resolves the project id behind your key pair once per isolate (`GET /api/public/projects`, cached in module scope, the same "practically never changes" caching pattern `ensureSchema` and `attachTraceSink` already use) and builds `/project/{id}/traces/{traceId}`. A failed lookup just falls back to linking the dashboard root rather than a broken link.
+
+**LLM-as-judge.** This app already has its own judge (`evals.judge`, see below) for scoring eval replays against a saved case. What Langfuse adds is a *second*, zero-code judge: its **Evaluators** feature (Langfuse project → Evaluators) runs an LLM-graded rubric automatically against live traces matching a filter you set — e.g. grade every `resume.build` trace for tone, or every `fit.assess` trace for whether the reason actually cites the posting. Nothing in this codebase needs to change to use it: the traces already carry the `input`/`output` text an evaluator template reads, since that's exactly what `sendToLangfuse()` populates on every call. Configure it once in the Langfuse UI and scores start appearing on the matching traces going forward.
+
+**Eval replays are deliberately excluded, same as the local trace table.** `evals.ts`'s `replayTask()` already strips the D1 sink for the same reason the header comment there gives — "an eval run is not production spend... letting it write into `llm_traces` would quietly inflate the Cost tab's totals with experimentation nobody asked the app to do" — and it strips the two Langfuse keys off the isolated env for the identical reason: a candidate comparing models in the eval harness shouldn't see their Langfuse project fill up with test replays. The one exception is the same one D1 already carves out: `judgeRun()` runs through the real env and is traced (and now sent to Langfuse) normally, because judging genuinely costs money and should be as visible as any other call.
+
+**Failure handling.** Every function in `langfuse.ts` follows the same rule `record()` in `llm.ts` already does: observability must never be able to break the call it's observing. `sendToLangfuse()` and the project-id lookup both swallow their own errors and return `null` rather than throwing — a Langfuse outage, a wrong key, or no configuration at all just means nothing gets sent that time, silently, with the LLM call itself unaffected.
+
 ## Eval harness (`/dev`, Evals tab)
 
 Traces make a prompt visible; the eval harness is what makes changing one accountable. A **case** is a saved prompt worth testing repeatedly — usually promoted from a real trace, sometimes hand-authored. A **run** is one execution of a case against a chosen provider/model, scored by an LLM judge. Both live in `src/evals.ts`, `migrations/0016_evals.sql`, and the Evals tab in `src/devconsole.ts`.
@@ -508,6 +540,7 @@ Checkboxes keep their small box and get the height on the surrounding `<label>` 
 - Enrollment codes store only a SHA-256 hash (`enrollment_codes.code_hash`), never the raw code.
 - No Cloudflare API token, GitHub token, or model-provider key is ever sent to browser JavaScript.
 - Automatic GitHub deployment uses Cloudflare Workers Builds' native Git integration, which does not require storing a Cloudflare API token in GitHub Actions secrets.
+- `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` (see "Langfuse tracing" above) are Worker secrets like every other credential here — never committed, never sent to the browser. Every prompt and response this app sends is also sent to Langfuse when configured, exactly as it's already written to `llm_traces`, so treat a Langfuse project the same as the `/dev` console: real candidate data, not a throwaway debug feed.
 
 ### Deploy-before-migrate safety
 
