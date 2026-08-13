@@ -20,6 +20,7 @@ import {
   listTraces,
   taskRollups,
 } from "./devconsole";
+import { langfuseConfigured, langfuseTraceUrl } from "./langfuse";
 import {
   type ReplaySpec,
   createEvalCase,
@@ -102,6 +103,10 @@ interface Env {
   ANTHROPIC_SCREEN_MODEL?: string;
   OPENAI_SCREEN_MODEL?: string;
   LOCAL_RENDER_URL?: string;
+  /** See src/langfuse.ts. Unset means every call still runs, just not sent to Langfuse. */
+  LANGFUSE_PUBLIC_KEY?: string;
+  LANGFUSE_SECRET_KEY?: string;
+  LANGFUSE_HOST?: string;
   /** Set to "off" to stop recording model calls. Anything else (including unset) records them. */
   LLM_TRACE?: string;
   /** Installed once per isolate by the router; see attachTraceSink. */
@@ -195,8 +200,8 @@ function createTraceSink(env: Env): TraceSink {
     await env.DB.prepare(
       `INSERT INTO llm_traces
        (id, task, provider, model, tier, prompt, response, input_tokens, output_tokens,
-        cost_usd, latency_ms, ok, error)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        cost_usd, latency_ms, ok, error, langfuse_trace_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         crypto.randomUUID(),
@@ -212,6 +217,7 @@ function createTraceSink(env: Env): TraceSink {
         trace.latencyMs,
         trace.ok ? 1 : 0,
         trace.error,
+        trace.langfuseTraceId,
       )
       .run();
 
@@ -266,6 +272,8 @@ const ADDITIVE_COLUMNS = [
   "ALTER TABLE resumes ADD COLUMN is_master INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE resumes ADD COLUMN plan_json TEXT NOT NULL DEFAULT '{}'",
   "ALTER TABLE job_postings ADD COLUMN requirements_json TEXT NOT NULL DEFAULT '{}'",
+  // 0018_langfuse.sql
+  "ALTER TABLE llm_traces ADD COLUMN langfuse_trace_id TEXT",
 ];
 
 /**
@@ -7648,11 +7656,18 @@ async function devConsole(request: Request, env: Env, url: URL): Promise<Respons
   if (method === "GET" && path === "/dev/costs") {
     return json(await costSummary(env.DB, days));
   }
+  if (method === "GET" && path === "/dev/langfuse") {
+    return json({ configured: langfuseConfigured(env), host: env.LANGFUSE_HOST || "https://cloud.langfuse.com" });
+  }
 
   const traceMatch = path.match(/^\/dev\/traces\/(.+)$/);
   if (method === "GET" && traceMatch) {
     const trace = await getTrace(env.DB, decodeURIComponent(traceMatch[1]));
-    return trace ? json({ trace }) : json({ error: "not_found" }, 404);
+    if (!trace) return json({ error: "not_found" }, 404);
+    // Only resolved when this particular call was actually sent to Langfuse -- most won't be, if
+    // Langfuse isn't configured at all, and langfuseTraceUrl itself no-ops in that case anyway.
+    const langfuseUrl = trace.langfuse_trace_id ? await langfuseTraceUrl(env, trace.langfuse_trace_id) : null;
+    return json({ trace: { ...trace, langfuse_url: langfuseUrl } });
   }
   if (method === "GET" && path === "/dev/traces") {
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 200);

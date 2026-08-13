@@ -31,6 +31,7 @@ export type TraceRow = {
   ok: number;
   error: string | null;
   created_at: string;
+  langfuse_trace_id: string | null;
 };
 
 type Db = D1Database;
@@ -232,6 +233,7 @@ export const DEV_PAGE = `<!doctype html>
 <header>
   <h1>Model calls</h1>
   <span class="sub">Developer view. Every prompt this app sends, what it returned, and what it cost.</span>
+  <span class="sub" id="langfuse-status"></span>
 </header>
 <nav>
   <button data-panel="calls" aria-selected="true">Calls</button>
@@ -415,9 +417,17 @@ export const DEV_PAGE = `<!doctype html>
       ' &middot; ' + esc(when(t.created_at));
     if (!t.ok) head += '<div class="warn" style="margin-top:.6rem">' + esc(t.error) + '</div>';
     var meta = window.__taskMeta && window.__taskMeta[t.task];
-    if (meta && meta.replayable) {
-      head += '<div style="margin-top:.6rem"><button class="action" id="save-as-case-btn">Save as eval case</button> ' +
-        '<span class="sub" id="save-as-case-status"></span></div>';
+    if ((meta && meta.replayable) || t.langfuse_trace_id) {
+      head += '<div style="margin-top:.6rem">';
+      if (meta && meta.replayable) {
+        head += '<button class="action" id="save-as-case-btn">Save as eval case</button> ' +
+          '<span class="sub" id="save-as-case-status"></span> ';
+      }
+      if (t.langfuse_trace_id && t.langfuse_url) {
+        head += '<a class="action" style="text-decoration:none;display:inline-block" href="' +
+          esc(t.langfuse_url) + '" target="_blank" rel="noopener">Open in Langfuse</a>';
+      }
+      head += '</div>';
     }
     head += '<h3>Prompt (' + String(t.prompt || '').length + ' chars)</h3><pre>' + esc(t.prompt) + '</pre>';
     head += '<h3>Response</h3><pre>' + esc(t.response || '(none)') + '</pre></div>';
@@ -713,6 +723,20 @@ export const DEV_PAGE = `<!doctype html>
       });
     }
   });
+
+  get('/dev/langfuse').then(function (data) {
+    var el = document.getElementById('langfuse-status');
+    el.textContent = data.configured
+      ? 'Also sending every call to Langfuse.'
+      : 'Langfuse not configured -- see the README to turn on richer tracing.';
+    if (data.configured) {
+      var link = document.createElement('a');
+      link.href = data.host; link.target = '_blank'; link.rel = 'noopener';
+      link.textContent = 'Open Langfuse';
+      link.style.marginLeft = '.5rem';
+      el.appendChild(link);
+    }
+  }).catch(function () { /* purely informational -- a failed check is not worth surfacing */ });
 
   refresh();
 })();
