@@ -5,7 +5,6 @@ import {
   type LlmTrace,
   type Provider,
   type TraceSink,
-  WRITING_STYLE_RULES,
   callStructured,
   callText,
   friendlyMessage,
@@ -20,7 +19,7 @@ import {
   listTraces,
   taskRollups,
 } from "./devconsole";
-import { langfuseConfigured, langfuseTraceUrl } from "./langfuse";
+import { getManagedPrompt, langfuseConfigured, langfuseTraceUrl } from "./langfuse";
 import {
   type ReplaySpec,
   createEvalCase,
@@ -915,36 +914,13 @@ async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response
   const dealbreakers = readDealbreakers(preferencesJson);
   const careAbout = readCareAbout(preferencesJson);
 
-  const prompt = [
-    "A job candidate wants two things from you: what matters to them in a search regardless of role, and which",
-    "distinct kinds of roles their background and stated interests actually support.",
-    "",
-    "SUMMARY: one short paragraph covering only things that apply no matter what role they're looking at --",
-    "location constraints, what to avoid, what to prioritize. Do not name specific job titles here.",
-    "",
-    "ROLES: each genuinely distinct role family they should be shown -- not variations on one title, but",
-    "different fields or functions entirely (for example, a former teacher now open to machine learning",
-    "engineering roles, advocacy roles, AND corporate training roles). Do not blend them into a single hybrid",
-    "role that doesn't actually exist in the job market, like 'ML advocate and trainer'. Being open to several",
-    "different paths is not the same as wanting one job that combines all of them, and a posting only has to be",
-    "a strong match for ONE entry to be worth surfacing, not all of them at once. For each entry, give a short",
-    "concrete title plus a description covering role family/titles, seniority, domain, must-have vs nice-to-have",
-    "aspects, and enough concrete keywords (actual job titles a posting would use) that a simple keyword match",
-    "could find it.",
-    "",
-    "Ground both in the candidate's actual background below, not just their notes -- a role their experience",
-    "doesn't support isn't a good entry even if a note mentions interest in it.",
-    "",
-    WRITING_STYLE_RULES,
-    "",
-    matchProfile ? `CANDIDATE BACKGROUND:\n${matchProfile}` : "",
-    notes.length ? `NOTES AND LINKS:\n${notes.map((c) => `- ${c}`).join("\n")}` : "",
-    desiredLocations ? `LOCATIONS THEY'LL WORK IN:\n${desiredLocations}` : "",
-    dealbreakers ? `DEALBREAKERS:\n${dealbreakers}` : "",
-    careAbout ? `WHAT THEY SAID THEY CARE ABOUT:\n${careAbout}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const prompt = await getManagedPrompt(env, "roles/analyze", {
+    candidate_background: matchProfile ? `CANDIDATE BACKGROUND:\n${matchProfile}` : "",
+    notes_and_links: notes.length ? `NOTES AND LINKS:\n${notes.map((c) => `- ${c}`).join("\n")}` : "",
+    locations: desiredLocations ? `LOCATIONS THEY'LL WORK IN:\n${desiredLocations}` : "",
+    dealbreakers: dealbreakers ? `DEALBREAKERS:\n${dealbreakers}` : "",
+    criteria: careAbout ? `WHAT THEY SAID THEY CARE ABOUT:\n${careAbout}` : "",
+  });
 
   let analysis: RoleAnalysis;
   try {
@@ -1602,45 +1578,16 @@ async function reviewJobQuestion(request: Request, env: Env, id: string): Promis
     .bind(id)
     .all<{ claim: string }>();
 
-  const prompt = [
-    "You are helping a candidate prepare to apply to a specific job. Find ONE concrete gap between",
-    "what this job asks for and what their profile currently shows evidence of, then write a single",
-    "short, conversational nudge that helps them fill that gap in their own words.",
-    "",
-    "A bare question makes people freeze on a blank page, even when they have a relevant story --",
-    "they just don't immediately connect it to the ask. So don't only ask; do some of the connecting",
-    "for them. Actually look through the candidate profile below for one or two SPECIFIC, REAL",
-    "things -- a project, a role, an employer, a tool -- that plausibly relate to the gap, name them",
-    "by name, and float them as tentative possibilities: \"maybe something like the X you did at Y?",
-    "Or was it more Z?\" Give them something concrete to react to, correct, or build on, instead of",
-    "an empty prompt. If nothing in the profile plausibly connects, it's fine to ask straight instead",
-    "of forcing a stretch.",
-    "",
-    WRITING_STYLE_RULES,
-    "",
-    "Rules:",
-    "- Only name things that actually appear in the candidate profile below. Never invent a project,",
-    "  employer, or skill that isn't there -- a confident wrong guess is worse than no guess at all.",
-    "- Ask about something the posting actually states or clearly implies, not a generic prompt.",
-    "- Phrase it the way a sharp friend prepping you for an interview would, not a form -- e.g. \"This",
-    "  role wants people-management experience -- did leading the migration team at Acme count, or",
-    "  was that more of an individual push?\"",
-    "- Two or three sentences: the question itself, plus the specific thing(s) you're floating. Still",
-    "  no preamble or throat-clearing -- go straight into it.",
-    "- If the profile already covers everything the posting asks for well, ask about whichever",
-    "  detail would most strengthen an application anyway, rather than inventing a gap.",
-    (prior.results ?? []).length
+  const prompt = await getManagedPrompt(env, "jobs/review_question", {
+    prior_answers_rule: (prior.results ?? []).length
       ? "- Don't repeat ground already covered by these previous answers for this same job:\n" +
         prior.results.map((r) => `  - ${r.claim}`).join("\n")
       : "",
-    "",
-    `JOB: ${job.title} at ${job.company}`,
-    `JOB DESCRIPTION:\n${job.raw_description.slice(0, 3000)}`,
-    "",
-    `CANDIDATE PROFILE:\n${JSON.stringify(profile.structured)}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+    job_title: job.title,
+    company: job.company,
+    job_description: job.raw_description.slice(0, 3000),
+    candidate_profile: JSON.stringify(profile.structured),
+  });
 
   try {
     const question = await callText(env, provider, "review.question", prompt);
@@ -2946,25 +2893,17 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   if (sourceParts.length === 0) return json({ error: "no_source_material" }, 400);
 
   const existingStructured = readStructuredProfile(profile?.structured_json ?? "{}");
-  const prompt = [
-    "You are updating a job candidate's structured professional profile: education history, work experience with",
-    "highlights, skills, a headline, and a short narrative summary.",
-    existingStructured
+  const prompt = await getManagedPrompt(env, "profile/structure", {
+    baseline_rule: existingStructured
       ? "This candidate already has a profile (given below as 'Current profile'). Treat it as the baseline: " +
         "keep every education and experience entry from it that the new material below does not contradict, even " +
         "if the new material doesn't happen to repeat it. Only change a specific field, or add a new entry, when " +
         "the new material below adds information or directly conflicts with what's already there. Never silently " +
         "drop an entry just because it isn't mentioned again."
       : "Base this on the material below.",
-    "Do not invent schools, employers, dates, or accomplishments that are not present in the current profile or",
-    "the new material. Leave a field empty rather than guessing.",
-    "",
-    WRITING_STYLE_RULES,
-    "",
-    ...(existingStructured ? [`Current profile:\n${JSON.stringify(existingStructured)}`, ""] : []),
-    "New material:",
-    ...sourceParts,
-  ].join("\n\n");
+    current_profile: existingStructured ? `Current profile:\n${JSON.stringify(existingStructured)}` : "",
+    source_material: sourceParts.join("\n\n"),
+  });
 
   try {
     const raw = await callStructured<StructuredProfile>(
@@ -3456,21 +3395,12 @@ async function decideResumeBase(
   job: { title: string; company: string; raw_description: string },
   candidates: { id: string; name: string; instructions: string }[],
 ): Promise<{ base_resume_id: string; tailoring_notes: string }> {
-  const prompt = [
-    "A candidate has several existing general-purpose resume versions and wants to apply to a specific job.",
-    "Pick whichever existing version is the closest fit as a starting point, and say what -- if anything --",
-    "should change to tailor it for this specific posting. Only reordering, re-emphasizing, or trimming what's",
-    "already true is allowed; never suggest inventing anything not already in the candidate's profile.",
-    "",
-    // tailoring_notes is passed straight through as compose instructions, so it carries the same
-    // rules; otherwise the guidance itself can reintroduce the phrasing the resume rules strip.
-    WRITING_STYLE_RULES,
-    "",
-    `JOB: ${job.title} at ${job.company}`,
-    `JOB DESCRIPTION:\n${job.raw_description.slice(0, 2000)}`,
-    "",
-    `EXISTING VERSIONS:\n${JSON.stringify(candidates.map((c) => ({ id: c.id, name: c.name, instructions: c.instructions })))}`,
-  ].join("\n");
+  const prompt = await getManagedPrompt(env, "resume/select_base", {
+    job_title: job.title,
+    company: job.company,
+    job_description: job.raw_description.slice(0, 2000),
+    resume_versions: JSON.stringify(candidates.map((c) => ({ id: c.id, name: c.name, instructions: c.instructions }))),
+  });
 
   const result = await callStructured<{ base_resume_id: string; tailoring_notes: string }>(
     env,
@@ -3763,25 +3693,11 @@ async function composeCoverLetter(
   reviewAnswers: string[],
   resumeContactLine: string,
 ): Promise<string> {
-  const prompt = [
-    "Write a cover letter for this candidate applying to this specific job. Genuine and specific, not generic --",
-    "reference concrete evidence from the profile that actually matches what the posting asks for. Never invent",
-    "an employer, title, credential, or accomplishment not in the profile below.",
-    "",
-    WRITING_STYLE_RULES,
-    "",
-    "This letter goes to an employer, so the register is professional throughout: no casual phrasing, no",
-    "gushing, no rhetorical questions, and no restating the job description back at them. Confident and",
-    "direct, without overclaiming.",
-    "",
-    "Structure: a brief greeting, 3-4 short paragraphs (why this role/company, the strongest relevant evidence,",
-    "one more concrete example, a short close), and a sign-off using the candidate's name. One page's worth of",
-    "text.",
-    "",
-    `JOB: ${job.title} at ${job.company}`,
-    `JOB DESCRIPTION:\n${job.raw_description.slice(0, 3000)}`,
-    "",
-    reviewAnswers.length
+  const prompt = await getManagedPrompt(env, "cover_letter/compose", {
+    job_title: job.title,
+    company: job.company,
+    job_description: job.raw_description.slice(0, 3000),
+    review_answers: reviewAnswers.length
       ? [
           "The candidate answered follow-up questions specifically for this application, in their own words",
           "below. Treat these as real evidence available to draw on, not a requirement to use all of it and",
@@ -3793,13 +3709,10 @@ async function composeCoverLetter(
           "CANDIDATE'S OWN WORDS FOR THIS APPLICATION:",
           ...reviewAnswers.map((a) => `- ${a}`),
           "",
-        ].join("\n")
-      : "",
-    resumeContactLine ? `CONTACT LINE (for reference, do not repeat verbatim in the letter body): ${resumeContactLine}\n` : "",
-    `CANDIDATE PROFILE:\n${JSON.stringify(profile)}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+        ].join("\n") : "",
+    contact_line: resumeContactLine ? `CONTACT LINE (for reference, do not repeat verbatim in the letter body): ${resumeContactLine}\n` : "",
+    candidate_profile: JSON.stringify(profile),
+  });
 
   const result = await callStructured<{ letter_body: string }>(
     env,
@@ -3937,30 +3850,29 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
 // Application autofill: turning a live form into answers
 // ---------------------------------------------------------------------------
 
-type FormField = { name: string; label: string; type?: string; required?: boolean; options?: string[] };
+type FormField = {
+  name: string;
+  label: string;
+  type?: string;
+  required?: boolean;
+  options?: string[];
+  maxLength?: number;
+};
 
-const MATCH_SCHEMA = {
+/** One focused answer, grounded or explicitly not, for the on-demand /applications/generate-answer call. */
+const GENERATE_ANSWER_SCHEMA = {
   type: "object",
   properties: {
-    answers: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "The field's name, exactly as given." },
-          value: { type: "string", description: "The answer to type into it." },
-          answered: {
-            type: "boolean",
-            description:
-              "false if the profile does not actually establish this. Decline rather than guessing; " +
-              "a declined field is handed to the candidate to answer themselves.",
-          },
-        },
-        required: ["name", "value", "answered"],
-      },
+    answer: { type: "string", description: "The drafted answer text, ready to review and edit." },
+    grounded: {
+      type: "boolean",
+      description:
+        "true if the answer is well-supported by the candidate's actual profile/evidence/job context. " +
+        "false if this is a best-effort draft with limited support -- say so rather than hiding it, since " +
+        "the candidate reviews and edits every draft before it's used either way.",
     },
   },
-  required: ["answers"],
+  required: ["answer", "grounded"],
 } as const;
 
 /**
@@ -3971,6 +3883,57 @@ const MATCH_SCHEMA = {
  */
 const NEVER_INFER =
   /\b(sponsor\w*|visa|authoriz\w*|work permit|citizen\w*|veteran\w*|disab\w*|gender|sex|race|ethnic\w*|hispanic|latino|felon\w*|convict\w*|criminal|background check|salary|salaries|compensat\w*|expected pay|desired pay|notice period|start date|available to start|relocat\w*|security clearance|clearance)\b/i;
+
+/**
+ * Where an answer the candidate just typed should live, which is a different question from whether
+ * a model may invent it (that's NEVER_INFER above -- salary is never inferable, but once the
+ * candidate states it, it is worth remembering).
+ *
+ *   stable_fact  a fact about the person that doesn't change per employer (phone, work auth)
+ *   preference   a standing choice that holds until they change their mind (willing to relocate)
+ *   contextual   reusable but liable to go stale (salary expectation, notice period, start date)
+ *   job_specific true of exactly one application ("why do you want to work at Acme?")
+ *   one_time     an artifact of this form and meaningless elsewhere (agree-to-terms, referral source)
+ *
+ * Rule-based rather than a model call, deliberately: this runs on every answered field, the
+ * categories are stable and few, and a wrong classification quietly mis-files personal data --
+ * which is exactly the kind of decision that should be inspectable in a regex rather than
+ * re-litigated by a model each time. Anything unmatched returns `uncertain`, which the sidebar
+ * turns into an explicit "remember this?" question rather than defaulting either way.
+ */
+type AnswerCategory = "stable_fact" | "preference" | "contextual" | "job_specific" | "one_time" | "uncertain";
+type AnswerStorage = "bank" | "job" | "none" | "ask";
+
+const JOB_SPECIFIC_PATTERN =
+  /\b(why (do|are|would) you|why (this|our|us)|interest(ed)? in (this|our|the) (role|company|position|team)|what (interests|excites|draws|attracts) you|how (does|do) your (experience|background|skill)\w* (relate|apply|fit|align)|cover letter|what do you know about (us|our))\b/i;
+const ONE_TIME_PATTERN =
+  /\b(i (agree|certify|acknowledge|consent|confirm)|agree to|terms|privacy (policy|notice)|acknowledg\w*|certif\w*|consent|how did you hear|referr\w*|referred by|hear about (us|this))\b/i;
+const CONTEXTUAL_PATTERN =
+  /\b(salary|salaries|compensat\w*|expected pay|desired pay|pay range|hourly rate|notice period|start date|available to start|availability|earliest.*(start|available))\b/i;
+const PREFERENCE_PATTERN =
+  /\b(willing to relocat\w*|open to relocat\w*|relocat\w*|travel|remote|hybrid|on-?site|in-?office|work arrangement|work preference|shift|weekend|overtime)\b/i;
+const STABLE_FACT_PATTERN =
+  /\b(sponsor\w*|visa|authoriz\w*|work permit|citizen\w*|veteran\w*|disab\w*|gender|sex|race|ethnic\w*|hispanic|latino|felon\w*|convict\w*|criminal|background check|security clearance|clearance|phone|mobile|telephone|e-?mail|linkedin|github|portfolio|website|address|city|state|country|zip|postal|pronoun|first name|last name|full name)\b/i;
+
+function classifyAnswer(question: string): { category: AnswerCategory; storage: AnswerStorage; explain: string } {
+  const q = String(question ?? "");
+  if (JOB_SPECIFIC_PATTERN.test(q)) {
+    return { category: "job_specific", storage: "job", explain: "That one's specific to this application, so I'll keep it with this job rather than reuse it elsewhere." };
+  }
+  if (ONE_TIME_PATTERN.test(q)) {
+    return { category: "one_time", storage: "none", explain: "That's particular to this form, so there's nothing worth saving." };
+  }
+  if (CONTEXTUAL_PATTERN.test(q)) {
+    return { category: "contextual", storage: "bank", explain: "I'll remember that, though it's the kind of thing worth revisiting later." };
+  }
+  if (PREFERENCE_PATTERN.test(q)) {
+    return { category: "preference", storage: "bank", explain: "I'll remember that preference for future applications." };
+  }
+  if (STABLE_FACT_PATTERN.test(q)) {
+    return { category: "stable_fact", storage: "bank", explain: "I'll remember that for future applications." };
+  }
+  return { category: "uncertain", storage: "ask", explain: "Want me to remember this for future applications?" };
+}
 
 /**
  * The identity fields every form starts with. StructuredProfile has no name/email/phone of its own
@@ -4019,12 +3982,14 @@ async function matchApplication(request: Request, env: Env): Promise<Response> {
   const body = (await request.json().catch(() => ({}))) as {
     job_id?: string;
     fields?: FormField[];
-    provider?: string;
   };
   const fields = (body.fields ?? []).filter((f) => f && f.name);
   if (!fields.length) return json({ error: "fields_required" }, 400);
 
-  const provider = normalizeProvider(body.provider);
+  // No model call happens in this endpoint any more -- narrative fields are left for the candidate
+  // to fill or explicitly draft via POST /applications/generate-answer, which takes its own
+  // provider. This one only ever does lookups (bank, job-scoped answers, deterministic contact
+  // facts), so there's no provider to choose here.
   const profile = await loadProfileForResume(env);
   if (profile instanceof Response) return profile;
 
@@ -4054,86 +4019,75 @@ async function matchApplication(request: Request, env: Env): Promise<Response> {
     .all<{ question_key: string; question_text: string; answer: string }>();
   const bank = new Map((bankRows.results ?? []).map((r) => [r.question_key, r.answer]));
 
-  const answers: { name: string; value: string; source: string }[] = [];
+  // Answers given for *this* job outrank the shared bank: "why this company" has one right answer
+  // per company, and the shared bank should never be holding one in the first place.
+  const jobBankRows = body.job_id
+    ? await env.DB.prepare(
+        "SELECT question_key, answer FROM job_application_answers WHERE profile_id = ? AND job_id = ?",
+      )
+        .bind(profileId, body.job_id)
+        .all<{ question_key: string; answer: string }>()
+    : null;
+  const jobBank = new Map((jobBankRows?.results ?? []).map((r) => [r.question_key, r.answer]));
+
+  const answers: { name: string; value: string; source: string; confidence: string }[] = [];
   const unresolved: FormField[] = [];
 
+  // Resolution order, cheapest and most authoritative first. Everything above the model tier is a
+  // plain lookup -- no call is ever spent deciding something already known (see the agent's
+  // deterministic-by-default contract in extension/agent.js).
   for (const field of fields) {
     const label = (field.label || field.name).trim();
-    const hit = bank.get(questionKey(label));
+    const key = questionKey(label);
+    const jobHit = jobBank.get(key);
+    if (jobHit) {
+      answers.push({ name: field.name, value: jobHit, source: "job_answer", confidence: "high" });
+      continue;
+    }
+    const hit = bank.get(key);
     if (hit) {
-      answers.push({ name: field.name, value: hit, source: "bank" });
+      answers.push({ name: field.name, value: hit, source: "bank", confidence: "high" });
       continue;
     }
     const deterministic = deterministicAnswer(label, contact);
     if (deterministic) {
-      answers.push({ name: field.name, value: deterministic, source: "profile" });
+      answers.push({ name: field.name, value: deterministic, source: "profile", confidence: "high" });
       continue;
     }
     unresolved.push(field);
   }
 
-  // Sensitive fields are never sent to the model. If the bank did not already answer one, the
-  // candidate answers it, full stop.
-  const askable = unresolved.filter((f) => !NEVER_INFER.test(f.label || f.name));
-  const sensitive = unresolved.filter((f) => NEVER_INFER.test(f.label || f.name));
-  const missing: FormField[] = [...sensitive];
+  // Free-text/textarea are the only types worth offering a draft for -- generating a fabricated
+  // date or a plausible-looking number is exactly the invention this app refuses to do elsewhere,
+  // so a date/number/select/radio field only ever gets a real value: the employer's own options,
+  // or the candidate's own typing. See extension/sidebar.js for how each reason renders.
+  const GENERATABLE_TYPES = new Set(["text", "textarea"]);
+  const toMissing = (f: FormField, reason: string) => {
+    const sensitive = reason === "sensitive";
+    const classification = sensitive ? null : classifyAnswer(f.label || f.name);
+    return {
+      name: f.name,
+      label: f.label,
+      type: f.type ?? "text",
+      options: f.options ?? [],
+      required: Boolean(f.required),
+      max_length: f.maxLength ?? null,
+      reason,
+      category: classification?.category ?? null,
+      // Never for a sensitive field, and never for a fixed-choice/date/number field -- generation
+      // only makes sense where there's nothing to invent but prose, and prose the candidate reads
+      // and edits before anything reaches the employer's page.
+      can_generate: !sensitive && GENERATABLE_TYPES.has(f.type ?? "text"),
+    };
+  };
 
-  if (askable.length && !providerKeyMissing(env, provider)) {
-    const jobRow = body.job_id
-      ? await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
-          .bind(body.job_id)
-          .first<{ title: string; company: string; raw_description: string }>()
-      : null;
-    const reviewClaims = body.job_id ? await loadJobReviewClaims(env, body.job_id) : [];
-
-    const prompt = [
-      "Fill in this job application form on the candidate's behalf, using only what their profile",
-      "below actually establishes.",
-      "",
-      WRITING_STYLE_RULES,
-      "",
-      "Set answered=false for any field the profile does not genuinely support. A declined field is",
-      "handed back to the candidate to answer themselves, which is the correct outcome. Never guess,",
-      "never approximate, and never invent an employer, title, date, credential, or number. For a",
-      "field offering fixed options, the value must be exactly one of them.",
-      "",
-      jobRow ? `JOB: ${jobRow.title} at ${jobRow.company}` : "",
-      jobRow ? `JOB DESCRIPTION:\n${jobRow.raw_description.slice(0, 2000)}` : "",
-      reviewClaims.length ? `CONTEXT THE CANDIDATE GAVE FOR THIS APPLICATION:\n${reviewClaims.map((c) => `- ${c}`).join("\n")}` : "",
-      "",
-      `CANDIDATE PROFILE:\n${JSON.stringify(profile.structured)}`,
-      "",
-      `FIELDS:\n${JSON.stringify(askable.map((f) => ({ name: f.name, label: f.label, type: f.type, options: f.options })))}`,
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-    try {
-      const result = await callStructured<{ answers: { name: string; value: string; answered: boolean }[] }>(
-        env,
-        provider,
-        "application.answers",
-        prompt,
-        MATCH_SCHEMA,
-        "submit_application_answers",
-        3000,
-      );
-      const byName = new Map((result.answers ?? []).map((a) => [a.name, a]));
-      for (const field of askable) {
-        const got = byName.get(field.name);
-        if (got && got.answered && (got.value ?? "").trim()) {
-          answers.push({ name: field.name, value: got.value.trim(), source: "generated" });
-        } else {
-          missing.push(field);
-        }
-      }
-    } catch {
-      // A failed model call must not silently drop fields; they all become the candidate's to fill.
-      missing.push(...askable);
-    }
-  } else {
-    missing.push(...askable);
-  }
+  // Nothing here calls a model. Sensitive fields never reach the model at all (NEVER_INFER,
+  // enforced again server-side in /applications/generate-answer as a second gate); every other
+  // unresolved field -- narrative or not -- is left for the candidate to fill, choose, or
+  // explicitly draft with Generate. Auto-filling a narrative answer without being asked is exactly
+  // the behavior this endpoint used to have and no longer does: see the "Generate -> review/edit ->
+  // Fill or Save" flow in extension/agent.js, which replaces the old silent best-effort autofill.
+  const missing = unresolved.map((f) => toMissing(f, NEVER_INFER.test(f.label || f.name) ? "sensitive" : "open"));
 
   const letter = body.job_id
     ? await env.DB.prepare("SELECT content_html FROM cover_letters WHERE job_id = ?")
@@ -4141,12 +4095,264 @@ async function matchApplication(request: Request, env: Env): Promise<Response> {
         .first<{ content_html: string }>()
     : null;
 
+  const jobMeta = body.job_id
+    ? await env.DB.prepare("SELECT title, company FROM job_postings WHERE id = ?")
+        .bind(body.job_id)
+        .first<{ title: string; company: string }>()
+    : null;
+
   return json({
     answers,
-    missing: missing.map((f) => ({ name: f.name, label: f.label, type: f.type ?? "text", options: f.options ?? [] })),
+    missing,
     resume_url: resumeRow ? `/resumes/${resumeRow.id}/file` : null,
     cover_letter_text: letter ? stripHtmlToText(letter.content_html) : null,
+    job: jobMeta ? { id: body.job_id, title: jobMeta.title, company: jobMeta.company } : null,
+    // So the sidebar can say "I don't have a tailored resume for this job yet" and point back at
+    // the main app rather than silently attaching nothing (see extension/sidebar.js).
+    assets: { resume: Boolean(resumeRow), cover_letter: Boolean(letter) },
   });
+}
+
+/**
+ * One focused draft for one open-ended field, on demand -- see the "Generate -> review/edit ->
+ * Fill or Save" flow in extension/agent.js/sidebar.js. Deliberately not a batch pass: a narrative
+ * answer is only ever drafted when the candidate asks for this specific field, and the draft lands
+ * in the sidebar's input for them to read and edit, never straight into the employer's form.
+ *
+ * The prompt itself lives in Langfuse (`applications/generate_answer`), not here -- see "Prompt
+ * Management" in the README for how to create/update it. Every runtime value the model gets is
+ * passed as a template variable rather than folded into a hardcoded string, so the instructions can
+ * be revised without a deploy.
+ */
+async function generateApplicationAnswer(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    job_id?: string;
+    provider?: string;
+    field?: { name?: string; label?: string; type?: string; max_length?: number | null };
+  };
+  const label = (body.field?.label ?? "").trim();
+  if (!label) return json({ error: "field_label_required" }, 400);
+  // Re-checked here rather than trusted from the client -- the sidebar's own gating (hiding
+  // Generate for a sensitive question) is the UI half of this rule; this is the actual safeguard.
+  if (NEVER_INFER.test(label)) return json({ error: "field_not_generatable" }, 400);
+
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const profile = await loadProfileForResume(env);
+  if (profile instanceof Response) return profile;
+
+  const jobRow = body.job_id
+    ? await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
+        .bind(body.job_id)
+        .first<{ title: string; company: string; raw_description: string }>()
+    : null;
+  const reviewClaims = body.job_id ? await loadJobReviewClaims(env, body.job_id) : [];
+
+  // Existing saved answers -- global and job-scoped -- can carry real context a generic profile
+  // read wouldn't (an already-stated salary range, an already-answered "why this kind of role").
+  const bankRows = await env.DB.prepare(
+    "SELECT question_text, answer FROM application_answers WHERE profile_id = ?",
+  )
+    .bind(profile.profileId)
+    .all<{ question_text: string; answer: string }>();
+  const jobBankRows = body.job_id
+    ? await env.DB.prepare(
+        "SELECT question_text, answer FROM job_application_answers WHERE profile_id = ? AND job_id = ?",
+      )
+        .bind(profile.profileId, body.job_id)
+        .all<{ question_text: string; answer: string }>()
+    : null;
+  const savedAnswers = [...(bankRows.results ?? []), ...(jobBankRows?.results ?? [])];
+
+  // Fetching the managed prompt is folded into the same try/catch as the model call itself: a
+  // missing/unpromoted Langfuse prompt is exactly as much "generation didn't work this time" as a
+  // provider outage, and neither should ever escape as a raw exception with a stack trace attached.
+  try {
+    const prompt = await getManagedPrompt(env, "applications/generate_answer", {
+      question: label,
+      field_type: body.field?.type || "text",
+      max_length: body.field?.max_length ? String(body.field.max_length) : "",
+      job: jobRow ? `${jobRow.title} at ${jobRow.company}` : "",
+      company: jobRow?.company ?? "",
+      job_description: jobRow ? jobRow.raw_description.slice(0, 2000) : "",
+      candidate_profile: JSON.stringify(profile.structured),
+      review_context: reviewClaims.length ? reviewClaims.map((c) => `- ${c}`).join("\n") : "",
+      saved_answers: savedAnswers.length
+        ? savedAnswers.map((a) => `- ${a.question_text}: ${a.answer}`).join("\n")
+        : "",
+    });
+    const result = await callStructured<{ answer: string; grounded: boolean }>(
+      env,
+      provider,
+      "application.generate_answer",
+      prompt,
+      GENERATE_ANSWER_SCHEMA,
+      "submit_drafted_answer",
+      1200,
+    );
+    return json({ answer: (result.answer ?? "").trim(), grounded: Boolean(result.grounded) });
+  } catch (err) {
+    return json({ error: "generation_failed", message: (err as Error).message }, 502);
+  }
+}
+
+/**
+ * The candidate's explicit answer to a field the agent couldn't resolve, kept for reuse -- the
+ * backend half of Save (see extension/agent.js for the Fill/Save split: Fill never calls this,
+ * since using an answer once and remembering it are now two distinct actions rather than one call
+ * with a `remember` flag).
+ *
+ * Three jobs, in order: notice when this contradicts something already stored, decide where (or
+ * whether) the answer belongs, and write it. The contradiction check comes first and is not
+ * silently resolved -- an explicit `confirm_overwrite` is required before a durable stored answer
+ * changes, so the current application always uses what the candidate just said while the saved
+ * record only moves when they mean it to. Save is itself the candidate's explicit "remember this"
+ * signal, so an otherwise-ambiguous classification resolves to the bank here rather than asking a
+ * second time -- the sidebar only offers Save once the candidate has already chosen to keep it.
+ */
+async function saveApplicationAgentAnswer(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    question?: string;
+    answer?: string;
+    answer_type?: string;
+    job_id?: string;
+    confirm_overwrite?: boolean;
+  };
+  const question = (body.question ?? "").trim();
+  const answer = (body.answer ?? "").trim();
+  if (!question || !answer) return json({ error: "question_and_answer_required" }, 400);
+  const key = questionKey(question);
+  if (!key) return json({ error: "question_not_recognizable" }, 400);
+
+  const profileId = await getOrCreateProfileId(env);
+  const classification = classifyAnswer(question);
+  const answerType = (body.answer_type ?? "text").trim() || "text";
+  const storage: AnswerStorage = classification.storage === "ask" ? "bank" : classification.storage;
+
+  if (storage === "none") {
+    return json({ stored: false, storage, category: classification.category, message: classification.explain });
+  }
+
+  const existing =
+    storage === "bank"
+      ? await env.DB.prepare("SELECT answer FROM application_answers WHERE profile_id = ? AND question_key = ?")
+          .bind(profileId, key)
+          .first<{ answer: string }>()
+      : null;
+
+  if (
+    storage === "bank" &&
+    existing &&
+    existing.answer.trim().toLowerCase() !== answer.toLowerCase() &&
+    body.confirm_overwrite !== true
+  ) {
+    return json({
+      stored: false,
+      conflict: { existing_answer: existing.answer, new_answer: answer },
+      category: classification.category,
+      message: "That's different from the answer I had saved. Should I update the saved one?",
+    });
+  }
+
+  if (storage === "job" && !body.job_id) {
+    return json({
+      stored: false,
+      storage,
+      category: classification.category,
+      message: "I can't tell which application this belongs to, so there's nothing to save it against.",
+    });
+  }
+
+  if (storage === "bank") {
+    await env.DB.prepare(
+      `INSERT INTO application_answers (id, profile_id, question_key, question_text, answer, answer_type, category)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(profile_id, question_key) DO UPDATE SET
+         question_text = excluded.question_text,
+         answer = excluded.answer,
+         answer_type = excluded.answer_type,
+         category = excluded.category,
+         updated_at = CURRENT_TIMESTAMP`,
+    )
+      .bind(crypto.randomUUID(), profileId, key, question, answer, answerType, classification.category)
+      .run();
+  } else {
+    await env.DB.prepare(
+      `INSERT INTO job_application_answers (id, profile_id, job_id, question_key, question_text, answer, answer_type)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(profile_id, job_id, question_key) DO UPDATE SET
+         question_text = excluded.question_text,
+         answer = excluded.answer,
+         answer_type = excluded.answer_type,
+         updated_at = CURRENT_TIMESTAMP`,
+    )
+      .bind(crypto.randomUUID(), profileId, body.job_id, key, question, answer, answerType)
+      .run();
+  }
+
+  let message: string;
+  if (storage === "job") {
+    const job = await env.DB.prepare("SELECT company FROM job_postings WHERE id = ?")
+      .bind(body.job_id)
+      .first<{ company: string }>();
+    message = job?.company
+      ? `Filled and saved for future ${job.company} applications.`
+      : "Filled and saved for future applications to this job.";
+  } else if (classification.category === "contextual") {
+    message = "Filled and saved. You can update this later if it changes.";
+  } else {
+    message = "Filled and saved for future applications.";
+  }
+
+  return json({ stored: true, storage, category: classification.category, message });
+}
+
+/**
+ * The agent's decision log (see migration 0022). Batched because a single autofill pass produces
+ * one event per field and a request each would be absurd.
+ *
+ * Values are dropped for anything NEVER_INFER matches: knowing that a work-authorization question
+ * was asked and answered by the candidate is the useful signal for debugging and later evaluation;
+ * storing the answer itself a second time, outside the answer bank, is not.
+ */
+async function recordAgentEvents(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    job_id?: string;
+    application_url?: string;
+    events?: { type?: string; field?: string; detail?: Record<string, unknown> }[];
+  };
+  const events = (body.events ?? []).slice(0, 200);
+  if (!events.length) return json({ recorded: 0 });
+
+  const profileId = await getOrCreateProfileId(env);
+  const url = (body.application_url ?? "").slice(0, 500);
+  const statements = events.map((event) => {
+    const field = String(event.field ?? "").slice(0, 200);
+    const detail = { ...(event.detail ?? {}) };
+    if (NEVER_INFER.test(field) || NEVER_INFER.test(String(detail.label ?? ""))) delete detail.value;
+    return env.DB.prepare(
+      `INSERT INTO application_agent_events (id, profile_id, job_id, application_url, event_type, field_name, detail_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      crypto.randomUUID(),
+      profileId,
+      body.job_id ?? null,
+      url,
+      String(event.type ?? "unknown").slice(0, 60),
+      field,
+      JSON.stringify(detail).slice(0, 4000),
+    );
+  });
+  await env.DB.batch(statements);
+  return json({ recorded: statements.length });
 }
 
 /** The stored cover letter is HTML; a form textarea needs the plain text back out of it. */
@@ -5087,7 +5293,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           </div>
 
           <div id="interested-apply-panel" style="display:none">
-            <p class="hint">What's ready for this application. Autofill arrives with the browser extension; for now, open the posting, use the resume and cover letter above, then mark it applied to move it to the Applied tab.</p>
+            <p class="hint">What's ready for this application. Press <strong>Apply</strong> on the card above to open the employer's page — with the ApplyGo extension installed, the in-page assistant picks it up from there and fills what it can. Mark it applied here once you've submitted.</p>
             <div id="interested-apply-readiness"></div>
             <p id="interested-apply-status" class="status" role="status" aria-live="polite"></p>
             <button id="interested-apply-mark" type="button">Mark as applied</button>
@@ -7800,18 +8006,10 @@ const DASHBOARD_PAGE = `<!doctype html>
       interestedJobs.forEach(function (job) {
         var hasScore = hasCompletedFitScore(job);
         var badgeText = hasScore ? job.fit_score + '% match' : FIT_LABELS.interested.text;
-        // Same direct link the Jobs tab row has -- marking a job interested shouldn't cost the
-        // one-click "just take me to the posting" path it had before. Stopping propagation keeps
-        // that external navigation distinct from the card's accordion action.
-        var titleNode = job.source_url
-          ? el('a', {
-              className: 'row-title', href: job.source_url, target: '_blank', rel: 'noopener',
-              textContent: job.title,
-            })
-          : el('span', { className: 'row-title', textContent: job.title });
-        if (job.source_url) {
-          titleNode.addEventListener('click', function (event) { event.stopPropagation(); });
-        }
+        // Deliberately not a link any more. The whole card, title included, is one accordion
+        // control; "go to the employer's page" is the Apply button's job, so that navigation
+        // happens exactly once, from the one place that also hands off to the extension's agent.
+        var titleNode = el('span', { className: 'row-title', textContent: job.title });
         var titleLine = [
           titleNode,
           el('span', { className: 'badge strong', textContent: badgeText }),
@@ -7823,6 +8021,20 @@ const DASHBOARD_PAGE = `<!doctype html>
         ].filter(Boolean).join(' · ');
         var body = [el('div', { className: 'row-title-line' }, titleLine), el('div', { className: 'row-meta', textContent: meta })];
 
+        // The handoff point: opens the employer's own application page, where the extension's
+        // in-page agent takes over (see extension/agent.js). Disabled rather than hidden when a
+        // posting has no URL, so the button's absence never reads as "this job can't be applied to".
+        var applyButton = el('button', {
+          className: 'success', type: 'button', textContent: 'Apply',
+          disabled: !job.source_url,
+          title: job.source_url ? 'Open the application page' : 'This posting has no URL on file',
+        });
+        applyButton.addEventListener('click', function (event) {
+          event.stopPropagation();
+          if (!job.source_url) return;
+          window.open(job.source_url, '_blank', 'noopener');
+        });
+
         var notInterested = el('button', { className: 'danger', type: 'button', textContent: 'Not Interested' });
         notInterested.addEventListener('click', function (event) {
           event.stopPropagation();
@@ -7833,7 +8045,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         var card = el('div', { className: 'row-item interested-card', tabIndex: 0 }, [
           el('div', { className: 'row' }, [
             el('div', {}, body),
-            el('div', { className: 'row-actions' }, [notInterested]),
+            el('div', { className: 'row-actions' }, [applyButton, notInterested]),
           ]),
           inlineHost,
         ]);
@@ -8665,6 +8877,9 @@ async function downloadArtifact(request: Request, env: Env, key: string): Promis
 const EXTENSION_CORS_PATHS = [
   /^\/auth\/enroll$/,
   /^\/applications\/match$/,
+  /^\/applications\/answer$/,
+  /^\/applications\/generate-answer$/,
+  /^\/applications\/events$/,
   /^\/application-answers$/,
   /^\/jobs$/,
   /^\/jobs\/[^/]+\/fit$/,
@@ -8687,7 +8902,7 @@ function corsHeaders(origin: string): Record<string, string> {
  * evals.ts because every schema it needs is already in scope in this file or imported above --
  * evals.ts staying schema-agnostic avoids a circular import back into index.ts for the four schemas
  * that are defined here (STRUCTURED_PROFILE_JSON_SCHEMA, RESUME_BASE_SCHEMA, COVER_LETTER_SCHEMA,
- * MATCH_SCHEMA).
+ * GENERATE_ANSWER_SCHEMA).
  *
  * `resume.design_review` (needs a screenshot, never stored) and `evals.judge` (not a savable case)
  * fall through to null, matching `replayable: false` in tasks.ts.
@@ -8698,7 +8913,7 @@ function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "structured", schema: SCREEN_BATCH_SCHEMA, toolName: "submit_screen", maxTokens: 4000 };
     case "fit.assess":
       return { kind: "structured", schema: FIT_BATCH_SCHEMA, toolName: "submit_fit_assessment", maxTokens: 7000 };
-    case "fit.care_about_topics":
+    case "fit.criteria":
       return { kind: "structured", schema: CARE_ABOUT_TOPICS_SCHEMA, toolName: "submit_topics", maxTokens: 1200 };
     case "companies.discover":
       return { kind: "structured", schema: COMPANY_LIST_SCHEMA, toolName: "submit_companies", maxTokens: 4000 };
@@ -8718,8 +8933,8 @@ function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "structured", schema: RESUME_BASE_SCHEMA, toolName: "submit_resume_base", maxTokens: 1000 };
     case "cover_letter.write":
       return { kind: "structured", schema: COVER_LETTER_SCHEMA, toolName: "submit_cover_letter", maxTokens: 2000 };
-    case "application.answers":
-      return { kind: "structured", schema: MATCH_SCHEMA, toolName: "submit_application_answers", maxTokens: 3000 };
+    case "application.generate_answer":
+      return { kind: "structured", schema: GENERATE_ANSWER_SCHEMA, toolName: "submit_drafted_answer", maxTokens: 1200 };
     default:
       return null;
   }
@@ -8985,6 +9200,9 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "POST" && url.pathname === "/gmail/disconnect") return disconnectGmail(request, env);
     if (request.method === "POST" && url.pathname === "/gmail/check-replies") return checkGmailReplies(request, env, ctx);
     if (request.method === "POST" && url.pathname === "/applications/match") return matchApplication(request, env);
+    if (request.method === "POST" && url.pathname === "/applications/generate-answer") return generateApplicationAnswer(request, env);
+    if (request.method === "POST" && url.pathname === "/applications/answer") return saveApplicationAgentAnswer(request, env);
+    if (request.method === "POST" && url.pathname === "/applications/events") return recordAgentEvents(request, env);
     if (request.method === "POST" && url.pathname === "/artifacts") return uploadArtifact(request, env);
     const artifactMatch = url.pathname.match(/^\/artifacts\/(.+)$/);
     if (request.method === "GET" && artifactMatch) return downloadArtifact(request, env, decodeURIComponent(artifactMatch[1]));

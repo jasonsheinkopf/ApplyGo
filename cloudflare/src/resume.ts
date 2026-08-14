@@ -15,14 +15,11 @@ import { extractText, getDocumentProxy } from "unpdf";
 import {
   type LlmEnv,
   type Provider,
-  WRITING_STYLE_RULES,
   bytesToBase64,
   callStructured,
   callStructuredWithImage,
 } from "./llm";
-// Only values flow this way; philosophy.ts takes StructuredProfile back from here as an `import
-// type`, which is erased at compile time, so the two files don't form a runtime cycle.
-import { MASTER_DOCTRINE, RESUME_DOCTRINE } from "./philosophy";
+import { getManagedPrompt } from "./langfuse";
 
 export interface ResumeEnv extends LlmEnv {
   FILES: R2Bucket;
@@ -189,126 +186,52 @@ export const RESUME_DOC_SCHEMA = {
 } as const;
 
 /**
- * The writing rules. These are split the way the evidence actually splits: hard constraints come
- * from ATS-vendor parsing documentation and from the requirement not to lie; strong defaults come
- * from recruiter research and broad professional convention; the rest are tunable preferences.
- */
-/**
- * The constraints that hold no matter what the document is for. Split out from COMPOSE_RULES so the
- * master archive can take these without also taking the selection defaults below -- "be selective",
- * "3-5 bullets", and "drop irrelevant roles" are exactly what that document must not do.
- */
-const COMPOSE_RULES_TRUTH_ONLY = `
-${WRITING_STYLE_RULES}
-
-This document goes to an employer, so the register is formal throughout. No casual phrasing, no
-conversational asides, no rhetorical questions.
-
-HARD CONSTRAINTS (never violate):
-- Never invent an employer, title, date, degree, credential, metric, or accomplishment. Every claim must
-  trace to the profile below. If something would strengthen the resume but is not in the profile, omit it.
-- Never invent contact details. Use only what the profile contains.
-- Do not inflate scope or seniority. Do not imply a result was validated if the profile does not say so.
-- Dates must stay consistent with the profile.
-- No first-person pronouns. No "Responsible for". No sentence-ending periods on fragment bullets is fine,
-  but be consistent.
-`.trim();
-
-const COMPOSE_RULES = `
-${COMPOSE_RULES_TRUTH_ONLY}
-
-STRONG DEFAULTS (follow unless the user's instructions override):
-- Reverse chronological. Experience is the dominant section; education is concise for an experienced candidate.
-- Lead with the strongest, most relevant, most recent evidence. Bury nothing important at the bottom.
-- Prefer clarity and structure over density of keywords. Clear communication is what actually moves recruiters.
-- Rewrite raw profile highlights into achievement bullets. A good bullet combines several of:
-  action + technical object + problem or constraint + method + result or decision enabled.
-  Weak:   "Responsible for researching datasets for an AI project."
-  Strong: "Led a three-path data feasibility study for hybrid-vehicle personalization, evaluating licensable,
-           semi-synthetic, and fully synthetic sources against required signals, participant diversity, and cost."
-- Quantify only with numbers that are actually present or directly implied. Never fabricate a metric to satisfy
-  a "quantify everything" rule. Legitimate non-numeric evidence includes: decisions enabled, risk avoided,
-  development unblocked, systems shipped, scope of stakeholders, comparisons run.
-- Technical skills should appear in context inside bullets, not only as a list.
-- Use the target roles' vocabulary where it is truthful. Do not keyword-stuff.
-- 3-5 bullets for the most relevant recent roles, 1-2 for older or less relevant ones. Drop irrelevant roles'
-  bullets entirely before dropping the role itself.
-`.trim();
-
-/**
  * Extra shaping for one composition, beyond the profile and the target.
  *
- * `master` flips the whole posture: no page budget, no selection, include everything (see
- * MASTER_DOCTRINE). `planDirective` is the pre-decided per-role feature/include/compress/omit plan
+ * `master` flips the whole posture: no page budget, no selection, include everything (see the
+ * managed `resume/compose_master` prompt). `planDirective` is the pre-decided per-role feature/include/compress/omit plan
  * plus the requirement-coverage report, rendered by `renderPlanDirective` -- when present it
  * outranks the writer's own instincts about what deserves space.
  */
 export type ComposeOptions = { master?: boolean; planDirective?: string };
 
-function composePrompt(
+async function composePrompt(
+  env: ResumeEnv,
   profile: StructuredProfile,
   desiredRoles: string,
   instructions: string,
   layout: LayoutSpec,
   feedback: string,
   options: ComposeOptions,
-): string {
+): Promise<import("./langfuse").ManagedPrompt> {
   const budget =
     layout.max_pages === 1
       ? "This must fit on ONE US Letter page. Be selective -- that is the point of this step."
       : "This may run to two US Letter pages, but only if the second page is genuinely full.";
 
   if (options.master) {
-    return [
-      "You are building a candidate's master career archive as a resume-shaped document.",
-      "",
-      MASTER_DOCTRINE,
-      "",
-      COMPOSE_RULES_TRUTH_ONLY,
-      "",
-      "Include the summary: write a full narrative one, not a tightened positioning line.",
-      "",
-      instructions ? `USER INSTRUCTIONS:\n${instructions}` : "",
-      feedback ? `\nREVISION FEEDBACK -- address this specifically:\n${feedback}` : "",
-      "",
-      `CANDIDATE PROFILE (the only permitted source of facts):\n${JSON.stringify(profile)}`,
-    ]
-      .filter(Boolean)
-      .join("\n");
+    return getManagedPrompt(env, "resume/compose_master", {
+      user_instructions: instructions ? `USER INSTRUCTIONS:\n${instructions}` : "",
+      revision_feedback: feedback ? `\nREVISION FEEDBACK -- address this specifically:\n${feedback}` : "",
+      candidate_profile: JSON.stringify(profile),
+    });
   }
 
-  return [
-    "You are an experienced professional resume writer preparing one resume version for a candidate.",
-    "You are given the candidate's full verified profile as evidence, plus the kinds of roles they are targeting.",
-    "Select, order, compress, and rewrite that evidence into resume content. You are not writing prose about them;",
-    "you are choosing what belongs on the page and stating it well.",
-    "",
-    RESUME_DOCTRINE,
-    "",
-    COMPOSE_RULES,
-    "",
-    `PAGE BUDGET: ${budget}`,
-    layout.show_summary
+  return getManagedPrompt(env, "resume/compose", {
+    page_budget: budget,
+    summary_rule: layout.show_summary
       ? "Include a short summary."
       : "Omit the summary -- return an empty string for it. The page needs the space.",
-    "",
-    // Placed after the doctrine and before the free-text target: the plan is a decision already
-    // made against this specific posting, so it should be read as settled rather than as one more
-    // consideration to weigh against the general guidance above.
-    options.planDirective ? `${options.planDirective}\n` : "",
-    desiredRoles
+    plan_directive: options.planDirective ? `${options.planDirective}\n` : "",
+    target_roles: desiredRoles
       ? `TARGET ROLES (what this resume should be angled toward):\n${desiredRoles}`
       : "TARGET ROLES: none specified. Produce a strong general-purpose resume for the candidate's evident field.",
-    "",
-    instructions
+    user_instructions: instructions
       ? `USER INSTRUCTIONS FOR THIS VERSION (these take priority over the strong defaults):\n${instructions}`
       : "USER INSTRUCTIONS: none.",
-    feedback ? `\nREVISION FEEDBACK -- address this specifically in your rewrite:\n${feedback}` : "",
-    "",
-    `CANDIDATE PROFILE (the only permitted source of facts):\n${JSON.stringify(profile)}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+    revision_feedback: feedback ? `\nREVISION FEEDBACK -- address this specifically in your rewrite:\n${feedback}` : "",
+    candidate_profile: JSON.stringify(profile),
+  });
 }
 
 export async function composeResumeDoc(
@@ -325,7 +248,7 @@ export async function composeResumeDoc(
     env,
     provider,
     "resume.build",
-    composePrompt(profile, desiredRoles, instructions, layout, feedback, options),
+    await composePrompt(env, profile, desiredRoles, instructions, layout, feedback, options),
     RESUME_DOC_SCHEMA,
     "submit_resume",
     // The archive is meant to be exhaustive, so it needs materially more room to come back whole --
@@ -879,33 +802,13 @@ export async function reviewResumeDesign(
   userComment: string,
 ): Promise<DesignReview> {
   const problems = checks.filter((c) => c.severity !== "ok");
-  const prompt = [
-    "You are a professional resume designer reviewing the rendered page above. Judge it the way a recruiter",
-    "would in a six-second skim, and the way a typographer would on a second look.",
-    "",
-    "Look specifically for: unbalanced or excessive whitespace; a page that runs slightly over and leaves an",
-    "almost-empty second page; cramped or colliding text; inconsistent alignment of dates and headings;",
-    "a weak visual hierarchy where the most important evidence does not draw the eye first; orphaned headings;",
-    "and sections that are disproportionate to their importance (education dominating experience, for example).",
-    "",
-    "You may only adjust the layout knobs in the schema -- you cannot write CSS, and you should not try.",
-    "If the real problem is that the writing is too long or emphasizes the wrong things, say so by setting",
-    "needs_content_revision and giving precise content_guidance; a writer will rewrite from verified evidence.",
-    "Do not ask for fabricated content. Do not request decorative elements, photos, icons, skill bars, or",
-    "multi-column layouts -- those break applicant tracking system parsing.",
-    "",
-    // content_guidance is fed straight back into the compose step, so it has to follow the same
-    // rules the resume itself does or it will reintroduce exactly what those rules strip out.
-    WRITING_STYLE_RULES,
-    "",
-    `Current layout settings: ${JSON.stringify(layout)}`,
-    problems.length
+  const prompt = await getManagedPrompt(env, "resume/design_review", {
+    layout: JSON.stringify(layout),
+    automated_checks: problems.length
       ? `Automated checks already flagged:\n${problems.map((c) => `- [${c.severity}] ${c.message}`).join("\n")}`
       : "Automated checks all passed.",
-    userComment ? `\nThe candidate specifically asked for:\n${userComment}\nTreat this as the priority.` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
+    user_comment: userComment ? `\nThe candidate specifically asked for:\n${userComment}\nTreat this as the priority.` : "",
+  });
 
   const review = await callStructuredWithImage<DesignReview>(
     env,

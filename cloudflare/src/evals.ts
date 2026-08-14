@@ -17,6 +17,7 @@
 // task, because judging genuinely costs money and the user should see that cost like any other.
 
 import { type LlmEnv, type Provider, type LlmTrace, callStructured, callText } from "./llm";
+import { getManagedPrompt } from "./langfuse";
 
 export type ReplaySpec = { kind: "text" } | { kind: "structured"; schema: unknown; toolName: string; maxTokens: number };
 
@@ -124,20 +125,14 @@ export async function judgeRun(
   notes: string,
 ): Promise<{ score: number; reasoning: string }> {
   const provider: Provider = "anthropic";
-  const judgePrompt = [
-    "You are grading one output from an internal job-search assistant's prompt pipeline. Be exacting --",
-    "this grading is used to decide whether a prompt or model change is actually an improvement.",
-    "",
-    `WHAT THIS TASK IS SUPPOSED TO DO:\n${taskWhat}`,
-    "",
-    notes.trim() ? `NOTES FROM WHOEVER SAVED THIS TEST CASE (weigh these heavily -- they know what matters here):\n${notes.trim()}` : "",
-    "",
-    `THE EXACT PROMPT THAT WAS SENT:\n${prompt.slice(0, 12000)}`,
-    "",
-    `THE RESPONSE IT PRODUCED:\n${response.slice(0, 8000) || "(empty -- the call failed or returned nothing)"}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const judgePrompt = await getManagedPrompt(env, "evaluation/judge", {
+    task_description: taskWhat,
+    case_notes: notes.trim()
+      ? `NOTES FROM WHOEVER SAVED THIS TEST CASE (weigh these heavily -- they know what matters here):\n${notes.trim()}`
+      : "",
+    evaluated_prompt: prompt.slice(0, 12000),
+    evaluated_response: response.slice(0, 8000) || "(empty -- the call failed or returned nothing)",
+  });
 
   const result = await callStructured<{ score: number; reasoning: string }>(
     env,

@@ -10,7 +10,8 @@
 // disqualifier fed back into future assessments. An AI misjudgment that never gets confirmed by
 // the user can't reinforce itself into a permanent rule -- see index.ts's job_feedback writes.
 
-import { type LlmEnv, type Provider, WRITING_STYLE_RULES, callStructured } from "./llm";
+import { type LlmEnv, type Provider, callStructured } from "./llm";
+import { getManagedPrompt } from "./langfuse";
 
 /** The subset of the profile that matters for judging a job. Structurally compatible with StructuredProfile. */
 type ProfileForMatching = {
@@ -87,21 +88,6 @@ export function verdictForScore(score: number): FitVerdict {
   if (score >= 40) return "possible";
   return "reject";
 }
-
-const FIT_SCORE_GUIDANCE = [
-  "Score each posting 0-100 for how well it fits this specific candidate, not how good the job is",
-  "in the abstract. Calibrate roughly like this:",
-  "  90-100: exceptional overlap, this is exactly their evident experience and level.",
-  "  70-89:  strong match, solidly within their demonstrated experience.",
-  "  40-69:  a genuine stretch or a posting too vague to be sure -- worth seeing, not a clear miss.",
-  "  15-39:  a real mismatch on the posting's own terms, but not a flatly stated disqualifier.",
-  "  0-14:   the posting states a hard requirement the profile clearly does not meet (a specific",
-  "          language/tool with no evidence of it, a degree not held, years of experience far",
-  "          beyond their history) -- score low here regardless of how good the rest looks, a",
-  "          single hard disqualifier should not be averaged away by an otherwise strong overlap.",
-  "Use the full range. Do not default to the middle when uncertain -- say what's actually uncertain",
-  "in the reason instead of hedging the number.",
-].join("\n");
 
 export const FIT_BATCH_SCHEMA = {
   type: "object",
@@ -214,25 +200,12 @@ export async function deriveCareAboutTopics(
 ): Promise<CareAboutTopic[]> {
   const text = careAbout.trim();
   if (!text) return [];
-  const prompt = [
-    "A job seeker described, in their own words, which details they want to see at a glance for every",
-    "job posting -- the handful of things they'd otherwise open each posting to go find.",
-    "",
-    "Work out what they actually mean and turn it into a short list of topics. Interpret intent rather",
-    "than transcribing: they are describing what matters to them, not writing the labels themselves.",
-    "Split a sentence that covers several things into separate topics, merge duplicates, and keep the",
-    "order they seem to care about most. Only include topics that could plausibly be answered from a",
-    "job posting's own text.",
-    "",
-    WRITING_STYLE_RULES,
-    "",
-    `WHAT THEY WROTE:\n${text.slice(0, 2000)}`,
-  ].join("\n");
+  const prompt = await getManagedPrompt(env, "roles/criteria/extract", { criteria_text: text.slice(0, 2000) });
 
   const { topics } = await callStructured<{ topics: CareAboutTopic[] }>(
     env,
     provider,
-    "fit.care_about_topics",
+    "fit.criteria",
     prompt,
     CARE_ABOUT_TOPICS_SCHEMA,
     "submit_topics",
@@ -254,108 +227,76 @@ export async function deriveCareAboutTopics(
  * through as a "stretch". Calibrated to what actually reads as fine vs. not: needing 5 when you
  * have 3 is a normal reach; needing 7 when you have 3 is a different job level entirely.
  */
-function experienceGapRule(currentYear: number): string {
-  return [
-    "Years-of-experience requirements get a concrete rule, since they're precise enough to reason",
-    "about numerically rather than qualitatively: when a posting states a minimum (e.g. '7+ years'),",
-    `estimate the candidate's actual total years of relevant professional experience from their work`,
-    `history's start/end years (treat "Present" as ${currentYear}). A gap of up to 2 years is a normal,`,
-    "fine stretch -- do not reject for it alone (needing 5 years when they have 3 is fine). A gap of",
-    "more than 2 years is a genuine mismatch and should be rejected, citing the specific gap (needing",
-    "7+ years when they have about 3 is a different seniority level, not a stretch).",
-  ].join("\n");
-}
-
-function fitPrompt(
+async function fitPrompt(
+  env: LlmEnv,
   profileJson: string,
   desiredRoles: string,
   disqualifiers: string[],
   customPreferences: string,
   careAboutTopics: CareAboutTopic[],
   jobs: JobToAssess[],
-): string {
-  return [
-    "You are screening job postings for a candidate against their own verified profile -- the same",
-    "kind of judgment call a careful applicant makes before spending time on a posting, not a",
-    "generic keyword match.",
-    "",
-    WRITING_STYLE_RULES,
-    "",
-    FIT_SCORE_GUIDANCE,
-    "",
-    "Only score down for requirements the posting actually states (a specific language or tool, a",
-    "degree, a minimum years of experience), not for assumptions about culture fit, company size, or",
-    "anything the posting doesn't say.",
-    "",
-    experienceGapRule(new Date().getUTCFullYear()),
-    "",
-    // The one thing a candidate scrolling a list of these actually wants at a glance is whether the
-    // years requirement is a problem -- burying it in the middle of a reason about other things
-    // means they still have to open the real posting to find it, which defeats the point of scoring
-    // it in the first place.
-    "Whenever a posting states a required (not preferred) years-of-experience figure, say so plainly",
-    "in `reason` itself, not just as a factor silently weighed into the score -- e.g. \"Requires 5+",
-    "years; you have about 3, a real stretch\" or \"Requires 3-5 years, comfortably within your range\".",
-    "",
-    customPreferences
-      ? [
-          "The candidate wrote these matching preferences themselves, in their own words. Enforce them as",
-          "binding rules with the same weight as a stated hard requirement above -- if a posting clearly",
-          "violates one, that is a hard disqualifier regardless of how strong the rest of the overlap is:",
-          customPreferences,
-          "",
-        ].join("\n")
-      : "",
-    careAboutTopics.length
-      ? [
-          "QUICK FACTS TO REPORT: fill in `facts` with exactly one entry per topic below, in this order,",
-          "copying each `label` verbatim -- these are fixed column headings shown next to every posting, so",
-          "rewording one makes the same topic look like a different one from posting to posting. For each,",
-          "read the posting for what's described and give the value it states, or exactly 'Not specified'.",
-          "This is informational only and must NOT affect `score` -- a topic here is something the candidate",
-          "wants to see without opening the posting, not a requirement the posting has to meet:",
-          ...careAboutTopics.map((topic) => `- ${topic.label} -- ${topic.looking_for}`),
-          "",
-        ].join("\n")
-      : "",
-    disqualifiers.length
-      ? [
-          "The candidate has previously confirmed these were NOT a fit, and why -- weigh a posting",
-          "with a similar stated requirement accordingly:",
-          ...disqualifiers.map((d) => `- ${d}`),
-          "",
-        ].join("\n")
-      : "",
-    desiredRoles
-      ? [
-          "TARGET ROLES -- the candidate may be open to more than one genuinely different kind of role, listed",
-          "below. A posting only has to be a strong match for ONE of them to be on-target; it is not a mismatch",
-          "just because it doesn't also touch the others, and you should not expect or require a single posting",
-          "to combine several of them at once:",
-          desiredRoles,
-          "",
-        ].join("\n")
-      : "",
-    `CANDIDATE PROFILE:\n${profileJson}`,
-    "",
-    `POSTINGS TO ASSESS:\n${JSON.stringify(
-      jobs.map((j) => ({
-        id: j.id,
-        title: j.title,
-        company: j.company,
-        location: j.location,
-        // Matches the storage cap (src/index.ts) and the scrape cap (DESCRIPTION_CAP in
-        // companies.ts) -- compensation, remote/onsite, hours, and travel facts routinely sit at
-        // the very end of a real posting, past where a tighter slice here used to cut them off
-        // even when the fuller text was already stored.
-        description: j.description.slice(0, 8000),
-      })),
-    )}`,
-    "",
-    "Return one result per posting, in any order, each with the matching id.",
-  ]
-    .filter(Boolean)
-    .join("\n");
+): Promise<import("./langfuse").ManagedPrompt> {
+  const customPreferencesSection = customPreferences
+    ? [
+        "The candidate wrote these matching preferences themselves, in their own words. Enforce them as",
+        "binding rules with the same weight as a stated hard requirement above -- if a posting clearly",
+        "violates one, that is a hard disqualifier regardless of how strong the rest of the overlap is:",
+        customPreferences,
+        "",
+      ].join("\n")
+    : "";
+  const quickFacts = careAboutTopics.length
+    ? [
+        "QUICK FACTS TO REPORT: fill in `facts` with exactly one entry per topic below, in this order,",
+        "copying each `label` verbatim -- these are fixed column headings shown next to every posting, so",
+        "rewording one makes the same topic look like a different one from posting to posting. For each,",
+        "read the posting for what's described and give the value it states, or exactly 'Not specified'.",
+        "This is informational only and must NOT affect `score` -- a topic here is something the candidate",
+        "wants to see without opening the posting, not a requirement the posting has to meet:",
+        ...careAboutTopics.map((topic) => `- ${topic.label} -- ${topic.looking_for}`),
+        "",
+      ].join("\n")
+    : "";
+  const disqualifierSection = disqualifiers.length
+    ? [
+        "The candidate has previously confirmed these were NOT a fit, and why -- weigh a posting",
+        "with a similar stated requirement accordingly:",
+        ...disqualifiers.map((d) => `- ${d}`),
+        "",
+      ].join("\n")
+    : "";
+  const targetRoles = desiredRoles
+    ? [
+        "TARGET ROLES -- the candidate may be open to more than one genuinely different kind of role, listed",
+        "below. A posting only has to be a strong match for ONE of them to be on-target; it is not a mismatch",
+        "just because it doesn't also touch the others, and you should not expect or require a single posting",
+        "to combine several of them at once:",
+        desiredRoles,
+        "",
+      ].join("\n")
+    : "";
+  const postings = JSON.stringify(
+    jobs.map((j) => ({
+      id: j.id,
+      title: j.title,
+      company: j.company,
+      location: j.location,
+      // Matches the storage cap (src/index.ts) and the scrape cap (DESCRIPTION_CAP in
+      // companies.ts) -- compensation, remote/onsite, hours, and travel facts routinely sit at
+      // the very end of a real posting, past where a tighter slice here used to cut them off
+      // even when the fuller text was already stored.
+      description: j.description.slice(0, 8000),
+    })),
+  );
+  return getManagedPrompt(env, "jobs/fit", {
+    current_year: String(new Date().getUTCFullYear()),
+    custom_preferences: customPreferencesSection,
+    quick_facts: quickFacts,
+    disqualifiers: disqualifierSection,
+    target_roles: targetRoles,
+    candidate_profile: profileJson,
+    postings,
+  });
 }
 
 /**
@@ -406,7 +347,7 @@ export async function assessJobFitBatch(
     env,
     provider,
     "fit.assess",
-    fitPrompt(profileJson, desiredRoles, disqualifiers, customPreferences, careAboutTopics, jobs),
+    await fitPrompt(env, profileJson, desiredRoles, disqualifiers, customPreferences, careAboutTopics, jobs),
     FIT_BATCH_SCHEMA,
     "submit_fit_assessment",
     // Bumped alongside the richer per-posting schema (up to 8 candidate-defined facts per posting) --
@@ -481,35 +422,14 @@ export async function screenJobsBatch(
   jobs: JobToAssess[],
 ): Promise<ScreenResult[]> {
   if (!jobs.length) return [];
-  const prompt = [
-    "Decide which of these job postings are worth a closer look for this candidate, based only on",
-    "each posting's title and location -- you are not given a description.",
-    "",
-    "Keep anything plausible. Drop only clear mismatches obvious from the title alone: a different",
-    "profession or field entirely (e.g. a mechanical/aerospace/hardware title against a software",
-    "background), or a seniority word far outside their range (e.g. \"Staff\"/\"Director\" against an",
-    "early-career profile, or \"Intern\"/\"Entry-Level\" against a senior one). If the title alone",
-    "doesn't make the mismatch obvious, keep it -- the next stage reads the full posting.",
-    "",
-    // Only the dash rule here, not the full WRITING_STYLE_RULES block. This tier's entire output is
-    // an eight-word fragment, and it runs at the highest volume of anything in the app (60 postings
-    // per call, many calls), so the rest of the style guidance would be prompt cost buying nothing.
-    "Never use an em dash (—) or en dash (–) in the note. Use a comma or start a new phrase.",
-    "",
-    disqualifiers.length
+  const prompt = await getManagedPrompt(env, "jobs/prescreen", {
+    disqualifiers: disqualifiers.length
       ? `The candidate has already rejected roles for these reasons:\n${disqualifiers.map((d) => `- ${d}`).join("\n")}\n`
       : "",
-    // May list several genuinely different role types the candidate would take any one of, not a
-    // single combined role -- a posting matching just one of them is still a keep.
-    desiredRoles ? `WANTS (any ONE of the following, not all at once): ${desiredRoles.slice(0, 600)}\n` : "",
-    `CANDIDATE:\n${matchProfile}`,
-    "",
-    `POSTINGS:\n${JSON.stringify(jobs.map((j) => ({ id: j.id, title: j.title, location: j.location })))}`,
-    "",
-    "Return one result per posting.",
-  ]
-    .filter(Boolean)
-    .join("\n");
+    target_roles: desiredRoles ? `WANTS (any ONE of the following, not all at once): ${desiredRoles.slice(0, 600)}\n` : "",
+    candidate_profile: matchProfile,
+    postings: JSON.stringify(jobs.map((j) => ({ id: j.id, title: j.title, location: j.location }))),
+  });
 
   const { results } = await callStructured<{ results: ScreenResult[] }>(
     env,

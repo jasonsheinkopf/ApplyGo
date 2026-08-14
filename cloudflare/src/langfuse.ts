@@ -12,12 +12,12 @@
  * Building one standards-compliant OTLP JSON envelope per completed call keeps this exporter
  * stateless while using Langfuse's current v4 ingestion path.
  *
- * Every function here follows the same rule llm.ts's own record() does: observability must never
- * be able to break the call it's observing. Nothing in this file throws; a Langfuse outage or a
- * missing API key just means nothing gets sent this time.
+ * Trace-export functions follow llm.ts's rule that observability cannot break the call being
+ * observed. Prompt retrieval is application input, so it fails clearly only when neither Langfuse
+ * nor a last-known-good cached production prompt is available.
  */
 
-import type { LlmTrace } from "./llm";
+import type { LlmTrace } from "./llm.ts";
 
 export interface LangfuseEnv {
   LANGFUSE_PUBLIC_KEY?: string;
@@ -26,7 +26,27 @@ export interface LangfuseEnv {
   LANGFUSE_BASE_URL?: string;
   /** Backward-compatible alias. Defaults to Langfuse Cloud's EU region when neither URL is set. */
   LANGFUSE_HOST?: string;
+  /** Optional persistent last-known-good prompt cache (the application's existing D1 binding). */
+  DB?: D1Database;
 }
+
+export type ManagedPrompt = {
+  text: string;
+  name: string;
+  version: number;
+  id: string | null;
+};
+
+type LangfuseTextPrompt = {
+  id?: string;
+  name: string;
+  version: number;
+  type: "text";
+  prompt: string;
+};
+
+const PROMPT_TTL_MS = 5 * 60 * 1000;
+const promptMemoryCache = new Map<string, { prompt: LangfuseTextPrompt; expiresAt: number }>();
 
 export function langfuseConfigured(env: LangfuseEnv): boolean {
   return Boolean(env.LANGFUSE_PUBLIC_KEY && env.LANGFUSE_SECRET_KEY);
@@ -38,6 +58,93 @@ function host(env: LangfuseEnv): string {
 
 function authHeader(env: LangfuseEnv): string {
   return `Basic ${btoa(`${env.LANGFUSE_PUBLIC_KEY}:${env.LANGFUSE_SECRET_KEY}`)}`;
+}
+
+/** Compile Langfuse text-prompt variables strictly, so a missing value never reaches a model. */
+export function compilePrompt(template: string, variables: Record<string, string>): string {
+  for (const name of Object.keys(variables)) {
+    if (!/^[A-Za-z_]+$/.test(name)) throw new Error(`langfuse_prompt_invalid_variable:${name}`);
+  }
+  const required = new Set(Array.from(template.matchAll(/{{\s*([A-Za-z_]+)\s*}}/g), (match) => match[1]));
+  const missing = [...required].filter((name) => !(name in variables));
+  if (missing.length) throw new Error(`langfuse_prompt_missing_variables:${missing.join(",")}`);
+  const withoutEmptyLines = template.replace(
+    /^[\t ]*{{\s*([A-Za-z_]+)\s*}}[\t ]*(?:\r?\n|$)/gm,
+    (line, name: string) => variables[name] === "" ? "" : line,
+  );
+  const compiled = withoutEmptyLines.replace(/{{\s*([A-Za-z_]+)\s*}}/g, (_, name: string) => variables[name]);
+  if (/{{[^{}]+}}/.test(compiled)) throw new Error("langfuse_prompt_unresolved_variable");
+  return compiled;
+}
+
+async function readCachedPrompt(env: LangfuseEnv, name: string): Promise<LangfuseTextPrompt | null> {
+  if (!env.DB) return null;
+  try {
+    const row = await env.DB.prepare(
+      "SELECT prompt_json FROM langfuse_prompt_cache WHERE prompt_name = ?",
+    ).bind(name).first<{ prompt_json: string }>();
+    return row?.prompt_json ? JSON.parse(row.prompt_json) as LangfuseTextPrompt : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeCachedPrompt(env: LangfuseEnv, prompt: LangfuseTextPrompt): Promise<void> {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO langfuse_prompt_cache (prompt_name, prompt_json, fetched_at)
+       VALUES (?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(prompt_name) DO UPDATE SET prompt_json = excluded.prompt_json, fetched_at = CURRENT_TIMESTAMP`,
+    ).bind(prompt.name, JSON.stringify(prompt)).run();
+  } catch {
+    // A cache migration lag must not hide a successfully fetched production prompt.
+  }
+}
+
+/**
+ * Fetches the production-labeled Langfuse prompt, with an isolate cache and a persistent D1
+ * last-known-good fallback. Prompt bodies therefore have one source of truth without making a
+ * temporary Langfuse outage break an already-running installation.
+ */
+export async function getManagedPrompt(
+  env: LangfuseEnv,
+  name: string,
+  variables: Record<string, string>,
+): Promise<ManagedPrompt> {
+  const key = `${host(env)}:${env.LANGFUSE_PUBLIC_KEY ?? ""}:${name}`;
+  const memory = promptMemoryCache.get(key);
+  let managed = memory && memory.expiresAt > Date.now() ? memory.prompt : null;
+  let fetchError: Error | null = null;
+
+  if (!managed && langfuseConfigured(env)) {
+    try {
+      const res = await fetch(`${host(env)}/api/public/v2/prompts/${encodeURIComponent(name)}?label=production`, {
+        headers: { authorization: authHeader(env) },
+      });
+      if (!res.ok) throw new Error(`langfuse_prompt_fetch_${res.status}:${name}`);
+      const value = await res.json() as LangfuseTextPrompt;
+      if (value.type !== "text" || typeof value.prompt !== "string") {
+        throw new Error(`langfuse_prompt_wrong_type:${name}`);
+      }
+      managed = value;
+      promptMemoryCache.set(key, { prompt: value, expiresAt: Date.now() + PROMPT_TTL_MS });
+      await writeCachedPrompt(env, value);
+    } catch (err) {
+      fetchError = err as Error;
+    }
+  }
+
+  if (!managed) managed = await readCachedPrompt(env, name);
+  if (!managed) {
+    throw fetchError ?? new Error(`langfuse_prompt_unavailable:${name}`);
+  }
+  return {
+    text: compilePrompt(managed.prompt, variables),
+    name: managed.name,
+    version: managed.version,
+    id: managed.id ?? null,
+  };
 }
 
 function randomHex(bytes: number): string {
@@ -87,6 +194,9 @@ export async function sendToLangfuse(
     attribute("langfuse.observation.metadata.provider", trace.provider),
     attribute("langfuse.observation.metadata.tier", trace.tier),
   ];
+  if (trace.promptName) attributes.push(attribute("langfuse.observation.prompt.name", trace.promptName));
+  if (trace.promptVersion != null) attributes.push(attribute("langfuse.observation.prompt.version", trace.promptVersion));
+  if (trace.promptId) attributes.push(attribute("langfuse.observation.prompt.id", trace.promptId));
   if (trace.ok) attributes.push(attribute("langfuse.observation.output", JSON.stringify(trace.response)));
   if (trace.costUsd != null) {
     attributes.push(attribute("langfuse.observation.cost_details", JSON.stringify({ total: trace.costUsd })));

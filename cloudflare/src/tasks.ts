@@ -16,7 +16,7 @@ import type { Tier } from "./llm";
 export type LlmTaskId =
   | "fit.screen"
   | "fit.assess"
-  | "fit.care_about_topics"
+  | "fit.criteria"
   | "companies.discover"
   | "profile.structure"
   | "roles.analyze"
@@ -77,8 +77,8 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     replayable: true,
   },
   {
-    id: "fit.care_about_topics",
-    name: "Interpret 'what I care about'",
+    id: "fit.criteria",
+    name: "Interpret criteria",
     stage: "Profile",
     tier: "screen",
     what: "Turns the free-text field into canonical {label, looking_for} topics. Runs once per save, not per posting.",

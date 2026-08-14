@@ -238,15 +238,27 @@ The dashboard fetches `application_answers` once at page load, so an answer save
 
 The Interested tab's **Apply** sub-tab shows a readiness checklist (posting link, tailored résumé, cover letter, answers on file) and a "Mark as applied" button. The résumé and cover-letter rows read `has_resume`/`has_cover_letter`, columns `listJobs` computes with an `EXISTS` subquery against `resumes`/`cover_letters`, rather than tracking whether the dashboard happened to generate one earlier in the session -- otherwise switching jobs and back would show a document as missing that was actually generated days ago. The Resume and Cover letter sub-tabs use the same fields: opening either one for a job that already has a document loads and displays it immediately, through the existing no-LLM `reused: true` path, instead of waiting for another click on Generate/Draft. Autofill arrives with the browser extension; this is the tracking half of that feature, built first because it is useful on its own and is what the extension will read from.
 
-### Autofill and the browser extension
+### The application agent and the browser extension
 
-`extension/` is a Manifest V3 browser extension (see its own README for install steps). It exists because server-side form filling does not work reliably: Cloudflare's headless browsers run from datacenter IPs that ATS bot detection flags, CAPTCHAs end an attempt with no recourse, and there is no way for the candidate to intervene mid-run. Running in the candidate's own browser solves all of that, and reading the live DOM means it works on job boards ApplyGo has never seen rather than only the four ATS platforms it can scan.
+`extension/` is a Manifest V3 browser extension (see its own README for install steps and its internal architecture). It exists because server-side form filling does not work reliably: Cloudflare's headless browsers run from datacenter IPs that ATS bot detection flags, CAPTCHAs end an attempt with no recourse, and there is no way for the candidate to intervene mid-run. Running in the candidate's own browser solves all of that, and reading the live DOM means it works on job boards ApplyGo has never seen rather than only the four ATS platforms it can scan.
 
-**It fills and stops. It never submits.** Submitting an application cannot be undone, and a mis-filled auto-submit is not recoverable, so the last click stays with the human. Filled fields are outlined blue, skipped ones amber.
+**It fills and stops. It never submits.** Submitting an application cannot be undone, and a mis-filled auto-submit is not recoverable, so the last click stays with the human. Filled fields are outlined blue, unresolved ones amber. **There is no Skip.** A field the agent can't resolve on its own stays visibly unresolved until the candidate fills it, saves it, or — only when the employer's own form marks it optional — explicitly leaves it blank; a required field can never be dismissed unanswered.
 
-`POST /applications/match` turns a live form into answers. Resolution runs cheapest and most trustworthy first: contact facts parsed deterministically from the profile label and the tailored résumé's `contact_line` (StructuredProfile models career history, not contact details), then the answer bank by normalized `questionKey()`, then one model call for whatever is left. **Anything unresolved comes back as `missing` rather than guessed**, including when the model call fails outright, so a provider outage degrades into "you answer these" instead of silently skipped fields.
+**The handoff is the Interested card's Apply button.** The whole card, title included, is one accordion control; **Apply** is the single thing that navigates to the employer's page, which is also where the extension picks the job up (by matching the tab's URL against `source_url`). That means the tailored résumé, cover letter, and any job-specific answers already prepared in the main app are the ones the agent uses.
 
-**`NEVER_INFER` fields skip the model entirely.** Work authorization, sponsorship, citizenship, veteran status, disability, gender, race, criminal history, salary, notice period, start date, relocation, and security clearance are legally or personally consequential, and a confident guess is worse than no answer. Either the bank already holds it or the candidate is asked. The regex is stem-based (`disab\w*`, `relocat\w*`) because word-boundary matching silently missed "disability" and "relocate"; `scratchpad/ui/assert_never_infer.mjs` reads the pattern straight out of the source and checks 27 real question phrasings against it so the two cannot drift apart.
+**It's an orchestrator, not one big prompt.** The extension holds a structured application state and works down a resolution order — job-specific answers, then the answer bank, then deterministic profile facts, then the prepared documents, then ask the candidate. Everything above "ask" is a lookup; no model call is ever spent deciding that a first name goes in the first-name field, and there is no automatic model pass over whatever's left — a narrative field is only ever drafted on the candidate's own request (see Generate below). It fills one field at a time so the candidate can watch, **verifies each value against the live DOM** before counting it (forms reformat, reject, and silently revert values), **re-reads the page** after each pass because answering one question routinely reveals another, and finishes with a review pass for required-but-blank fields, validation errors, and fills that didn't stick. The model never touches the DOM: the agent may only take actions from a fixed tool set that deterministic code executes.
+
+`POST /applications/match` is the resolver behind the lookup tiers, and stays the single place the profile is needed for this pass. Resolution runs cheapest and most trustworthy first: job-scoped answers, then the answer bank by normalized `questionKey()`, then contact facts parsed deterministically from the profile label and the tailored résumé's `contact_line` (StructuredProfile models career history, not contact details). **Anything unresolved comes back as `missing` rather than guessed or drafted**, each entry carrying a `reason` (`sensitive` or `open`), the field's real `options` straight off the employer's form (never invented — a radio or select with no reliable options comes back with an empty list rather than a synthesized `["Yes","No"]`), a `category` from `classifyAnswer` (for anything not sensitive), and `can_generate`, which is true only for a `text`/`textarea` field that isn't sensitive — a date, number, select, or radio field only ever gets a real value: the employer's own options, or what the candidate types, never a fabricated date or number.
+
+**Three actions replace the old "fill and remember" ambiguity: Generate, Fill, Save.** For an open-ended field `can_generate` allows drafting, the sidebar offers **Generate**, which calls `POST /applications/generate-answer` for a single focused draft grounded in the candidate's structured profile, resume history, the job description and company, job-specific review evidence (`candidate_evidence` with `category = 'job_review'`), and any existing saved answers — never fabricating experience, credentials, dates, or employers. The draft lands in the sidebar's own editable textarea and is never written to the employer's form directly: **Generate → review/edit → Fill or Save**. The prompt itself is Langfuse-managed (`applications/generate_answer`, see "Prompt Management" below), not hardcoded, so its instructions can be revised without a deploy; `NEVER_INFER` is checked again server-side before any draft is attempted, not just trusted from the sidebar's own gating. **Fill** uses the candidate's answer (typed or drafted-then-edited) on this application only — no backend write beyond the audit event. **Save** does that and also remembers it, scoped by `POST /applications/answer`'s classification (below); the sidebar shows the resulting category-and-scope-aware confirmation (e.g. "Filled and saved for future Anthropic applications.") rather than a generic "saved."
+
+**Not every answer is worth remembering, and Save is itself the "remember this" signal.** `POST /applications/answer` classifies what the candidate types (`classifyAnswer`) before deciding where it goes: stable facts and standing preferences into the durable bank; salary/notice-period/start-date into the bank but marked `contextual` because they go stale; "why do you want to work here" against that job only, in `job_application_answers`, so it can never leak into an unrelated company's application; agree-to-terms and referral-source nowhere at all, and the endpoint says so honestly rather than claiming something was saved. Since the candidate only ever calls this endpoint by clicking Save, an otherwise-ambiguous classification resolves straight into the bank instead of asking a second time. The classification is rule-based on purpose — it runs on every answered field, and mis-filing personal data is the kind of decision that should be inspectable in a regex rather than re-litigated by a model each time.
+
+**Contradictions are surfaced, not silently resolved.** If the new answer disagrees with a saved one, the endpoint returns the conflict instead of writing, and the agent asks — "Update the saved answer" or "Just this once." The candidate's current answer always governs the application in front of them; the stored copy only changes with an explicit `confirm_overwrite`.
+
+**The agent's decisions are logged.** `POST /applications/events` writes to `application_agent_events` (migration `0022`): which tier answered a field, whether the value stuck, what the candidate was asked, what got stored, contradictions, the final review. Values are dropped for anything `NEVER_INFER` matches — that a work-authorization question was asked and answered is the useful signal; storing the answer a second time outside the bank is not.
+
+**`NEVER_INFER` fields skip the model entirely — no autofill, no Generate.** Work authorization, sponsorship, citizenship, veteran status, disability, gender, race, criminal history, salary, notice period, start date, relocation, and security clearance are legally or personally consequential, and a confident guess is worse than no answer. Either the bank already holds an explicit answer the candidate gave before, or the candidate is asked directly; the sidebar never shows a Generate button for these, and `POST /applications/generate-answer` re-checks the same regex server-side rather than trusting that gating. The regex is stem-based (`disab\w*`, `relocat\w*`) because word-boundary matching silently missed "disability" and "relocate"; `scratchpad/ui/assert_never_infer.mjs` reads the pattern straight out of the source and checks 27 real question phrasings against it so the two cannot drift apart.
 
 **Auth reuses the existing device sessions.** `requireSession` accepts `Authorization: Bearer` alongside the cookie, hashed against the same `device_sessions` table, and the extension enrolls through the ordinary one-time-code flow (`return_token: true` on `POST /auth/enroll` hands back the raw token, which the caller already receives via `Set-Cookie` anyway). So the extension shows up in the Devices tab and is revoked like any other device, with no second credential system to outlive a revoke. CORS is scoped to the handful of paths the extension calls and **never allows credentials**, which keeps cookie auth strictly same-origin: a cross-origin caller must present a bearer token, and only the enrolled extension has one.
 
@@ -536,6 +548,71 @@ That's the entire setup — no other config, no schema to define on the Langfuse
 **Eval replays are deliberately excluded, same as the local trace table.** `evals.ts`'s `replayTask()` already strips the D1 sink for the same reason the header comment there gives — "an eval run is not production spend... letting it write into `llm_traces` would quietly inflate the Cost tab's totals with experimentation nobody asked the app to do" — and it strips the two Langfuse keys off the isolated env for the identical reason: a candidate comparing models in the eval harness shouldn't see their Langfuse project fill up with test replays. The one exception is the same one D1 already carves out: `judgeRun()` runs through the real env and is traced (and now sent to Langfuse) normally, because judging genuinely costs money and should be as visible as any other call.
 
 **Failure handling.** Every function in `langfuse.ts` follows the same rule `record()` in `llm.ts` already does: observability must never be able to break the call it's observing. `sendToLangfuse()` and the project-id lookup both swallow their own errors and return `null` rather than throwing — a Langfuse outage, a wrong key, or no configuration at all just means nothing gets sent that time, silently, with the LLM call itself unaffected.
+
+## Prompt Management
+
+Substantive LLM instructions are managed in Langfuse Prompt Management rather than hardcoded in the repository. Every runtime call fetches the prompt's `production` label, compiles its `{{alphabetic_or_underscore_variable}}` values, and passes the resulting text into the existing provider call. The fetched prompt name, ID, and version are attached to the Langfuse generation so an output can be traced back to the exact prompt version that produced it. Existing task names such as `fit.assess` and `resume.build` remain unchanged.
+
+To change a prompt, open it in Langfuse, create a new version, and test that version without moving the `production` label. Promote it by assigning `production` to the approved version; runtime code never pins version numbers. New prompts should use the slash hierarchy already established (`roles/...`, `jobs/...`, `resume/...`, `applications/...`) and must define every runtime value with `{{variable_name}}`. Missing variables fail with `langfuse_prompt_missing_variables` instead of sending malformed instructions to a model.
+
+Model/provider routing remains in [`src/llm.ts`](src/llm.ts), and JSON schemas plus Anthropic tool definitions remain beside their call sites. Prompt Management does not control either one.
+
+For local development, set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` in the repository `.env`; Japan-region projects use `https://jp.cloud.langfuse.com`. Run `npm run migrate:local` once so migration `0023_langfuse_prompt_cache.sql` is applied, then start the app normally. Production should apply the same migration before deployment.
+
+Prompt retrieval uses a five-minute in-isolate cache. Every successful fetch is also written to D1 as the last-known-good production prompt. If Langfuse is temporarily unreachable, ApplyGo uses that persistent cached version; a fresh installation that has never fetched the prompt fails clearly with `langfuse_prompt_unavailable:<name>` rather than silently substituting different instructions. The legacy Python service uses the same production label and stores its last-known-good cache under `data/private/`.
+
+### Creating `applications/generate_answer`
+
+`POST /applications/generate-answer` (extension → Generate button) fetches this prompt by name and fails with `langfuse_prompt_unavailable:applications/generate_answer` until it exists with a `production` label. It doesn't ship in the repo — create it once, by hand, in Langfuse:
+
+1. Langfuse → Prompts → New prompt → name it exactly `applications/generate_answer`, type **Text**.
+2. Paste the template below as the prompt content, then **Save as new version**.
+3. Promote that version's label to `production`.
+
+```
+You are drafting one answer for a job application, on behalf of the candidate described below. The
+candidate will read and edit this before it is used, so an honest, well-grounded draft is more
+useful than a polished but invented one.
+
+Employer's question: {{question}}
+Field type: {{field_type}}
+Character limit (if any): {{max_length}}
+
+Applying for: {{job}}
+Company: {{company}}
+Job description:
+{{job_description}}
+
+Candidate's structured profile:
+{{candidate_profile}}
+
+Relevant evidence from this candidate's own notes about this job/company:
+{{review_context}}
+
+Answers the candidate has already given on other questions (for tone and consistency, and to reuse
+real context rather than reinvent it):
+{{saved_answers}}
+
+Write a draft answer to the employer's question above. Ground every claim in the profile, evidence,
+and job description given above -- never invent experience, credentials, achievements, dates,
+metrics, or employers, and never state a fact you would need to guess. If the available material
+only weakly supports a good answer, still write the best honest draft you can, but be conservative
+about specifics rather than filling gaps with plausible-sounding invention. If a character limit was
+given, stay within it.
+
+Write like the candidate would actually write, not like an AI answering a prompt. That means:
+concrete and specific to this exact question, company, and role -- not something that could be
+pasted into any application unchanged. Plain, direct sentences over polished marketing language.
+No throat-clearing openers ("I am excited to..."), no stacked buzzwords, no generic enthusiasm
+that isn't backed by something real in the material above. Say the actual thing, in the fewest
+words that say it well. If the honest answer is short, let it be short.
+
+Set `grounded` to true only if the draft is well-supported by the material above; set it to false
+if this is a best-effort draft with meaningfully limited support -- the candidate reviews and edits
+every draft either way, so say so honestly rather than hiding it.
+```
+
+Every `{{variable}}` above must stay present verbatim — `compilePrompt` throws `langfuse_prompt_missing_variables` if the code ever calls this prompt without supplying one, and throws `langfuse_prompt_unresolved_variable` if the template references one the code doesn't send. The code sends exactly these nine: `question`, `field_type`, `max_length`, `job`, `company`, `job_description`, `candidate_profile`, `review_context`, `saved_answers` (`generateApplicationAnswer` in `src/index.ts`). Model/provider routing and the response schema (`answer`, `grounded`) stay in code, not in this prompt, per the split described above.
 
 ## Gmail reply-checking (optional, read-only)
 
