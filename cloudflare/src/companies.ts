@@ -15,7 +15,69 @@
 
 import { type LlmEnv, type Provider, WRITING_STYLE_RULES, callStructured } from "./llm";
 
-export type AtsProvider = "greenhouse" | "lever" | "ashby" | "smartrecruiters";
+// Every ATS this app recognizes on a careers page, whether or not it can actually read job
+// listings from it. Recognizing a platform is worth doing even without a read path: it's the
+// difference between telling a candidate "no job board found" (implying there's nothing to see)
+// and "this company hires through ADP -- here's the link" (true, and actionable).
+export type AtsProvider =
+  | "greenhouse"
+  | "lever"
+  | "ashby"
+  | "smartrecruiters"
+  | "workday"
+  | "adp"
+  | "icims"
+  | "bamboohr"
+  | "workable"
+  | "recruitee"
+  | "jazzhr"
+  | "breezy"
+  | "personio"
+  | "paylocity"
+  | "ukg"
+  | "successfactors"
+  | "taleo"
+  | "jobvite";
+
+/**
+ * Providers this app can read structured job listings from. The other six are still worth
+ * *detecting* -- see the type comment above -- but none of them publish a stable, unauthenticated
+ * public API the way Greenhouse/Lever/Ashby/SmartRecruiters/Workday do; some (ADP, iCIMS, most of
+ * the enterprise HR suites) are fully server-rendered with no documented API at all, and guessing
+ * a JSON shape with no way to verify it against a live response is how you ship code that silently
+ * returns nothing while looking like it works. A detected-but-unreadable company gets a working
+ * link to its board instead, via ATS_DISPLAY_NAMES and the isReadableAtsProvider check below.
+ */
+const READABLE_ATS_PROVIDERS = new Set<AtsProvider>(["greenhouse", "lever", "ashby", "smartrecruiters", "workday"]);
+
+export function isReadableAtsProvider(provider: AtsProvider): boolean {
+  return READABLE_ATS_PROVIDERS.has(provider);
+}
+
+const ATS_DISPLAY_NAMES: Record<AtsProvider, string> = {
+  greenhouse: "Greenhouse",
+  lever: "Lever",
+  ashby: "Ashby",
+  smartrecruiters: "SmartRecruiters",
+  workday: "Workday",
+  adp: "ADP",
+  icims: "iCIMS",
+  bamboohr: "BambooHR",
+  workable: "Workable",
+  recruitee: "Recruitee",
+  jazzhr: "JazzHR",
+  breezy: "Breezy",
+  personio: "Personio",
+  paylocity: "Paylocity",
+  ukg: "UKG/UltiPro",
+  successfactors: "SAP SuccessFactors",
+  taleo: "Oracle Taleo",
+  jobvite: "Jobvite",
+};
+
+export function atsDisplayName(provider: AtsProvider): string {
+  return ATS_DISPLAY_NAMES[provider] ?? provider;
+}
 
 export type CompanyProposal = {
   name: string;
@@ -281,10 +343,21 @@ async function fetchWithTimeout(url: string, ms: number, init: RequestInit = {})
   }
 }
 
-/** Confirms a proposed company's site actually resolves, so hallucinated entries are flagged. */
+/**
+ * Confirms a proposed company's site actually resolves, so a hallucinated or defunct entry never
+ * gets added at all -- see discoverCompanies in index.ts, which now skips a company outright
+ * rather than adding it flagged "unreachable". Getting this right in both directions matters: a
+ * company whose domain genuinely doesn't resolve (out of business, DNS gone) should never appear,
+ * but a company whose site blocks scrapers with a 401/403 is still very much alive and shouldn't
+ * be punished for having a bot-blocking WAF in front of an otherwise ordinary website.
+ */
 export async function verifyWebsite(website: string): Promise<boolean> {
   const res = await fetchWithTimeout(website, 8000, { method: "GET", redirect: "follow" });
-  return Boolean(res && res.status < 400);
+  // No response at all means the domain didn't resolve, the connection was refused, or it timed
+  // out -- a genuinely dead site, not a picky one.
+  if (!res) return false;
+  if (res.status === 401 || res.status === 403) return true;
+  return res.status < 400;
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +366,13 @@ export async function verifyWebsite(website: string): Promise<boolean> {
 
 // Each company's careers page almost always links out to whichever ATS hosts the real board.
 // Finding that link gives us the board token without guessing.
+//
+// Split into two groups. The first five are READABLE_ATS_PROVIDERS -- their capture group is the
+// org slug boardApiUrl needs to build a listing request. The rest are detect-only: their capture
+// group is the whole host+path fragment the link pointed at (no scheme), stored as the token
+// as-is and turned straight into a clickable `https://` URL by the caller, since there's no API
+// to build a request against. Workday's capture spans tenant+pod+site together (its careers link
+// is one hostname, not a bare org slug) and gets split apart by parseWorkdayToken below.
 const ATS_PATTERNS: { provider: AtsProvider; pattern: RegExp }[] = [
   { provider: "greenhouse", pattern: /(?:boards|job-boards)\.greenhouse\.io\/(?:embed\/job_board\?for=)?([a-z0-9_-]+)/i },
   // A careers page that renders its board client-side often still names the org slug in an inline
@@ -303,6 +383,24 @@ const ATS_PATTERNS: { provider: AtsProvider; pattern: RegExp }[] = [
   { provider: "lever", pattern: /jobs\.(?:eu\.)?lever\.co\/([a-z0-9_-]+)/i },
   { provider: "ashby", pattern: /jobs\.ashbyhq\.com\/([a-z0-9_.-]+)/i },
   { provider: "smartrecruiters", pattern: /careers\.smartrecruiters\.com\/([a-z0-9_-]+)/i },
+  { provider: "workday", pattern: /([a-z0-9-]+\.wd\d+\.myworkdayjobs\.com\/(?:[a-z]{2}-[A-Z]{2}\/)?[a-zA-Z0-9_.-]+)/i },
+
+  // Detect-only: recognized so a company using one of these reads as "found, here's the link"
+  // instead of "no supported job board" -- not read automatically, since none of them publish a
+  // documented public API the way the five above do. See the AtsProvider type comment.
+  { provider: "adp", pattern: /((?:workforcenow|recruiting|jobs)\.adp\.com\/[^\s"'<>]+)/i },
+  { provider: "icims", pattern: /([a-z0-9-]+\.icims\.com\/(?:jobs|careers)[^\s"'<>]*)/i },
+  { provider: "bamboohr", pattern: /([a-z0-9-]+\.bamboohr\.com\/(?:jobs|careers)[^\s"'<>]*)/i },
+  { provider: "workable", pattern: /([a-z0-9-]+\.workable\.com\/[^\s"'<>]*)/i },
+  { provider: "recruitee", pattern: /([a-z0-9-]+\.recruitee\.com[^\s"'<>]*)/i },
+  { provider: "jazzhr", pattern: /([a-z0-9-]+\.applytojob\.com[^\s"'<>]*)/i },
+  { provider: "breezy", pattern: /([a-z0-9-]+\.breezy\.hr[^\s"'<>]*)/i },
+  { provider: "personio", pattern: /([a-z0-9-]+\.(?:jobs\.)?personio\.(?:de|com)[^\s"'<>]*)/i },
+  { provider: "paylocity", pattern: /(recruiting\.paylocity\.com\/recruiting\/jobs[^\s"'<>]*)/i },
+  { provider: "ukg", pattern: /(recruiting2?\.ultipro\.com[^\s"'<>]*)/i },
+  { provider: "successfactors", pattern: /([a-z0-9-]+\.(?:career\d*\.)?successfactors\.(?:com|eu)[^\s"'<>]*)/i },
+  { provider: "taleo", pattern: /([a-z0-9-]+\.taleo\.net[^\s"'<>]*)/i },
+  { provider: "jobvite", pattern: /(jobs\.jobvite\.com\/[a-z0-9-]+[^\s"'<>]*)/i },
 ];
 
 const CAREERS_PATHS = [
@@ -320,14 +418,32 @@ function boardApiUrl(provider: AtsProvider, token: string): string {
       return `https://api.ashbyhq.com/posting-api/job-board/${encodeURIComponent(token)}`;
     case "smartrecruiters":
       return `https://api.smartrecruiters.com/v1/companies/${encodeURIComponent(token)}/postings?limit=100`;
+    default:
+      // Workday builds its own request (POST, paginated -- see fetchWorkdayJobs) and every
+      // detect-only provider is never read at all, so neither ever reaches this function. Reaching
+      // it anyway is a caller bug, not a live-traffic path.
+      throw new Error(`no_board_api_url_for_${provider}`);
   }
+}
+
+/** Splits a matched Workday careers-link fragment into the three pieces its CXS API needs. */
+function parseWorkdayToken(raw: string): { tenant: string; pod: string; site: string } | null {
+  const match = raw.match(/^([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com\/(?:[a-z]{2}-[A-Z]{2}\/)?([a-zA-Z0-9_.-]+)/i);
+  if (!match) return null;
+  return { tenant: match[1], pod: match[2], site: match[3] };
 }
 
 /** Scrapes only for the ATS link itself -- never for job content, which comes from the board API. */
 function detectAtsInHtml(html: string): { provider: AtsProvider; token: string } | null {
   for (const { provider, pattern } of ATS_PATTERNS) {
     const match = html.match(pattern);
-    if (match?.[1]) return { provider, token: match[1] };
+    if (!match?.[1]) continue;
+    if (provider === "workday") {
+      const parsed = parseWorkdayToken(match[1]);
+      if (!parsed) continue;
+      return { provider, token: `${parsed.tenant}|${parsed.pod}|${parsed.site}` };
+    }
+    return { provider, token: match[1] };
   }
   return null;
 }
@@ -372,29 +488,103 @@ function boardHasListings(provider: AtsProvider, body: string): boolean {
  * the only thing that can work at all for a careers page that renders its board client-side, since
  * the real link then never appears in the static HTML this fetches to begin with.
  */
+function safeJoin(base: string, path: string): string {
+  try {
+    return new URL(path, base).toString();
+  } catch {
+    return "";
+  }
+}
+
+// Words that show up in a real "go see our openings" link, in either the href path or the
+// anchor's own visible text -- a link reading "Join our team" whose href is just "/careers"
+// matches on text; a link whose visible text is a translated or icon-only label but whose href is
+// "/en/careers/open-positions" matches on href. Checking both is what catches a link the blind
+// CAREERS_PATHS guesses below would miss because the real path isn't one of the common ones.
+const CAREERS_LINK_HINTS = /career|jobs?|opening|position|hiring|join[- ]?(?:us|our)|work[- ]?(?:with|for)[- ]?us|employment/i;
+
+/**
+ * Pulls every plausible "careers" link off a page (typically the homepage) and ranks them so the
+ * strongest candidates -- hinted in both the href and the visible link text -- are tried first.
+ *
+ * This is what makes finding a company's board work the way a person actually does it: open the
+ * homepage, find the button that says "Careers", click it, see where it goes -- rather than only
+ * ever trying a fixed list of guessed URL paths. It also means a careers page that hands off
+ * straight to a third-party ATS (an "you are now leaving our site" interstitial, or just a direct
+ * link to a WorkForceNow/iCIMS/etc. board) gets followed and read for an ATS pattern the same way
+ * any other page does, instead of the guesswork never reaching it at all.
+ */
+function extractCareersLinks(html: string, baseUrl: string): string[] {
+  const anchorPattern = /<a\b[^>]*href\s*=\s*["']([^"'#][^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  const candidates: { url: string; score: number }[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = anchorPattern.exec(html))) {
+    const href = match[1];
+    if (/^(mailto|tel|javascript):/i.test(href)) continue;
+    const text = htmlToText(match[2]);
+    const hrefHints = CAREERS_LINK_HINTS.test(href);
+    const textHints = CAREERS_LINK_HINTS.test(text);
+    if (!hrefHints && !textHints) continue;
+    const absolute = safeJoin(baseUrl, href);
+    if (!absolute) continue;
+    candidates.push({ url: absolute, score: (hrefHints ? 1 : 0) + (textHints ? 1 : 0) });
+  }
+
+  const seen = new Set<string>();
+  return candidates
+    .sort((a, b) => b.score - a.score)
+    .map((c) => c.url)
+    .filter((url) => {
+      if (seen.has(url)) return false;
+      seen.add(url);
+      return true;
+    });
+}
+
+/**
+ * Resolves a company's job board. Order of attempts, cheapest and most-likely-correct first:
+ *
+ * 1. Read the homepage itself -- it's fetched anyway to find a careers link (step 2), so checking
+ *    it directly for an ATS pattern first is free, and catches the case where the ATS link (or
+ *    even the board itself) is right there on the front page with no separate careers page at all.
+ * 2. Follow the LLM-proposed careers URL, then whichever links on the homepage actually look like
+ *    "go see our openings" (see extractCareersLinks) -- a real link the site publishes, which is
+ *    far more likely to land on the right page than a blind guess.
+ * 3. Fall back to a fixed list of common careers paths, for sites whose real link this missed.
+ * 4. Last resort: guess plausible org slugs (from the domain and the company's name) against every
+ *    provider with a public API, for a careers page that renders its board client-side and never
+ *    puts the real link in the static HTML at all.
+ */
 export async function resolveBoard(
   website: string,
   careersUrl: string,
   name: string,
   budget: { remaining: number },
 ): Promise<BoardResolution> {
-  const pages = [careersUrl, ...CAREERS_PATHS.map((p) => safeJoin(website, p))].filter(Boolean);
   const seen = new Set<string>();
 
-  for (const page of pages) {
-    if (budget.remaining <= 0) return null;
-    if (seen.has(page)) continue;
+  async function tryPage(page: string): Promise<{ found: BoardResolution; html: string } | null> {
+    if (!page || seen.has(page) || budget.remaining <= 0) return null;
     seen.add(page);
     budget.remaining -= 1;
     const res = await fetchWithTimeout(page, 8000, { redirect: "follow" });
-    if (!res || !res.ok) continue;
+    if (!res || !res.ok) return null;
     const html = await res.text().catch(() => "");
-    if (!html) continue;
-    const found = detectAtsInHtml(html);
-    if (found) return found;
+    if (!html) return null;
     // Some careers pages are a thin redirect shell; the final URL itself may be the board.
-    const fromFinalUrl = detectAtsInHtml(res.url);
-    if (fromFinalUrl) return fromFinalUrl;
+    const found = detectAtsInHtml(html) ?? detectAtsInHtml(res.url);
+    return { found, html };
+  }
+
+  const home = await tryPage(website);
+  if (home?.found) return home.found;
+
+  const discoveredLinks = home?.html ? extractCareersLinks(home.html, website) : [];
+  const pages = [careersUrl, ...discoveredLinks, ...CAREERS_PATHS.map((p) => safeJoin(website, p))].filter(Boolean);
+
+  for (const page of pages) {
+    const result = await tryPage(page);
+    if (result?.found) return result.found;
   }
 
   const slugs = Array.from(new Set([slugFromWebsite(website), ...slugsFromName(name)].filter(Boolean)));
@@ -410,14 +600,6 @@ export async function resolveBoard(
     }
   }
   return null;
-}
-
-function safeJoin(base: string, path: string): string {
-  try {
-    return new URL(path, base).toString();
-  } catch {
-    return "";
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +675,70 @@ function joinSections(parts: (string | undefined)[]): string {
  */
 const DESCRIPTION_CAP = 8000;
 
+/**
+ * Workday's CXS API is POST-with-a-body and paginated, unlike the other four providers' plain
+ * GET-a-URL shape -- see fetchBoardJobs, which branches to this before ever calling boardApiUrl.
+ * `token` is the `tenant|pod|site` string parseWorkdayToken produced when the board was resolved.
+ *
+ * Capped at MAX_WORKDAY_PAGES pages of listings: a huge board shouldn't spend the whole scan
+ * budget on titles and locations alone when the descriptions fetched afterward (fetchMissingDescriptions,
+ * only for postings that survive filtering) are the expensive part per posting.
+ */
+const MAX_WORKDAY_PAGES = 10;
+const WORKDAY_PAGE_SIZE = 20;
+
+async function fetchWorkdayJobs(tenant: string, pod: string, site: string): Promise<ScannedJob[]> {
+  const base = `https://${tenant}.${pod}.myworkdayjobs.com/wday/cxs/${tenant}/${site}`;
+  const jobs: ScannedJob[] = [];
+
+  for (let page = 0; page < MAX_WORKDAY_PAGES; page++) {
+    const offset = page * WORKDAY_PAGE_SIZE;
+    const res = await fetchWithTimeout(`${base}/jobs`, 12000, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ appliedFacets: {}, limit: WORKDAY_PAGE_SIZE, offset, searchText: "" }),
+    });
+    if (!res || !res.ok) {
+      if (page === 0) throw new Error(`board_http_${res ? res.status : "unreachable"}`);
+      break;
+    }
+    const data = (await res.json().catch(() => null)) as {
+      total?: number;
+      jobPostings?: { title?: string; externalPath?: string; locationsText?: string }[];
+    } | null;
+    if (page === 0 && !data) throw new Error("board_bad_json");
+    const postings = data?.jobPostings ?? [];
+    if (!postings.length) break;
+
+    for (const posting of postings) {
+      const externalPath = posting.externalPath ?? "";
+      jobs.push({
+        // externalPath (e.g. "/job/.../R-12345") is unique per posting and doubles as the id
+        // fetchMissingDescriptions uses to build the detail-endpoint URL below.
+        external_id: externalPath,
+        title: String(posting.title ?? ""),
+        url: externalPath ? `https://${tenant}.${pod}.myworkdayjobs.com/${site}${externalPath}` : "",
+        location: String(posting.locationsText ?? ""),
+        // Workday's listing only gives a relative phrase ("Posted 3 Days Ago"), not a real
+        // timestamp -- left blank rather than guessed at, same rule DESCRIPTION_CAP's neighbors
+        // already follow for any field a provider doesn't actually publish.
+        posted_at: "",
+        description: "",
+      });
+    }
+    if (typeof data?.total === "number" && offset + postings.length >= data.total) break;
+  }
+
+  return jobs;
+}
+
 export async function fetchBoardJobs(provider: AtsProvider, token: string): Promise<ScannedJob[]> {
+  if (provider === "workday") {
+    const [tenant, pod, site] = token.split("|");
+    if (!tenant || !pod || !site) throw new Error("board_bad_token");
+    return fetchWorkdayJobs(tenant, pod, site);
+  }
+
   const res = await fetchWithTimeout(boardApiUrl(provider, token), 12000);
   if (!res || !res.ok) throw new Error(`board_http_${res ? res.status : "unreachable"}`);
   const data = (await res.json().catch(() => null)) as unknown;
@@ -589,8 +834,9 @@ const DETAIL_CONCURRENCY = 5;
 /**
  * Fills in descriptions for providers whose board listing doesn't include one.
  *
- * Only SmartRecruiters needs this today: its `/postings` list returns titles and locations but no
- * body at all, so without this every SmartRecruiters posting reached tier-2 scoring with an empty
+ * SmartRecruiters' `/postings` list returns titles and locations but no body at all, and
+ * Workday's listing endpoint is the same -- both need one extra fetch per posting to get the real
+ * text. Without this, every posting from either provider reached tier-2 scoring with an empty
  * description -- judged on its title alone, and structurally unable to report a salary or
  * years-of-experience figure no matter how clearly the real posting states one.
  *
@@ -606,8 +852,12 @@ export async function fetchMissingDescriptions(
   jobs: ScannedJob[],
   budget: { remaining: number },
 ): Promise<void> {
-  if (provider !== "smartrecruiters") return;
+  if (provider !== "smartrecruiters" && provider !== "workday") return;
   const pending = jobs.filter((job) => !job.description && job.external_id).slice(0, MAX_DETAIL_FETCHES);
+
+  const [tenant, pod, site] = provider === "workday" ? token.split("|") : [];
+  if (provider === "workday" && (!tenant || !pod || !site)) return;
+  const workdayBase = `https://${tenant}.${pod}.myworkdayjobs.com/wday/cxs/${tenant}/${site}`;
 
   for (let i = 0; i < pending.length; i += DETAIL_CONCURRENCY) {
     if (budget.remaining <= 5) return;
@@ -616,6 +866,20 @@ export async function fetchMissingDescriptions(
     await Promise.all(
       batch.map(async (job) => {
         try {
+          if (provider === "workday") {
+            // job.external_id is the externalPath fetchWorkdayJobs stored (e.g. "/job/.../R-12345"),
+            // which is also the suffix the CXS detail endpoint expects appended to the same base
+            // the listing request used.
+            const res = await fetchWithTimeout(`${workdayBase}${job.external_id}`, 8000);
+            if (!res || !res.ok) return;
+            const detail = (await res.json().catch(() => null)) as {
+              jobPostingInfo?: { jobDescription?: string };
+            } | null;
+            const description = detail?.jobPostingInfo?.jobDescription;
+            if (description) job.description = joinSections([description]);
+            return;
+          }
+
           const url = `https://api.smartrecruiters.com/v1/companies/${encodeURIComponent(token)}/postings/${encodeURIComponent(job.external_id)}`;
           const res = await fetchWithTimeout(url, 8000);
           if (!res || !res.ok) return;

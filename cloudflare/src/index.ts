@@ -46,10 +46,12 @@ import {
 import {
   type AtsProvider,
   COMPANY_LIST_SCHEMA,
+  atsDisplayName,
   companyNameKey,
   fetchBoardJobs,
   fetchMissingDescriptions,
   filterJobsByRoles,
+  isReadableAtsProvider,
   locationMatches,
   parseLocationFilter,
   proposeCompanies,
@@ -1917,10 +1919,19 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
       async (proposal) => verifyWebsite(proposal.website),
       async (proposal, reachable) => {
         checked += 1;
-        if (!reachable) unreachable += 1;
+        // A proposal whose site genuinely doesn't resolve is never added at all, not added and
+        // flagged -- an out-of-business or misremembered company (verifyWebsite already treats a
+        // bot-blocking 401/403 as reachable, so this is a real dead end, not a picky WAF) clutters
+        // the list with an entry the candidate can do nothing useful with. Skipping it here means
+        // there's nothing to clean up later, either.
+        if (!reachable) {
+          unreachable += 1;
+          await emit({ type: "progress", stage: "verify", done: checked, total: fresh.length, company: proposal.name, reachable });
+          return;
+        }
         const inserted = await addCompanyRow(env, profileId, {
           ...proposal,
-          status: reachable ? "reachable" : "unreachable",
+          status: "reachable",
           source: "ai",
         });
         if (inserted) added += 1;
@@ -2078,12 +2089,32 @@ async function scanOneCompany(
         `UPDATE companies SET ats_provider = 'none', scan_note = ?, last_scanned_at = CURRENT_TIMESTAMP,
          updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       )
-        .bind("No supported job board found on their site.", company.id)
+        .bind("No careers page or supported job board found on their site.", company.id)
         .run();
       return { jobs: 0, newJobs: 0, note: "no supported board found" };
     }
     provider = resolved.provider;
     token = resolved.token;
+  }
+
+  // Some ATS platforms are recognized by their URL but publish no public API to read listings
+  // from -- ADP and iCIMS chief among them (see companies.ts's AtsProvider comment for the full
+  // list and why). Recognizing the platform is still real progress over "nothing found": the
+  // candidate gets a working link straight to the board instead of a dead end, even though this
+  // app can't auto-score postings on it. This check runs on every call, not just a fresh
+  // resolution, since a company already labeled this way from a prior scan skips resolveBoard
+  // above entirely and would otherwise fall through into fetchBoardJobs with a provider it has no
+  // case for.
+  if (!isReadableAtsProvider(provider as AtsProvider)) {
+    const boardUrl = `https://${token}`;
+    const label = atsDisplayName(provider as AtsProvider);
+    await env.DB.prepare(
+      `UPDATE companies SET ats_provider = ?, ats_token = ?, careers_url = ?, scan_note = ?,
+       last_scanned_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    )
+      .bind(provider, token, boardUrl, `Uses ${label} for hiring. View current openings directly.`, company.id)
+      .run();
+    return { jobs: 0, newJobs: 0, note: `uses ${label}, view directly` };
   }
 
   let scanned;
@@ -5613,12 +5644,20 @@ const DASHBOARD_PAGE = `<!doctype html>
       return haystack.toLowerCase().indexOf(needle.toLowerCase()) !== -1;
     }
 
+    // Mirrors companies.ts's READABLE_ATS_PROVIDERS -- the handful of platforms this app can
+    // actually read structured job listings from. Everything else companies.ts recognizes (ADP,
+    // iCIMS, and the rest) is a real find with a working link, just not one this app can auto-scan.
+    var READABLE_ATS = { greenhouse: 1, lever: 1, ashby: 1, smartrecruiters: 1, workday: 1 };
+
     // A site that didn't resolve at discovery time, or one whose board we scanned and found
     // nothing supported on, isn't going to start yielding postings on its own -- surfacing it
-    // in the main list every time is just noise. Kept in the database either way; this only
-    // controls what renders by default.
+    // in the main list every time is just noise. A detected-but-unreadable ATS (ADP, iCIMS, ...)
+    // gets the same treatment: no postings will ever appear automatically, even though the
+    // company itself was a real find. Kept in the database either way; this only controls what
+    // renders by default.
     function isUnscannable(company) {
-      return company.status === 'unreachable' || company.ats_provider === 'none';
+      return company.status === 'unreachable' || company.ats_provider === 'none' ||
+        (company.ats_provider && !READABLE_ATS[company.ats_provider]);
     }
 
     function renderCompanyRows(list, companies) {
@@ -5639,6 +5678,8 @@ const DASHBOARD_PAGE = `<!doctype html>
           titleChildren.push(el('span', { className: 'badge warn', textContent: 'site unreachable' }));
         } else if (company.ats_provider === 'none') {
           titleChildren.push(el('span', { className: 'badge warn', textContent: 'no job board found' }));
+        } else if (company.ats_provider && !READABLE_ATS[company.ats_provider]) {
+          titleChildren.push(el('span', { className: 'badge warn', textContent: 'view directly, see below' }));
         }
         if (company.status === 'dismissed') {
           titleChildren.push(el('span', { className: 'badge', textContent: 'dismissed' }));
@@ -5657,6 +5698,15 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (company.bio) body.push(el('p', { className: 'company-bio', textContent: company.bio }));
         if (company.why_fit) body.push(el('p', { className: 'company-why', textContent: company.why_fit }));
         if (company.scan_note) body.push(el('div', { className: 'row-meta', textContent: company.scan_note }));
+        // Resolved once this company was scanned -- the actual careers/board link the site
+        // publishes, not just its homepage. Most useful for a detected-but-unreadable ATS (ADP,
+        // iCIMS, ...), where this is the only way to actually see the postings, but shown whenever
+        // it's known since "click through and look yourself" is always a fair fallback.
+        if (company.careers_url) {
+          body.push(el('div', { className: 'row-meta' }, [
+            el('a', { href: company.careers_url, target: '_blank', rel: 'noopener', textContent: 'View job board ↗' }),
+          ]));
+        }
 
         var scanOne = el('button', { type: 'button', textContent: 'Scan' });
         scanOne.addEventListener('click', async function () {
@@ -5863,7 +5913,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (data.off_target) {
           parts.push(data.off_target + ' rejected as outside ' + (data.locations || 'your locations') + '.');
         }
-        if (data.unreachable) parts.push(data.unreachable + " couldn't be reached — flagged for you to check.");
+        if (data.unreachable) parts.push(data.unreachable + " couldn't be reached and " + (data.unreachable === 1 ? 'was' : 'were') + " skipped.");
         statusEl.textContent = parts.join(' ');
         statusEl.className = 'status success';
         loadCompanies();
