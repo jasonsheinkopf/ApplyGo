@@ -4654,6 +4654,35 @@ const DASHBOARD_PAGE = `<!doctype html>
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.24), inset 0 0 0 1px rgba(255, 255, 255, 0.18);
   }
   .segmented-control button:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--accent); outline-offset: -1px; }
+  /* Mobile replacement for a .segmented-control: a row of pagination dots plus the current
+     subsection's name, with horizontal swipe doing the actual navigating (see the
+     initMobileSubnav script below). Hidden by default -- the media query below is what turns
+     it on and hides the segmented control it stands in for, only on screens too narrow to fit
+     every sub-tab label on one line. */
+  .mobile-subnav { display: none; }
+  @media (max-width: 640px) {
+    /* Visually hidden rather than display:none -- the buttons still do the real navigating
+       (the dots/swipe are cosmetic, see initMobileSubnav below), so a screen reader or keyboard
+       user needs them to stay reachable even though sighted mobile users no longer see them. */
+    .segmented-control.has-mobile-subnav {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+      clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
+    .mobile-subnav {
+      display: flex; flex-direction: column; align-items: center; gap: 0.3rem; margin-bottom: 1rem;
+    }
+    .mobile-subnav-dots { display: flex; align-items: center; gap: 0.4rem; }
+    .mobile-subnav-dot {
+      width: 6px; height: 6px; border-radius: 50%; background: var(--border-strong); padding: 0;
+      transition: background 0.12s ease, transform 0.12s ease;
+    }
+    .mobile-subnav-dot.active { background: var(--accent); transform: scale(1.25); }
+    .mobile-subnav-label { font-size: 0.95rem; font-weight: 650; color: var(--text); }
+  }
+  /* Settings tab's gear icon replaces its text label but keeps the same button box, so it needs
+     to center the icon the way a short text label centers itself. */
+  nav button.tab-icon { display: inline-flex; align-items: center; justify-content: center; }
+  nav button.tab-icon svg { display: block; }
   details.disclosure {
     margin-top: 1.1rem; border-top: 1px solid var(--border); padding-top: 0.9rem;
   }
@@ -4908,11 +4937,17 @@ const DASHBOARD_PAGE = `<!doctype html>
 
   <nav id="workflow-nav">
     <button class="tab active" data-tab="roles" type="button">Roles</button>
-    <button class="tab" data-tab="resume" type="button">Resume</button>
+    <button class="tab" data-tab="resume" type="button">CV</button>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
     <button class="tab" data-tab="jindr" type="button">Jindr</button>
-    <button class="tab" data-tab="settings" type="button">Settings</button>
+    <button class="tab tab-icon" data-tab="settings" type="button" aria-label="Settings" title="Settings">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+      </svg>
+      <span class="sr-only">Settings</span>
+    </button>
   </nav>
 
   <div id="panel-roles" class="panel active">
@@ -5537,6 +5572,140 @@ const DASHBOARD_PAGE = `<!doctype html>
         document.getElementById('settings-subpanel-' + subtabButton.dataset.settingsSubtab).classList.add('active');
       });
     });
+
+    // Mobile replacement for a .segmented-control row of secondary tabs: pagination dots plus
+    // the current subsection's name, with the actual navigating done by a horizontal swipe
+    // anywhere in the page content. Desktop keeps the segmented control as-is (see the
+    // .has-mobile-subnav media query above) -- this only changes how the same buttons are
+    // reached on a screen too narrow to show every label at once.
+    //
+    // Deliberately built on top of the existing per-section click handlers rather than
+    // duplicating their logic: each subtab button already knows how to activate itself (toggle
+    // a subpanel, refetch a list, whatever), so swiping just clicks the next/previous button and
+    // lets that handler do its normal job. That also means the dots/label stay correct even when
+    // something other than a swipe changes the active button (a plain click, or code elsewhere
+    // calling .click()).
+    var mobileSwipeTargets = {};
+
+    // Pulls a button's own label text, ignoring nested elements like a live count badge
+    // ("Added <span id=...>3</span>") so the mobile label reads "Added", not "Added 3".
+    function subtabLabelText(button) {
+      var label = '';
+      button.childNodes.forEach(function (node) {
+        if (node.nodeType === Node.TEXT_NODE) label += node.textContent;
+      });
+      label = label.trim();
+      return label || button.textContent.trim();
+    }
+
+    function initMobileSubnav(container) {
+      if (!container) return null;
+      var buttons = Array.prototype.slice.call(container.children).filter(function (node) {
+        return node.tagName === 'BUTTON';
+      });
+      if (buttons.length < 2) return null;
+
+      container.classList.add('has-mobile-subnav');
+      var nav = el('div', { className: 'mobile-subnav' });
+      var dots = el('div', { className: 'mobile-subnav-dots' });
+      dots.setAttribute('role', 'tablist');
+      dots.setAttribute('aria-hidden', 'true');
+      var label = el('div', { className: 'mobile-subnav-label' });
+      label.setAttribute('aria-live', 'polite');
+      buttons.forEach(function () { dots.appendChild(el('span', { className: 'mobile-subnav-dot' })); });
+      nav.appendChild(dots);
+      nav.appendChild(label);
+      container.parentNode.insertBefore(nav, container);
+
+      function activeIndex() {
+        var idx = buttons.findIndex(function (b) { return b.classList.contains('active'); });
+        return idx === -1 ? 0 : idx;
+      }
+      function sync() {
+        var idx = activeIndex();
+        Array.prototype.forEach.call(dots.children, function (dot, i) { dot.classList.toggle('active', i === idx); });
+        label.textContent = subtabLabelText(buttons[idx]);
+      }
+      // Deferred rather than run inline: this listener is wired up before the section's own
+      // click handler that actually moves the .active class (e.g. the Companies/Jobs view
+      // handlers are registered much further down the script), so reading the active button
+      // synchronously here would always be one click stale. A zero-delay timeout runs after
+      // every click listener attached in the same tick has finished, including ones added later
+      // in the file, so the dots/label end up correct regardless of listener order.
+      buttons.forEach(function (button) { button.addEventListener('click', function () { setTimeout(sync, 0); }); });
+      sync();
+
+      return {
+        next: function () { var idx = activeIndex(); if (idx < buttons.length - 1) buttons[idx + 1].click(); },
+        prev: function () { var idx = activeIndex(); if (idx > 0) buttons[idx - 1].click(); },
+      };
+    }
+
+    [
+      ['panel-roles', document.querySelector('#panel-roles .segmented-control')],
+      ['panel-resume', document.querySelector('#panel-resume .segmented-control')],
+      ['panel-companies', document.getElementById('companies-view-tabs')],
+      ['panel-jobs', document.getElementById('jobs-view-tabs')],
+      ['panel-settings', document.querySelector('#panel-settings .segmented-control')],
+    ].forEach(function (entry) {
+      var controller = initMobileSubnav(entry[1]);
+      if (controller) mobileSwipeTargets[entry[0]] = controller;
+    });
+
+    // A touch is treated as a page-swipe candidate only when it starts outside any element that
+    // is already horizontally scrollable on its own (the primary nav, a .subtabs row, etc) --
+    // checked dynamically by scroll width rather than a hardcoded selector list, so it keeps
+    // working if more such rows are added later. Direction is locked in on the first move past a
+    // small deadzone by comparing |dx| to |dy|, so an intentional vertical scroll never gets
+    // reinterpreted as a swipe partway through.
+    (function () {
+      function isInsideHorizontalScroller(node) {
+        while (node && node !== document.body) {
+          if (node.scrollWidth > node.clientWidth + 1) {
+            var overflowX = getComputedStyle(node).overflowX;
+            if (overflowX === 'auto' || overflowX === 'scroll') return true;
+          }
+          node = node.parentElement;
+        }
+        return false;
+      }
+
+      var startX = 0, startY = 0, tracking = false, horizontal = null, controller = null;
+      var SWIPE_THRESHOLD = 50;
+      var DIRECTION_DEADZONE = 10;
+      var HORIZONTAL_RATIO = 1.5;
+
+      document.addEventListener('touchstart', function (e) {
+        tracking = false;
+        if (e.touches.length !== 1) return;
+        if (e.target.closest && (e.target.closest('input, textarea, select') || isInsideHorizontalScroller(e.target))) return;
+        var panel = document.querySelector('.panel.active');
+        controller = panel && mobileSwipeTargets[panel.id];
+        if (!controller) return;
+        startX = e.touches[0].clientX;
+        startY = e.touches[0].clientY;
+        horizontal = null;
+        tracking = true;
+      }, { passive: true });
+
+      document.addEventListener('touchmove', function (e) {
+        if (!tracking || horizontal !== null) return;
+        var dx = e.touches[0].clientX - startX;
+        var dy = e.touches[0].clientY - startY;
+        if (Math.abs(dx) > DIRECTION_DEADZONE || Math.abs(dy) > DIRECTION_DEADZONE) {
+          horizontal = Math.abs(dx) > Math.abs(dy) * HORIZONTAL_RATIO;
+        }
+      }, { passive: true });
+
+      document.addEventListener('touchend', function (e) {
+        if (!tracking) return;
+        tracking = false;
+        if (!horizontal || !controller) return;
+        var dx = e.changedTouches[0].clientX - startX;
+        if (Math.abs(dx) < SWIPE_THRESHOLD) return;
+        if (dx < 0) controller.next(); else controller.prev();
+      }, { passive: true });
+    })();
 
     // Drives the nav's edge fades (see .can-scroll-* above). Runs on scroll and on resize, plus
     // once at startup so the initial state is right before anything is touched.
