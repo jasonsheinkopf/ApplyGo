@@ -8,7 +8,7 @@
 // Langfuse (see langfuse.ts) is wired in here instead of in the D1 trace sink downstream -- every
 // call gets a Langfuse trace for free, with no per-call-site opt-in possible to forget.
 
-import { type LangfuseEnv, sendToLangfuse } from "./langfuse";
+import { type LangfuseEnv, type ManagedPrompt, sendToLangfuse } from "./langfuse.ts";
 
 export interface LlmEnv extends LangfuseEnv {
   ANTHROPIC_API_KEY?: string;
@@ -33,6 +33,9 @@ export type LlmTrace = {
   model: string;
   tier: Tier;
   prompt: string;
+  promptName: string | null;
+  promptVersion: number | null;
+  promptId: string | null;
   response: string;
   inputTokens: number;
   outputTokens: number;
@@ -131,7 +134,7 @@ async function record(env: LlmEnv, trace: Omit<LlmTrace, "langfuseTraceId">): Pr
 /** Wraps one call in timing, token accounting, and trace emission -- including on the error path. */
 async function traced<T>(
   env: LlmEnv,
-  meta: { task: string; provider: Provider; model: string; tier: Tier; prompt: string },
+  meta: Pick<LlmTrace, "task" | "provider" | "model" | "tier" | "prompt" | "promptName" | "promptVersion" | "promptId">,
   run: () => Promise<{ value: T; response: string; inputTokens: number; outputTokens: number }>,
 ): Promise<T> {
   const started = Date.now();
@@ -163,6 +166,14 @@ async function traced<T>(
   }
 }
 
+type PromptInput = string | ManagedPrompt;
+
+function promptMeta(prompt: PromptInput): Pick<LlmTrace, "prompt" | "promptName" | "promptVersion" | "promptId"> {
+  return typeof prompt === "string"
+    ? { prompt, promptName: null, promptVersion: null, promptId: null }
+    : { prompt: prompt.text, promptName: prompt.name, promptVersion: prompt.version, promptId: prompt.id };
+}
+
 type Usage = { inputTokens: number; outputTokens: number };
 
 function anthropicUsage(data: unknown): Usage {
@@ -174,33 +185,6 @@ function openaiUsage(data: unknown): Usage {
   const usage = (data as { usage?: { prompt_tokens?: number; completion_tokens?: number } })?.usage;
   return { inputTokens: Number(usage?.prompt_tokens ?? 0), outputTokens: Number(usage?.completion_tokens ?? 0) };
 }
-
-/**
- * Shared writing rules for every prompt whose output a human actually reads.
- *
- * The em dash is the single most recognizable tell that text was machine-written, and a resume or
- * cover letter that reads as AI-generated is worse than one that reads as merely plain. Ordinary
- * hyphens in real compound terms are left alone: "full-stack" and "end-to-end" are how those words
- * are spelled, and removing the hyphen would look wrong to a recruiter rather than natural.
- *
- * The banned-phrase list is not exhaustive and isn't meant to be. It names the specific tics that
- * show up most often, which is enough to push the model's register away from them generally.
- */
-export const WRITING_STYLE_RULES = `
-WRITING STYLE (applies to every word you produce):
-- NEVER use an em dash (—) or an en dash (–). Not once. Where you would reach for one, use a period
-  and start a new sentence, or a comma, or parentheses, or a colon. This is the single most common
-  giveaway that writing was machine-generated, and it must not appear.
-- Ordinary hyphens inside genuine compound terms are correct and expected: "full-stack",
-  "end-to-end", "data-driven", "cross-functional". Keep those exactly as they are normally spelled.
-- Do not use: "delve", "leverage" as a verb, "robust", "seamless", "spearheaded", "passionate about",
-  "proven track record", "tapestry", "testament to", "in today's fast-paced world", "it's worth
-  noting". These read as filler.
-- Write plainly and concretely. Prefer the specific noun over the abstract one. State things directly
-  rather than hedging with "helped to", "worked to", or "was involved in".
-- Vary sentence length, and do not open consecutive sentences with the same word or structure.
-- No exclamation marks.
-`.trim();
 
 /**
  * Which class of model to use. "screen" is the cheap, high-volume tier used for bulk yes/no
@@ -301,7 +285,7 @@ export async function callText(
   env: LlmEnv,
   provider: Provider,
   task: string,
-  prompt: string,
+  prompt: PromptInput,
   /** Bypasses the configured model entirely. Only the eval harness sets this. */
   modelOverride?: string,
 ): Promise<string> {
@@ -310,12 +294,13 @@ export async function callText(
   const model =
     modelOverride ?? (provider === "openai" ? env.OPENAI_MODEL || "gpt-4o" : env.ANTHROPIC_MODEL || "claude-sonnet-5");
 
-  return traced(env, { task, provider, model, tier: "reason", prompt }, async () => {
+  const meta = promptMeta(prompt);
+  return traced(env, { task, provider, model, tier: "reason", ...meta }, async () => {
     if (provider === "openai") {
       const res = await fetch(OPENAI_URL, {
         method: "POST",
         headers: openaiHeaders(env),
-        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }] }),
+        body: JSON.stringify({ model, messages: [{ role: "user", content: meta.prompt }] }),
       });
       if (!res.ok) throw await failure(provider, res);
       const data = (await res.json()) as { choices: { message: { content: string } }[] };
@@ -329,7 +314,7 @@ export async function callText(
       body: JSON.stringify({
         model,
         max_tokens: 1500,
-        messages: [{ role: "user", content: prompt }],
+        messages: [{ role: "user", content: meta.prompt }],
       }),
     });
     if (!res.ok) throw await failure(provider, res);
@@ -352,7 +337,7 @@ export async function callStructured<T>(
   env: LlmEnv,
   provider: Provider,
   task: string,
-  prompt: string,
+  prompt: PromptInput,
   schema: unknown,
   toolName: string,
   maxTokens = 4000,
@@ -362,7 +347,8 @@ export async function callStructured<T>(
 ): Promise<T> {
   const model = modelOverride ?? modelFor(env, provider, tier);
 
-  return traced(env, { task, provider, model, tier, prompt }, async () => {
+  const meta = promptMeta(prompt);
+  return traced(env, { task, provider, model, tier, ...meta }, async () => {
     if (provider === "openai") {
       const res = await fetch(OPENAI_URL, {
         method: "POST",
@@ -377,7 +363,7 @@ export async function callStructured<T>(
                 "Respond with a single JSON object only, no prose outside it. It must validate " +
                 `against this JSON Schema:\n${JSON.stringify(schema)}`,
             },
-            { role: "user", content: prompt },
+            { role: "user", content: meta.prompt },
           ],
         }),
       });
@@ -393,7 +379,7 @@ export async function callStructured<T>(
       body: JSON.stringify({
         model,
         max_tokens: maxTokens,
-        messages: [{ role: "user", content: prompt }],
+        messages: [{ role: "user", content: meta.prompt }],
         tools: [{ name: toolName, input_schema: schema }],
         tool_choice: { type: "tool", name: toolName },
       }),
@@ -415,7 +401,7 @@ export async function callStructuredWithImage<T>(
   env: LlmEnv,
   provider: Provider,
   task: string,
-  prompt: string,
+  prompt: PromptInput,
   jpegBase64: string,
   schema: unknown,
   toolName: string,
@@ -425,9 +411,10 @@ export async function callStructuredWithImage<T>(
   // The image itself is not stored on the trace -- a base64 screenshot would dwarf every other
   // record in the table. The prompt is noted as carrying one so the trace isn't misread as the
   // whole input.
-  const tracedPrompt = `[+ 1 JPEG screenshot, ${Math.round(jpegBase64.length / 1365)}KB]\n\n${prompt}`;
+  const meta = promptMeta(prompt);
+  const tracedPrompt = `[+ 1 JPEG screenshot, ${Math.round(jpegBase64.length / 1365)}KB]\n\n${meta.prompt}`;
 
-  return traced(env, { task, provider, model, tier: "reason", prompt: tracedPrompt }, async () => {
+  return traced(env, { task, provider, model, tier: "reason", ...meta, prompt: tracedPrompt }, async () => {
     if (provider === "openai") {
       const res = await fetch(OPENAI_URL, {
         method: "POST",
@@ -446,7 +433,7 @@ export async function callStructuredWithImage<T>(
               role: "user",
               content: [
                 { type: "image_url", image_url: { url: `data:image/jpeg;base64,${jpegBase64}` } },
-                { type: "text", text: prompt },
+                { type: "text", text: meta.prompt },
               ],
             },
           ],
@@ -469,7 +456,7 @@ export async function callStructuredWithImage<T>(
             role: "user",
             content: [
               { type: "image", source: { type: "base64", media_type: "image/jpeg", data: jpegBase64 } },
-              { type: "text", text: prompt },
+              { type: "text", text: meta.prompt },
             ],
           },
         ],

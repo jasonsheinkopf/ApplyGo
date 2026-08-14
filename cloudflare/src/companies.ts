@@ -13,7 +13,8 @@
 // resolve is marked unreachable rather than silently trusted, because a model listing plausible
 // employers will occasionally invent or misremember one.
 
-import { type LlmEnv, type Provider, WRITING_STYLE_RULES, callStructured } from "./llm";
+import { type LlmEnv, type Provider, callStructured } from "./llm";
+import { getManagedPrompt } from "./langfuse";
 
 // Every ATS this app recognizes on a careers page, whether or not it can actually read job
 // listings from it. Recognizing a platform is worth doing even without a read path: it's the
@@ -263,15 +264,7 @@ export async function proposeCompanies(
   focus: string,
   locations: string,
 ): Promise<CompanyProposal[]> {
-  const prompt = [
-    "You are helping a candidate build a target list of companies to watch for openings.",
-    `Propose ${count} companies that genuinely fit the profile and target roles below.`,
-    "",
-    // The bio and why_fit strings are rendered straight into the Companies tab, so they get the
-    // same treatment as everything else the candidate reads.
-    WRITING_STYLE_RULES,
-    "",
-    locations
+  const locationRequirement = locations
       ? [
           "LOCATION REQUIREMENT -- this is a hard constraint, not a preference:",
           `The candidate will only consider work in: ${locations}.`,
@@ -280,30 +273,19 @@ export async function proposeCompanies(
           "A company that does not qualify must be left out entirely, even if it is otherwise a",
           "perfect fit. Returning fewer companies is correct; returning out-of-area ones is not.",
           "",
-        ].join("\n")
-      : "",
-    "Rules:",
-    "- Real, currently operating companies only. If you are not confident a company still exists",
-    "  under that name, leave it out.",
-    "- Give the real primary domain. Do not guess at a URL pattern you are unsure of; an empty",
-    "  careers_url is much better than an invented one.",
-    "- Favor companies where the candidate's specific evidence would actually be competitive, not",
-    "  just famous names. A mix of sizes is more useful than ten household names.",
-    "- Vary the list: do not return near-duplicates of each other.",
-    focus ? `- The candidate specifically asked to focus on: ${focus}` : "",
-    "",
-    existingNames.length
+        ].join("\n") : "";
+  const prompt = await getManagedPrompt(env, "companies/discover", {
+    count: String(count),
+    location_requirement: locationRequirement,
+    focus_rule: focus ? `- The candidate specifically asked to focus on: ${focus}` : "",
+    existing_companies: existingNames.length
       ? `ALREADY ON THE LIST -- do not propose any of these again:\n${existingNames.join(", ")}`
       : "The list is currently empty.",
-    "",
-    desiredRoles
+    target_roles: desiredRoles
       ? `TARGET ROLES (if these state a location or work arrangement, treat it as binding):\n${desiredRoles}`
       : "TARGET ROLES: not specified; infer from the profile.",
-    "",
-    `CANDIDATE PROFILE:\n${profileJson}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+    candidate_profile: profileJson,
+  });
 
   const result = await callStructured<{ companies: CompanyProposal[] }>(
     env,
@@ -327,7 +309,7 @@ export async function proposeCompanies(
     .filter((c) => c.name && c.website);
 }
 
-async function fetchWithTimeout(url: string, ms: number, init: RequestInit = {}): Promise<Response | null> {
+export async function fetchWithTimeout(url: string, ms: number, init: RequestInit = {}): Promise<Response | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {

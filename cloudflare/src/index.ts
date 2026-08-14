@@ -5,7 +5,6 @@ import {
   type LlmTrace,
   type Provider,
   type TraceSink,
-  WRITING_STYLE_RULES,
   callStructured,
   callText,
   friendlyMessage,
@@ -20,7 +19,7 @@ import {
   listTraces,
   taskRollups,
 } from "./devconsole";
-import { langfuseConfigured, langfuseTraceUrl } from "./langfuse";
+import { getManagedPrompt, langfuseConfigured, langfuseTraceUrl } from "./langfuse";
 import {
   type ReplaySpec,
   createEvalCase,
@@ -91,6 +90,22 @@ import {
   reviewResumeDesign,
   runAllChecks,
 } from "./resume";
+import {
+  type GmailConnection,
+  type GmailMatch,
+  type GoogleOAuthClient,
+  GmailInvalidClientError,
+  GmailReconnectRequiredError,
+  GmailRedirectMismatchError,
+  exchangeGmailCode,
+  fetchGmailAddress,
+  isSearchableCompanyName,
+  readGmailConnection,
+  readGoogleOAuthClient,
+  refreshGmailAccessToken,
+  revokeGmailToken,
+  searchGmailForCompany,
+} from "./gmail";
 
 interface Env {
   DB: D1Database;
@@ -114,6 +129,9 @@ interface Env {
   LLM_TRACE?: string;
   /** Installed once per isolate by the router; see attachTraceSink. */
   LLM_TRACE_SINK?: TraceSink;
+  /** See src/gmail.ts. Unset means the Settings > Email "Connect Gmail" flow can't start. */
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
 }
 
 type Session = {
@@ -347,6 +365,18 @@ function clearSessionCookie(): string {
   return "applygo_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0";
 }
 
+// SameSite=Lax, not Strict: Google's redirect back to /gmail/callback is a top-level cross-site
+// GET, and a Strict cookie is withheld on exactly that kind of navigation, which would silently
+// break CSRF verification. A short Max-Age is enough -- this only has to survive one round trip
+// to Google's consent screen and back.
+function gmailStateCookie(token: string): string {
+  return `applygo_gmail_state=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`;
+}
+
+function clearGmailStateCookie(): string {
+  return "applygo_gmail_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0";
+}
+
 /**
  * Accepts either the dashboard's cookie or an `Authorization: Bearer` token, both hashed against
  * the same device_sessions table. The bearer path exists for the browser extension, which runs on
@@ -434,8 +464,10 @@ async function listDevices(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
   const devices = await env.DB.prepare(
     `SELECT id, device_name, created_at, last_seen_at, expires_at,
-            CASE WHEN revoked_at IS NULL THEN 0 ELSE 1 END AS revoked
-     FROM device_sessions ORDER BY created_at DESC`,
+            0 AS revoked
+     FROM device_sessions
+     WHERE revoked_at IS NULL
+     ORDER BY created_at DESC`,
   ).all();
   return json({ current_device_id: auth.id, devices: devices.results });
 }
@@ -478,7 +510,7 @@ function readDesiredRoles(preferencesJson: string): string {
   }
 }
 
-/** The score (0-100) at or above which a rated posting counts as a Good Match rather than Bad Match. */
+/** The score (0-100) at or above which a rated posting counts as Recommended. */
 function readMatchThreshold(preferencesJson: string): number {
   try {
     const value = (JSON.parse(preferencesJson || "{}") as { match_threshold?: number }).match_threshold;
@@ -882,36 +914,13 @@ async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response
   const dealbreakers = readDealbreakers(preferencesJson);
   const careAbout = readCareAbout(preferencesJson);
 
-  const prompt = [
-    "A job candidate wants two things from you: what matters to them in a search regardless of role, and which",
-    "distinct kinds of roles their background and stated interests actually support.",
-    "",
-    "SUMMARY: one short paragraph covering only things that apply no matter what role they're looking at --",
-    "location constraints, what to avoid, what to prioritize. Do not name specific job titles here.",
-    "",
-    "ROLES: each genuinely distinct role family they should be shown -- not variations on one title, but",
-    "different fields or functions entirely (for example, a former teacher now open to machine learning",
-    "engineering roles, advocacy roles, AND corporate training roles). Do not blend them into a single hybrid",
-    "role that doesn't actually exist in the job market, like 'ML advocate and trainer'. Being open to several",
-    "different paths is not the same as wanting one job that combines all of them, and a posting only has to be",
-    "a strong match for ONE entry to be worth surfacing, not all of them at once. For each entry, give a short",
-    "concrete title plus a description covering role family/titles, seniority, domain, must-have vs nice-to-have",
-    "aspects, and enough concrete keywords (actual job titles a posting would use) that a simple keyword match",
-    "could find it.",
-    "",
-    "Ground both in the candidate's actual background below, not just their notes -- a role their experience",
-    "doesn't support isn't a good entry even if a note mentions interest in it.",
-    "",
-    WRITING_STYLE_RULES,
-    "",
-    matchProfile ? `CANDIDATE BACKGROUND:\n${matchProfile}` : "",
-    notes.length ? `NOTES AND LINKS:\n${notes.map((c) => `- ${c}`).join("\n")}` : "",
-    desiredLocations ? `LOCATIONS THEY'LL WORK IN:\n${desiredLocations}` : "",
-    dealbreakers ? `DEALBREAKERS:\n${dealbreakers}` : "",
-    careAbout ? `WHAT THEY SAID THEY CARE ABOUT:\n${careAbout}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const prompt = await getManagedPrompt(env, "roles/analyze", {
+    candidate_background: matchProfile ? `CANDIDATE BACKGROUND:\n${matchProfile}` : "",
+    notes_and_links: notes.length ? `NOTES AND LINKS:\n${notes.map((c) => `- ${c}`).join("\n")}` : "",
+    locations: desiredLocations ? `LOCATIONS THEY'LL WORK IN:\n${desiredLocations}` : "",
+    dealbreakers: dealbreakers ? `DEALBREAKERS:\n${dealbreakers}` : "",
+    criteria: careAbout ? `WHAT THEY SAID THEY CARE ABOUT:\n${careAbout}` : "",
+  });
 
   let analysis: RoleAnalysis;
   try {
@@ -988,7 +997,7 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
     .bind(profileId)
     .first<{ preferences_json: string }>();
   const matchThreshold = readMatchThreshold(profileRow?.preferences_json ?? "{}");
-  return json({ jobs: jobs.results, counts: await jobPipelineCounts(env), match_threshold: matchThreshold });
+  return json({ jobs: jobs.results, counts: await jobPipelineCounts(env, matchThreshold), match_threshold: matchThreshold });
 }
 
 /** Recent user-confirmed disqualifier reasons, most recent first, deduped case-insensitively. */
@@ -1041,6 +1050,7 @@ async function assessRowsBatched(
   careAboutTopics: CareAboutTopic[],
   rows: JobRow[],
   total: number,
+  fitThreshold: number,
   emit: (event: unknown) => Promise<void>,
 ): Promise<{ assessed: number; errors: string[] }> {
   const items = toAssessable(rows);
@@ -1073,11 +1083,11 @@ async function assessRowsBatched(
       if (!results) return;
       await storeFitResults(env, results);
       assessed += results.length;
-      // Same reasoning as the screen stage's emit above: recommended/discarded are real,
-      // just-happened counts for this batch (via the same verdictForScore cutoff storeFitResults
-      // itself used), not a guess derived from done/total.
+      // These live buckets use the candidate's current Fit Threshold, exactly like the Jobs page.
+      // fit_status remains the model pipeline's legacy fixed verdict; fit_score is the source of
+      // truth for user-facing Recommended / Not Recommended categorization.
       for (const result of results) {
-        if (verdictForScore(result.score) === "reject") discarded += 1;
+        if (result.score < fitThreshold) discarded += 1;
         else recommended += 1;
       }
       await emit({
@@ -1086,7 +1096,12 @@ async function assessRowsBatched(
         phase: "resolved",
         outcomes: results.map((result) => ({
           id: result.id,
-          outcome: verdictForScore(result.score) === "reject" ? "rejected" : "recommended",
+          // Presentation metadata for the Search Sankey only. The stored verdict, score, and Jobs
+          // categorization remain unchanged; this simply lets the diagram distinguish the deep
+          // model's existing hard-reject verdict from its threshold-based score split.
+          outcome: verdictForScore(result.score) === "reject"
+            ? "failed"
+            : result.score < fitThreshold ? "rejected" : "recommended",
         })),
       });
       await emit({ type: "progress", stage: "assess", done: assessed, total, recommended, discarded });
@@ -1239,20 +1254,31 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
     const careAboutTopics = await ensureCareAboutTopics(env, provider, profileId, profileRow?.preferences_json ?? "{}");
     const assessResult = await assessRowsBatched(
       env, provider, structured, desiredRoles, disqualifiers, dealbreakers, careAboutTopics,
-      assessRows.results ?? [], assessTotal, emit,
+      assessRows.results ?? [], assessTotal, readMatchThreshold(profileRow?.preferences_json ?? "{}"), emit,
     );
     assessed = assessResult.assessed;
     errors.push(...assessResult.errors);
 
-    return { screened, screened_out: screenedOut, assessed, errors, counts: await jobPipelineCounts(env) };
+    return {
+      screened, screened_out: screenedOut, assessed, errors,
+      counts: await jobPipelineCounts(env, readMatchThreshold(profileRow?.preferences_json ?? "{}")),
+    };
   });
 }
 
 /** Row counts per pipeline stage, used for both the Jobs status line and the Data tab. */
-async function jobPipelineCounts(env: Env): Promise<Record<string, number>> {
+async function jobPipelineCounts(env: Env, threshold?: number): Promise<Record<string, number>> {
+  if (threshold === undefined) {
+    const profile = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles LIMIT 1")
+      .first<{ preferences_json: string }>();
+    threshold = readMatchThreshold(profile?.preferences_json ?? "{}");
+  }
   const rows = await env.DB.prepare(
-    "SELECT fit_status, manual_status, COUNT(*) AS n FROM job_postings GROUP BY fit_status, manual_status",
-  ).all<{ fit_status: string; manual_status: string; n: number }>();
+    `SELECT fit_status, fit_score, CASE WHEN assessed_at IS NULL THEN 0 ELSE 1 END AS completed,
+            manual_status, COUNT(*) AS n
+     FROM job_postings
+     GROUP BY fit_status, fit_score, completed, manual_status`,
+  ).all<{ fit_status: string; fit_score: number | null; completed: number; manual_status: string; n: number }>();
   const counts: Record<string, number> = {
     unassessed: 0,
     screened_in: 0,
@@ -1264,13 +1290,26 @@ async function jobPipelineCounts(env: Env): Promise<Record<string, number>> {
     applied: 0,
     manual_interested: 0,
     manual_removed: 0,
+    good_fit: 0,
+    bad_fit: 0,
+    unrated: 0,
+    ruled_out: 0,
   };
+  let total = 0;
   for (const row of rows.results ?? []) {
+    total += row.n;
     if (row.manual_status === "interested") counts.manual_interested += row.n;
     else if (row.manual_status === "removed") counts.manual_removed += row.n;
     else counts[row.fit_status] = (counts[row.fit_status] ?? 0) + row.n;
+
+    const hasCompletedScore = row.completed === 1 && Number.isFinite(row.fit_score) &&
+      (row.fit_score as number) >= 0 && (row.fit_score as number) <= 100;
+    if (!hasCompletedScore && row.fit_status === "screened_out") counts.ruled_out += row.n;
+    else if (!hasCompletedScore) counts.unrated += row.n;
+    else if ((row.fit_score as number) >= threshold) counts.good_fit += row.n;
+    else counts.bad_fit += row.n;
   }
-  counts.total = Object.values(counts).reduce((a, b) => a + b, 0);
+  counts.total = total;
   return counts;
 }
 
@@ -1448,7 +1487,7 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
 
   if (body.action === "readd") {
     // Restoring from Removed never re-derives a fit_status/fit_score -- there's nothing to
-    // recompute, they were never touched in the first place. Good/Bad Match falls out live from
+    // recompute, they were never touched in the first place. Recommended/Not Recommended falls out live from
     // the untouched fit_score once manual_status goes back to 'normal'.
     const target = job.removed_from_status === "interested" ? "interested" : "normal";
     await env.DB.prepare(
@@ -1539,45 +1578,16 @@ async function reviewJobQuestion(request: Request, env: Env, id: string): Promis
     .bind(id)
     .all<{ claim: string }>();
 
-  const prompt = [
-    "You are helping a candidate prepare to apply to a specific job. Find ONE concrete gap between",
-    "what this job asks for and what their profile currently shows evidence of, then write a single",
-    "short, conversational nudge that helps them fill that gap in their own words.",
-    "",
-    "A bare question makes people freeze on a blank page, even when they have a relevant story --",
-    "they just don't immediately connect it to the ask. So don't only ask; do some of the connecting",
-    "for them. Actually look through the candidate profile below for one or two SPECIFIC, REAL",
-    "things -- a project, a role, an employer, a tool -- that plausibly relate to the gap, name them",
-    "by name, and float them as tentative possibilities: \"maybe something like the X you did at Y?",
-    "Or was it more Z?\" Give them something concrete to react to, correct, or build on, instead of",
-    "an empty prompt. If nothing in the profile plausibly connects, it's fine to ask straight instead",
-    "of forcing a stretch.",
-    "",
-    WRITING_STYLE_RULES,
-    "",
-    "Rules:",
-    "- Only name things that actually appear in the candidate profile below. Never invent a project,",
-    "  employer, or skill that isn't there -- a confident wrong guess is worse than no guess at all.",
-    "- Ask about something the posting actually states or clearly implies, not a generic prompt.",
-    "- Phrase it the way a sharp friend prepping you for an interview would, not a form -- e.g. \"This",
-    "  role wants people-management experience -- did leading the migration team at Acme count, or",
-    "  was that more of an individual push?\"",
-    "- Two or three sentences: the question itself, plus the specific thing(s) you're floating. Still",
-    "  no preamble or throat-clearing -- go straight into it.",
-    "- If the profile already covers everything the posting asks for well, ask about whichever",
-    "  detail would most strengthen an application anyway, rather than inventing a gap.",
-    (prior.results ?? []).length
+  const prompt = await getManagedPrompt(env, "jobs/review_question", {
+    prior_answers_rule: (prior.results ?? []).length
       ? "- Don't repeat ground already covered by these previous answers for this same job:\n" +
         prior.results.map((r) => `  - ${r.claim}`).join("\n")
       : "",
-    "",
-    `JOB: ${job.title} at ${job.company}`,
-    `JOB DESCRIPTION:\n${job.raw_description.slice(0, 3000)}`,
-    "",
-    `CANDIDATE PROFILE:\n${JSON.stringify(profile.structured)}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+    job_title: job.title,
+    company: job.company,
+    job_description: job.raw_description.slice(0, 3000),
+    candidate_profile: JSON.stringify(profile.structured),
+  });
 
   try {
     const question = await callText(env, provider, "review.question", prompt);
@@ -2246,6 +2256,304 @@ async function getOrCreateProfileId(env: Env): Promise<string> {
   return id;
 }
 
+// ---------------------------------------------------------------------------
+// Gmail (read-only) -- see src/gmail.ts for the OAuth/token/search logic itself.
+//
+// Self-hosted ApplyGo has no shared Google OAuth app to fall back on, so the Client ID/Secret are
+// normally entered by the user through Settings > Email's guided setup and stored in
+// candidate_profiles.google_oauth_json -- resolveGoogleOAuthClient() below is the one place that
+// decides where they come from, DB first, GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET env vars as a
+// fallback for developers/advanced deployments (see README).
+// ---------------------------------------------------------------------------
+
+const GMAIL_OAUTH_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+
+/** Derived from the incoming request's own origin, so the same code works on localhost and
+ * production without a hardcoded domain -- Settings > Email displays this exact value (with a
+ * copy button) for the user to paste into their Google OAuth client's Authorized redirect URIs. */
+function gmailRedirectUri(request: Request): string {
+  return new URL("/gmail/callback", request.url).toString();
+}
+
+async function readGmailProfileConnection(env: Env, profileId: string): Promise<GmailConnection | null> {
+  const row = await env.DB.prepare("SELECT gmail_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ gmail_json: string }>();
+  return readGmailConnection(row?.gmail_json ?? "{}");
+}
+
+async function writeGmailProfileConnection(env: Env, profileId: string, connection: GmailConnection): Promise<void> {
+  await env.DB.prepare("UPDATE candidate_profiles SET gmail_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(JSON.stringify(connection), profileId)
+    .run();
+}
+
+async function readGoogleOAuthProfileClient(env: Env, profileId: string): Promise<GoogleOAuthClient | null> {
+  const row = await env.DB.prepare("SELECT google_oauth_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ google_oauth_json: string }>();
+  return readGoogleOAuthClient(row?.google_oauth_json ?? "{}");
+}
+
+/** DB-stored credentials (entered via Settings > Email) win over the env-var fallback, so a user
+ * who fills in the form always gets what they entered even if GOOGLE_CLIENT_ID/SECRET happen to
+ * also be set. */
+async function resolveGoogleOAuthClient(
+  env: Env,
+  profileId: string,
+): Promise<{ clientId: string; clientSecret: string } | null> {
+  const stored = await readGoogleOAuthProfileClient(env, profileId);
+  if (stored) return { clientId: stored.client_id, clientSecret: stored.client_secret };
+  if (env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET) {
+    return { clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET };
+  }
+  return null;
+}
+
+/** The Client ID is not sensitive (it's a public value visible in the browser's own address bar
+ * during the consent redirect) and is safe to echo back so Settings > Email can show what's saved;
+ * the Client Secret is never read back over the wire once saved. */
+async function saveGoogleOAuthCredentials(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { client_id?: string; client_secret?: string };
+  const clientId = (body.client_id ?? "").trim();
+  const clientSecret = (body.client_secret ?? "").trim();
+  if (!clientId || !clientSecret) return json({ error: "client_id_and_secret_required" }, 400);
+
+  const profileId = await getOrCreateProfileId(env);
+  const client: GoogleOAuthClient = { client_id: clientId, client_secret: clientSecret, saved_at: new Date().toISOString() };
+  await env.DB.prepare("UPDATE candidate_profiles SET google_oauth_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(JSON.stringify(client), profileId)
+    .run();
+  return json({ state: "ready", client_id: clientId });
+}
+
+async function startGmailConnect(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const client = await resolveGoogleOAuthClient(env, profileId);
+  // Reachable only if someone hits this URL directly with nothing configured -- the Connect button
+  // itself is hidden until Settings > Email reports state "ready" or beyond. A redirect (not a raw
+  // JSON error) keeps this consistent with every other outcome of this top-level navigation.
+  if (!client) {
+    return new Response(null, { status: 302, headers: { location: "/?gmail_error=not_configured" } });
+  }
+
+  const state = randomToken(24);
+  const params = new URLSearchParams({
+    client_id: client.clientId,
+    redirect_uri: gmailRedirectUri(request),
+    response_type: "code",
+    scope: GMAIL_OAUTH_SCOPE,
+    // offline + consent guarantee a refresh_token comes back even on a reconnect -- without
+    // prompt=consent, Google only issues one the very first time an account approves this app.
+    access_type: "offline",
+    prompt: "consent",
+    state,
+  });
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`,
+      "set-cookie": gmailStateCookie(state),
+    },
+  });
+}
+
+/**
+ * Deliberately unauthenticated, the same way exchangeEnrollment is -- Google's redirect back here
+ * cannot carry the dashboard's session cookie (it's a fresh top-level navigation from
+ * accounts.google.com), so the short-lived state cookie set by startGmailConnect is what proves
+ * this callback belongs to a connect flow this same browser actually started.
+ *
+ * Every outcome (success or failure) redirects back to `/` with a query param rather than
+ * rendering a standalone page, so Settings > Email -- not a bare error screen -- is always what
+ * the user actually sees, with friendly copy translated client-side from the short error code.
+ */
+async function handleGmailCallback(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const googleError = url.searchParams.get("error");
+  const cookieState = cookieValue(request, "applygo_gmail_state");
+  const clearCookie = clearGmailStateCookie();
+  const redirectWithError = (errorCode: string, detail?: string): Response => {
+    const params = new URLSearchParams({ gmail_error: errorCode });
+    if (detail) params.set("gmail_error_detail", detail.slice(0, 200));
+    return new Response(null, { status: 302, headers: { location: `/?${params.toString()}`, "set-cookie": clearCookie } });
+  };
+
+  // Google redirects back with ?error=... (not ?code=...) when the user declines on the consent
+  // screen, or for a handful of other consent-time problems -- access_denied is common enough
+  // (someone just changes their mind) to deserve its own friendly copy; anything else falls back
+  // to a generic "Google reported an error" with the raw code in technical details.
+  if (googleError) {
+    return redirectWithError(googleError === "access_denied" ? "access_denied" : "google_error", googleError);
+  }
+  if (!code || !state || !cookieState || state !== cookieState) {
+    return redirectWithError("invalid_request");
+  }
+
+  const profileId = await getOrCreateProfileId(env);
+  const client = await resolveGoogleOAuthClient(env, profileId);
+  if (!client) return redirectWithError("not_configured");
+
+  try {
+    const tokens = await exchangeGmailCode(client.clientId, client.clientSecret, code, gmailRedirectUri(request));
+    const emailAddress = await fetchGmailAddress(tokens.accessToken);
+    await writeGmailProfileConnection(env, profileId, {
+      email_address: emailAddress,
+      access_token: tokens.accessToken,
+      refresh_token: tokens.refreshToken,
+      token_expires_at: tokens.expiresAt,
+      connected_at: new Date().toISOString(),
+      needs_reconnect: false,
+    });
+    return new Response(null, {
+      status: 302,
+      headers: { location: "/?gmail=connected", "set-cookie": clearCookie },
+    });
+  } catch (err) {
+    if (err instanceof GmailInvalidClientError) return redirectWithError("invalid_client");
+    if (err instanceof GmailRedirectMismatchError) return redirectWithError("redirect_mismatch");
+    return redirectWithError("exchange_failed", (err as Error).message);
+  }
+}
+
+/**
+ * Passive read only -- never attempts a live token refresh, so this can never surface a Gmail
+ * problem as the bare 401 the frontend's api() helper treats as "log the whole app out." Reports
+ * one of four states Settings > Email renders directly: not_configured (no Client ID/Secret yet),
+ * ready (configured, not connected), connected, or needs_reconnect (set by checkGmailReplies the
+ * next time a refresh hits invalid_grant -- this endpoint only ever reads that flag, never
+ * triggers the refresh that would discover it).
+ */
+async function getGmailStatus(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const storedClient = await readGoogleOAuthProfileClient(env, profileId);
+  const envFallback = Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET);
+  const configured = Boolean(storedClient) || envFallback;
+  const connection = await readGmailProfileConnection(env, profileId);
+
+  let state: "not_configured" | "ready" | "connected" | "needs_reconnect";
+  if (!configured) state = "not_configured";
+  else if (!connection) state = "ready";
+  else if (connection.needs_reconnect) state = "needs_reconnect";
+  else state = "connected";
+
+  return json({
+    state,
+    redirect_uri: gmailRedirectUri(request),
+    client_id: storedClient?.client_id ?? (envFallback ? env.GOOGLE_CLIENT_ID : "") ?? "",
+    using_env_fallback: !storedClient && envFallback,
+    email_address: connection?.email_address ?? "",
+    connected_at: connection?.connected_at ?? "",
+  });
+}
+
+async function disconnectGmail(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const connection = await readGmailProfileConnection(env, profileId);
+  await env.DB.prepare("UPDATE candidate_profiles SET gmail_json = '{}', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(profileId)
+    .run();
+  if (connection?.access_token) await revokeGmailToken(connection.access_token);
+  return json({ connected: false });
+}
+
+type GmailCheckOutcome =
+  | { skipped: true }
+  | { skipped: false; matches: GmailMatch[]; error?: string };
+
+/**
+ * One pass over every applied job, run-to-completion in a single request rather than
+ * /companies/scan's multi-round budget pattern -- realistic personal-use volume (tens of applied
+ * jobs, not hundreds) comfortably fits Workers' subrequest limits in one call, and results are
+ * deliberately not persisted to D1 (they only ever live in the client's in-memory state for this
+ * session), so there's no server-side "already checked" state a resumable design would need.
+ */
+async function checkGmailReplies(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const client = await resolveGoogleOAuthClient(env, profileId);
+  if (!client) return json({ error: "google_client_not_configured" }, 500);
+  const connection = await readGmailProfileConnection(env, profileId);
+  if (!connection) return json({ error: "gmail_not_connected" }, 400);
+
+  let accessToken: string;
+  try {
+    const refreshed = await refreshGmailAccessToken(client.clientId, client.clientSecret, connection);
+    accessToken = refreshed.accessToken;
+    if (refreshed.accessToken !== connection.access_token) {
+      await writeGmailProfileConnection(env, profileId, {
+        ...connection,
+        access_token: refreshed.accessToken,
+        token_expires_at: refreshed.expiresAt,
+        needs_reconnect: false,
+      });
+    }
+  } catch (err) {
+    if (err instanceof GmailReconnectRequiredError) {
+      // Persisted, not just returned -- so the next Settings > Email load (a passive status read)
+      // already shows "needs reconnecting" without this route having to run again.
+      await writeGmailProfileConnection(env, profileId, { ...connection, needs_reconnect: true });
+      return json({ error: "gmail_reconnect_required" }, 400);
+    }
+    return json({ error: "gmail_refresh_failed", message: (err as Error).message }, 502);
+  }
+
+  const jobs = await env.DB.prepare(
+    "SELECT id, company, applied_at FROM job_postings WHERE applied_at IS NOT NULL ORDER BY applied_at DESC",
+  ).all<{ id: string; company: string; applied_at: string }>();
+  const targets = jobs.results ?? [];
+
+  return ndjsonResponse(ctx, async (emit) => {
+    const matchesByJob: Record<string, GmailMatch[]> = {};
+    const skipped: string[] = [];
+    let done = 0;
+
+    await runPooled<{ id: string; company: string; applied_at: string }, GmailCheckOutcome>(
+      targets,
+      4,
+      async (job) => {
+        const name = companyNameKey(job.company);
+        if (!isSearchableCompanyName(name)) return { skipped: true };
+        try {
+          const matches = await searchGmailForCompany(accessToken, name, new Date(job.applied_at));
+          return { skipped: false, matches };
+        } catch (err) {
+          return { skipped: false, matches: [], error: (err as Error).message };
+        }
+      },
+      async (job, outcome) => {
+        done += 1;
+        if (outcome.skipped) {
+          skipped.push(job.id);
+        } else {
+          matchesByJob[job.id] = outcome.matches;
+        }
+        await emit({
+          type: "progress",
+          done,
+          total: targets.length,
+          job_id: job.id,
+          company: job.company,
+          found: outcome.skipped ? 0 : outcome.matches.length,
+        });
+      },
+    );
+
+    return { matches: matchesByJob, skipped, checked: targets.length };
+  });
+}
+
 const DOCUMENT_TYPES = new Set([
   "application/pdf",
   "text/plain",
@@ -2585,25 +2893,17 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   if (sourceParts.length === 0) return json({ error: "no_source_material" }, 400);
 
   const existingStructured = readStructuredProfile(profile?.structured_json ?? "{}");
-  const prompt = [
-    "You are updating a job candidate's structured professional profile: education history, work experience with",
-    "highlights, skills, a headline, and a short narrative summary.",
-    existingStructured
+  const prompt = await getManagedPrompt(env, "profile/structure", {
+    baseline_rule: existingStructured
       ? "This candidate already has a profile (given below as 'Current profile'). Treat it as the baseline: " +
         "keep every education and experience entry from it that the new material below does not contradict, even " +
         "if the new material doesn't happen to repeat it. Only change a specific field, or add a new entry, when " +
         "the new material below adds information or directly conflicts with what's already there. Never silently " +
         "drop an entry just because it isn't mentioned again."
       : "Base this on the material below.",
-    "Do not invent schools, employers, dates, or accomplishments that are not present in the current profile or",
-    "the new material. Leave a field empty rather than guessing.",
-    "",
-    WRITING_STYLE_RULES,
-    "",
-    ...(existingStructured ? [`Current profile:\n${JSON.stringify(existingStructured)}`, ""] : []),
-    "New material:",
-    ...sourceParts,
-  ].join("\n\n");
+    current_profile: existingStructured ? `Current profile:\n${JSON.stringify(existingStructured)}` : "",
+    source_material: sourceParts.join("\n\n"),
+  });
 
   try {
     const raw = await callStructured<StructuredProfile>(
@@ -3095,21 +3395,12 @@ async function decideResumeBase(
   job: { title: string; company: string; raw_description: string },
   candidates: { id: string; name: string; instructions: string }[],
 ): Promise<{ base_resume_id: string; tailoring_notes: string }> {
-  const prompt = [
-    "A candidate has several existing general-purpose resume versions and wants to apply to a specific job.",
-    "Pick whichever existing version is the closest fit as a starting point, and say what -- if anything --",
-    "should change to tailor it for this specific posting. Only reordering, re-emphasizing, or trimming what's",
-    "already true is allowed; never suggest inventing anything not already in the candidate's profile.",
-    "",
-    // tailoring_notes is passed straight through as compose instructions, so it carries the same
-    // rules; otherwise the guidance itself can reintroduce the phrasing the resume rules strip.
-    WRITING_STYLE_RULES,
-    "",
-    `JOB: ${job.title} at ${job.company}`,
-    `JOB DESCRIPTION:\n${job.raw_description.slice(0, 2000)}`,
-    "",
-    `EXISTING VERSIONS:\n${JSON.stringify(candidates.map((c) => ({ id: c.id, name: c.name, instructions: c.instructions })))}`,
-  ].join("\n");
+  const prompt = await getManagedPrompt(env, "resume/select_base", {
+    job_title: job.title,
+    company: job.company,
+    job_description: job.raw_description.slice(0, 2000),
+    resume_versions: JSON.stringify(candidates.map((c) => ({ id: c.id, name: c.name, instructions: c.instructions }))),
+  });
 
   const result = await callStructured<{ base_resume_id: string; tailoring_notes: string }>(
     env,
@@ -3402,25 +3693,11 @@ async function composeCoverLetter(
   reviewAnswers: string[],
   resumeContactLine: string,
 ): Promise<string> {
-  const prompt = [
-    "Write a cover letter for this candidate applying to this specific job. Genuine and specific, not generic --",
-    "reference concrete evidence from the profile that actually matches what the posting asks for. Never invent",
-    "an employer, title, credential, or accomplishment not in the profile below.",
-    "",
-    WRITING_STYLE_RULES,
-    "",
-    "This letter goes to an employer, so the register is professional throughout: no casual phrasing, no",
-    "gushing, no rhetorical questions, and no restating the job description back at them. Confident and",
-    "direct, without overclaiming.",
-    "",
-    "Structure: a brief greeting, 3-4 short paragraphs (why this role/company, the strongest relevant evidence,",
-    "one more concrete example, a short close), and a sign-off using the candidate's name. One page's worth of",
-    "text.",
-    "",
-    `JOB: ${job.title} at ${job.company}`,
-    `JOB DESCRIPTION:\n${job.raw_description.slice(0, 3000)}`,
-    "",
-    reviewAnswers.length
+  const prompt = await getManagedPrompt(env, "cover_letter/compose", {
+    job_title: job.title,
+    company: job.company,
+    job_description: job.raw_description.slice(0, 3000),
+    review_answers: reviewAnswers.length
       ? [
           "The candidate answered follow-up questions specifically for this application, in their own words",
           "below. Treat these as real evidence available to draw on, not a requirement to use all of it and",
@@ -3432,13 +3709,10 @@ async function composeCoverLetter(
           "CANDIDATE'S OWN WORDS FOR THIS APPLICATION:",
           ...reviewAnswers.map((a) => `- ${a}`),
           "",
-        ].join("\n")
-      : "",
-    resumeContactLine ? `CONTACT LINE (for reference, do not repeat verbatim in the letter body): ${resumeContactLine}\n` : "",
-    `CANDIDATE PROFILE:\n${JSON.stringify(profile)}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+        ].join("\n") : "",
+    contact_line: resumeContactLine ? `CONTACT LINE (for reference, do not repeat verbatim in the letter body): ${resumeContactLine}\n` : "",
+    candidate_profile: JSON.stringify(profile),
+  });
 
   const result = await callStructured<{ letter_body: string }>(
     env,
@@ -3576,30 +3850,29 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
 // Application autofill: turning a live form into answers
 // ---------------------------------------------------------------------------
 
-type FormField = { name: string; label: string; type?: string; required?: boolean; options?: string[] };
+type FormField = {
+  name: string;
+  label: string;
+  type?: string;
+  required?: boolean;
+  options?: string[];
+  maxLength?: number;
+};
 
-const MATCH_SCHEMA = {
+/** One focused answer, grounded or explicitly not, for the on-demand /applications/generate-answer call. */
+const GENERATE_ANSWER_SCHEMA = {
   type: "object",
   properties: {
-    answers: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "The field's name, exactly as given." },
-          value: { type: "string", description: "The answer to type into it." },
-          answered: {
-            type: "boolean",
-            description:
-              "false if the profile does not actually establish this. Decline rather than guessing; " +
-              "a declined field is handed to the candidate to answer themselves.",
-          },
-        },
-        required: ["name", "value", "answered"],
-      },
+    answer: { type: "string", description: "The drafted answer text, ready to review and edit." },
+    grounded: {
+      type: "boolean",
+      description:
+        "true if the answer is well-supported by the candidate's actual profile/evidence/job context. " +
+        "false if this is a best-effort draft with limited support -- say so rather than hiding it, since " +
+        "the candidate reviews and edits every draft before it's used either way.",
     },
   },
-  required: ["answers"],
+  required: ["answer", "grounded"],
 } as const;
 
 /**
@@ -3610,6 +3883,57 @@ const MATCH_SCHEMA = {
  */
 const NEVER_INFER =
   /\b(sponsor\w*|visa|authoriz\w*|work permit|citizen\w*|veteran\w*|disab\w*|gender|sex|race|ethnic\w*|hispanic|latino|felon\w*|convict\w*|criminal|background check|salary|salaries|compensat\w*|expected pay|desired pay|notice period|start date|available to start|relocat\w*|security clearance|clearance)\b/i;
+
+/**
+ * Where an answer the candidate just typed should live, which is a different question from whether
+ * a model may invent it (that's NEVER_INFER above -- salary is never inferable, but once the
+ * candidate states it, it is worth remembering).
+ *
+ *   stable_fact  a fact about the person that doesn't change per employer (phone, work auth)
+ *   preference   a standing choice that holds until they change their mind (willing to relocate)
+ *   contextual   reusable but liable to go stale (salary expectation, notice period, start date)
+ *   job_specific true of exactly one application ("why do you want to work at Acme?")
+ *   one_time     an artifact of this form and meaningless elsewhere (agree-to-terms, referral source)
+ *
+ * Rule-based rather than a model call, deliberately: this runs on every answered field, the
+ * categories are stable and few, and a wrong classification quietly mis-files personal data --
+ * which is exactly the kind of decision that should be inspectable in a regex rather than
+ * re-litigated by a model each time. Anything unmatched returns `uncertain`, which the sidebar
+ * turns into an explicit "remember this?" question rather than defaulting either way.
+ */
+type AnswerCategory = "stable_fact" | "preference" | "contextual" | "job_specific" | "one_time" | "uncertain";
+type AnswerStorage = "bank" | "job" | "none" | "ask";
+
+const JOB_SPECIFIC_PATTERN =
+  /\b(why (do|are|would) you|why (this|our|us)|interest(ed)? in (this|our|the) (role|company|position|team)|what (interests|excites|draws|attracts) you|how (does|do) your (experience|background|skill)\w* (relate|apply|fit|align)|cover letter|what do you know about (us|our))\b/i;
+const ONE_TIME_PATTERN =
+  /\b(i (agree|certify|acknowledge|consent|confirm)|agree to|terms|privacy (policy|notice)|acknowledg\w*|certif\w*|consent|how did you hear|referr\w*|referred by|hear about (us|this))\b/i;
+const CONTEXTUAL_PATTERN =
+  /\b(salary|salaries|compensat\w*|expected pay|desired pay|pay range|hourly rate|notice period|start date|available to start|availability|earliest.*(start|available))\b/i;
+const PREFERENCE_PATTERN =
+  /\b(willing to relocat\w*|open to relocat\w*|relocat\w*|travel|remote|hybrid|on-?site|in-?office|work arrangement|work preference|shift|weekend|overtime)\b/i;
+const STABLE_FACT_PATTERN =
+  /\b(sponsor\w*|visa|authoriz\w*|work permit|citizen\w*|veteran\w*|disab\w*|gender|sex|race|ethnic\w*|hispanic|latino|felon\w*|convict\w*|criminal|background check|security clearance|clearance|phone|mobile|telephone|e-?mail|linkedin|github|portfolio|website|address|city|state|country|zip|postal|pronoun|first name|last name|full name)\b/i;
+
+function classifyAnswer(question: string): { category: AnswerCategory; storage: AnswerStorage; explain: string } {
+  const q = String(question ?? "");
+  if (JOB_SPECIFIC_PATTERN.test(q)) {
+    return { category: "job_specific", storage: "job", explain: "That one's specific to this application, so I'll keep it with this job rather than reuse it elsewhere." };
+  }
+  if (ONE_TIME_PATTERN.test(q)) {
+    return { category: "one_time", storage: "none", explain: "That's particular to this form, so there's nothing worth saving." };
+  }
+  if (CONTEXTUAL_PATTERN.test(q)) {
+    return { category: "contextual", storage: "bank", explain: "I'll remember that, though it's the kind of thing worth revisiting later." };
+  }
+  if (PREFERENCE_PATTERN.test(q)) {
+    return { category: "preference", storage: "bank", explain: "I'll remember that preference for future applications." };
+  }
+  if (STABLE_FACT_PATTERN.test(q)) {
+    return { category: "stable_fact", storage: "bank", explain: "I'll remember that for future applications." };
+  }
+  return { category: "uncertain", storage: "ask", explain: "Want me to remember this for future applications?" };
+}
 
 /**
  * The identity fields every form starts with. StructuredProfile has no name/email/phone of its own
@@ -3658,12 +3982,14 @@ async function matchApplication(request: Request, env: Env): Promise<Response> {
   const body = (await request.json().catch(() => ({}))) as {
     job_id?: string;
     fields?: FormField[];
-    provider?: string;
   };
   const fields = (body.fields ?? []).filter((f) => f && f.name);
   if (!fields.length) return json({ error: "fields_required" }, 400);
 
-  const provider = normalizeProvider(body.provider);
+  // No model call happens in this endpoint any more -- narrative fields are left for the candidate
+  // to fill or explicitly draft via POST /applications/generate-answer, which takes its own
+  // provider. This one only ever does lookups (bank, job-scoped answers, deterministic contact
+  // facts), so there's no provider to choose here.
   const profile = await loadProfileForResume(env);
   if (profile instanceof Response) return profile;
 
@@ -3693,86 +4019,75 @@ async function matchApplication(request: Request, env: Env): Promise<Response> {
     .all<{ question_key: string; question_text: string; answer: string }>();
   const bank = new Map((bankRows.results ?? []).map((r) => [r.question_key, r.answer]));
 
-  const answers: { name: string; value: string; source: string }[] = [];
+  // Answers given for *this* job outrank the shared bank: "why this company" has one right answer
+  // per company, and the shared bank should never be holding one in the first place.
+  const jobBankRows = body.job_id
+    ? await env.DB.prepare(
+        "SELECT question_key, answer FROM job_application_answers WHERE profile_id = ? AND job_id = ?",
+      )
+        .bind(profileId, body.job_id)
+        .all<{ question_key: string; answer: string }>()
+    : null;
+  const jobBank = new Map((jobBankRows?.results ?? []).map((r) => [r.question_key, r.answer]));
+
+  const answers: { name: string; value: string; source: string; confidence: string }[] = [];
   const unresolved: FormField[] = [];
 
+  // Resolution order, cheapest and most authoritative first. Everything above the model tier is a
+  // plain lookup -- no call is ever spent deciding something already known (see the agent's
+  // deterministic-by-default contract in extension/agent.js).
   for (const field of fields) {
     const label = (field.label || field.name).trim();
-    const hit = bank.get(questionKey(label));
+    const key = questionKey(label);
+    const jobHit = jobBank.get(key);
+    if (jobHit) {
+      answers.push({ name: field.name, value: jobHit, source: "job_answer", confidence: "high" });
+      continue;
+    }
+    const hit = bank.get(key);
     if (hit) {
-      answers.push({ name: field.name, value: hit, source: "bank" });
+      answers.push({ name: field.name, value: hit, source: "bank", confidence: "high" });
       continue;
     }
     const deterministic = deterministicAnswer(label, contact);
     if (deterministic) {
-      answers.push({ name: field.name, value: deterministic, source: "profile" });
+      answers.push({ name: field.name, value: deterministic, source: "profile", confidence: "high" });
       continue;
     }
     unresolved.push(field);
   }
 
-  // Sensitive fields are never sent to the model. If the bank did not already answer one, the
-  // candidate answers it, full stop.
-  const askable = unresolved.filter((f) => !NEVER_INFER.test(f.label || f.name));
-  const sensitive = unresolved.filter((f) => NEVER_INFER.test(f.label || f.name));
-  const missing: FormField[] = [...sensitive];
+  // Free-text/textarea are the only types worth offering a draft for -- generating a fabricated
+  // date or a plausible-looking number is exactly the invention this app refuses to do elsewhere,
+  // so a date/number/select/radio field only ever gets a real value: the employer's own options,
+  // or the candidate's own typing. See extension/sidebar.js for how each reason renders.
+  const GENERATABLE_TYPES = new Set(["text", "textarea"]);
+  const toMissing = (f: FormField, reason: string) => {
+    const sensitive = reason === "sensitive";
+    const classification = sensitive ? null : classifyAnswer(f.label || f.name);
+    return {
+      name: f.name,
+      label: f.label,
+      type: f.type ?? "text",
+      options: f.options ?? [],
+      required: Boolean(f.required),
+      max_length: f.maxLength ?? null,
+      reason,
+      category: classification?.category ?? null,
+      // Never for a sensitive field, and never for a fixed-choice/date/number field -- generation
+      // only makes sense where there's nothing to invent but prose, and prose the candidate reads
+      // and edits before anything reaches the employer's page.
+      can_generate: !sensitive && GENERATABLE_TYPES.has(f.type ?? "text"),
+    };
+  };
 
-  if (askable.length && !providerKeyMissing(env, provider)) {
-    const jobRow = body.job_id
-      ? await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
-          .bind(body.job_id)
-          .first<{ title: string; company: string; raw_description: string }>()
-      : null;
-    const reviewClaims = body.job_id ? await loadJobReviewClaims(env, body.job_id) : [];
-
-    const prompt = [
-      "Fill in this job application form on the candidate's behalf, using only what their profile",
-      "below actually establishes.",
-      "",
-      WRITING_STYLE_RULES,
-      "",
-      "Set answered=false for any field the profile does not genuinely support. A declined field is",
-      "handed back to the candidate to answer themselves, which is the correct outcome. Never guess,",
-      "never approximate, and never invent an employer, title, date, credential, or number. For a",
-      "field offering fixed options, the value must be exactly one of them.",
-      "",
-      jobRow ? `JOB: ${jobRow.title} at ${jobRow.company}` : "",
-      jobRow ? `JOB DESCRIPTION:\n${jobRow.raw_description.slice(0, 2000)}` : "",
-      reviewClaims.length ? `CONTEXT THE CANDIDATE GAVE FOR THIS APPLICATION:\n${reviewClaims.map((c) => `- ${c}`).join("\n")}` : "",
-      "",
-      `CANDIDATE PROFILE:\n${JSON.stringify(profile.structured)}`,
-      "",
-      `FIELDS:\n${JSON.stringify(askable.map((f) => ({ name: f.name, label: f.label, type: f.type, options: f.options })))}`,
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-    try {
-      const result = await callStructured<{ answers: { name: string; value: string; answered: boolean }[] }>(
-        env,
-        provider,
-        "application.answers",
-        prompt,
-        MATCH_SCHEMA,
-        "submit_application_answers",
-        3000,
-      );
-      const byName = new Map((result.answers ?? []).map((a) => [a.name, a]));
-      for (const field of askable) {
-        const got = byName.get(field.name);
-        if (got && got.answered && (got.value ?? "").trim()) {
-          answers.push({ name: field.name, value: got.value.trim(), source: "generated" });
-        } else {
-          missing.push(field);
-        }
-      }
-    } catch {
-      // A failed model call must not silently drop fields; they all become the candidate's to fill.
-      missing.push(...askable);
-    }
-  } else {
-    missing.push(...askable);
-  }
+  // Nothing here calls a model. Sensitive fields never reach the model at all (NEVER_INFER,
+  // enforced again server-side in /applications/generate-answer as a second gate); every other
+  // unresolved field -- narrative or not -- is left for the candidate to fill, choose, or
+  // explicitly draft with Generate. Auto-filling a narrative answer without being asked is exactly
+  // the behavior this endpoint used to have and no longer does: see the "Generate -> review/edit ->
+  // Fill or Save" flow in extension/agent.js, which replaces the old silent best-effort autofill.
+  const missing = unresolved.map((f) => toMissing(f, NEVER_INFER.test(f.label || f.name) ? "sensitive" : "open"));
 
   const letter = body.job_id
     ? await env.DB.prepare("SELECT content_html FROM cover_letters WHERE job_id = ?")
@@ -3780,12 +4095,264 @@ async function matchApplication(request: Request, env: Env): Promise<Response> {
         .first<{ content_html: string }>()
     : null;
 
+  const jobMeta = body.job_id
+    ? await env.DB.prepare("SELECT title, company FROM job_postings WHERE id = ?")
+        .bind(body.job_id)
+        .first<{ title: string; company: string }>()
+    : null;
+
   return json({
     answers,
-    missing: missing.map((f) => ({ name: f.name, label: f.label, type: f.type ?? "text", options: f.options ?? [] })),
+    missing,
     resume_url: resumeRow ? `/resumes/${resumeRow.id}/file` : null,
     cover_letter_text: letter ? stripHtmlToText(letter.content_html) : null,
+    job: jobMeta ? { id: body.job_id, title: jobMeta.title, company: jobMeta.company } : null,
+    // So the sidebar can say "I don't have a tailored resume for this job yet" and point back at
+    // the main app rather than silently attaching nothing (see extension/sidebar.js).
+    assets: { resume: Boolean(resumeRow), cover_letter: Boolean(letter) },
   });
+}
+
+/**
+ * One focused draft for one open-ended field, on demand -- see the "Generate -> review/edit ->
+ * Fill or Save" flow in extension/agent.js/sidebar.js. Deliberately not a batch pass: a narrative
+ * answer is only ever drafted when the candidate asks for this specific field, and the draft lands
+ * in the sidebar's input for them to read and edit, never straight into the employer's form.
+ *
+ * The prompt itself lives in Langfuse (`applications/generate_answer`), not here -- see "Prompt
+ * Management" in the README for how to create/update it. Every runtime value the model gets is
+ * passed as a template variable rather than folded into a hardcoded string, so the instructions can
+ * be revised without a deploy.
+ */
+async function generateApplicationAnswer(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    job_id?: string;
+    provider?: string;
+    field?: { name?: string; label?: string; type?: string; max_length?: number | null };
+  };
+  const label = (body.field?.label ?? "").trim();
+  if (!label) return json({ error: "field_label_required" }, 400);
+  // Re-checked here rather than trusted from the client -- the sidebar's own gating (hiding
+  // Generate for a sensitive question) is the UI half of this rule; this is the actual safeguard.
+  if (NEVER_INFER.test(label)) return json({ error: "field_not_generatable" }, 400);
+
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const profile = await loadProfileForResume(env);
+  if (profile instanceof Response) return profile;
+
+  const jobRow = body.job_id
+    ? await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
+        .bind(body.job_id)
+        .first<{ title: string; company: string; raw_description: string }>()
+    : null;
+  const reviewClaims = body.job_id ? await loadJobReviewClaims(env, body.job_id) : [];
+
+  // Existing saved answers -- global and job-scoped -- can carry real context a generic profile
+  // read wouldn't (an already-stated salary range, an already-answered "why this kind of role").
+  const bankRows = await env.DB.prepare(
+    "SELECT question_text, answer FROM application_answers WHERE profile_id = ?",
+  )
+    .bind(profile.profileId)
+    .all<{ question_text: string; answer: string }>();
+  const jobBankRows = body.job_id
+    ? await env.DB.prepare(
+        "SELECT question_text, answer FROM job_application_answers WHERE profile_id = ? AND job_id = ?",
+      )
+        .bind(profile.profileId, body.job_id)
+        .all<{ question_text: string; answer: string }>()
+    : null;
+  const savedAnswers = [...(bankRows.results ?? []), ...(jobBankRows?.results ?? [])];
+
+  // Fetching the managed prompt is folded into the same try/catch as the model call itself: a
+  // missing/unpromoted Langfuse prompt is exactly as much "generation didn't work this time" as a
+  // provider outage, and neither should ever escape as a raw exception with a stack trace attached.
+  try {
+    const prompt = await getManagedPrompt(env, "applications/generate_answer", {
+      question: label,
+      field_type: body.field?.type || "text",
+      max_length: body.field?.max_length ? String(body.field.max_length) : "",
+      job: jobRow ? `${jobRow.title} at ${jobRow.company}` : "",
+      company: jobRow?.company ?? "",
+      job_description: jobRow ? jobRow.raw_description.slice(0, 2000) : "",
+      candidate_profile: JSON.stringify(profile.structured),
+      review_context: reviewClaims.length ? reviewClaims.map((c) => `- ${c}`).join("\n") : "",
+      saved_answers: savedAnswers.length
+        ? savedAnswers.map((a) => `- ${a.question_text}: ${a.answer}`).join("\n")
+        : "",
+    });
+    const result = await callStructured<{ answer: string; grounded: boolean }>(
+      env,
+      provider,
+      "application.generate_answer",
+      prompt,
+      GENERATE_ANSWER_SCHEMA,
+      "submit_drafted_answer",
+      1200,
+    );
+    return json({ answer: (result.answer ?? "").trim(), grounded: Boolean(result.grounded) });
+  } catch (err) {
+    return json({ error: "generation_failed", message: (err as Error).message }, 502);
+  }
+}
+
+/**
+ * The candidate's explicit answer to a field the agent couldn't resolve, kept for reuse -- the
+ * backend half of Save (see extension/agent.js for the Fill/Save split: Fill never calls this,
+ * since using an answer once and remembering it are now two distinct actions rather than one call
+ * with a `remember` flag).
+ *
+ * Three jobs, in order: notice when this contradicts something already stored, decide where (or
+ * whether) the answer belongs, and write it. The contradiction check comes first and is not
+ * silently resolved -- an explicit `confirm_overwrite` is required before a durable stored answer
+ * changes, so the current application always uses what the candidate just said while the saved
+ * record only moves when they mean it to. Save is itself the candidate's explicit "remember this"
+ * signal, so an otherwise-ambiguous classification resolves to the bank here rather than asking a
+ * second time -- the sidebar only offers Save once the candidate has already chosen to keep it.
+ */
+async function saveApplicationAgentAnswer(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    question?: string;
+    answer?: string;
+    answer_type?: string;
+    job_id?: string;
+    confirm_overwrite?: boolean;
+  };
+  const question = (body.question ?? "").trim();
+  const answer = (body.answer ?? "").trim();
+  if (!question || !answer) return json({ error: "question_and_answer_required" }, 400);
+  const key = questionKey(question);
+  if (!key) return json({ error: "question_not_recognizable" }, 400);
+
+  const profileId = await getOrCreateProfileId(env);
+  const classification = classifyAnswer(question);
+  const answerType = (body.answer_type ?? "text").trim() || "text";
+  const storage: AnswerStorage = classification.storage === "ask" ? "bank" : classification.storage;
+
+  if (storage === "none") {
+    return json({ stored: false, storage, category: classification.category, message: classification.explain });
+  }
+
+  const existing =
+    storage === "bank"
+      ? await env.DB.prepare("SELECT answer FROM application_answers WHERE profile_id = ? AND question_key = ?")
+          .bind(profileId, key)
+          .first<{ answer: string }>()
+      : null;
+
+  if (
+    storage === "bank" &&
+    existing &&
+    existing.answer.trim().toLowerCase() !== answer.toLowerCase() &&
+    body.confirm_overwrite !== true
+  ) {
+    return json({
+      stored: false,
+      conflict: { existing_answer: existing.answer, new_answer: answer },
+      category: classification.category,
+      message: "That's different from the answer I had saved. Should I update the saved one?",
+    });
+  }
+
+  if (storage === "job" && !body.job_id) {
+    return json({
+      stored: false,
+      storage,
+      category: classification.category,
+      message: "I can't tell which application this belongs to, so there's nothing to save it against.",
+    });
+  }
+
+  if (storage === "bank") {
+    await env.DB.prepare(
+      `INSERT INTO application_answers (id, profile_id, question_key, question_text, answer, answer_type, category)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(profile_id, question_key) DO UPDATE SET
+         question_text = excluded.question_text,
+         answer = excluded.answer,
+         answer_type = excluded.answer_type,
+         category = excluded.category,
+         updated_at = CURRENT_TIMESTAMP`,
+    )
+      .bind(crypto.randomUUID(), profileId, key, question, answer, answerType, classification.category)
+      .run();
+  } else {
+    await env.DB.prepare(
+      `INSERT INTO job_application_answers (id, profile_id, job_id, question_key, question_text, answer, answer_type)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(profile_id, job_id, question_key) DO UPDATE SET
+         question_text = excluded.question_text,
+         answer = excluded.answer,
+         answer_type = excluded.answer_type,
+         updated_at = CURRENT_TIMESTAMP`,
+    )
+      .bind(crypto.randomUUID(), profileId, body.job_id, key, question, answer, answerType)
+      .run();
+  }
+
+  let message: string;
+  if (storage === "job") {
+    const job = await env.DB.prepare("SELECT company FROM job_postings WHERE id = ?")
+      .bind(body.job_id)
+      .first<{ company: string }>();
+    message = job?.company
+      ? `Filled and saved for future ${job.company} applications.`
+      : "Filled and saved for future applications to this job.";
+  } else if (classification.category === "contextual") {
+    message = "Filled and saved. You can update this later if it changes.";
+  } else {
+    message = "Filled and saved for future applications.";
+  }
+
+  return json({ stored: true, storage, category: classification.category, message });
+}
+
+/**
+ * The agent's decision log (see migration 0022). Batched because a single autofill pass produces
+ * one event per field and a request each would be absurd.
+ *
+ * Values are dropped for anything NEVER_INFER matches: knowing that a work-authorization question
+ * was asked and answered by the candidate is the useful signal for debugging and later evaluation;
+ * storing the answer itself a second time, outside the answer bank, is not.
+ */
+async function recordAgentEvents(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    job_id?: string;
+    application_url?: string;
+    events?: { type?: string; field?: string; detail?: Record<string, unknown> }[];
+  };
+  const events = (body.events ?? []).slice(0, 200);
+  if (!events.length) return json({ recorded: 0 });
+
+  const profileId = await getOrCreateProfileId(env);
+  const url = (body.application_url ?? "").slice(0, 500);
+  const statements = events.map((event) => {
+    const field = String(event.field ?? "").slice(0, 200);
+    const detail = { ...(event.detail ?? {}) };
+    if (NEVER_INFER.test(field) || NEVER_INFER.test(String(detail.label ?? ""))) delete detail.value;
+    return env.DB.prepare(
+      `INSERT INTO application_agent_events (id, profile_id, job_id, application_url, event_type, field_name, detail_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      crypto.randomUUID(),
+      profileId,
+      body.job_id ?? null,
+      url,
+      String(event.type ?? "unknown").slice(0, 60),
+      field,
+      JSON.stringify(detail).slice(0, 4000),
+    );
+  });
+  await env.DB.batch(statements);
+  return json({ recorded: statements.length });
 }
 
 /** The stored cover letter is HTML; a form textarea needs the plain text back out of it. */
@@ -4105,6 +4672,20 @@ const DASHBOARD_PAGE = `<!doctype html>
   .row-item { padding: 0.7rem 0; border-top: 1px solid var(--border); }
   .row-item:first-child { border-top: none; padding-top: 0.15rem; }
   .row-item:last-child { padding-bottom: 0.15rem; }
+  .interested-card {
+    margin: 0 0 0.65rem; padding: 0.8rem 0.9rem; border: 1px solid var(--border);
+    border-radius: var(--radius-sm); background: var(--surface); cursor: pointer;
+    transition: border-color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
+  }
+  .interested-card:first-child { padding-top: 0.8rem; border-top: 1px solid var(--border); }
+  .interested-card:last-child { padding-bottom: 0.8rem; }
+  .interested-card:hover { border-color: var(--border-strong); background: var(--surface-2); }
+  .interested-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .interested-card.is-expanded { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+  .interested-inline-tools { margin-top: 0.85rem; cursor: default; }
+  .interested-inline-tools > #interested-detail-section {
+    margin: 0; padding: 1rem; background: var(--surface-2); box-shadow: none;
+  }
   .row-title { font-weight: 600; font-size: 0.95rem; }
   a.row-title { color: inherit; text-decoration: none; }
   a.row-title:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 0.15em; }
@@ -4165,6 +4746,11 @@ const DASHBOARD_PAGE = `<!doctype html>
   .checks .error .mark { color: var(--error); }
   .checks .warning .mark { color: #b8860b; }
   .checks .ok .mark { color: var(--success); }
+  .gmail-steps { margin: 0.75rem 0; padding-left: 1.25rem; display: grid; gap: 0.5rem; font-size: 0.9rem; line-height: 1.5; }
+  code {
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 0.85em;
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 0.3rem; padding: 0.05rem 0.3rem;
+  }
   .critique {
     font-size: 0.9rem; border-left: 3px solid var(--accent); padding: 0.5rem 0.75rem;
     background: var(--surface-2, rgba(127,127,127,0.08)); border-radius: 0 0.4rem 0.4rem 0;
@@ -4207,7 +4793,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     background: var(--surface); border: 1px solid var(--error); color: var(--error);
   }
   .jindr-actions button.danger:hover:not(:disabled) { background: var(--error-soft); opacity: 1; }
-  /* Compact green action -- Good/Bad Fit's "Interested" and Removed's "Re-add" -- same quiet,
+  /* Compact green action -- Recommended/Not Recommended's "Interested" and Removed's "Re-add" -- same quiet,
      colors-on-hover convention as .danger, just green instead of red. */
   .row-actions button.success:hover:not(:disabled) { color: var(--success); border-color: var(--success); }
   .summary-line {
@@ -4324,10 +4910,8 @@ const DASHBOARD_PAGE = `<!doctype html>
     <button class="tab active" data-tab="roles" type="button">Roles</button>
     <button class="tab" data-tab="resume" type="button">Resume</button>
     <button class="tab" data-tab="companies" type="button">Companies</button>
-    <button class="tab" data-tab="search" type="button">Search</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
     <button class="tab" data-tab="jindr" type="button">Jindr</button>
-    <button class="tab" data-tab="applied" type="button">Applied</button>
     <button class="tab" data-tab="settings" type="button">Settings</button>
   </nav>
 
@@ -4509,7 +5093,7 @@ const DASHBOARD_PAGE = `<!doctype html>
 
   <div id="panel-companies" class="panel">
     <div class="segmented-control" id="companies-view-tabs" role="group" aria-label="Company sections">
-      <button class="active" data-companies-view="find" type="button" aria-pressed="true">Find</button>
+      <button class="active" data-companies-view="find" type="button" aria-pressed="true">Search</button>
       <button data-companies-view="added" type="button" aria-pressed="false">Added <span id="companies-added-count"></span></button>
       <button data-companies-view="unscannable" type="button" aria-pressed="false">Unscannable <span id="companies-unscannable-count"></span></button>
       <button data-companies-view="removed" type="button" aria-pressed="false">Removed <span id="companies-removed-count"></span></button>
@@ -4564,7 +5148,17 @@ const DASHBOARD_PAGE = `<!doctype html>
     </section>
   </div>
 
-  <div id="panel-search" class="panel">
+  <div id="panel-jobs" class="panel">
+    <div class="segmented-control" id="jobs-view-tabs" role="group" aria-label="Job sections">
+      <button class="active" data-jobs-view="search" type="button" aria-pressed="true">Search</button>
+      <button data-jobs-view="good_match" type="button" aria-pressed="false">Good Fit <span id="jobs-good_match-count"></span></button>
+      <button data-jobs-view="bad_match" type="button" aria-pressed="false">Bad Fit <span id="jobs-bad_match-count"></span></button>
+      <button data-jobs-view="removed" type="button" aria-pressed="false">Removed <span id="jobs-removed-count"></span></button>
+      <button data-jobs-view="fit_fail" type="button" aria-pressed="false">Fit Fail <span id="jobs-fit_fail-count"></span></button>
+      <button data-jobs-view="interested" type="button" aria-pressed="false">Interested <span id="jobs-interested-count"></span></button>
+      <button data-jobs-view="applied" type="button" aria-pressed="false">Applied <span id="jobs-applied-count"></span></button>
+    </div>
+
     <section id="jobs-find-section">
       <h2>Find jobs</h2>
       <p class="hint">Reads every company's job board, then screens and scores whatever's new against your profile — start to finish in one click. Boards are cheap to read, so every company is re-read on every click regardless of when it was last scanned.</p>
@@ -4573,14 +5167,14 @@ const DASHBOARD_PAGE = `<!doctype html>
         <svg id="pf-svg" preserveAspectRatio="xMidYMid meet"></svg>
         <div class="pf-legend">
           <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--accent)"></span>Processing</span>
-          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--warning)"></span>Waiting</span>
-          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--error)"></span>Ruled out / removed</span>
-          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--success)"></span>Recommended / interested</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--warning)"></span>Pass / waiting</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--error)"></span>Fail / Bad Fit</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--success)"></span>Good Fit</span>
         </div>
         <div class="pf-progress-track"><div class="pf-progress-fill" id="pfProgressFill"></div></div>
         <div class="pf-stat-row">
           <span>Scanned: <b id="pfStatScanned">0</b></span>
-          <span>Recommended: <b id="pfStatRecommended">0</b></span>
+          <span>Good Fit: <b id="pfStatRecommended">0</b></span>
           <span>Screen accept rate: <b id="pfStatScreenRate">—</b></span>
           <span>Fully processed: <b id="pfStatProcessed">0%</b></span>
         </div>
@@ -4597,17 +5191,9 @@ const DASHBOARD_PAGE = `<!doctype html>
       </div>
       <p id="jobs-find-status" class="status" role="status" aria-live="polite"></p>
     </section>
-  </div>
 
-  <div id="panel-jobs" class="panel">
-    <section id="jobs-section">
+    <section id="jobs-section" style="display:none">
       <h2>Job postings</h2>
-      <div class="segmented-control" id="jobs-view-tabs" role="group" aria-label="Job status">
-        <button class="active" data-jobs-view="good_match" type="button" aria-pressed="true">Good Fit <span id="jobs-good_match-count"></span></button>
-        <button data-jobs-view="bad_match" type="button" aria-pressed="false">Bad Fit <span id="jobs-bad_match-count"></span></button>
-        <button data-jobs-view="interested" type="button" aria-pressed="false">Interested <span id="jobs-interested-count"></span></button>
-        <button data-jobs-view="removed" type="button" aria-pressed="false">Removed <span id="jobs-removed-count"></span></button>
-      </div>
       <label for="jobs-filter">Filter</label>
       <input id="jobs-filter" placeholder="Search by title, company, or location">
       <div class="controls">
@@ -4640,7 +5226,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           </select>
         </div>
         <div>
-          <label for="jobs-match-threshold">Match threshold ≥</label>
+          <label for="jobs-match-threshold">Fit Threshold ≥</label>
           <input id="jobs-match-threshold" type="number" min="0" max="100" step="1" value="70">
         </div>
       </div>
@@ -4648,19 +5234,18 @@ const DASHBOARD_PAGE = `<!doctype html>
 
       <div id="jobs-list"><p class="empty">Loading…</p></div>
 
-      <!-- Interested subtab: the old top-level Interested tab's list + detail workspace, shown
-           only when the Interested segment is active (see jobs-view click handler). -->
+      <!-- Interested subtab: cards expand the shared job tools inline; nothing renders in a
+           separate selected-job area below the list. -->
       <div id="jobs-interested-section" style="display:none">
         <section id="interested-list-section">
-          <p class="hint">Jobs you've marked "Interested". Click one to open its workspace — the posting link, an assistant that asks what your profile is still missing for it, a resume tailored to this posting, and a matching cover letter.</p>
+          <p class="hint">Jobs you've marked "Interested". Click anywhere on a card except its posting link or buttons to expand Ask, Resume, Cover Letter, and Apply tools inline.</p>
           <div id="interested-list"><p class="empty">Loading…</p></div>
         </section>
 
+        <!-- The existing job tools are a single reusable panel. JavaScript moves it into the
+             expanded card, then parks it here invisibly when the accordion is closed. -->
+        <div id="interested-detail-home" style="display:none">
         <section id="interested-detail-section" style="display:none">
-          <h2 id="interested-detail-title"></h2>
-          <p id="interested-detail-meta" class="row-meta"></p>
-          <p id="interested-detail-reason" class="job-reason"></p>
-          <a id="interested-detail-link" class="row-title" target="_blank" rel="noopener">Open posting</a>
 
           <!-- Assistant/Resume/Cover letter/Apply are sub-tabs, not stacked sections -- only one shows
                at a time, the same way the top-level dashboard tabs work, so opening one doesn't leave
@@ -4668,7 +5253,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           <div class="subtabs">
             <button id="interested-subtab-assistant" type="button">Ask</button>
             <button id="interested-subtab-resume" class="secondary" type="button">Resume</button>
-            <button id="interested-subtab-cover" class="secondary" type="button">Cover</button>
+            <button id="interested-subtab-cover" class="secondary" type="button">Cover Letter</button>
             <button id="interested-subtab-apply" class="secondary" type="button">Apply</button>
           </div>
 
@@ -4708,12 +5293,13 @@ const DASHBOARD_PAGE = `<!doctype html>
           </div>
 
           <div id="interested-apply-panel" style="display:none">
-            <p class="hint">What's ready for this application. Autofill arrives with the browser extension; for now, open the posting, use the resume and cover letter above, then mark it applied to move it to the Applied tab.</p>
+            <p class="hint">What's ready for this application. Press <strong>Apply</strong> on the card above to open the employer's page — with the ApplyGo extension installed, the in-page assistant picks it up from there and fills what it can. Mark it applied here once you've submitted.</p>
             <div id="interested-apply-readiness"></div>
             <p id="interested-apply-status" class="status" role="status" aria-live="polite"></p>
             <button id="interested-apply-mark" type="button">Mark as applied</button>
           </div>
         </section>
+        </div>
       </div>
 
       <details class="disclosure">
@@ -4731,6 +5317,18 @@ const DASHBOARD_PAGE = `<!doctype html>
         </form>
         <p id="job-status" class="status" role="status" aria-live="polite"></p>
       </details>
+    </section>
+
+    <section id="applied-section" style="display:none">
+      <h2>Applied</h2>
+      <p class="hint">Jobs you've applied to, most recent first. Everything generated for each one stays available.</p>
+      <p id="applied-summary" class="summary-line"></p>
+      <div class="controls">
+        <button id="gmail-check-replies-button" type="button" style="display:none">Check for replies</button>
+      </div>
+      <p id="gmail-not-connected-hint" class="hint" style="display:none">Connect Gmail in Settings &rarr; Email to check for replies here.</p>
+      <p id="gmail-check-status" class="status" role="status" aria-live="polite"></p>
+      <div id="applied-list"><p class="empty">Loading…</p></div>
     </section>
   </div>
 
@@ -4759,18 +5357,10 @@ const DASHBOARD_PAGE = `<!doctype html>
     </section>
   </div>
 
-  <div id="panel-applied" class="panel">
-    <section id="applied-section">
-      <h2>Applied</h2>
-      <p class="hint">Jobs you've applied to, most recent first. Everything generated for each one stays available.</p>
-      <p id="applied-summary" class="summary-line"></p>
-      <div id="applied-list"><p class="empty">Loading…</p></div>
-    </section>
-  </div>
-
   <div id="panel-settings" class="panel">
     <div class="segmented-control" role="group" aria-label="Settings sections">
       <button class="active" data-settings-subtab="devices" type="button" aria-pressed="true">Devices</button>
+      <button data-settings-subtab="email" type="button" aria-pressed="false">Email</button>
       <button data-settings-subtab="data" type="button" aria-pressed="false">Data</button>
     </div>
 
@@ -4778,6 +5368,82 @@ const DASHBOARD_PAGE = `<!doctype html>
       <section id="devices-section">
         <h2>Devices</h2>
         <div id="devices-list"><p class="empty">Loading…</p></div>
+      </section>
+    </div>
+
+    <div id="settings-subpanel-email" class="subpanel">
+      <section id="gmail-section">
+        <h2>Email</h2>
+        <p class="hint">Connect Gmail to let ApplyGo check your inbox for replies related to jobs you've applied to.</p>
+        <p class="hint"><strong>ApplyGo only requests read-only Gmail access. It cannot send, edit, or delete your email.</strong></p>
+
+        <div id="gmail-status-card"><p class="empty">Loading…</p></div>
+        <p id="gmail-flow-message" class="status" role="status" aria-live="polite"></p>
+        <details id="gmail-error-details" style="display:none">
+          <summary>Technical details</summary>
+          <p id="gmail-error-technical" class="job-reason"></p>
+        </details>
+
+        <details id="gmail-setup-details">
+          <summary id="gmail-setup-summary">Set up Gmail</summary>
+          <p class="hint">Google requires you to create your own OAuth credentials so ApplyGo can ask permission to read your Gmail. This usually only needs to be done once for this ApplyGo installation.</p>
+
+          <div class="row-item">
+            <div class="row">
+              <div>
+                <div class="row-title">Authorized redirect URI</div>
+                <div class="row-meta" id="gmail-redirect-uri">Loading…</div>
+              </div>
+              <button id="gmail-copy-redirect" class="secondary" type="button">Copy</button>
+            </div>
+          </div>
+          <p class="hint">Copy this exact URL into Google's "Authorized redirect URIs" field -- see step 9 below.</p>
+
+          <details>
+            <summary>How do I get these?</summary>
+            <ol class="gmail-steps">
+              <li>Open <a href="https://console.cloud.google.com/" target="_blank" rel="noopener">Google Cloud Console</a>.</li>
+              <li>Create a new Google Cloud project, or select an existing one dedicated to ApplyGo.</li>
+              <li>Using the search bar at the top, find and enable the <strong>Gmail API</strong>.</li>
+              <li>Open <strong>APIs &amp; Services &rarr; OAuth consent screen</strong>.</li>
+              <li>Choose <strong>External</strong> as the audience, and fill in the required app name and your email address.</li>
+              <li>Under <strong>Audience &rarr; Test users</strong>, add your own Google account -- required while the app is in Testing status.</li>
+              <li>Under <strong>Data access</strong>, add the scope ApplyGo needs: <code>https://www.googleapis.com/auth/gmail.readonly</code>.</li>
+              <li>Go to <strong>APIs &amp; Services &rarr; Credentials &rarr; Create Credentials &rarr; OAuth client ID</strong>, and choose <strong>Web application</strong> as the type.</li>
+              <li>Under <strong>Authorized redirect URIs</strong>, click Add URI and paste the exact address shown above.</li>
+              <li>Click Create. Google will show a <strong>Client ID</strong> and <strong>Client Secret</strong> -- copy both.</li>
+              <li>Paste them into the fields below and click <strong>Save credentials</strong>.</li>
+              <li>Come back here and click <strong>Connect Gmail</strong>.</li>
+            </ol>
+          </details>
+
+          <form id="gmail-credentials-form">
+            <label for="gmail-client-id">Google Client ID</label>
+            <input id="gmail-client-id" type="text" placeholder="1234567890-abc123.apps.googleusercontent.com" autocomplete="off">
+            <label for="gmail-client-secret">Google Client Secret</label>
+            <div class="controls">
+              <div style="flex:1">
+                <input id="gmail-client-secret" type="password" placeholder="GOCSPX-…" autocomplete="off" style="width:100%">
+              </div>
+              <button id="gmail-toggle-secret" class="secondary" type="button">Show</button>
+            </div>
+            <button type="submit">Save credentials</button>
+          </form>
+          <p id="gmail-credentials-status" class="status" role="status" aria-live="polite"></p>
+        </details>
+
+        <div id="gmail-connect-section" style="display:none">
+          <div class="row-item">
+            <div class="row-title">What ApplyGo can do</div>
+            <p class="row-meta">✓ Search your Gmail inbox<br>✓ Read message metadata/content necessary to identify potential application replies</p>
+          </div>
+          <div class="row-item">
+            <div class="row-title">What ApplyGo cannot do</div>
+            <p class="row-meta">✕ Send email<br>✕ Reply to email<br>✕ Edit messages<br>✕ Delete messages</p>
+          </div>
+          <p class="hint"><strong>Using Google's Testing mode?</strong> Google may require you to reconnect Gmail periodically -- typically after seven days. If that happens, ApplyGo will show "Reconnect Gmail." Your ApplyGo data is unaffected.</p>
+          <button id="gmail-connect-button" type="button">Connect Gmail</button>
+        </div>
       </section>
     </div>
 
@@ -5596,6 +6262,43 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     var allCompanies = [];
     var allJobs = [];
+    // Populated by a "Check for replies" run (see the gmail-check-replies-button handler) -- held
+    // only in memory for this page load, never persisted, keyed by job id.
+    var gmailReplyMatches = {};
+    var gmailReplySkipped = {};
+    var liveJobsRefreshTimer = null;
+    var liveJobsRefreshInFlight = false;
+    var liveJobsRefreshAgain = false;
+
+    // Search and Jobs share the database as their source of truth. Coalesce bursts of pipeline
+    // events into small authoritative /jobs refreshes so rows and counts advance batch-by-batch
+    // without resetting the Search diagram's transient in-flight animation state.
+    function queueLiveJobsRefresh() {
+      clearTimeout(liveJobsRefreshTimer);
+      liveJobsRefreshTimer = setTimeout(async function refreshLiveJobs() {
+        if (liveJobsRefreshInFlight) {
+          liveJobsRefreshAgain = true;
+          return;
+        }
+        liveJobsRefreshInFlight = true;
+        try {
+          await loadJobs(false);
+          // Reconcile the Search Sankey from the newly persisted rows too. This keeps its two
+          // visually distinct Fail populations authoritative between streaming batches without
+          // resetting the rest of the running Search UI.
+          syncPipelineFitCountsFromJobs();
+        } catch (err) {
+          // The main Search request remains authoritative and will do a final full refresh. A
+          // transient side-refresh failure should not abort paid screening work already in flight.
+        } finally {
+          liveJobsRefreshInFlight = false;
+          if (liveJobsRefreshAgain) {
+            liveJobsRefreshAgain = false;
+            queueLiveJobsRefresh();
+          }
+        }
+      }, 80);
+    }
 
     function matchesFilter(haystack, needle) {
       if (!needle) return true;
@@ -5715,7 +6418,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       if (!visible.length) {
         list.appendChild(el('p', {
           className: 'empty',
-          textContent: !allCompanies.length ? 'No companies yet — use the Find tab to add some.'
+          textContent: !allCompanies.length ? 'No companies yet — use the Search tab to add some.'
             : (matching.length ? 'No companies in this category.' : 'No companies match that filter.'),
         }));
         return;
@@ -5888,32 +6591,43 @@ const DASHBOARD_PAGE = `<!doctype html>
       strong: { text: 'Strong match', cls: 'strong' },
       possible: { text: 'Possible match', cls: 'possible' },
       reject: { text: 'Not a fit', cls: 'warn' },
-      screened_out: { text: 'Screened out', cls: 'warn' },
+      screened_out: { text: 'AI Ruled Out', cls: 'warn' },
       screened_in: { text: 'Awaiting review', cls: 'queued' },
       unassessed: { text: 'Not filtered yet', cls: 'queued' },
       interested: { text: 'Interested', cls: 'strong' },
       applied: { text: 'Applied', cls: 'strong' },
     };
     // Jindr still queues directly off the AI pipeline's own fit_status buckets -- it only ever
-    // shows already-rated, not-yet-decided postings, independent of the Jobs page's five subtabs.
+    // shows already-rated, not-yet-decided postings, independent of the Jobs page's six subtabs.
     var QUEUED_STATUSES = { unassessed: true, screened_in: true };
     var RULED_OUT_STATUSES = { reject: true, screened_out: true };
 
     var matchThreshold = 70;
-    var jobsView = 'good_match';
+    var jobsView = 'search';
 
-    // Good Fit/Bad Fit/Interested/Removed. manual_status wins over everything else -- a rated
-    // posting only falls into Good or Bad Fit once it's *not* been manually moved. A posting with
-    // no fit_score yet (unassessed/screened_out/screened_in) counts as Bad Fit too -- the pipeline
-    // always ends by either screening a posting out or scoring it, so there's no separate "not
-    // rated yet" bucket to show. fit_score/fit_status are never written by a manual action, so this
-    // is always safe to recompute live, including after the threshold changes or a job is Re-added.
+    function hasCompletedFitScore(job) {
+      var score = Number(job.fit_score);
+      return Boolean(job.assessed_at) && job.fit_score !== null && job.fit_score !== undefined &&
+        Number.isFinite(score) && score >= 0 && score <= 100;
+    }
+
+    // The underlying AI category remains independent from later manual actions. Search analytics
+    // use this even after a job moves to Interested or Removed, and Re-add can reveal it again
+    // without rerunning AI. Changing the threshold only re-partitions saved scores.
+    function pipelineJobCategory(job) {
+      if (hasCompletedFitScore(job) && job.fit_status === 'reject') return 'fit_fail';
+      if (!hasCompletedFitScore(job) && job.fit_status === 'screened_out') return 'screen_fail';
+      if (!hasCompletedFitScore(job)) return 'unrated';
+      return Number(job.fit_score) >= matchThreshold ? 'good_match' : 'bad_match';
+    }
+
+    // On the Jobs page, an explicit human choice wins tab membership. The saved score and AI
+    // pipeline state remain untouched underneath this view-level category.
     function jobCategory(job) {
+      if (job.applied_at) return 'applied';
       if (job.manual_status === 'interested') return 'interested';
       if (job.manual_status === 'removed') return 'removed';
-      return job.fit_score !== null && job.fit_score !== undefined && job.fit_score >= matchThreshold
-        ? 'good_match'
-        : 'bad_match';
+      return pipelineJobCategory(job);
     }
 
     async function submitJobFit(jobId, action, reason, reload) {
@@ -6086,14 +6800,16 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     document.querySelector('[data-tab="jindr"]').addEventListener('click', jindrBuildQueue);
 
-    // Shared title/badge/meta/facts/reason/missing block for Good/Bad/Unrated/Removed cards.
-    // "Unrated" always wins over the pipeline's own sub-state label (unassessed/screened_in/
-    // screened_out) -- the candidate only ever needs to know it hasn't got a match % yet.
+    // Shared title/badge/meta/facts/reason/missing block for Recommended, Not Recommended, Unrated,
+    // AI Ruled Out, and manually removed cards.
+    // A quick-screen rejection gets an explicit AI Ruled Out badge; other postings without a
+    // completed score remain Unrated.
     function buildJobCardBody(job) {
       var fitInfo = FIT_LABELS[job.fit_status] || FIT_LABELS.unassessed;
-      var hasScore = job.fit_score !== null && job.fit_score !== undefined;
-      var badgeText = hasScore ? job.fit_score + '% match' : 'Unrated';
-      var badgeCls = hasScore ? fitInfo.cls : 'queued';
+      var hasScore = hasCompletedFitScore(job);
+      var isRuledOut = !hasScore && job.fit_status === 'screened_out';
+      var badgeText = hasScore ? job.fit_score + '% match' : (isRuledOut ? 'AI Ruled Out' : 'Unrated');
+      var badgeCls = hasScore ? fitInfo.cls : (isRuledOut ? 'warn' : 'queued');
       var missing = [];
       try { missing = JSON.parse(job.fit_missing_json || '[]'); } catch (e) { missing = []; }
       var fitDetail = {};
@@ -6124,12 +6840,11 @@ const DASHBOARD_PAGE = `<!doctype html>
       return body;
     }
 
-    // Good Fit/Bad Fit: compact, immediate, no-confirmation actions to the right of the card --
+    // Recommended/Not Recommended: compact, immediate, no-confirmation actions to the right of the card --
     // Interested (green) then Remove (red). Neither touches fit_score/fit_status; see setJobFit.
     function renderMatchCards(list, jobs) {
       jobs.forEach(function (job) {
         var body = buildJobCardBody(job);
-
         var interested = el('button', { className: 'success', type: 'button', textContent: 'Interested' });
         interested.addEventListener('click', function () { submitJobFit(job.id, 'interested'); });
         var remove = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
@@ -6221,8 +6936,8 @@ const DASHBOARD_PAGE = `<!doctype html>
     // cheap screen before ever reaching the scoring tier) is never excluded by a score threshold
     // -- there's nothing to compare, and this filter isn't what's gating those groups anyway.
     function withinScore(job, minScore) {
-      if (!minScore || job.fit_score === null || job.fit_score === undefined) return true;
-      return job.fit_score >= minScore;
+      if (!minScore || !hasCompletedFitScore(job)) return true;
+      return Number(job.fit_score) >= minScore;
     }
 
     // A posting missing whatever field this sort is on (never processed, no known post date)
@@ -6247,7 +6962,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       };
     }
 
-    var JOB_VIEWS = ['good_match', 'bad_match', 'interested', 'removed'];
+    var JOB_COUNT_VIEWS = ['good_match', 'bad_match', 'removed', 'fit_fail', 'interested', 'applied'];
 
     function renderJobs() {
       var needle = document.getElementById('jobs-filter').value.trim();
@@ -6255,8 +6970,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       var minScore = Number(document.getElementById('jobs-min-score').value) || 0;
       var list = document.getElementById('jobs-list');
 
-      // Shared across all five subtabs, same as Companies' text filter -- changing the search box
-      // filters within whichever subtab is currently active rather than needing five separate
+      // Shared across all six result subtabs, same as Companies' text filter -- changing the
+      // filter controls applies within whichever result subtab is currently active.
       // filter implementations.
       var filtered = allJobs.filter(function (job) {
         return matchesFilter([job.title, job.company, job.location].join(' '), needle)
@@ -6266,22 +6981,41 @@ const DASHBOARD_PAGE = `<!doctype html>
 
       // Counts reflect the full, unfiltered set -- same convention Companies' segmented-control
       // counts use -- so the badges don't shift just because the search box has something in it.
-      var counts = { good_match: 0, bad_match: 0, interested: 0, removed: 0 };
+      var counts = {
+        good_match: 0, bad_match: 0, removed: 0, fit_fail: 0, interested: 0, applied: 0,
+        // These remain real pipeline states, but the simplified Jobs tabs intentionally omit them.
+        unrated: 0, screen_fail: 0,
+      };
       allJobs.forEach(function (job) {
         var category = jobCategory(job);
-        if (category === 'interested' && job.applied_at) return; // applied jobs live on the Applied tab, not here
         counts[category] += 1;
       });
-      JOB_VIEWS.forEach(function (view) {
+      JOB_COUNT_VIEWS.forEach(function (view) {
         document.getElementById('jobs-' + view + '-count').textContent = '(' + counts[view] + ')';
       });
 
+      var showingSearch = jobsView === 'search';
       var showingInterested = jobsView === 'interested';
+      var showingApplied = jobsView === 'applied';
+      document.getElementById('jobs-find-section').style.display = showingSearch ? 'block' : 'none';
+      document.getElementById('jobs-section').style.display = showingSearch || showingApplied ? 'none' : 'block';
+      document.getElementById('applied-section').style.display = showingApplied ? 'block' : 'none';
       document.getElementById('jobs-interested-section').style.display = showingInterested ? 'block' : 'none';
-      list.style.display = showingInterested ? 'none' : 'block';
+      document.getElementById('interested-list-section').style.display = 'block';
+      list.style.display = showingSearch || showingInterested || showingApplied ? 'none' : 'block';
+
+      if (showingSearch) {
+        pfWake();
+        return;
+      }
 
       if (showingInterested) {
         renderInterestedList(filtered);
+        return;
+      }
+
+      if (showingApplied) {
+        renderAppliedList();
         return;
       }
 
@@ -6302,7 +7036,10 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
 
       if (jobsView === 'removed') renderRemovedCards(list, bucket);
-      else renderMatchCards(list, bucket);
+      else bucket.forEach(function (job) {
+        if (job.manual_status === 'removed') renderRemovedCards(list, [job]);
+        else renderMatchCards(list, [job]);
+      });
     }
 
     document.getElementById('jobs-filter').addEventListener('input', renderJobs);
@@ -6333,6 +7070,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       value = Math.min(Math.max(Math.round(value), 0), 100);
       matchThreshold = value;
       renderJobs();
+      syncPipelineFitCountsFromJobs();
 
       clearTimeout(jobsMatchThresholdSaveTimer);
       jobsMatchThresholdSaveTimer = setTimeout(function () {
@@ -6381,6 +7119,7 @@ const DASHBOARD_PAGE = `<!doctype html>
             // New listings land as unassessed the moment they're inserted -- grow the pipeline
             // diagram live as each company's board read completes, not only once scanning is done.
             pfBumpScanned(event.new_jobs);
+            if (event.new_jobs) queueLiveJobsRefresh();
           });
           totalCompaniesScanned += scanData.scanned;
           totalNewListings += scanData.new_listings;
@@ -6407,6 +7146,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           data = await readNdjson(res, function (event) {
             if (event.type === 'pipeline') {
               pfApplyPipelineEvent(event);
+              if (event.stage === 'assess' && event.phase === 'resolved') queueLiveJobsRefresh();
               return;
             }
             if (event.stage === 'assess') roundRecommended = event.recommended || 0;
@@ -6454,9 +7194,8 @@ const DASHBOARD_PAGE = `<!doctype html>
     // A live liquid pipeline. Waiting work is always upstream of the gate that will process it;
     // only completed decisions flow downstream. Backend pipeline events remove real postings from
     // queue reservoirs at dispatch and release them from gates when their real batch resolves.
-    // Not-interested/Interested/Applied aren't shown -- this page is about finding matches, not
-    // the human review funnel after it; Interested/Applied postings are folded into "Recommended"
-    // here since that's still what they were found as.
+    // Human actions aren't shown -- this diagram ends with the AI pipeline's Fit outcomes. Manual
+    // state never changes which path a posting took through the screening and fit stages.
     //
     // setPfCounts() is the single entry point, same idea as a real-events-call-decideNext design:
     // it's called with the authoritative shape jobPipelineCounts() returns (every full /jobs load
@@ -6464,22 +7203,20 @@ const DASHBOARD_PAGE = `<!doctype html>
     // run is actively in flight, via pfBumpScanned() and pfApplyPipelineEvent() below. No
     // probability or random weighting is used: dispatch and outcome events come from real work.
     var PF_NODES = [
-      { id: 'screen_gate', label: 'Pre-screen', stage: 0, kind: 'gate' },
-      { id: 'screen_rejected', label: 'Screened out', stage: 1, kind: 'reject' },
-      { id: 'review_queue', label: 'Awaiting review', stage: 1, kind: 'queue' },
-      { id: 'fit_gate', label: 'AI Review', stage: 2, kind: 'gate' },
-      { id: 'fit_rejected', label: 'Ruled out', stage: 3, kind: 'reject' },
-      { id: 'fit_recommended', label: 'Recommended', stage: 3, kind: 'success' },
-      { id: 'human_interested', label: 'Interested', stage: 4, kind: 'success' },
-      { id: 'human_removed', label: 'Removed', stage: 4, kind: 'reject' },
+      { id: 'screen_gate', label: 'Pre-Screen', stage: 0, kind: 'gate' },
+      { id: 'screen_rejected', label: 'Fail', stage: 1, kind: 'reject' },
+      { id: 'review_queue', label: 'Pass', stage: 1, kind: 'queue' },
+      // Fit Fail is the deep assessment's existing hard-reject verdict. Good and Bad are the
+      // remaining completed scores split by the user's current Fit Threshold.
+      { id: 'fit_failed', label: 'Fail', stage: 2, kind: 'reject' },
+      { id: 'fit_recommended', label: 'Good', stage: 2, kind: 'success' },
+      { id: 'fit_rejected', label: 'Bad', stage: 2, kind: 'reject' },
     ];
     var PF_BRANCHES = {
       screen_gate: ['screen_rejected', 'review_queue'],
-      review_queue: ['fit_gate'],
-      fit_gate: ['fit_rejected', 'fit_recommended'],
-      fit_recommended: ['human_interested', 'human_removed'],
+      review_queue: ['fit_failed', 'fit_recommended', 'fit_rejected'],
     };
-    var PF_STAGE_TITLES = ['Screening', 'Screen result', 'AI Review', 'Fit', 'Human input'];
+    var PF_STAGE_TITLES = ['Pre-Screen', 'Screen', 'Fit'];
     var PF_KIND_COLOR = { queue: 'var(--warning)', gate: 'var(--accent)', reject: 'var(--error)', success: 'var(--success)' };
 
     var PF_VB_W = 1320, PF_VB_H = 340;
@@ -6490,7 +7227,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     var PF_ROW_GAP = 26; // generous on purpose: each node's 2-line label needs real clearance from its neighbors, not just its own (possibly tiny) bar height
     var PF_SOURCE_HEIGHT = 200;
     var PF_COL_MARGIN = 66;
-    var PF_COL_STEP = 285;
+    var PF_COL_STEP = 550;
     var PF_SMOOTH_RATE = 6;
 
     var pfNodeMap = {};
@@ -6523,6 +7260,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     var pfNodeCounts = {};
     var pfScreenWaiting = 0;
     var pfScreenProcessing = 0;
+    var pfFitProcessing = 0;
     var pfLastCountsPayload = null;
     var pfAnimating = false;
     var pfLastFrame = 0;
@@ -6533,8 +7271,45 @@ const DASHBOARD_PAGE = `<!doctype html>
       return pfNodeCounts[nodeId] || 0;
     }
     function pfTargetHeight(n) {
-      if (n.kind === 'gate' && n.id !== 'screen_gate') return Math.max(34, Math.min(82, 34 + pfDerivedTotal(n.id) * 2));
       return Math.max(PF_MIN_H, (pfDerivedTotal(n.id) / Math.max(1, pfSourceTotal)) * PF_SOURCE_HEIGHT);
+    }
+
+    // Sankey-only interpretation of the existing rows. This deliberately does not call
+    // jobCategory(): manual Interested/Removed choices and the Jobs tabs must not rewrite the AI
+    // path. Likewise, Fit Fail uses the already-stored deep-model reject verdict, while the two
+    // other completed-fit buckets use the adjustable threshold over their existing saved scores.
+    function pfBucketsFromJobs(counts) {
+      var buckets = {
+        unassessed: 0,
+        screenFailed: 0,
+        screenPassed: 0,
+        fitFailed: 0,
+        recommended: 0,
+        notRecommended: 0,
+      };
+      if (!allJobs.length && (counts.total || 0) > 0) {
+        buckets.unassessed = counts.unassessed || 0;
+        buckets.screenFailed = counts.screened_out || counts.ruled_out || 0;
+        buckets.screenPassed = counts.screened_in || 0;
+        buckets.fitFailed = counts.reject || 0;
+        buckets.recommended = counts.good_fit || 0;
+        buckets.notRecommended = Math.max(0, (counts.bad_fit || 0) - buckets.fitFailed);
+        return buckets;
+      }
+      allJobs.forEach(function (job) {
+        if (hasCompletedFitScore(job)) {
+          if (job.fit_status === 'reject') buckets.fitFailed += 1;
+          else if (Number(job.fit_score) >= matchThreshold) buckets.recommended += 1;
+          else buckets.notRecommended += 1;
+        } else if (job.fit_status === 'screened_out') {
+          buckets.screenFailed += 1;
+        } else if (job.fit_status === 'screened_in') {
+          buckets.screenPassed += 1;
+        } else {
+          buckets.unassessed += 1;
+        }
+      });
+      return buckets;
     }
 
     // The one entry point that actually moves the diagram, and the one place bursts get decided:
@@ -6547,33 +7322,24 @@ const DASHBOARD_PAGE = `<!doctype html>
       var isFirstLoad = pfLastCountsPayload === null;
 
       pfLastCountsPayload = counts;
-      var unassessed = counts.unassessed || 0;
-      var screenedOut = counts.screened_out || 0;
-      var screenedIn = counts.screened_in || 0;
-      var reject = counts.reject || 0;
-      var recommended = (counts.strong || 0) + (counts.possible || 0) + (counts.interested || 0) + (counts.applied || 0);
-      var humanInterested = counts.manual_interested || 0;
-      var humanRemoved = counts.manual_removed || 0;
-      var allRecommended = recommended + humanInterested + humanRemoved;
-      var screenAccepted = screenedIn + reject + allRecommended;
-      pfSourceTotal = unassessed + screenedOut + screenedIn + reject + allRecommended;
-      pfScreenWaiting = unassessed;
+      var buckets = pfBucketsFromJobs(counts);
+      var screenAccepted = buckets.screenPassed + buckets.fitFailed + buckets.recommended + buckets.notRecommended;
+      pfSourceTotal = counts.total || allJobs.length ||
+        (buckets.unassessed + buckets.screenFailed + screenAccepted);
+      pfScreenWaiting = buckets.unassessed;
       pfScreenProcessing = 0;
-      pfNodeCounts.screen_gate = unassessed;
-      pfNodeCounts.screen_rejected = screenedOut;
-      pfNodeCounts.review_queue = screenedIn;
-      pfNodeCounts.fit_gate = 0;
-      pfNodeCounts.fit_rejected = reject;
-      pfNodeCounts.fit_recommended = recommended;
-      pfNodeCounts.human_interested = humanInterested;
-      pfNodeCounts.human_removed = humanRemoved;
-      pfEdges['screen_gate->screen_rejected'].committed = screenedOut;
-      pfEdges['screen_gate->review_queue'].committed = screenedIn + reject + allRecommended;
-      pfEdges['review_queue->fit_gate'].committed = screenedIn;
-      pfEdges['fit_gate->fit_rejected'].committed = reject;
-      pfEdges['fit_gate->fit_recommended'].committed = allRecommended;
-      pfEdges['fit_recommended->human_interested'].committed = humanInterested;
-      pfEdges['fit_recommended->human_removed'].committed = humanRemoved;
+      pfFitProcessing = 0;
+      pfNodeCounts.screen_gate = buckets.unassessed;
+      pfNodeCounts.screen_rejected = buckets.screenFailed;
+      pfNodeCounts.review_queue = buckets.screenPassed;
+      pfNodeCounts.fit_failed = buckets.fitFailed;
+      pfNodeCounts.fit_rejected = buckets.notRecommended;
+      pfNodeCounts.fit_recommended = buckets.recommended;
+      pfEdges['screen_gate->screen_rejected'].committed = buckets.screenFailed;
+      pfEdges['screen_gate->review_queue'].committed = screenAccepted;
+      pfEdges['review_queue->fit_failed'].committed = buckets.fitFailed;
+      pfEdges['review_queue->fit_rejected'].committed = buckets.notRecommended;
+      pfEdges['review_queue->fit_recommended'].committed = buckets.recommended;
 
       // Reservoirs mirror the currently retained volume at each destination. On first load there
       // is no historical trip to replay, so begin full. Later decreases reconcile immediately;
@@ -6590,15 +7356,16 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
 
       document.getElementById('jobs-pipeline-summary').textContent =
-        allRecommended + ' match' + (allRecommended === 1 ? '' : 'es') +
-        ', ' + (unassessed + screenedIn) + ' waiting to be filtered' +
-        ', ' + screenedOut + ' dropped in screening' +
-        ', ' + reject + ' ruled out.';
+        buckets.screenFailed + ' failed pre-screen' +
+        ', ' + buckets.screenPassed + ' passed and awaiting fit' +
+        ', ' + buckets.fitFailed + ' failed fit' +
+        ', ' + buckets.recommended + ' good fit' +
+        ', ' + buckets.notRecommended + ' bad fit.';
       document.getElementById('pfStatScanned').textContent = String(pfSourceTotal);
-      document.getElementById('pfStatRecommended').textContent = String(allRecommended);
-      var totalScreened = screenedOut + screenAccepted;
+      document.getElementById('pfStatRecommended').textContent = String(buckets.recommended);
+      var totalScreened = buckets.screenFailed + screenAccepted;
       document.getElementById('pfStatScreenRate').textContent = totalScreened ? Math.round(100 * screenAccepted / totalScreened) + '%' : '—';
-      var processed = pfSourceTotal ? Math.round(100 * (pfSourceTotal - unassessed - screenedIn) / pfSourceTotal) : 0;
+      var processed = pfSourceTotal ? Math.round(100 * (buckets.screenFailed + buckets.fitFailed + buckets.recommended + buckets.notRecommended) / pfSourceTotal) : 0;
       document.getElementById('pfStatProcessed').textContent = processed + '%';
       document.getElementById('pfProgressFill').style.width = processed + '%';
 
@@ -6610,14 +7377,11 @@ const DASHBOARD_PAGE = `<!doctype html>
     function pfSyncLiveEdges() {
       pfEdges['screen_gate->screen_rejected'].committed = pfNodeCounts.screen_rejected || 0;
       pfEdges['screen_gate->review_queue'].committed = (pfNodeCounts.review_queue || 0) +
-        (pfNodeCounts.fit_gate || 0) + (pfNodeCounts.fit_rejected || 0) + (pfNodeCounts.fit_recommended || 0) +
-        (pfNodeCounts.human_interested || 0) + (pfNodeCounts.human_removed || 0);
-      pfEdges['review_queue->fit_gate'].committed = pfNodeCounts.review_queue || 0;
-      pfEdges['fit_gate->fit_rejected'].committed = pfNodeCounts.fit_rejected || 0;
-      pfEdges['fit_gate->fit_recommended'].committed = (pfNodeCounts.fit_recommended || 0) +
-        (pfNodeCounts.human_interested || 0) + (pfNodeCounts.human_removed || 0);
-      pfEdges['fit_recommended->human_interested'].committed = pfNodeCounts.human_interested || 0;
-      pfEdges['fit_recommended->human_removed'].committed = pfNodeCounts.human_removed || 0;
+        (pfNodeCounts.fit_failed || 0) +
+        (pfNodeCounts.fit_rejected || 0) + (pfNodeCounts.fit_recommended || 0);
+      pfEdges['review_queue->fit_failed'].committed = pfNodeCounts.fit_failed || 0;
+      pfEdges['review_queue->fit_rejected'].committed = pfNodeCounts.fit_rejected || 0;
+      pfEdges['review_queue->fit_recommended'].committed = pfNodeCounts.fit_recommended || 0;
       pfLayoutColumns();
       pfRecomputeEdgeSlices();
       pfRender();
@@ -6637,13 +7401,10 @@ const DASHBOARD_PAGE = `<!doctype html>
           pfBurstIntoGate('screen_gate', count);
           return;
         }
-        var queue = 'review_queue';
-        var gate = 'fit_gate';
-        pfNodeCounts[queue] = Math.max(0, (pfNodeCounts[queue] || 0) - count);
-        pfReservoirCounts[queue] = pfNodeCounts[queue];
-        pfNodeCounts[gate] = (pfNodeCounts[gate] || 0) + count;
+        // There is intentionally no separate AI Review node. A dispatched deep-assessment batch
+        // remains represented by Screen > Pass until its real Fit outcome resolves.
+        pfFitProcessing += count;
         pfSyncLiveEdges();
-        pfBurst(queue + '->' + gate, count, false, false);
         return;
       }
       if (event.phase === 'failed') {
@@ -6655,21 +7416,18 @@ const DASHBOARD_PAGE = `<!doctype html>
           pfSyncLiveEdges();
           return;
         }
-        var failedQueue = 'review_queue';
-        var failedGate = 'fit_gate';
-        pfNodeCounts[failedGate] = Math.max(0, (pfNodeCounts[failedGate] || 0) - count);
-        pfNodeCounts[failedQueue] = (pfNodeCounts[failedQueue] || 0) + count;
+        pfFitProcessing = Math.max(0, pfFitProcessing - count);
         pfSyncLiveEdges();
-        pfBurst(failedQueue + '->' + failedGate, count, true, false);
         return;
       }
       if (event.phase === 'resolved') {
-        var resolvedGate = event.stage === 'screen' ? 'screen_gate' : 'fit_gate';
         if (event.stage === 'screen') {
           pfScreenProcessing = Math.max(0, pfScreenProcessing - count);
           pfNodeCounts.screen_gate = pfScreenWaiting + pfScreenProcessing;
         } else {
-          pfNodeCounts[resolvedGate] = Math.max(0, (pfNodeCounts[resolvedGate] || 0) - count);
+          pfFitProcessing = Math.max(0, pfFitProcessing - count);
+          pfNodeCounts.review_queue = Math.max(0, (pfNodeCounts.review_queue || 0) - count);
+          pfReservoirCounts.review_queue = pfNodeCounts.review_queue;
         }
         var grouped = {};
         event.outcomes.forEach(function (item) { grouped[item.outcome] = (grouped[item.outcome] || 0) + 1; });
@@ -6680,11 +7438,13 @@ const DASHBOARD_PAGE = `<!doctype html>
           if (grouped.rejected) pfBurst('screen_gate->screen_rejected', grouped.rejected, false, false);
           if (grouped.passed) pfBurst('screen_gate->review_queue', grouped.passed, false, false);
         } else {
+          pfNodeCounts.fit_failed += grouped.failed || 0;
           pfNodeCounts.fit_rejected += grouped.rejected || 0;
           pfNodeCounts.fit_recommended += grouped.recommended || 0;
           pfSyncLiveEdges();
-          if (grouped.rejected) pfBurst('fit_gate->fit_rejected', grouped.rejected, false, false);
-          if (grouped.recommended) pfBurst('fit_gate->fit_recommended', grouped.recommended, false, false);
+          if (grouped.failed) pfBurst('review_queue->fit_failed', grouped.failed, false, false);
+          if (grouped.rejected) pfBurst('review_queue->fit_rejected', grouped.rejected, false, false);
+          if (grouped.recommended) pfBurst('review_queue->fit_recommended', grouped.recommended, false, false);
         }
       }
     }
@@ -6989,19 +7749,49 @@ const DASHBOARD_PAGE = `<!doctype html>
       setPfCounts(counts);
     }
 
-    // rAF keeps running while a background tab is (mostly) inactive, but some browsers throttle
-    // it heavily -- waking it explicitly when the Search tab becomes visible again catches up any
-    // easing that stalled while it was hidden.
-    document.querySelector('[data-tab="search"]').addEventListener('click', pfWake);
+    // A Fit Threshold change is a pure view change over saved scores. Recompute the Search page's
+    // fit totals from the same in-memory rows immediately too, so it cannot keep showing the old
+    // boundary while Jobs has already moved those postings between Recommended and Not Recommended.
+    function syncPipelineFitCountsFromJobs() {
+      var counts = Object.assign({}, pfLastCountsPayload || {});
+      counts.good_fit = 0;
+      counts.bad_fit = 0;
+      counts.unrated = 0;
+      counts.ruled_out = 0;
+      counts.reject = 0;
+      counts.screened_out = 0;
+      allJobs.forEach(function (job) {
+        var category = pipelineJobCategory(job);
+        if (category === 'good_match') counts.good_fit += 1;
+        else if (category === 'bad_match') counts.bad_fit += 1;
+        else if (category === 'fit_fail') counts.reject += 1;
+        else if (category === 'screen_fail') {
+          counts.ruled_out += 1;
+          counts.screened_out += 1;
+        }
+        else counts.unrated += 1;
+      });
+      counts.total = allJobs.length;
+      setPfCounts(counts);
+    }
 
-    async function loadJobs() {
+    // rAF keeps running while a background tab is (mostly) inactive, but some browsers throttle
+    // it heavily -- waking it explicitly when Jobs > Search becomes visible again catches up any
+    // easing that stalled while it was hidden.
+    document.querySelector('[data-tab="jobs"]').addEventListener('click', function () {
+      if (jobsView === 'search') pfWake();
+    });
+
+    async function loadJobs(syncPipeline) {
       var res = await api('/jobs');
       var data = await res.json();
       allJobs = data.jobs || [];
-      matchThreshold = Number.isFinite(data.match_threshold) ? data.match_threshold : 70;
-      document.getElementById('jobs-match-threshold').value = matchThreshold;
-      renderJobPipeline(data.counts || {});
-      // renderJobs() also drives the Interested subtab (via renderInterestedList) when it's active.
+      if (syncPipeline !== false) {
+        matchThreshold = Number.isFinite(data.match_threshold) ? data.match_threshold : 70;
+        document.getElementById('jobs-match-threshold').value = matchThreshold;
+        renderJobPipeline(data.counts || {});
+      }
+      // renderJobs() also drives the Interested subtab (via renderInterestedList) when it is active.
       renderJobs();
       renderAppliedList();
     }
@@ -7074,24 +7864,18 @@ const DASHBOARD_PAGE = `<!doctype html>
       buildInterestedCoverLetter(false);
     }
 
-    function showInterestedDetail(job) {
+    function parkInterestedDetail() {
+      var section = document.getElementById('interested-detail-section');
+      section.style.display = 'none';
+      document.getElementById('interested-detail-home').appendChild(section);
+    }
+
+    function showInterestedDetail(job, inlineHost) {
       activeInterestedJobId = job.id;
       showInterestedSubtab('assistant');
       var section = document.getElementById('interested-detail-section');
+      inlineHost.appendChild(section);
       section.style.display = 'block';
-      document.getElementById('interested-detail-title').textContent = job.title;
-      document.getElementById('interested-detail-meta').textContent =
-        [job.company, job.location].filter(Boolean).join(' · ');
-      var reasonEl = document.getElementById('interested-detail-reason');
-      reasonEl.textContent = job.fit_reason || '';
-      reasonEl.style.display = job.fit_reason ? 'block' : 'none';
-      var link = document.getElementById('interested-detail-link');
-      if (job.source_url) {
-        link.href = job.source_url;
-        link.style.display = 'inline-block';
-      } else {
-        link.style.display = 'none';
-      }
       // Review, resume, and cover-letter state are all per-job -- switching to a different job
       // shouldn't carry over a pending question, answer, or preview that belonged to the last one.
       pendingReviewQuestion = null;
@@ -7148,6 +7932,14 @@ const DASHBOARD_PAGE = `<!doctype html>
         var titleNode = job.source_url
           ? el('a', { className: 'row-title', href: job.source_url, target: '_blank', rel: 'noopener', textContent: job.title })
           : el('span', { className: 'row-title', textContent: job.title });
+        var titleLine = [titleNode];
+        var matches = gmailReplyMatches[job.id] || [];
+        if (matches.length) {
+          titleLine.push(el('span', {
+            className: 'badge strong',
+            textContent: matches.length + ' possible repl' + (matches.length === 1 ? 'y' : 'ies'),
+          }));
+        }
         var meta = [
           job.company,
           job.location,
@@ -7155,9 +7947,22 @@ const DASHBOARD_PAGE = `<!doctype html>
         ].filter(Boolean).join(' · ');
 
         var body = [
-          el('div', { className: 'row-title-line' }, [titleNode]),
+          el('div', { className: 'row-title-line' }, titleLine),
           el('div', { className: 'row-meta', textContent: meta }),
         ];
+        if (gmailReplySkipped[job.id]) {
+          body.push(el('p', { className: 'row-meta', textContent: 'Not checked -- company name too short/generic to search reliably.' }));
+        }
+        matches.forEach(function (match) {
+          body.push(el('div', { className: 'row-item' }, [
+            el('a', {
+              className: 'row-title', href: 'https://mail.google.com/mail/u/0/#all/' + match.id,
+              target: '_blank', rel: 'noopener', textContent: match.subject || '(no subject)',
+            }),
+            el('div', { className: 'row-meta', textContent: [match.from, match.date].filter(Boolean).join(' · ') }),
+            el('p', { className: 'job-reason', textContent: match.snippet }),
+          ]));
+        });
 
         // "Not applied" read as a status claim contradicting the "N applications sent" line right
         // above it. Every other action in the app is an imperative; this one should be too.
@@ -7174,39 +7979,37 @@ const DASHBOARD_PAGE = `<!doctype html>
     }
 
     // candidateJobs is renderJobs()'s already-search/age/score-filtered array, so the Interested
-    // subtab's list respects the same shared filter controls as the other four subtabs.
+    // subtab's list respects the same shared filter controls as the other five subtabs.
     function renderInterestedList(candidateJobs) {
       var list = document.getElementById('interested-list');
+      var expandedJobId = activeInterestedJobId;
+      // The reusable tools may currently live inside a card that is about to be replaced.
+      // Detach them before clearing the list so their event handlers and generated state survive.
+      parkInterestedDetail();
       list.innerHTML = '';
       // Applied jobs stay manual_status='interested' (applying only ever happens from this
-      // workspace) but live on the separate Applied tab, not here -- same exclusion this list has
+      // workspace) but live on the Applied subtab, not here -- same exclusion this list has
       // always had, back when applying overwrote fit_status away from 'interested'.
       var interestedJobs = candidateJobs.filter(function (j) { return j.manual_status === 'interested' && !j.applied_at; });
-      // Most recently marked first -- this is the "what did I just decide to go after" list, not
-      // a freshness-of-posting one, so it sorts on interested_at rather than posted_at/fit_score.
-      interestedJobs.sort(function (a, b) { return new Date(b.interested_at || 0) - new Date(a.interested_at || 0); });
+      interestedJobs.sort(jobSortComparator(document.getElementById('jobs-sort').value));
 
       if (!interestedJobs.length) {
         list.appendChild(el('p', {
           className: 'empty',
-          textContent: 'No interested jobs yet — mark one Interested from Good Match, Bad Match, or Unrated.',
+          textContent: 'No interested jobs yet — mark one Interested from Good Fit, Bad Fit, or Fit Fail.',
         }));
-        document.getElementById('interested-detail-section').style.display = 'none';
         activeInterestedJobId = null;
         return;
       }
 
+      var expandedEntry = null;
       interestedJobs.forEach(function (job) {
-        var hasScore = job.fit_score !== null && job.fit_score !== undefined;
+        var hasScore = hasCompletedFitScore(job);
         var badgeText = hasScore ? job.fit_score + '% match' : FIT_LABELS.interested.text;
-        // Same direct link the Jobs tab row has -- marking a job interested shouldn't cost the
-        // one-click "just take me to the posting" path it had before, only add the workspace below.
-        var titleNode = job.source_url
-          ? el('a', {
-              className: 'row-title', href: job.source_url, target: '_blank', rel: 'noopener',
-              textContent: job.title,
-            })
-          : el('span', { className: 'row-title', textContent: job.title });
+        // Deliberately not a link any more. The whole card, title included, is one accordion
+        // control; "go to the employer's page" is the Apply button's job, so that navigation
+        // happens exactly once, from the one place that also hands off to the extension's agent.
+        var titleNode = el('span', { className: 'row-title', textContent: job.title });
         var titleLine = [
           titleNode,
           el('span', { className: 'badge strong', textContent: badgeText }),
@@ -7218,22 +8021,82 @@ const DASHBOARD_PAGE = `<!doctype html>
         ].filter(Boolean).join(' · ');
         var body = [el('div', { className: 'row-title-line' }, titleLine), el('div', { className: 'row-meta', textContent: meta })];
 
-        var view = el('button', { type: 'button', textContent: 'View' });
-        view.addEventListener('click', function () { showInterestedDetail(job); });
-        var remove = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
-        remove.addEventListener('click', function () { submitJobFit(job.id, 'removed'); });
+        // The handoff point: opens the employer's own application page, where the extension's
+        // in-page agent takes over (see extension/agent.js). Disabled rather than hidden when a
+        // posting has no URL, so the button's absence never reads as "this job can't be applied to".
+        var applyButton = el('button', {
+          className: 'success', type: 'button', textContent: 'Apply',
+          disabled: !job.source_url,
+          title: job.source_url ? 'Open the application page' : 'This posting has no URL on file',
+        });
+        applyButton.addEventListener('click', function (event) {
+          event.stopPropagation();
+          if (!job.source_url) return;
+          window.open(job.source_url, '_blank', 'noopener');
+        });
 
-        list.appendChild(el('div', { className: 'row-item' }, [
+        var notInterested = el('button', { className: 'danger', type: 'button', textContent: 'Not Interested' });
+        notInterested.addEventListener('click', function (event) {
+          event.stopPropagation();
+          submitJobFit(job.id, 'removed');
+        });
+
+        var inlineHost = el('div', { className: 'interested-inline-tools' });
+        var card = el('div', { className: 'row-item interested-card', tabIndex: 0 }, [
           el('div', { className: 'row' }, [
             el('div', {}, body),
-            el('div', { className: 'row-actions' }, [view, remove]),
+            el('div', { className: 'row-actions' }, [applyButton, notInterested]),
           ]),
-        ]));
+          inlineHost,
+        ]);
+        card.setAttribute('role', 'group');
+        card.setAttribute('aria-expanded', 'false');
+        card.setAttribute('aria-label', job.title + ' — click to show or hide ApplyGo tools');
+
+        function toggleCard() {
+          var section = document.getElementById('interested-detail-section');
+          var isOpen = activeInterestedJobId === job.id && section.parentElement === inlineHost && section.style.display !== 'none';
+          var previous = list.querySelector('.interested-card.is-expanded');
+          if (previous) {
+            previous.classList.remove('is-expanded');
+            previous.setAttribute('aria-expanded', 'false');
+          }
+          parkInterestedDetail();
+          if (isOpen) {
+            activeInterestedJobId = null;
+            return;
+          }
+          card.classList.add('is-expanded');
+          card.setAttribute('aria-expanded', 'true');
+          showInterestedDetail(job, inlineHost);
+        }
+
+        card.addEventListener('click', function (event) {
+          if (event.target.closest('a, button, input, textarea, select, iframe, .interested-inline-tools')) return;
+          toggleCard();
+        });
+        card.addEventListener('keydown', function (event) {
+          if (event.target !== card || (event.key !== 'Enter' && event.key !== ' ')) return;
+          event.preventDefault();
+          toggleCard();
+        });
+
+        list.appendChild(card);
+        if (expandedJobId === job.id) expandedEntry = { job: job, card: card, host: inlineHost };
       });
 
-      // Keep showing whichever job was already open across a refresh; default to the newest otherwise.
-      var stillActive = interestedJobs.filter(function (j) { return j.id === activeInterestedJobId; })[0];
-      showInterestedDetail(stillActive || interestedJobs[0]);
+      // A live refresh keeps an explicitly opened card open, but the initial list starts fully
+      // collapsed. If the active job left Interested, the reusable tools remain parked and hidden.
+      if (expandedEntry) {
+        expandedEntry.card.classList.add('is-expanded');
+        expandedEntry.card.setAttribute('aria-expanded', 'true');
+        var detailSection = document.getElementById('interested-detail-section');
+        expandedEntry.host.appendChild(detailSection);
+        detailSection.style.display = 'block';
+        activeInterestedJobId = expandedEntry.job.id;
+      } else {
+        activeInterestedJobId = null;
+      }
     }
 
     document.getElementById('interested-review-button').addEventListener('click', async function () {
@@ -7601,26 +8464,25 @@ const DASHBOARD_PAGE = `<!doctype html>
     function renderDevices(currentId, devices) {
       var list = document.getElementById('devices-list');
       list.innerHTML = '';
-      devices.forEach(function (device) {
+      // The API omits revoked sessions; keep this defensive filter so a stale/cached response
+      // cannot briefly put one back into Settings after the user revoked it.
+      devices.filter(function (device) { return !device.revoked; }).forEach(function (device) {
         var isCurrent = device.id === currentId;
         var titleLine = [el('span', { className: 'row-title', textContent: device.device_name })];
         if (isCurrent) titleLine.push(el('span', { className: 'badge possible', textContent: 'this device' }));
-        if (device.revoked) titleLine.push(el('span', { className: 'badge warn', textContent: 'revoked' }));
         var children = [
           el('div', {}, [
             el('div', { className: 'row-title-line' }, titleLine),
             el('div', { className: 'row-meta', textContent: 'Last seen ' + new Date(device.last_seen_at).toLocaleString() }),
           ]),
         ];
-        if (!device.revoked) {
-          var revoke = el('button', { className: 'danger', type: 'button', textContent: 'Revoke' });
-          revoke.addEventListener('click', async function () {
-            await api('/devices/' + encodeURIComponent(device.id) + '/revoke', { method: 'POST' });
-            if (isCurrent) { goToEnroll(); return; }
-            loadDevices();
-          });
-          children.push(el('div', { className: 'row-actions' }, [revoke]));
-        }
+        var revoke = el('button', { className: 'danger', type: 'button', textContent: 'Revoke' });
+        revoke.addEventListener('click', async function () {
+          await api('/devices/' + encodeURIComponent(device.id) + '/revoke', { method: 'POST' });
+          if (isCurrent) { goToEnroll(); return; }
+          loadDevices();
+        });
+        children.push(el('div', { className: 'row-actions' }, [revoke]));
         list.appendChild(el('div', { className: 'row-item' }, [el('div', { className: 'row' }, children)]));
       });
     }
@@ -7746,6 +8608,220 @@ const DASHBOARD_PAGE = `<!doctype html>
       renderDevices(data.current_device_id, data.devices);
     }
 
+    // One state -> one card. The credentials form (Step 1) and Connect button (Step 3) sections
+    // are shown/hidden/relabeled from here rather than duplicated per state, so there's a single
+    // source of truth for "what does the user see right now."
+    function renderGmailStatus(status) {
+      var card = document.getElementById('gmail-status-card');
+      card.innerHTML = '';
+      var checkButton = document.getElementById('gmail-check-replies-button');
+      var notConnectedHint = document.getElementById('gmail-not-connected-hint');
+      var setupDetails = document.getElementById('gmail-setup-details');
+      var setupSummary = document.getElementById('gmail-setup-summary');
+      var connectSection = document.getElementById('gmail-connect-section');
+
+      document.getElementById('gmail-redirect-uri').textContent = status.redirect_uri || '';
+      if (document.activeElement !== document.getElementById('gmail-client-id')) {
+        document.getElementById('gmail-client-id').value = status.client_id || '';
+      }
+
+      var title, meta, badgeClass, actions = [];
+
+      if (status.state === 'not_configured') {
+        title = 'Not configured';
+        meta = 'Google OAuth credentials have not been entered yet.';
+        badgeClass = 'queued';
+        setupDetails.open = true;
+        setupSummary.textContent = 'Set up Gmail';
+        connectSection.style.display = 'none';
+      } else if (status.state === 'ready') {
+        title = 'Ready to connect';
+        meta = 'Google credentials are saved' + (status.using_env_fallback ? ' (via environment variables)' : '') +
+          '. Your Gmail account is not connected yet.';
+        badgeClass = 'possible';
+        setupDetails.open = false;
+        setupSummary.textContent = 'Update Google credentials';
+        connectSection.style.display = '';
+      } else if (status.state === 'needs_reconnect') {
+        title = 'Connection expired — needs attention';
+        meta = 'Google needs you to reconnect Gmail. This can happen periodically; your ApplyGo data is unaffected.';
+        badgeClass = 'warn';
+        setupDetails.open = false;
+        setupSummary.textContent = 'Update Google credentials';
+        connectSection.style.display = 'none';
+        var reconnect = el('button', { type: 'button', textContent: 'Reconnect Gmail' });
+        reconnect.addEventListener('click', function () { window.location.href = '/gmail/connect'; });
+        actions.push(reconnect);
+      } else {
+        title = 'Connected' + (status.email_address ? ' as ' + status.email_address : '');
+        meta = status.connected_at ? 'Connected ' + new Date(status.connected_at).toLocaleString() : '';
+        badgeClass = 'strong';
+        setupDetails.open = false;
+        setupSummary.textContent = 'Update Google credentials';
+        connectSection.style.display = 'none';
+        var disconnect = el('button', { className: 'danger', type: 'button', textContent: 'Disconnect' });
+        disconnect.addEventListener('click', async function () {
+          disconnect.disabled = true;
+          await api('/gmail/disconnect', { method: 'POST' });
+          await loadGmailStatus();
+        });
+        actions.push(disconnect);
+      }
+
+      var connectedNow = status.state === 'connected';
+      checkButton.style.display = connectedNow ? '' : 'none';
+      notConnectedHint.style.display = connectedNow ? 'none' : '';
+
+      var body = [
+        el('div', { className: 'row-title-line' }, [
+          el('span', { className: 'row-title', textContent: title }),
+          el('span', { className: 'badge ' + badgeClass, textContent: status.state.split('_').join(' ') }),
+        ]),
+        el('div', { className: 'row-meta', textContent: meta }),
+      ];
+      card.appendChild(el('div', { className: 'row-item' }, [
+        el('div', { className: 'row' }, [el('div', {}, body), el('div', { className: 'row-actions' }, actions)]),
+      ]));
+    }
+
+    async function loadGmailStatus() {
+      var res = await api('/gmail/status');
+      var data = await res.json();
+      renderGmailStatus(data);
+    }
+
+    document.getElementById('gmail-credentials-form').addEventListener('submit', async function (event) {
+      event.preventDefault();
+      var statusEl = document.getElementById('gmail-credentials-status');
+      var clientId = document.getElementById('gmail-client-id').value.trim();
+      var clientSecret = document.getElementById('gmail-client-secret').value.trim();
+      if (!clientId || !clientSecret) {
+        statusEl.textContent = 'Enter both the Client ID and Client Secret.';
+        statusEl.className = 'status error';
+        return;
+      }
+      statusEl.textContent = 'Saving…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/gmail/credentials', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ client_id: clientId, client_secret: clientSecret }),
+        });
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'save_failed'));
+        // The secret itself is never echoed back or kept in the field once saved -- only the
+        // Client ID (not sensitive) is redisplayed, by loadGmailStatus below.
+        document.getElementById('gmail-client-secret').value = '';
+        statusEl.textContent = 'Credentials saved. Click Connect Gmail below.';
+        statusEl.className = 'status success';
+        await loadGmailStatus();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    document.getElementById('gmail-toggle-secret').addEventListener('click', function () {
+      var input = document.getElementById('gmail-client-secret');
+      var showing = input.type === 'text';
+      input.type = showing ? 'password' : 'text';
+      this.textContent = showing ? 'Show' : 'Hide';
+    });
+
+    document.getElementById('gmail-copy-redirect').addEventListener('click', async function () {
+      var button = this;
+      var value = document.getElementById('gmail-redirect-uri').textContent;
+      try {
+        await navigator.clipboard.writeText(value);
+      } catch (err) {
+        window.prompt('Copy this URL:', value);
+        return;
+      }
+      var original = button.textContent;
+      button.textContent = 'Copied!';
+      setTimeout(function () { button.textContent = original; }, 1500);
+    });
+
+    // A real top-level navigation, not an api()/fetch() call -- the browser has to follow Google's
+    // redirect chain itself, which a fetch() would just consume internally.
+    document.getElementById('gmail-connect-button').addEventListener('click', function () {
+      window.location.href = '/gmail/connect';
+    });
+
+    document.getElementById('gmail-check-replies-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('gmail-check-status');
+      var button = this;
+      button.disabled = true;
+      statusEl.textContent = 'Checking for replies…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/gmail/check-replies', { method: 'POST' });
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'gmail_check_failed'));
+        var data = await readNdjson(res, function (event) {
+          statusEl.textContent = 'Checking… ' + event.done + ' of ' + event.total + ' (' + event.company + ')' +
+            (event.found ? ' — ' + event.found + ' possible match' + (event.found === 1 ? '' : 'es') : '');
+        });
+        gmailReplyMatches = data.matches || {};
+        gmailReplySkipped = {};
+        (data.skipped || []).forEach(function (id) { gmailReplySkipped[id] = true; });
+        var foundCount = Object.keys(gmailReplyMatches).filter(function (id) { return gmailReplyMatches[id].length; }).length;
+        statusEl.textContent = 'Checked ' + data.checked + ' applied job' + (data.checked === 1 ? '' : 's') +
+          ' — ' + foundCount + ' with possible replies.';
+        statusEl.className = 'status success';
+        renderAppliedList();
+      } catch (err) {
+        if (err.message === 'gmail_reconnect_required') {
+          statusEl.textContent = 'Gmail needs reconnecting — see Settings → Email.';
+          await loadGmailStatus();
+        } else {
+          statusEl.textContent = 'Error: ' + err.message;
+        }
+        statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    // Friendly copy for every error handleGmailCallback can redirect back with. Kept out of the
+    // primary message: raw Google error text (gmail_error_detail, when present) only ever shows in
+    // the "Technical details" disclosure, never inline.
+    var GMAIL_ERROR_MESSAGES = {
+      access_denied: 'Gmail was not connected because permission was not granted. Nothing was changed.',
+      invalid_client: 'ApplyGo could not authenticate with the Google credentials you entered. Check the Client ID and Client Secret in Google Cloud and try again.',
+      redirect_mismatch: 'Google does not recognize this ApplyGo URL. Make sure the redirect URI shown below is entered exactly in your Google OAuth client’s Authorized redirect URIs.',
+      invalid_request: 'That connection attempt expired or was invalid. Click Connect Gmail to try again.',
+      not_configured: 'Google credentials are not set up yet. Save your Client ID and Client Secret below first.',
+      google_error: 'Google reported a problem completing the connection.',
+      exchange_failed: 'ApplyGo could not complete the connection with Google.',
+    };
+
+    // Google's redirect back after Connect Gmail lands here with a query param either way -- jump
+    // straight to Settings > Email so the result is immediately visible, rather than leaving the
+    // user on whatever tab happened to be active before they clicked Connect.
+    (function () {
+      var params = new URLSearchParams(window.location.search);
+      var connected = params.get('gmail') === 'connected';
+      var errorCode = params.get('gmail_error');
+      if (!connected && !errorCode) return;
+      window.history.replaceState({}, '', window.location.pathname);
+      document.querySelector('[data-tab="settings"]').click();
+      document.querySelector('[data-settings-subtab="email"]').click();
+
+      var messageEl = document.getElementById('gmail-flow-message');
+      if (connected) {
+        messageEl.textContent = 'Gmail connected. ApplyGo can now check your inbox for job-related replies.';
+        messageEl.className = 'status success';
+        return;
+      }
+      messageEl.textContent = GMAIL_ERROR_MESSAGES[errorCode] || 'Something went wrong connecting Gmail.';
+      messageEl.className = 'status error';
+      var detail = params.get('gmail_error_detail');
+      if (detail) {
+        document.getElementById('gmail-error-technical').textContent = detail;
+        document.getElementById('gmail-error-details').style.display = '';
+      }
+    })();
+
     loadProfile();
     loadRoleSignals();
     loadDocuments();
@@ -7754,6 +8830,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     loadCompanies();
     loadJobs();
     loadDevices();
+    loadGmailStatus();
     loadAnswers();
     loadData();
   </script>
@@ -7800,6 +8877,9 @@ async function downloadArtifact(request: Request, env: Env, key: string): Promis
 const EXTENSION_CORS_PATHS = [
   /^\/auth\/enroll$/,
   /^\/applications\/match$/,
+  /^\/applications\/answer$/,
+  /^\/applications\/generate-answer$/,
+  /^\/applications\/events$/,
   /^\/application-answers$/,
   /^\/jobs$/,
   /^\/jobs\/[^/]+\/fit$/,
@@ -7822,7 +8902,7 @@ function corsHeaders(origin: string): Record<string, string> {
  * evals.ts because every schema it needs is already in scope in this file or imported above --
  * evals.ts staying schema-agnostic avoids a circular import back into index.ts for the four schemas
  * that are defined here (STRUCTURED_PROFILE_JSON_SCHEMA, RESUME_BASE_SCHEMA, COVER_LETTER_SCHEMA,
- * MATCH_SCHEMA).
+ * GENERATE_ANSWER_SCHEMA).
  *
  * `resume.design_review` (needs a screenshot, never stored) and `evals.judge` (not a savable case)
  * fall through to null, matching `replayable: false` in tasks.ts.
@@ -7833,7 +8913,7 @@ function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "structured", schema: SCREEN_BATCH_SCHEMA, toolName: "submit_screen", maxTokens: 4000 };
     case "fit.assess":
       return { kind: "structured", schema: FIT_BATCH_SCHEMA, toolName: "submit_fit_assessment", maxTokens: 7000 };
-    case "fit.care_about_topics":
+    case "fit.criteria":
       return { kind: "structured", schema: CARE_ABOUT_TOPICS_SCHEMA, toolName: "submit_topics", maxTokens: 1200 };
     case "companies.discover":
       return { kind: "structured", schema: COMPANY_LIST_SCHEMA, toolName: "submit_companies", maxTokens: 4000 };
@@ -7853,8 +8933,8 @@ function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "structured", schema: RESUME_BASE_SCHEMA, toolName: "submit_resume_base", maxTokens: 1000 };
     case "cover_letter.write":
       return { kind: "structured", schema: COVER_LETTER_SCHEMA, toolName: "submit_cover_letter", maxTokens: 2000 };
-    case "application.answers":
-      return { kind: "structured", schema: MATCH_SCHEMA, toolName: "submit_application_answers", maxTokens: 3000 };
+    case "application.generate_answer":
+      return { kind: "structured", schema: GENERATE_ANSWER_SCHEMA, toolName: "submit_drafted_answer", maxTokens: 1200 };
     default:
       return null;
   }
@@ -8113,7 +9193,16 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "GET" && url.pathname === "/devices") return listDevices(request, env);
     const deviceMatch = url.pathname.match(/^\/devices\/([^/]+)\/revoke$/);
     if (request.method === "POST" && deviceMatch) return revokeDevice(request, env, deviceMatch[1]);
+    if (request.method === "POST" && url.pathname === "/gmail/credentials") return saveGoogleOAuthCredentials(request, env);
+    if (request.method === "GET" && url.pathname === "/gmail/connect") return startGmailConnect(request, env);
+    if (request.method === "GET" && url.pathname === "/gmail/callback") return handleGmailCallback(request, env);
+    if (request.method === "GET" && url.pathname === "/gmail/status") return getGmailStatus(request, env);
+    if (request.method === "POST" && url.pathname === "/gmail/disconnect") return disconnectGmail(request, env);
+    if (request.method === "POST" && url.pathname === "/gmail/check-replies") return checkGmailReplies(request, env, ctx);
     if (request.method === "POST" && url.pathname === "/applications/match") return matchApplication(request, env);
+    if (request.method === "POST" && url.pathname === "/applications/generate-answer") return generateApplicationAnswer(request, env);
+    if (request.method === "POST" && url.pathname === "/applications/answer") return saveApplicationAgentAnswer(request, env);
+    if (request.method === "POST" && url.pathname === "/applications/events") return recordAgentEvents(request, env);
     if (request.method === "POST" && url.pathname === "/artifacts") return uploadArtifact(request, env);
     const artifactMatch = url.pathname.match(/^\/artifacts\/(.+)$/);
     if (request.method === "GET" && artifactMatch) return downloadArtifact(request, env, decodeURIComponent(artifactMatch[1]));
