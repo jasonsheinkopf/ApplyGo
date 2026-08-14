@@ -1696,12 +1696,13 @@ async function addCompanyRow(
     why_fit: string;
     status: string;
     source: string;
+    scan_note?: string;
   },
 ): Promise<boolean> {
   const result = await env.DB.prepare(
     `INSERT OR IGNORE INTO companies
-       (id, profile_id, name, name_key, website, careers_url, bio, location, why_fit, status, source)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, profile_id, name, name_key, website, careers_url, bio, location, why_fit, status, source, scan_note)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       crypto.randomUUID(),
@@ -1715,6 +1716,7 @@ async function addCompanyRow(
       company.why_fit,
       company.status,
       company.source,
+      company.scan_note ?? "",
     )
     .run();
   return result.meta.changes > 0;
@@ -1914,6 +1916,9 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
           ...proposal,
           status: reachable ? "reachable" : "unreachable",
           source: "ai",
+          scan_note: reachable
+            ? "Website verified; checking its careers page and supported job boards."
+            : "The proposed company website could not be reached, so its careers page and job board could not be checked.",
         });
         if (inserted) added += 1;
         await emit({
@@ -2070,7 +2075,10 @@ async function scanOneCompany(
         `UPDATE companies SET ats_provider = 'none', scan_note = ?, last_scanned_at = CURRENT_TIMESTAMP,
          updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       )
-        .bind("No supported job board found on their site.", company.id)
+        .bind(
+          "Checked the company careers page and common careers-page paths, then tested likely Greenhouse, Lever, Ashby, and SmartRecruiters board addresses. No accessible supported job board was found.",
+          company.id,
+        )
         .run();
       return { jobs: 0, newJobs: 0, note: "no supported board found" };
     }
@@ -4061,6 +4069,24 @@ const DASHBOARD_PAGE = `<!doctype html>
   }
   .subtabs::-webkit-scrollbar { display: none; }
   .subtabs button { flex: none; margin-top: 0; white-space: nowrap; }
+  .subtabs button.active { background: var(--accent); color: var(--accent-contrast); }
+  /* A true three-way selector for the Companies list. The connected outer track makes it read as
+     one control, while the filled active segment and inset ring remain unmistakable in either
+     color scheme instead of relying on a subtle color shift between three unrelated buttons. */
+  .segmented-control {
+    display: inline-flex; gap: 0; overflow: hidden; padding: 3px; margin-bottom: 1rem;
+    border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface-2);
+  }
+  .segmented-control button {
+    margin: 0; border: 0; border-radius: calc(var(--radius-sm) - 3px); background: transparent;
+    color: var(--text-muted); font-weight: 650;
+  }
+  .segmented-control button:hover:not(:disabled) { background: var(--surface); color: var(--text); opacity: 1; }
+  .segmented-control button.active {
+    background: var(--accent); color: var(--accent-contrast);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.24), inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+  }
+  .segmented-control button:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--accent); outline-offset: -1px; }
   details.disclosure {
     margin-top: 1.1rem; border-top: 1px solid var(--border); padding-top: 0.9rem;
   }
@@ -4518,7 +4544,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           </div>
           <button id="companies-discover-button" type="button">Find more companies</button>
           <p id="companies-discover-status" class="status" role="status" aria-live="polite"></p>
-          <p class="hint">Once companies are on your list, scan their boards for openings from the Jobs tab.</p>
+          <p class="hint">Each result is checked for a usable job board and its current openings are imported automatically.</p>
 
           <h3>Where they are</h3>
           <div id="companies-locations"><p class="empty">No companies yet.</p></div>
@@ -4544,11 +4570,13 @@ const DASHBOARD_PAGE = `<!doctype html>
       </div>
       <div>
         <section id="companies-list-section">
+          <div class="segmented-control" id="companies-view-tabs" role="group" aria-label="Company status">
+            <button class="active" data-companies-view="added" type="button" aria-pressed="true">Added <span id="companies-added-count"></span></button>
+            <button data-companies-view="unscannable" type="button" aria-pressed="false">Unscannable <span id="companies-unscannable-count"></span></button>
+            <button data-companies-view="removed" type="button" aria-pressed="false">Removed <span id="companies-removed-count"></span></button>
+          </div>
           <label for="companies-filter">Filter</label>
           <input id="companies-filter" placeholder="Search by name, location, or description">
-          <label class="checkbox-label">
-            <input id="companies-show-unscannable" type="checkbox"><span id="companies-unscannable-count">Show companies that can't be scanned</span>
-          </label>
           <div id="companies-list"><p class="empty">Loading…</p></div>
         </section>
       </div>
@@ -5610,8 +5638,11 @@ const DASHBOARD_PAGE = `<!doctype html>
     // in the main list every time is just noise. Kept in the database either way; this only
     // controls what renders by default.
     function isUnscannable(company) {
-      return company.status === 'unreachable' || company.ats_provider === 'none';
+      return company.status === 'unreachable' || company.ats_provider === 'none' ||
+        String(company.scan_note || '').indexOf('Board read failed:') === 0;
     }
+
+    var companiesView = 'added';
 
     function renderCompanyRows(list, companies) {
       companies.forEach(function (company) {
@@ -5633,7 +5664,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           titleChildren.push(el('span', { className: 'badge warn', textContent: 'no job board found' }));
         }
         if (company.status === 'dismissed') {
-          titleChildren.push(el('span', { className: 'badge', textContent: 'dismissed' }));
+          titleChildren.push(el('span', { className: 'badge', textContent: 'removed' }));
         }
         if (company.off_target) {
           titleChildren.push(el('span', { className: 'badge warn', textContent: 'outside your locations' }));
@@ -5650,23 +5681,12 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (company.why_fit) body.push(el('p', { className: 'company-why', textContent: company.why_fit }));
         if (company.scan_note) body.push(el('div', { className: 'row-meta', textContent: company.scan_note }));
 
-        var scanOne = el('button', { type: 'button', textContent: 'Scan' });
-        scanOne.addEventListener('click', async function () {
-          scanOne.disabled = true;
-          scanOne.textContent = 'Scanning…';
-          await api('/companies/scan', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ company_id: company.id }),
-          });
-          await loadCompanies();
-          await loadJobs();
-        });
-        var dismiss = el('button', {
+        var changeStatus = el('button', {
           type: 'button',
-          textContent: company.status === 'dismissed' ? 'Restore' : 'Dismiss',
+          textContent: company.status === 'dismissed' ? 'Re-add' : 'Remove',
+          className: company.status === 'dismissed' ? '' : 'danger',
         });
-        dismiss.addEventListener('click', async function () {
+        changeStatus.addEventListener('click', async function () {
           await api('/companies/' + encodeURIComponent(company.id), {
             method: 'PATCH',
             headers: { 'content-type': 'application/json' },
@@ -5674,17 +5694,12 @@ const DASHBOARD_PAGE = `<!doctype html>
           });
           loadCompanies();
         });
-        var del = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
-        del.addEventListener('click', async function () {
-          await api('/companies/' + encodeURIComponent(company.id), { method: 'DELETE' });
-          loadCompanies();
-        });
 
         var muted = company.status === 'dismissed' || isUnscannable(company);
         list.appendChild(el('div', { className: 'row-item' + (muted ? ' is-muted' : '') }, [
           el('div', { className: 'row' }, [
             el('div', {}, body),
-            el('div', { className: 'row-actions' }, [scanOne, dismiss, del]),
+            el('div', { className: 'row-actions' }, [changeStatus]),
           ]),
         ]));
       });
@@ -5692,36 +5707,27 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     function renderCompanies() {
       var needle = document.getElementById('companies-filter').value.trim();
-      var showUnscannable = document.getElementById('companies-show-unscannable').checked;
       var list = document.getElementById('companies-list');
       list.innerHTML = '';
 
       var matching = allCompanies.filter(function (c) {
         return matchesFilter([c.name, c.location, c.bio, c.why_fit].join(' '), needle);
       });
-      var scannable = matching.filter(function (c) { return !isUnscannable(c); });
-      var unscannable = matching.filter(isUnscannable);
+      var visible = matching.filter(function (c) {
+        if (companiesView === 'removed') return c.status === 'dismissed';
+        if (companiesView === 'unscannable') return c.status !== 'dismissed' && isUnscannable(c);
+        return c.status !== 'dismissed' && !isUnscannable(c);
+      });
 
-      var toggle = document.getElementById('companies-show-unscannable');
-      toggle.parentElement.style.display = unscannable.length ? 'flex' : 'none';
-      document.getElementById('companies-unscannable-count').textContent =
-        "Show " + unscannable.length + " compan" + (unscannable.length === 1 ? 'y' : 'ies') + " that can't be scanned";
-
-      if (!scannable.length && !(showUnscannable && unscannable.length)) {
+      if (!visible.length) {
         list.appendChild(el('p', {
           className: 'empty',
-          textContent: allCompanies.length
-            ? (matching.length ? "Nothing to show — try the checkbox above to reveal companies that can't be scanned." : 'No companies match that filter.')
-            : 'No companies yet — run a search on the left.',
+          textContent: !allCompanies.length ? 'No companies yet — run a search on the left.'
+            : (matching.length ? 'No companies in this category.' : 'No companies match that filter.'),
         }));
         return;
       }
-
-      renderCompanyRows(list, scannable);
-      if (showUnscannable && unscannable.length) {
-        list.appendChild(el('h3', { className: 'subhead', textContent: "Can't be scanned" }));
-        renderCompanyRows(list, unscannable);
-      }
+      renderCompanyRows(list, visible);
     }
 
     function renderCompanyLocations() {
@@ -5757,32 +5763,19 @@ const DASHBOARD_PAGE = `<!doctype html>
       allCompanies = data.companies || [];
       var withJobs = allCompanies.filter(function (c) { return c.open_jobs > 0; }).length;
       var unscannableCount = allCompanies.filter(isUnscannable).length;
+      var removedCount = allCompanies.filter(function (c) { return c.status === 'dismissed'; }).length;
+      var addedCount = allCompanies.filter(function (c) { return c.status !== 'dismissed' && !isUnscannable(c); }).length;
+      unscannableCount = allCompanies.filter(function (c) { return c.status !== 'dismissed' && isUnscannable(c); }).length;
+      document.getElementById('companies-added-count').textContent = '(' + addedCount + ')';
+      document.getElementById('companies-unscannable-count').textContent = '(' + unscannableCount + ')';
+      document.getElementById('companies-removed-count').textContent = '(' + removedCount + ')';
       document.getElementById('companies-summary').innerHTML = '';
       var summaryChildren = [
         el('strong', { textContent: String(allCompanies.length) }),
-        // "not scanned yet" = board-check hasn't run on it; "can't be scanned" = it ran (or the
-        // site never resolved) and there's nothing to read. Kept as separate counts since only
-        // the first one means "scanning again would help."
         el('span', { textContent: ' compan' + (allCompanies.length === 1 ? 'y' : 'ies') +
-          ' · ' + withJobs + ' with open roles · ' + (data.unscanned || 0) + ' not scanned yet · ' }),
+          ' · ' + withJobs + ' with open roles · ' + addedCount + ' added · ' +
+          unscannableCount + ' unscannable · ' + removedCount + ' removed · ' }),
       ];
-      if (unscannableCount) {
-        // The count alone isn't actionable -- it just names a number with no way to act on it from
-        // here, which is worse than not saying it at all. Make it do the thing you'd otherwise have
-        // to scroll up and find a checkbox for.
-        var unscannableLink = el('button', {
-          className: 'text-link', type: 'button',
-          textContent: unscannableCount + " can't be scanned",
-        });
-        unscannableLink.addEventListener('click', function () {
-          var toggle = document.getElementById('companies-show-unscannable');
-          toggle.checked = true;
-          renderCompanies();
-          toggle.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        });
-        summaryChildren.push(unscannableLink);
-        summaryChildren.push(el('span', { textContent: ' · ' }));
-      }
       summaryChildren.push(el('span', { textContent:
         (data.off_target ? data.off_target + ' outside your locations · ' : '') +
         (data.desired_locations ? 'limited to ' + data.desired_locations : 'no location limit set') }));
@@ -5813,7 +5806,31 @@ const DASHBOARD_PAGE = `<!doctype html>
     }
 
     document.getElementById('companies-filter').addEventListener('input', renderCompanies);
-    document.getElementById('companies-show-unscannable').addEventListener('change', renderCompanies);
+    document.querySelectorAll('[data-companies-view]').forEach(function (button) {
+      button.addEventListener('click', function () {
+        companiesView = button.dataset.companiesView;
+        document.querySelectorAll('[data-companies-view]').forEach(function (item) {
+          item.classList.remove('active');
+          item.setAttribute('aria-pressed', 'false');
+        });
+        button.classList.add('active');
+        button.setAttribute('aria-pressed', 'true');
+        renderCompanies();
+      });
+    });
+
+    async function scanNewCompanies(statusEl) {
+      var res = await api('/companies/scan', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ limit: 500 }),
+      });
+      if (!res.ok) throw new Error(errorMessage(await res.json(), 'scan_failed'));
+      return readNdjson(res, function (event) {
+        statusEl.textContent = 'Checking job boards… ' + event.done + ' of ' + event.total +
+          ' (' + event.company + (event.new_jobs ? ', ' + event.new_jobs + ' openings added' : '') + ')';
+      });
+    }
 
     document.getElementById('companies-discover-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('companies-discover-status');
@@ -5850,7 +5867,10 @@ const DASHBOARD_PAGE = `<!doctype html>
           statusEl.textContent = prefix + ' Checking ' + event.done + ' of ' + event.total +
             (event.company ? ' (' + event.company + (event.done ? (event.reachable ? ', reachable' : ", couldn't be reached") : '') + ')' : '') + '…';
         });
-        var parts = ['Added ' + data.added + ' new.'];
+        var scanData = data.added ? await scanNewCompanies(statusEl) : null;
+        var parts = ['Found ' + data.added + ' new.'];
+        if (scanData) parts.push('Checked ' + scanData.scanned + ' job board' + (scanData.scanned === 1 ? '' : 's') +
+          ' and imported ' + scanData.new_listings + ' new opening' + (scanData.new_listings === 1 ? '' : 's') + '.');
         if (data.duplicates) parts.push(data.duplicates + ' already on your list.');
         if (data.off_target) {
           parts.push(data.off_target + ' rejected as outside ' + (data.locations || 'your locations') + '.');
@@ -5858,7 +5878,8 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (data.unreachable) parts.push(data.unreachable + " couldn't be reached — flagged for you to check.");
         statusEl.textContent = parts.join(' ');
         statusEl.className = 'status success';
-        loadCompanies();
+        await loadCompanies();
+        await loadJobs();
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
@@ -5946,10 +5967,14 @@ const DASHBOARD_PAGE = `<!doctype html>
         });
         var data = await res.json();
         if (!res.ok) throw new Error(errorMessage(data, 'add_failed'));
-        statusEl.textContent = data.added ? 'Added.' : 'Already on your list.';
+        var scanData = data.added ? await scanNewCompanies(statusEl) : null;
+        statusEl.textContent = data.added
+          ? 'Added and checked its job board' + (scanData ? '; imported ' + scanData.new_listings + ' opening' + (scanData.new_listings === 1 ? '' : 's') + '.' : '.')
+          : 'Already on your list.';
         statusEl.className = 'status success';
         document.getElementById('company-form').reset();
-        loadCompanies();
+        await loadCompanies();
+        await loadJobs();
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
@@ -5975,11 +6000,15 @@ const DASHBOARD_PAGE = `<!doctype html>
         });
         var data = await res.json();
         if (!res.ok) throw new Error(errorMessage(data, 'add_failed'));
+        var scanData = data.added ? await scanNewCompanies(statusEl) : null;
         statusEl.textContent = 'Added ' + data.added + ' of ' + data.total + '.' +
+          (scanData ? ' Checked ' + scanData.scanned + ' job board' + (scanData.scanned === 1 ? '' : 's') +
+            ' and imported ' + scanData.new_listings + ' opening' + (scanData.new_listings === 1 ? '' : 's') + '.' : '') +
           (data.skipped ? ' ' + data.skipped + ' already on your list.' : '');
         statusEl.className = 'status success';
         textEl.value = '';
-        loadCompanies();
+        await loadCompanies();
+        await loadJobs();
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
@@ -6365,7 +6394,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       statusEl.className = 'status';
       pfBeginRun();
       try {
-        var totalScreened = 0, totalScreenedOut = 0, totalAssessed = 0, allErrors = [];
+        var totalScreened = 0, totalScreenedOut = 0, totalAssessed = 0, totalRecommended = 0, allErrors = [];
         var round = 0;
         var data;
         // Same reasoning as "Scan company boards": one request only gets through as much of the
@@ -6375,6 +6404,10 @@ const DASHBOARD_PAGE = `<!doctype html>
         // can't spin forever.
         do {
           round += 1;
+          // Assessment progress reports a cumulative recommendation count for this request.
+          // Keep the latest value, then add it once when the round finishes so retries and
+          // multiple batches do not double-count the same newly recommended postings.
+          var roundRecommended = 0;
           var res = await api('/jobs/process', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
@@ -6382,9 +6415,11 @@ const DASHBOARD_PAGE = `<!doctype html>
           });
           if (!res.ok) throw new Error(errorMessage(await res.json(), 'process_failed'));
           data = await readNdjson(res, function (event) {
+            if (event.stage === 'assess') roundRecommended = event.recommended || 0;
             statusEl.textContent = (round > 1 ? 'Round ' + round + ': ' : '') + (event.stage === 'screen'
               ? 'Step 1 of 2 — quick screen: '
-              : 'Step 2 of 2 — detailed scoring: ') + event.done + ' of ' + event.total;
+              : 'Step 2 of 2 — detailed scoring: ') + event.done + ' of ' + event.total +
+              (event.stage === 'assess' ? ' · ' + roundRecommended + ' newly recommended' : '');
             // Real per-batch accept/reject counts, not a guess from done/total -- see
             // pfApplyRunEvent. This is what makes the pipeline diagram move live, batch by batch,
             // while this run is still in flight rather than only jumping once at the very end.
@@ -6396,6 +6431,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           totalScreened += data.screened || 0;
           totalScreenedOut += data.screened_out || 0;
           totalAssessed += data.assessed || 0;
+          totalRecommended += roundRecommended;
           if ((data.errors || []).length) allErrors.push.apply(allErrors, data.errors);
         } while (
           !allErrors.length && round < 25 &&
@@ -6407,7 +6443,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         var left = (counts.unassessed || 0) + (counts.screened_in || 0);
         var parts = [];
         if (totalScreened) parts.push('Screened ' + totalScreened + ', dropped ' + totalScreenedOut + ' as clear misses.');
-        if (totalAssessed) parts.push('Assessed ' + totalAssessed + ' in detail.');
+        if (totalAssessed) parts.push('Assessed ' + totalAssessed + ' in detail; ' + totalRecommended + ' newly recommended.');
         if (!parts.length) parts.push('Nothing left to process.');
         // Only reachable if the loop stopped without actually clearing the backlog: a real error,
         // the round cap, or a round that made no progress at all -- genuinely worth a click to retry.
