@@ -5382,6 +5382,20 @@ const DASHBOARD_PAGE = `<!doctype html>
       return (data && data.error) || fallback;
     }
 
+    // A non-JSON error body is either a genuine network-level failure or one specific, recognizable
+    // Cloudflare platform failure: the isolate handling the request got evicted and restarted before
+    // it could respond (a redeploy racing the request, an OOM, etc). That one is common enough to be
+    // worth naming plainly instead of dumping Cloudflare's own raw error page at the candidate, whose
+    // wording ("Only GET or HEAD requests are retried automatically") is instructing a human to just
+    // press the button again -- so say that instead. Anything else falls through to the raw text
+    // unchanged, so a genuinely new failure mode is never silently hidden behind a made-up message.
+    function platformFailureMessage(body) {
+      if (/worker restarted mid-request/i.test(body)) {
+        return 'The server was restarted while handling your request. Please try again.';
+      }
+      return body.replace(/\s+/g, ' ').trim().slice(0, 500);
+    }
+
     // A failed request should always end up with a readable message, even if the response body
     // isn't valid JSON (a raw platform error page, a network-level failure) -- res.json() throwing
     // there would otherwise surface as an opaque parse error instead of anything actionable.
@@ -5390,11 +5404,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       try { body = await res.text(); } catch (e) { body = ''; }
       if (body) {
         try { return errorMessage(JSON.parse(body), fallback + ' (HTTP ' + res.status + ')'); }
-        catch (e) {
-          // Cloudflare platform failures are plain text (often "Your worker..."). Preserve that
-          // useful explanation instead of hiding it behind an "Unexpected token" JSON error.
-          return body.replace(/\s+/g, ' ').trim().slice(0, 500);
-        }
+        catch (e) { return platformFailureMessage(body); }
       }
       return fallback + ' (HTTP ' + res.status + ')';
     }
@@ -5406,8 +5416,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       if (body) {
         try { data = JSON.parse(body); }
         catch (e) {
-          var platformMessage = body.replace(/\s+/g, ' ').trim().slice(0, 500);
-          throw new Error(platformMessage || fallback + ' (HTTP ' + res.status + ')');
+          throw new Error(platformFailureMessage(body) || fallback + ' (HTTP ' + res.status + ')');
         }
       }
       if (!res.ok) throw new Error(errorMessage(data, fallback + ' (HTTP ' + res.status + ')'));
