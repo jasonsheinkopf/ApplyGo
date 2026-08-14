@@ -115,7 +115,43 @@ Production deploys are connected through Cloudflare's native Workers Builds GitH
 
 A push to `main` that touches those paths automatically builds, applies pending D1 migrations, and deploys `applygo-prod` live (the **Deploy command**). Pushes that only touch unrelated paths (docs, the local Python app, résumé content, etc.) do not trigger a build. Pull requests run the same build/typecheck validation and upload a new Worker Version (the **Non-production branch deploy command**), which does not receive live traffic — it validates the deploy path without affecting the running Worker.
 
-## Enroll a phone or computer
+## Enroll a device
+
+Enrollment gives a browser a device session. Each enrollment code can be used once and expires
+quickly; after it is accepted, the browser keeps the session in a secure cookie. Enrolled sessions
+can be reviewed or revoked from **Settings → Devices** in ApplyGo.
+
+### Local development
+
+1. Create `cloudflare/.dev.vars` if it does not exist and add a local setup secret:
+
+   ```dotenv
+   SETUP_SECRET=anything-you-pick
+   ```
+
+2. Restart the local server after adding or changing `.dev.vars`:
+
+   ```bash
+   cd cloudflare
+   npm run dev
+   ```
+
+3. In a second terminal, from the `cloudflare` directory, generate a one-time code. The optional
+   arguments are the device label and expiration in minutes (1–60, default 15):
+
+   ```bash
+   npm run enroll:local -- "Jason's MacBook" 15
+   ```
+
+4. Open `http://localhost:8787/enroll` on the browser being enrolled. Enter the printed code and a
+   device name. Successful enrollment verifies the session and redirects to the ApplyGo dashboard.
+
+If `enroll:local` returns `403 {"error":"forbidden"}`, the running Worker and the script are using
+different `SETUP_SECRET` values—usually because `.dev.vars` was changed without restarting
+`npm run dev`. Confirm the file contains exactly one `SETUP_SECRET=...` line, restart the server,
+and generate a new code.
+
+### Production
 
 **From a machine with Wrangler logged in** (`npx wrangler login`, once per machine — real Cloudflare OAuth, no token needed): create a short-lived one-time code directly in D1, no `SETUP_SECRET` required:
 
@@ -464,19 +500,21 @@ The `/dev` console above is a homegrown tool: enough to read a prompt and its co
 
 **How it's wired.** `src/langfuse.ts` sends every model call to Langfuse, automatically, for every task and either provider (Anthropic or OpenAI) — it hooks into `llm.ts`'s `record()`, the same single choke point that already writes to `llm_traces`, so there was no call site to remember to opt in. One LLM call becomes one Langfuse **trace** with one **generation** inside it: name, prompt, response, model, tokens, cost, latency, and ok/error, shaped straight from the `LlmTrace` object the local sink already builds. Batched calls (`screenJobsBatch`, `assessJobFitBatch`) already cover many postings per call, so this granularity is naturally "one thing that happened" without threading a request-scoped session id through a dozen call sites.
 
-Deliberately raw `fetch` against Langfuse's documented ingestion endpoint (`POST /api/public/ingestion`), not the `langfuse` npm package. The published SDK is marked deprecated in favor of a v4/v5 rewrite built on OpenTelemetry, and wiring a general-purpose OTEL SDK correctly inside a Cloudflare Workers isolate — where a naive setup can leak span context across concurrent requests sharing the same isolate — is a real correctness hazard this codebase already reasons carefully about elsewhere (see `attachTraceSink` in `index.ts`). A single stateless POST per call sidesteps that hazard entirely and matches how every other provider in this file is already called.
+Deliberately raw `fetch` against Langfuse's current OTLP/HTTP JSON endpoint (`POST /api/public/otel/v1/traces`), not a process-global OpenTelemetry SDK. A general-purpose SDK's ambient span context can leak across concurrent requests sharing a Cloudflare Workers isolate. Building one standards-compliant OTLP envelope per completed call keeps the exporter stateless while using Langfuse's v4 data model. The exporter sends `x-langfuse-ingestion-version: 4`, so observations are ingested into the real-time path rather than the delayed compatibility path.
 
 **Setup.**
 
 1. Create a free account at [cloud.langfuse.com](https://cloud.langfuse.com) (EU region) or [us.cloud.langfuse.com](https://us.cloud.langfuse.com) (US region) and a project inside it.
 2. Project Settings → API Keys → create a new key pair.
-3. Set the two secrets (and the host, only if you picked the US region or you're self-hosting Langfuse):
+3. Set the two secrets (and the base URL if you picked a region other than EU or you're self-hosting Langfuse):
    ```
    npx wrangler secret put LANGFUSE_PUBLIC_KEY --env production
    npx wrangler secret put LANGFUSE_SECRET_KEY --env production
-   npx wrangler secret put LANGFUSE_HOST --env production   # only for the US region or self-hosting; defaults to the EU cloud
+   npx wrangler secret put LANGFUSE_BASE_URL --env production   # e.g. https://jp.cloud.langfuse.com for Japan
    ```
-4. For local development, add the same three lines to `.dev.vars` (gitignored, never committed).
+4. For local development, the `npm run dev` script loads both the repository-root `.env` and
+   `cloudflare/.dev.vars` via Wrangler's `--env-file` option; `.dev.vars` takes precedence when a
+   variable exists in both. `LANGFUSE_HOST` remains supported as a backward-compatible alias.
 
 That's the entire setup — no other config, no schema to define on the Langfuse side. The next model call this app makes shows up in your project's Traces tab.
 

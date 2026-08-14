@@ -106,6 +106,7 @@ interface Env {
   /** See src/langfuse.ts. Unset means every call still runs, just not sent to Langfuse. */
   LANGFUSE_PUBLIC_KEY?: string;
   LANGFUSE_SECRET_KEY?: string;
+  LANGFUSE_BASE_URL?: string;
   LANGFUSE_HOST?: string;
   /** Set to "off" to stop recording model calls. Anything else (including unset) records them. */
   LLM_TRACE?: string;
@@ -475,6 +476,17 @@ function readDesiredRoles(preferencesJson: string): string {
   }
 }
 
+/** The score (0-100) at or above which a rated posting counts as a Good Match rather than Bad Match. */
+function readMatchThreshold(preferencesJson: string): number {
+  try {
+    const value = (JSON.parse(preferencesJson || "{}") as { match_threshold?: number }).match_threshold;
+    if (!Number.isFinite(value)) return 70;
+    return Math.min(Math.max(Math.round(value as number), 0), 100);
+  } catch {
+    return 70;
+  }
+}
+
 /** Free-text hard requirements the candidate wrote themselves, enforced by tier-2 scoring as
  * binding rules alongside the built-in guidance (see fitPrompt in src/fit.ts). Deliberately
  * generic rather than a fixed "years of experience" field -- what counts as a dealbreaker (a
@@ -734,6 +746,30 @@ async function saveDesiredRoles(request: Request, env: Env): Promise<Response> {
   });
 }
 
+async function setMatchThreshold(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { match_threshold?: number };
+  if (!Number.isFinite(body.match_threshold)) return json({ error: "invalid_threshold" }, 400);
+  const threshold = Math.min(Math.max(Math.round(body.match_threshold as number), 0), 100);
+
+  const profileId = await getOrCreateProfileId(env);
+  const existing = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  let prefs: Record<string, unknown> = {};
+  try {
+    prefs = JSON.parse(existing?.preferences_json || "{}");
+  } catch {
+    prefs = {};
+  }
+  prefs.match_threshold = threshold;
+  await env.DB.prepare("UPDATE candidate_profiles SET preferences_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(JSON.stringify(prefs), profileId)
+    .run();
+  return json({ match_threshold: threshold });
+}
+
 async function listRoleSignals(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -939,13 +975,18 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
   const jobs = await env.DB.prepare(
     `SELECT id, title, company, source_url, location, posted_at, ats_provider,
             company_id, fit_status, fit_score, fit_reason, fit_missing_json, fit_detail_json, interested_at, applied_at, created_at,
-            assessed_at,
+            assessed_at, manual_status, removed_at, removed_from_status, removal_reason,
             EXISTS(SELECT 1 FROM resumes r WHERE r.job_id = job_postings.id) AS has_resume,
             EXISTS(SELECT 1 FROM cover_letters c WHERE c.job_id = job_postings.id) AS has_cover_letter
      FROM job_postings
      ORDER BY COALESCE(posted_at, created_at) DESC`,
   ).all();
-  return json({ jobs: jobs.results, counts: await jobPipelineCounts(env) });
+  const profileId = await getOrCreateProfileId(env);
+  const profileRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  const matchThreshold = readMatchThreshold(profileRow?.preferences_json ?? "{}");
+  return json({ jobs: jobs.results, counts: await jobPipelineCounts(env), match_threshold: matchThreshold });
 }
 
 /** Recent user-confirmed disqualifier reasons, most recent first, deduped case-insensitively. */
@@ -981,15 +1022,12 @@ function toAssessable(rows: JobRow[]) {
 
 // Same reasoning as the company-scan concurrency: an assess call is one LLM request per batch of
 // FIT_BATCH_SIZE postings, and the batches don't depend on each other, so several run at once
-// instead of one after another. Shared between processJobs's own tier-2 pass and the "reassess my
-// top matches" action below, so both get the same throughput.
+// instead of one after another.
 const ASSESS_CONCURRENCY = 8;
 
 /**
  * Tier-2 assessment over an already-fetched set of rows: batches them, fires the batches
- * concurrently, and writes+reports each as it completes. Factored out of processJobs so
- * `reassessTopMatches` below can reuse the exact same scoring logic against a different row
- * selection instead of duplicating the batching/concurrency/storage code.
+ * concurrently, and writes+reports each as it completes.
  */
 async function assessRowsBatched(
   env: Env,
@@ -1017,6 +1055,7 @@ async function assessRowsBatched(
     ASSESS_CONCURRENCY,
     async (batch) => {
       if (failed) return null;
+      await emit({ type: "pipeline", stage: "assess", phase: "dispatched", ids: batch.map((item) => item.id) });
       try {
         return await assessJobFitBatch(
           env, provider, JSON.stringify(structured), desiredRoles, disqualifiers, dealbreakers, careAboutTopics, batch,
@@ -1024,6 +1063,7 @@ async function assessRowsBatched(
       } catch (err) {
         errors.push(`assess: ${(err as Error).message}`);
         failed = true;
+        await emit({ type: "pipeline", stage: "assess", phase: "failed", ids: batch.map((item) => item.id) });
         return null;
       }
     },
@@ -1038,6 +1078,15 @@ async function assessRowsBatched(
         if (verdictForScore(result.score) === "reject") discarded += 1;
         else recommended += 1;
       }
+      await emit({
+        type: "pipeline",
+        stage: "assess",
+        phase: "resolved",
+        outcomes: results.map((result) => ({
+          id: result.id,
+          outcome: verdictForScore(result.score) === "reject" ? "rejected" : "recommended",
+        })),
+      });
       await emit({ type: "progress", stage: "assess", done: assessed, total, recommended, discarded });
     },
   );
@@ -1129,11 +1178,13 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
       LLM_CONCURRENCY,
       async (batch) => {
         if (screenFailed) return null;
+        await emit({ type: "pipeline", stage: "screen", phase: "dispatched", ids: batch.map((item) => item.id) });
         try {
           return await screenJobsBatch(env, provider, matchProfile, desiredRoles, disqualifiers, batch);
         } catch (err) {
           errors.push(`screen: ${(err as Error).message}`);
           screenFailed = true;
+          await emit({ type: "pipeline", stage: "screen", phase: "failed", ids: batch.map((item) => item.id) });
           return null;
         }
       },
@@ -1150,6 +1201,12 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
           if (!result.keep) screenedOut += 1;
         }
         screened += results.length;
+        await emit({
+          type: "pipeline",
+          stage: "screen",
+          phase: "resolved",
+          outcomes: results.map((result) => ({ id: result.id, outcome: result.keep ? "passed" : "rejected" })),
+        });
         // screened_in/screened_out here are cumulative within this call, not lifetime totals --
         // the Search tab's live pipeline diagram uses them as real per-batch deltas (this posting
         // really was just screened out, right now) rather than inferring a split from done/total,
@@ -1189,73 +1246,11 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
   });
 }
 
-/**
- * Re-scores whatever's already sitting at or above a score threshold, against the candidate's
- * current dealbreakers/preferences -- for after editing them, when the postings that mattered most
- * were already judged under the old criteria. Only reaches jobs still in the fresh-match buckets
- * (`strong`/`possible`); a job the candidate already acted on (interested/applied/manually
- * rejected) is a decision already made and isn't silently re-touched by this. Reuses the exact
- * scoring logic `processJobs`'s own tier-2 pass uses, via `assessRowsBatched`, rather than a
- * separate implementation that could drift from it.
- */
-async function reassessTopMatches(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const auth = await requireSession(request, env);
-  if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { provider?: string; min_score?: number };
-  const provider = normalizeProvider(body.provider);
-  const keyError = providerKeyMissing(env, provider);
-  if (keyError) return json({ error: keyError }, 501);
-  const minScore = Math.min(Math.max(Number(body.min_score) || 70, 0), 100);
-
-  const profileId = await getOrCreateProfileId(env);
-  const profileRow = await env.DB.prepare(
-    "SELECT preferences_json, structured_json FROM candidate_profiles WHERE id = ?",
-  )
-    .bind(profileId)
-    .first<{ preferences_json: string; structured_json: string }>();
-  const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
-  if (!structured) return json({ error: "no_profile_yet" }, 400);
-  const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
-  const dealbreakers = readDealbreakers(profileRow?.preferences_json ?? "{}");
-  const careAboutTopics = await ensureCareAboutTopics(env, provider, profileId, profileRow?.preferences_json ?? "{}");
-  const disqualifiers = await loadDisqualifiers(env, profileId);
-
-  // Capped defensively -- this is a deliberate one-off action the candidate chose to trigger with
-  // their own threshold, not a routine high-frequency operation, but a threshold of 0 shouldn't be
-  // able to re-run the strong model against the entire history in one click.
-  const targets = await env.DB.prepare(
-    `SELECT id, title, company, location, raw_description FROM job_postings
-     WHERE fit_status IN ('strong', 'possible') AND fit_score >= ?
-     ORDER BY fit_score DESC LIMIT 300`,
-  )
-    .bind(minScore)
-    .all<JobRow>();
-  const rows = targets.results ?? [];
-
-  return ndjsonResponse(ctx, async (emit) => {
-    if (!rows.length) return { assessed: 0, errors: [], counts: await jobPipelineCounts(env) };
-
-    // Flips them back to screened_in first (the same state a fresh screen would leave them in),
-    // so assessRowsBatched's write path is identical either way and a dropped connection here
-    // just means clicking the button again re-selects the same still-strong/possible rows.
-    await env.DB.prepare(
-      `UPDATE job_postings SET fit_status = 'screened_in' WHERE id IN (${rows.map(() => "?").join(",")})`,
-    )
-      .bind(...rows.map((r) => r.id))
-      .run();
-
-    const { assessed, errors } = await assessRowsBatched(
-      env, provider, structured, desiredRoles, disqualifiers, dealbreakers, careAboutTopics, rows, rows.length, emit,
-    );
-    return { assessed, errors, counts: await jobPipelineCounts(env) };
-  });
-}
-
 /** Row counts per pipeline stage, used for both the Jobs status line and the Data tab. */
 async function jobPipelineCounts(env: Env): Promise<Record<string, number>> {
   const rows = await env.DB.prepare(
-    "SELECT fit_status, COUNT(*) AS n FROM job_postings GROUP BY fit_status",
-  ).all<{ fit_status: string; n: number }>();
+    "SELECT fit_status, manual_status, COUNT(*) AS n FROM job_postings GROUP BY fit_status, manual_status",
+  ).all<{ fit_status: string; manual_status: string; n: number }>();
   const counts: Record<string, number> = {
     unassessed: 0,
     screened_in: 0,
@@ -1265,8 +1260,14 @@ async function jobPipelineCounts(env: Env): Promise<Record<string, number>> {
     reject: 0,
     interested: 0,
     applied: 0,
+    manual_interested: 0,
+    manual_removed: 0,
   };
-  for (const row of rows.results ?? []) counts[row.fit_status] = row.n;
+  for (const row of rows.results ?? []) {
+    if (row.manual_status === "interested") counts.manual_interested += row.n;
+    else if (row.manual_status === "removed") counts.manual_removed += row.n;
+    else counts[row.fit_status] = (counts[row.fit_status] ?? 0) + row.n;
+  }
   counts.total = Object.values(counts).reduce((a, b) => a + b, 0);
   return counts;
 }
@@ -1413,123 +1414,97 @@ async function storeFitResults(env: Env, results: FitResult[]): Promise<void> {
 async function setJobFit(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as {
-    action?: string;
-    reason?: string;
-    fit_status?: string;
-    fit_score?: number | null;
-    fit_reason?: string;
-    fit_missing_json?: string;
-    fit_detail_json?: string;
-  };
-  const job = await env.DB.prepare("SELECT title, company, fit_score FROM job_postings WHERE id = ?")
+  const body = (await request.json().catch(() => ({}))) as { action?: string; reason?: string };
+  const job = await env.DB.prepare("SELECT title, company, manual_status, removed_from_status FROM job_postings WHERE id = ?")
     .bind(id)
-    .first<{ title: string; company: string; fit_score: number | null }>();
+    .first<{ title: string; company: string; manual_status: string; removed_from_status: string | null }>();
   if (!job) return json({ error: "not_found" }, 404);
 
-  if (body.action === "restore") {
-    await env.DB.prepare(
-      "UPDATE job_postings SET fit_status = 'unassessed', fit_score = NULL, fit_reason = '', assessed_at = NULL WHERE id = ?",
-    )
-      .bind(id)
-      .run();
-    return json({ id, fit_status: "unassessed" });
-  }
-
-  if (body.action === "restore_snapshot") {
-    // Undo for Jindr: a reject overwrites fit_score/fit_reason below, so there's nothing left in
-    // the database to restore from once one happens -- the client has to hold onto its own copy of
-    // the row from just before the swipe and hand it back verbatim. interested_at is explicitly
-    // cleared since Jindr only ever swipes from the not-yet-interested state in the first place.
-    const fitStatus = body.fit_status || "unassessed";
-    await env.DB.prepare(
-      `UPDATE job_postings SET fit_status = ?, fit_score = ?, fit_reason = ?, fit_missing_json = ?,
-       fit_detail_json = ?, interested_at = NULL WHERE id = ?`,
-    )
-      .bind(
-        fitStatus,
-        body.fit_score ?? null,
-        body.fit_reason ?? "",
-        body.fit_missing_json ?? "[]",
-        body.fit_detail_json ?? "{}",
-        id,
-      )
-      .run();
-    return json({ id, fit_status: fitStatus });
-  }
-
   if (body.action === "interested") {
-    // A manual override on top of whatever the AI verdict was, the same way a rejection is --
-    // fit_score/fit_reason are left alone so the score/reason that made it interesting is still
-    // there to see once it's sitting in the Interested tab.
+    // A manual override on top of whatever the AI verdict was -- fit_score/fit_status/fit_reason
+    // are never touched, so the rating that made it interesting is still there to see.
     await env.DB.prepare(
-      "UPDATE job_postings SET fit_status = 'interested', interested_at = CURRENT_TIMESTAMP WHERE id = ?",
+      "UPDATE job_postings SET manual_status = 'interested', interested_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
       .bind(id)
       .run();
-    return json({ id, fit_status: "interested" });
+    return json({ id, manual_status: "interested" });
+  }
+
+  if (body.action === "removed") {
+    // Records where the job was (normal or interested) right before removal, so Re-add knows
+    // whether to send it back to Interested or let its rating recompute its bucket. fit_score/
+    // fit_status/fit_reason are never touched -- removal must never cost a job its rating.
+    await env.DB.prepare(
+      `UPDATE job_postings SET manual_status = 'removed', removed_at = CURRENT_TIMESTAMP,
+       removed_from_status = ?, removal_reason = '' WHERE id = ?`,
+    )
+      .bind(job.manual_status, id)
+      .run();
+    return json({ id, manual_status: "removed" });
+  }
+
+  if (body.action === "readd") {
+    // Restoring from Removed never re-derives a fit_status/fit_score -- there's nothing to
+    // recompute, they were never touched in the first place. Good/Bad Match falls out live from
+    // the untouched fit_score once manual_status goes back to 'normal'.
+    const target = job.removed_from_status === "interested" ? "interested" : "normal";
+    await env.DB.prepare(
+      `UPDATE job_postings SET manual_status = ?, removed_at = NULL, removed_from_status = NULL,
+       removal_reason = '' WHERE id = ?`,
+    )
+      .bind(target, id)
+      .run();
+    return json({ id, manual_status: target });
+  }
+
+  if (body.action === "set_removal_reason") {
+    const reason = (body.reason ?? "").trim();
+    const profileId = await getOrCreateProfileId(env);
+    // Keep the posting and its durable profile-learning signal in sync. Re-saving an edited
+    // reason replaces the prior lesson for this job instead of quietly accumulating duplicates;
+    // clearing it also removes the lesson from the profile.
+    const statements = [
+      env.DB.prepare("UPDATE job_postings SET removal_reason = ? WHERE id = ?").bind(reason, id),
+      env.DB.prepare("DELETE FROM job_feedback WHERE profile_id = ? AND job_id = ?").bind(profileId, id),
+    ];
+    if (reason) {
+      statements.push(
+        env.DB.prepare(
+          "INSERT INTO job_feedback (id, profile_id, job_id, title, company, reason) VALUES (?, ?, ?, ?, ?, ?)",
+        ).bind(crypto.randomUUID(), profileId, id, job.title, job.company, reason),
+      );
+    }
+    await env.DB.batch(statements);
+    return json({ id, removal_reason: reason });
   }
 
   if (body.action === "applied") {
-    // Same manual-override shape as 'interested'. interested_at is deliberately left set: a job you
-    // applied to was necessarily one you were interested in, and keeping the timestamp means
-    // un-applying can put it back on the Interested tab in its original position.
-    await env.DB.prepare(
-      "UPDATE job_postings SET fit_status = 'applied', applied_at = CURRENT_TIMESTAMP WHERE id = ?",
-    )
-      .bind(id)
-      .run();
-    return json({ id, fit_status: "applied" });
+    // manual_status is already 'interested' by construction -- applying only ever happens from
+    // the Interested workspace.
+    await env.DB.prepare("UPDATE job_postings SET applied_at = CURRENT_TIMESTAMP WHERE id = ?").bind(id).run();
+    return json({ id, applied: true });
   }
 
   if (body.action === "unapplied") {
-    // Undoing an application returns the job to Interested rather than all the way to the Jobs tab.
-    // Marking something applied by mistake shouldn't also discard the decision to pursue it.
+    await env.DB.prepare("UPDATE job_postings SET applied_at = NULL WHERE id = ?").bind(id).run();
+    return json({ id, applied: false });
+  }
+
+  if (body.action === "restore_snapshot") {
+    // Undo for Jindr. Swipes only ever change manual_status/interested_at -- never fit_score/
+    // fit_status -- so undo just needs to revert those, safe since Jindr only ever swipes cards
+    // that started out at manual_status='normal'.
     await env.DB.prepare(
-      `UPDATE job_postings SET fit_status = 'interested', applied_at = NULL,
-       interested_at = COALESCE(interested_at, CURRENT_TIMESTAMP) WHERE id = ?`,
+      `UPDATE job_postings SET manual_status = 'normal', interested_at = NULL, removed_at = NULL,
+       removed_from_status = NULL, removal_reason = '' WHERE id = ?`,
     )
       .bind(id)
       .run();
-    return json({ id, fit_status: "interested" });
+    return json({ id, manual_status: "normal" });
   }
 
-  if (body.action === "uninterested") {
-    // Leaving "interested" shouldn't cost the posting its score the way a full "restore" would --
-    // it goes back to whatever bucket its existing score already implies, or unassessed if it was
-    // never scored, rather than always resetting to unassessed and losing that context.
-    const fitStatus = job.fit_score !== null && job.fit_score !== undefined
-      ? verdictForScore(job.fit_score)
-      : "unassessed";
-    await env.DB.prepare(
-      "UPDATE job_postings SET fit_status = ?, interested_at = NULL WHERE id = ?",
-    )
-      .bind(fitStatus, id)
-      .run();
-    return json({ id, fit_status: fitStatus });
-  }
-
-  const reason = (body.reason ?? "").trim();
-  // A user rejection didn't come from the scoring model, but 0 is where a confirmed non-fit
-  // belongs on the same scale as a modeled score, so the score badge stays meaningful either way.
-  await env.DB.prepare(
-    "UPDATE job_postings SET fit_status = 'reject', fit_score = 0, fit_reason = ?, assessed_at = CURRENT_TIMESTAMP WHERE id = ?",
-  )
-    .bind(reason || "Not a fit.", id)
-    .run();
-
-  // Only an explicit, user-typed reason becomes a durable disqualifier -- a bare "not for me"
-  // click with nothing typed teaches the system nothing, which is the right default.
-  if (reason) {
-    const profileId = await getOrCreateProfileId(env);
-    await env.DB.prepare(
-      "INSERT INTO job_feedback (id, profile_id, job_id, title, company, reason) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-      .bind(crypto.randomUUID(), profileId, id, job.title, job.company, reason)
-      .run();
-  }
-
-  return json({ id, fit_status: "reject", reason });
+  return json({ error: "unknown_action" }, 400);
 }
 
 /**
@@ -1959,7 +1934,7 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
 async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { limit?: number; company_id?: string; force?: boolean };
+  const body = (await request.json().catch(() => ({}))) as { limit?: number; company_id?: string };
   const profileId = await getOrCreateProfileId(env);
 
   const profileRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
@@ -1980,27 +1955,23 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
         .bind(body.company_id, profileId)
         .all<CompanyScanRow>()
     : await env.DB.prepare(
-        // Unreachable companies are excluded from the bulk scan the same as dismissed ones --
-        // their site didn't resolve at discovery time, so spending scan budget retrying them
-        // automatically would just fail again. The single-company scan query above (by id, no
-        // status filter) still reaches them, for a deliberate manual retry.
+        // Unreachable companies are excluded the same as dismissed ones -- their site didn't
+        // resolve at discovery time, so spending scan budget retrying them automatically would just
+        // fail again. The single-company scan query above (by id, no status filter) still reaches
+        // them, for a deliberate manual retry.
         //
-        // A company already scanned today is excluded too by default -- its board was just read,
-        // so re-reading it minutes or hours later within the same click cycle just re-pays for the
-        // same listings. It becomes eligible again once the calendar day rolls over -- or
-        // immediately, with `force`, for the one case that guard actively works against: after a
-        // change to what gets captured from a posting (e.g. a widened description-length cap),
-        // every already-scanned posting is stuck on its old, thinner text until it's re-read, and
-        // the ordinary daily guard silently no-ops the very re-scan that's supposed to fix that
-        // (reports "0 scanned" with no indication anything was skipped, rather than an error).
+        // No "already scanned today" exclusion: every eligible company is always a candidate, so a
+        // Find Jobs click re-reads everything regardless of when it was last read. Ordering by
+        // least-recently-scanned first still matters when the fetch budget can't reach everyone in
+        // one request -- each round's just-scanned companies get a fresh last_scanned_at and sort
+        // to the back, so a multi-round run still ends up covering every company exactly once.
         `SELECT id, name, website, careers_url, ats_provider, ats_token
          FROM companies
          WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable')
-           AND (? OR last_scanned_at IS NULL OR date(last_scanned_at) < date('now'))
          ORDER BY last_scanned_at IS NOT NULL, last_scanned_at ASC
          LIMIT ?`,
       )
-        .bind(profileId, body.force === true ? 1 : 0, limit)
+        .bind(profileId, limit)
         .all<CompanyScanRow>();
 
   const companies = targets.results ?? [];
@@ -2043,17 +2014,15 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
       },
     );
 
-    // "Unscanned" here means "not yet scanned today", matching the query above -- a company
-    // scanned yesterday isn't owed another scan until this same cycle rolls into a new day.
-    const remaining = await env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM companies
-       WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable')
-         AND (last_scanned_at IS NULL OR date(last_scanned_at) < date('now'))`,
+    // Total eligible companies, not time-gated -- the client uses this against however many it's
+    // scanned so far across this click's rounds to know when a Find Jobs run has covered everyone.
+    const eligible = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable')`,
     )
       .bind(profileId)
       .first<{ n: number }>();
 
-    return { scanned: results.length, results, new_listings: newListings, unscanned: remaining?.n ?? 0 };
+    return { scanned: results.length, results, new_listings: newListings, eligible_total: eligible?.n ?? 0 };
   });
 }
 
@@ -3875,9 +3844,10 @@ const ENROLL_PAGE = `<!doctype html>
         })
         .then(function (meRes) {
           if (!meRes.ok) throw new Error('session_verification_failed');
-          statusEl.textContent = 'Device enrolled. Session verified — you can close this page.';
+          statusEl.textContent = 'Device enrolled. Opening your dashboard…';
           statusEl.className = 'success';
           form.reset();
+          window.location.replace('/');
         })
         .catch(function (err) {
           statusEl.textContent = 'Enrollment failed: ' + err.message;
@@ -3956,9 +3926,14 @@ const DASHBOARD_PAGE = `<!doctype html>
     display: flex; align-items: center; justify-content: space-between;
     padding: 1.1rem 0 0.9rem; gap: 0.75rem;
   }
-  .brand { display: flex; align-items: center; gap: 0.5rem; font-weight: 700; font-size: 1.15rem; letter-spacing: -0.01em; }
+  .brand {
+    display: flex; align-items: center; gap: 0.5rem; font-weight: 700; font-size: 1.15rem;
+    letter-spacing: -0.01em; color: var(--text); text-decoration: none;
+  }
+  .brand:hover { color: var(--text); }
   .brand svg { flex: none; }
   .brand .go { color: var(--accent); }
+  .header-actions { display: flex; align-items: center; }
   nav {
     display: flex; gap: 0.2rem; overflow-x: auto; padding: 0.25rem; margin-bottom: 1.1rem;
     background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
@@ -3993,20 +3968,6 @@ const DASHBOARD_PAGE = `<!doctype html>
   nav button.active { background: var(--accent); color: var(--accent-contrast); }
   .panel { display: none; }
   .panel.active { display: block; }
-  /* Same look as nav/.panel, namespaced separately so the sub-tab buttons never get picked up by
-     the top-level 'nav .tab' click handler that switches main panels. */
-  .subnav {
-    display: flex; gap: 0.2rem; overflow-x: auto; padding: 0.25rem; margin-bottom: 1.1rem;
-    background: var(--surface); border: 1px solid var(--border); border-radius: 999px; width: fit-content;
-    -webkit-overflow-scrolling: touch;
-  }
-  .subnav button {
-    flex: none; margin: 0; padding: 0.45rem 0.95rem; font-size: 0.85rem; font-weight: 600;
-    background: none; border: none; border-radius: 999px; color: var(--text-muted); cursor: pointer;
-    transition: background 0.12s ease, color 0.12s ease;
-  }
-  .subnav button:hover { color: var(--text); }
-  .subnav button.active { background: var(--accent); color: var(--accent-contrast); }
   .subpanel { display: none; }
   .subpanel.active { display: block; }
   .role-analysis-roles { display: flex; flex-direction: column; gap: 0.7rem; margin-top: 0.6rem; }
@@ -4132,13 +4093,8 @@ const DASHBOARD_PAGE = `<!doctype html>
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
     clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
   }
-  /* Pipeline flow diagram (Search tab) -- shows where scanned postings currently sit: not yet
-     screened, screened out, awaiting the detailed pass, ruled out on fit, or recommended. Node
-     heights and ribbon thickness are real counts from jobPipelineCounts, eased smoothly toward
-     whatever the current numbers are on every animation frame -- an initial load and a live
-     per-batch update during Scan/Find my matches both just change the target, so the diagram
-     visibly moves instead of only ever replacing a static number. Not-interested/Interested/
-     Applied aren't shown here -- this page is about finding matches, not the review funnel after. */
+  /* Pipeline flow diagram (Search tab). Queues are upstream reservoirs, processing stages are
+     narrow gates, and only resolved decisions accumulate downstream. */
   #jobs-pipeline { margin: 0.6rem 0 1rem; }
   #jobs-pipeline svg { display: block; width: 100%; height: auto; overflow: visible; }
   .pf-stage-title { font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; fill: var(--text-muted); text-transform: uppercase; }
@@ -4148,7 +4104,11 @@ const DASHBOARD_PAGE = `<!doctype html>
   .pf-node-pct { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 10px; fill: var(--text-muted); }
   /* fill and fill-opacity are set per-edge in JS (by flow kind); nothing to fix here. */
   .pf-dot { filter: drop-shadow(0 0 2px rgba(0,0,0,0.25)); }
-  @media (prefers-reduced-motion: reduce) { .pf-dot { display: none; } }
+  .pf-reservoir { pointer-events: none; }
+  .pf-reservoir-queue { stroke: var(--warning); stroke-width: 1; stroke-dasharray: 3 2; }
+  .pf-node-gate { stroke-width: 2.4; }
+  .pf-splash { pointer-events: none; }
+  @media (prefers-reduced-motion: reduce) { .pf-dot, .pf-splash { display: none; } }
   .pf-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: var(--text-muted); margin-top: 0.4rem; }
   .pf-legend-item { display: flex; align-items: center; gap: 6px; }
   .pf-swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
@@ -4216,6 +4176,9 @@ const DASHBOARD_PAGE = `<!doctype html>
     background: var(--surface); border: 1px solid var(--error); color: var(--error);
   }
   .jindr-actions button.danger:hover:not(:disabled) { background: var(--error-soft); opacity: 1; }
+  /* Compact green action -- Good/Bad Fit's "Interested" and Removed's "Re-add" -- same quiet,
+     colors-on-hover convention as .danger, just green instead of red. */
+  .row-actions button.success:hover:not(:disabled) { color: var(--success); border-color: var(--success); }
   .summary-line {
     font-size: 0.85rem; color: var(--text-muted); margin: 0 0 1rem; padding: 0.6rem 0.75rem;
     background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -4314,34 +4277,34 @@ const DASHBOARD_PAGE = `<!doctype html>
 <body>
   <div class="shell">
   <header>
-    <div class="brand">
+    <a class="brand" href="/" aria-label="ApplyGo home">
       <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
         <rect width="28" height="28" rx="8" fill="var(--accent)"/>
         <path d="M8 15L13 20L21 9" stroke="var(--accent-contrast)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
       <span>Apply<span class="go">Go</span></span>
+    </a>
+    <div class="header-actions" aria-label="Utilities">
+      <button id="sign-out" class="secondary" type="button">Sign out</button>
     </div>
-    <button id="sign-out" class="secondary" type="button">Sign out</button>
   </header>
 
-  <nav>
+  <nav id="workflow-nav">
     <button class="tab active" data-tab="roles" type="button">Roles</button>
     <button class="tab" data-tab="resume" type="button">Resume</button>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="search" type="button">Search</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
     <button class="tab" data-tab="jindr" type="button">Jindr</button>
-    <button class="tab" data-tab="interested" type="button">Interested</button>
     <button class="tab" data-tab="applied" type="button">Applied</button>
-    <button class="tab" data-tab="devices" type="button">Devices</button>
-    <button class="tab" data-tab="data" type="button">Database</button>
+    <button class="tab" data-tab="settings" type="button">Settings</button>
   </nav>
 
   <div id="panel-roles" class="panel active">
-    <div class="subnav">
-      <button class="subtab active" data-subtab="notes" type="button">Notes</button>
-      <button class="subtab" data-subtab="locations" type="button">Locations</button>
-      <button class="subtab" data-subtab="dealbreakers" type="button">Dealbreakers</button>
+    <div class="segmented-control" role="group" aria-label="Role sections">
+      <button class="subtab active" data-subtab="notes" type="button">Targets</button>
+      <button class="subtab" data-subtab="locations" type="button">Location</button>
+      <button class="subtab" data-subtab="dealbreakers" type="button">Deal Breakers</button>
       <button class="subtab" data-subtab="criteria" type="button">Criteria</button>
       <button class="subtab" data-subtab="analysis" type="button">Analysis</button>
     </div>
@@ -4409,22 +4372,12 @@ const DASHBOARD_PAGE = `<!doctype html>
         <button id="role-analysis-button" class="secondary" type="button">Reanalyze</button>
         <p id="role-analysis-status" class="status" role="status" aria-live="polite"></p>
         <div id="role-analysis-view"><p class="empty">Not analyzed yet -- click Reanalyze, or add a note on the Notes tab and switch tabs.</p></div>
-        <h3 class="subhead">Already have matches?</h3>
-        <p class="hint">Re-score your existing top matches against the current analysis, without re-running the whole pipeline from scratch.</p>
-        <div class="controls">
-          <div>
-            <label for="reassess-min-score">Minimum score to re-check</label>
-            <input id="reassess-min-score" type="number" min="0" max="100" value="70">
-          </div>
-          <button id="reassess-button" type="button">Re-check my top matches</button>
-        </div>
-        <p id="reassess-status" class="status" role="status" aria-live="polite"></p>
       </section>
     </div>
   </div>
 
   <div id="panel-resume" class="panel">
-    <div class="subnav" aria-label="Resume sections">
+    <div class="segmented-control" role="group" aria-label="Resume sections">
       <button class="active" data-resume-subtab="documents" type="button">Documents</button>
       <button data-resume-subtab="notes" type="button">Notes</button>
       <button data-resume-subtab="master" type="button">Master</button>
@@ -4524,106 +4477,74 @@ const DASHBOARD_PAGE = `<!doctype html>
   </div>
 
   <div id="panel-companies" class="panel">
-    <div class="split">
-      <div class="split-sticky">
-        <section id="companies-controls-section">
-          <h2>Target companies</h2>
-          <p class="hint">Built from your profile and desired roles. Jobs are read from each company's own board — no aggregators.</p>
-          <p id="companies-summary" class="summary-line">Loading…</p>
+    <div class="segmented-control" id="companies-view-tabs" role="group" aria-label="Company sections">
+      <button class="active" data-companies-view="find" type="button" aria-pressed="true">Find</button>
+      <button data-companies-view="added" type="button" aria-pressed="false">Added <span id="companies-added-count"></span></button>
+      <button data-companies-view="unscannable" type="button" aria-pressed="false">Unscannable <span id="companies-unscannable-count"></span></button>
+      <button data-companies-view="removed" type="button" aria-pressed="false">Removed <span id="companies-removed-count"></span></button>
+    </div>
 
-          <label for="company-focus">Focus this search (optional)</label>
-          <input id="company-focus" placeholder="e.g. automotive, robotics, Bay Area startups">
-          <div class="controls">
-            <div>
-              <label for="company-count">How many</label>
-              <select id="company-count">
-                <option value="10">10</option>
-                <option value="15">15</option>
-                <option value="20">20</option>
-              </select>
-            </div>
-            <div>
-              <label for="company-provider">Search using</label>
-              <select id="company-provider">
-                <option value="anthropic">Anthropic (Claude)</option>
-                <option value="openai">OpenAI</option>
-              </select>
-            </div>
-          </div>
-          <button id="companies-discover-button" type="button">Find more companies</button>
-          <p id="companies-discover-status" class="status" role="status" aria-live="polite"></p>
-          <p class="hint">Each result is checked for a usable job board and its current openings are imported automatically.</p>
-
-          <h3>Where they are</h3>
-          <div id="companies-locations"><p class="empty">No companies yet.</p></div>
-
-          <details class="disclosure">
-            <summary>Add a company yourself</summary>
-            <form id="company-form">
-              <label for="company-name">Name</label>
-              <input id="company-name" required placeholder="e.g. Acme Robotics">
-              <label for="company-website">Website</label>
-              <input id="company-website" type="url" placeholder="https://acme.com">
-              <button type="submit">Add company</button>
-            </form>
-            <p id="company-add-status" class="status" role="status" aria-live="polite"></p>
-
-            <h3 class="subhead">Already have a list? Add several at once</h3>
-            <label for="company-bulk-text">Names separated by commas, semicolons, or line breaks -- paste it however you already have it. A website right after a name attaches to it.</label>
-            <textarea id="company-bulk-text" rows="6" placeholder="Acme Robotics, Another Company, A Third One, https://third.example"></textarea>
-            <button id="company-bulk-button" type="button">Add up to 50</button>
-            <p id="company-bulk-status" class="status" role="status" aria-live="polite"></p>
-          </details>
-        </section>
+    <section id="companies-find-panel">
+      <h2>Find companies</h2>
+      <label for="company-focus">Search focus (optional)</label>
+      <input id="company-focus" placeholder="e.g. automotive, robotics, Bay Area startups">
+      <div class="controls">
+        <div>
+          <label for="company-count">How many</label>
+          <select id="company-count">
+            <option value="10">10</option>
+            <option value="15">15</option>
+            <option value="20">20</option>
+          </select>
+        </div>
+        <div>
+          <label for="company-provider">Search using</label>
+          <select id="company-provider">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI</option>
+          </select>
+        </div>
       </div>
-      <div>
-        <section id="companies-list-section">
-          <div class="segmented-control" id="companies-view-tabs" role="group" aria-label="Company status">
-            <button class="active" data-companies-view="added" type="button" aria-pressed="true">Added <span id="companies-added-count"></span></button>
-            <button data-companies-view="unscannable" type="button" aria-pressed="false">Unscannable <span id="companies-unscannable-count"></span></button>
-            <button data-companies-view="removed" type="button" aria-pressed="false">Removed <span id="companies-removed-count"></span></button>
-          </div>
+      <button id="companies-discover-button" type="button">Find companies</button>
+      <p id="companies-discover-status" class="status" role="status" aria-live="polite"></p>
+
+      <details class="disclosure">
+        <summary>Add companies manually</summary>
+        <form id="company-form">
+          <label for="company-name">Name</label>
+          <input id="company-name" required placeholder="e.g. Acme Robotics">
+          <label for="company-website">Website</label>
+          <input id="company-website" type="url" placeholder="https://acme.com">
+          <button type="submit">Add company</button>
+        </form>
+        <p id="company-add-status" class="status" role="status" aria-live="polite"></p>
+
+        <label for="company-bulk-text">Add a list</label>
+        <textarea id="company-bulk-text" rows="6" placeholder="Acme Robotics, Another Company, https://another.example"></textarea>
+        <button id="company-bulk-button" type="button">Add up to 50</button>
+        <p id="company-bulk-status" class="status" role="status" aria-live="polite"></p>
+      </details>
+    </section>
+
+    <section id="companies-list-section" style="display:none">
           <label for="companies-filter">Filter</label>
           <input id="companies-filter" placeholder="Search by name, location, or description">
           <div id="companies-list"><p class="empty">Loading…</p></div>
-        </section>
-      </div>
-    </div>
+    </section>
   </div>
 
   <div id="panel-search" class="panel">
-    <section id="jobs-scan-section">
-      <h2>1. Scan for new listings</h2>
-      <p class="hint">Reads the job boards of companies on your list. Each company costs a few requests, so however many you ask for, a single request only gets through as many as safely fit at once — picking "All" re-fires automatically until every company is covered, so you don't have to click through it by hand. A company already scanned today is skipped until tomorrow.</p>
-      <p id="jobs-scan-summary" class="summary-line">Loading…</p>
-      <div class="controls">
-        <div>
-          <label for="jobs-scan-count">Companies to scan</label>
-          <select id="jobs-scan-count">
-            <option value="1">1</option>
-            <option value="5">5</option>
-            <option value="10">10</option>
-            <option value="500" selected>All</option>
-          </select>
-        </div>
-        <button id="jobs-scan-button" type="button">Scan company boards</button>
-      </div>
-      <label><input id="jobs-scan-force" type="checkbox"> Re-scan companies already read today too</label>
-      <p class="hint">Off by default to avoid re-paying for boards you just read. Turn this on for a one-off re-read of everything right now — for example right after a fix widens what gets captured from a posting, so already-scanned postings pick up the fuller text instead of waiting until tomorrow's normal scan.</p>
-      <p id="jobs-scan-status" class="status" role="status" aria-live="polite"></p>
-    </section>
-
-    <section id="jobs-filter-section">
-      <h2>2. Filter for your best matches</h2>
-      <p class="hint">Screens new listings against your profile in two passes — a quick check, then a closer look at anything that survives it — so you only spend real attention on postings worth reading.</p>
+    <section id="jobs-find-section">
+      <h2>Find jobs</h2>
+      <p class="hint">Reads every company's job board, then screens and scores whatever's new against your profile — start to finish in one click. Boards are cheap to read, so every company is re-read on every click regardless of when it was last scanned.</p>
       <p id="jobs-pipeline-summary" class="sr-only" aria-live="polite"></p>
       <div id="jobs-pipeline" aria-hidden="true">
         <svg id="pf-svg" preserveAspectRatio="xMidYMid meet"></svg>
         <div class="pf-legend">
-          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--text-muted)"></span>Scanned / passed screening</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--accent)"></span>Processing</span>
           <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--warning)"></span>Waiting</span>
-          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--error)"></span>Dropped</span>
-          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--success)"></span>Recommended</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--error)"></span>Ruled out / removed</span>
+          <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--success)"></span>Recommended / interested</span>
         </div>
         <div class="pf-progress-track"><div class="pf-progress-fill" id="pfProgressFill"></div></div>
         <div class="pf-stat-row">
@@ -4641,15 +4562,21 @@ const DASHBOARD_PAGE = `<!doctype html>
             <option value="openai">OpenAI</option>
           </select>
         </div>
-        <button id="jobs-assess-button" type="button">Find my matches</button>
+        <button id="jobs-find-button" type="button">Find Jobs</button>
       </div>
-      <p id="jobs-assess-status" class="status" role="status" aria-live="polite"></p>
+      <p id="jobs-find-status" class="status" role="status" aria-live="polite"></p>
     </section>
   </div>
 
   <div id="panel-jobs" class="panel">
     <section id="jobs-section">
       <h2>Job postings</h2>
+      <div class="segmented-control" id="jobs-view-tabs" role="group" aria-label="Job status">
+        <button class="active" data-jobs-view="good_match" type="button" aria-pressed="true">Good Fit <span id="jobs-good_match-count"></span></button>
+        <button data-jobs-view="bad_match" type="button" aria-pressed="false">Bad Fit <span id="jobs-bad_match-count"></span></button>
+        <button data-jobs-view="interested" type="button" aria-pressed="false">Interested <span id="jobs-interested-count"></span></button>
+        <button data-jobs-view="removed" type="button" aria-pressed="false">Removed <span id="jobs-removed-count"></span></button>
+      </div>
       <label for="jobs-filter">Filter</label>
       <input id="jobs-filter" placeholder="Search by title, company, or location">
       <div class="controls">
@@ -4681,14 +4608,83 @@ const DASHBOARD_PAGE = `<!doctype html>
             <option value="posted">Recently posted</option>
           </select>
         </div>
+        <div>
+          <label for="jobs-match-threshold">Match threshold ≥</label>
+          <input id="jobs-match-threshold" type="number" min="0" max="100" step="1" value="70">
+        </div>
       </div>
-      <label class="checkbox-label">
-        <input id="jobs-show-unfiltered" type="checkbox"><span id="jobs-unfiltered-count">Show postings not filtered yet</span>
-      </label>
-      <label class="checkbox-label">
-        <input id="jobs-show-rejected" type="checkbox"><span id="jobs-rejected-count">Show postings marked not a fit</span>
-      </label>
+      <p id="jobs-match-threshold-status" class="status" role="status" aria-live="polite"></p>
+
       <div id="jobs-list"><p class="empty">Loading…</p></div>
+
+      <!-- Interested subtab: the old top-level Interested tab's list + detail workspace, shown
+           only when the Interested segment is active (see jobs-view click handler). -->
+      <div id="jobs-interested-section" style="display:none">
+        <section id="interested-list-section">
+          <p class="hint">Jobs you've marked "Interested". Click one to open its workspace — the posting link, an assistant that asks what your profile is still missing for it, a resume tailored to this posting, and a matching cover letter.</p>
+          <div id="interested-list"><p class="empty">Loading…</p></div>
+        </section>
+
+        <section id="interested-detail-section" style="display:none">
+          <h2 id="interested-detail-title"></h2>
+          <p id="interested-detail-meta" class="row-meta"></p>
+          <p id="interested-detail-reason" class="job-reason"></p>
+          <a id="interested-detail-link" class="row-title" target="_blank" rel="noopener">Open posting</a>
+
+          <!-- Assistant/Resume/Cover letter/Apply are sub-tabs, not stacked sections -- only one shows
+               at a time, the same way the top-level dashboard tabs work, so opening one doesn't leave
+               the others piled up underneath with no way to get back to just looking at one thing. -->
+          <div class="subtabs">
+            <button id="interested-subtab-assistant" type="button">Ask</button>
+            <button id="interested-subtab-resume" class="secondary" type="button">Resume</button>
+            <button id="interested-subtab-cover" class="secondary" type="button">Cover</button>
+            <button id="interested-subtab-apply" class="secondary" type="button">Apply</button>
+          </div>
+
+          <div id="interested-assistant-panel">
+            <p id="interested-review-status" class="status" role="status" aria-live="polite"></p>
+            <button id="interested-review-button" type="button">Ask a question</button>
+            <div id="interested-review-section" style="display:none">
+              <p id="interested-review-question" class="job-reason"></p>
+              <textarea id="interested-review-answer" placeholder="Answer in your own words — this gets added to your profile evidence for this job."></textarea>
+              <button id="interested-review-submit" type="button">Submit answer</button>
+            </div>
+            <div id="interested-review-history"></div>
+          </div>
+
+          <div id="interested-resume-panel" style="display:none">
+            <p id="interested-resume-status" class="status" role="status" aria-live="polite"></p>
+            <button id="interested-resume-button" type="button">Generate tailored resume</button>
+            <div id="interested-resume-section" style="display:none">
+              <p class="hint">On some phones the preview below can't scroll or show a page break — if that happens, use the link to open the actual PDF instead.</p>
+              <a id="interested-resume-open-link" class="row-title" target="_blank" rel="noopener">Open full PDF in a new tab</a>
+              <iframe id="interested-resume-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+              <div id="interested-resume-coverage" style="display:none"></div>
+              <div id="interested-resume-checks"></div>
+              <p id="interested-resume-critique" class="critique" style="display:none"></p>
+              <textarea id="interested-resume-comment" placeholder="Optional — steer the revision, e.g. tighten the second bullet, or point out what still doesn't fit"></textarea>
+              <button id="interested-resume-revise" class="secondary" type="button">Revise this version</button>
+            </div>
+          </div>
+
+          <div id="interested-cover-panel" style="display:none">
+            <p id="interested-cover-status" class="status" role="status" aria-live="polite"></p>
+            <button id="interested-cover-button" type="button">Draft cover letter</button>
+            <div id="interested-cover-section" style="display:none">
+              <iframe id="interested-cover-frame" style="width:100%; min-height:60vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+              <button id="interested-cover-regenerate" class="secondary" type="button">Regenerate for this job</button>
+            </div>
+          </div>
+
+          <div id="interested-apply-panel" style="display:none">
+            <p class="hint">What's ready for this application. Autofill arrives with the browser extension; for now, open the posting, use the resume and cover letter above, then mark it applied to move it to the Applied tab.</p>
+            <div id="interested-apply-readiness"></div>
+            <p id="interested-apply-status" class="status" role="status" aria-live="polite"></p>
+            <button id="interested-apply-mark" type="button">Mark as applied</button>
+          </div>
+        </section>
+      </div>
+
       <details class="disclosure">
         <summary>Add a posting by hand</summary>
         <form id="job-form">
@@ -4732,73 +4728,6 @@ const DASHBOARD_PAGE = `<!doctype html>
     </section>
   </div>
 
-  <div id="panel-interested" class="panel">
-    <section id="interested-list-section">
-      <h2>Interested jobs</h2>
-      <p class="hint">Jobs you've marked "Interested" on the Jobs tab. Click one to open its workspace — the posting link, an assistant that asks what your profile is still missing for it, a resume tailored to this posting, and a matching cover letter.</p>
-      <div id="interested-list"><p class="empty">Loading…</p></div>
-    </section>
-
-    <section id="interested-detail-section" style="display:none">
-      <h2 id="interested-detail-title"></h2>
-      <p id="interested-detail-meta" class="row-meta"></p>
-      <p id="interested-detail-reason" class="job-reason"></p>
-      <a id="interested-detail-link" class="row-title" target="_blank" rel="noopener">Open posting</a>
-
-      <!-- Assistant/Resume/Cover letter/Apply are sub-tabs, not stacked sections -- only one shows
-           at a time, the same way the top-level dashboard tabs work, so opening one doesn't leave
-           the others piled up underneath with no way to get back to just looking at one thing. -->
-      <div class="subtabs">
-        <button id="interested-subtab-assistant" type="button">Ask</button>
-        <button id="interested-subtab-resume" class="secondary" type="button">Resume</button>
-        <button id="interested-subtab-cover" class="secondary" type="button">Cover</button>
-        <button id="interested-subtab-apply" class="secondary" type="button">Apply</button>
-      </div>
-
-      <div id="interested-assistant-panel">
-        <p id="interested-review-status" class="status" role="status" aria-live="polite"></p>
-        <button id="interested-review-button" type="button">Ask a question</button>
-        <div id="interested-review-section" style="display:none">
-          <p id="interested-review-question" class="job-reason"></p>
-          <textarea id="interested-review-answer" placeholder="Answer in your own words — this gets added to your profile evidence for this job."></textarea>
-          <button id="interested-review-submit" type="button">Submit answer</button>
-        </div>
-        <div id="interested-review-history"></div>
-      </div>
-
-      <div id="interested-resume-panel" style="display:none">
-        <p id="interested-resume-status" class="status" role="status" aria-live="polite"></p>
-        <button id="interested-resume-button" type="button">Generate tailored resume</button>
-        <div id="interested-resume-section" style="display:none">
-          <p class="hint">On some phones the preview below can't scroll or show a page break — if that happens, use the link to open the actual PDF instead.</p>
-          <a id="interested-resume-open-link" class="row-title" target="_blank" rel="noopener">Open full PDF in a new tab</a>
-          <iframe id="interested-resume-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
-          <div id="interested-resume-coverage" style="display:none"></div>
-          <div id="interested-resume-checks"></div>
-          <p id="interested-resume-critique" class="critique" style="display:none"></p>
-          <textarea id="interested-resume-comment" placeholder="Optional — steer the revision, e.g. tighten the second bullet, or point out what still doesn't fit"></textarea>
-          <button id="interested-resume-revise" class="secondary" type="button">Revise this version</button>
-        </div>
-      </div>
-
-      <div id="interested-cover-panel" style="display:none">
-        <p id="interested-cover-status" class="status" role="status" aria-live="polite"></p>
-        <button id="interested-cover-button" type="button">Draft cover letter</button>
-        <div id="interested-cover-section" style="display:none">
-          <iframe id="interested-cover-frame" style="width:100%; min-height:60vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
-          <button id="interested-cover-regenerate" class="secondary" type="button">Regenerate for this job</button>
-        </div>
-      </div>
-
-      <div id="interested-apply-panel" style="display:none">
-        <p class="hint">What's ready for this application. Autofill arrives with the browser extension; for now, open the posting, use the resume and cover letter above, then mark it applied to move it to the Applied tab.</p>
-        <div id="interested-apply-readiness"></div>
-        <p id="interested-apply-status" class="status" role="status" aria-live="polite"></p>
-        <button id="interested-apply-mark" type="button">Mark as applied</button>
-      </div>
-    </section>
-  </div>
-
   <div id="panel-applied" class="panel">
     <section id="applied-section">
       <h2>Applied</h2>
@@ -4808,15 +4737,21 @@ const DASHBOARD_PAGE = `<!doctype html>
     </section>
   </div>
 
-  <div id="panel-devices" class="panel">
-    <section id="devices-section">
-      <h2>Devices</h2>
-      <div id="devices-list"><p class="empty">Loading…</p></div>
-    </section>
-  </div>
+  <div id="panel-settings" class="panel">
+    <div class="segmented-control" role="group" aria-label="Settings sections">
+      <button class="active" data-settings-subtab="devices" type="button" aria-pressed="true">Devices</button>
+      <button data-settings-subtab="data" type="button" aria-pressed="false">Data</button>
+    </div>
 
-  <div id="panel-data" class="panel">
-    <section id="runtime-mode-section">
+    <div id="settings-subpanel-devices" class="subpanel active">
+      <section id="devices-section">
+        <h2>Devices</h2>
+        <div id="devices-list"><p class="empty">Loading…</p></div>
+      </section>
+    </div>
+
+    <div id="settings-subpanel-data" class="subpanel">
+      <section id="runtime-mode-section">
       <h2>Where ApplyGo runs</h2>
       <p class="hint">Local is the default: your database, files, and browser work stay on this computer. Cloudflare is optional and adds access from your phone through infrastructure you own.</p>
       <div class="row-item">
@@ -4838,25 +4773,26 @@ const DASHBOARD_PAGE = `<!doctype html>
         </div>
       </div>
       <p class="hint">Cloudflare credentials cannot be entered into this web page: a deployed Worker must not receive or store the API token capable of deploying itself. The local launcher will collect that token on the computer, store it in a private OS-backed credential store, provision the deployment, and then expose the mode switch here.</p>
-    </section>
-    <section id="data-stored-section">
+      </section>
+      <section id="data-stored-section">
       <h2>What's stored</h2>
       <p class="hint">Everything ApplyGo keeps about you and your search, and how much space the bulky parts take.</p>
       <div id="data-counts"><p class="empty">Loading…</p></div>
-    </section>
+      </section>
 
-    <section id="data-pipeline-section">
+      <section id="data-pipeline-section">
       <h2>Pipeline</h2>
       <p class="hint">Each stage feeds the next. Resetting one also clears everything downstream of it, because those results were derived from what you're removing.</p>
       <div id="data-stages"><p class="empty">Loading…</p></div>
-    </section>
+      </section>
 
-    <section id="data-collections-section">
+      <section id="data-collections-section">
       <h2>Other collections</h2>
       <p class="hint">Standalone data that isn't part of the job pipeline.</p>
       <div id="data-collections"></div>
       <p id="data-status" class="status" role="status" aria-live="polite"></p>
-    </section>
+      </section>
+    </div>
   </div>
   </div>
 
@@ -4887,6 +4823,21 @@ const DASHBOARD_PAGE = `<!doctype html>
         document.querySelectorAll('#panel-resume > .subpanel').forEach(function (panel) { panel.classList.remove('active'); });
         subtabButton.classList.add('active');
         document.getElementById('resume-subpanel-' + subtabButton.dataset.resumeSubtab).classList.add('active');
+      });
+    });
+
+    document.querySelectorAll('[data-settings-subtab]').forEach(function (subtabButton) {
+      subtabButton.addEventListener('click', function () {
+        document.querySelectorAll('[data-settings-subtab]').forEach(function (button) {
+          button.classList.remove('active');
+          button.setAttribute('aria-pressed', 'false');
+        });
+        document.querySelectorAll('#panel-settings > .subpanel').forEach(function (panel) {
+          panel.classList.remove('active');
+        });
+        subtabButton.classList.add('active');
+        subtabButton.setAttribute('aria-pressed', 'true');
+        document.getElementById('settings-subpanel-' + subtabButton.dataset.settingsSubtab).classList.add('active');
       });
     });
 
@@ -5018,9 +4969,9 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     // --- Roles page: sub-tabs, the three raw preference inputs, and the derived analysis ---
 
-    document.querySelectorAll('#panel-roles .subnav .subtab').forEach(function (subtabButton) {
+    document.querySelectorAll('#panel-roles [data-subtab]').forEach(function (subtabButton) {
       subtabButton.addEventListener('click', function () {
-        document.querySelectorAll('#panel-roles .subnav .subtab').forEach(function (b) { b.classList.remove('active'); });
+        document.querySelectorAll('#panel-roles [data-subtab]').forEach(function (b) { b.classList.remove('active'); });
         document.querySelectorAll('#panel-roles .subpanel').forEach(function (p) { p.classList.remove('active'); });
         subtabButton.classList.add('active');
         document.getElementById('subpanel-' + subtabButton.dataset.subtab).classList.add('active');
@@ -5498,36 +5449,6 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
-    document.getElementById('reassess-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('reassess-status');
-      var button = this;
-      var minScore = Number(document.getElementById('reassess-min-score').value) || 70;
-      button.disabled = true;
-      statusEl.textContent = 'Re-checking…';
-      statusEl.className = 'status';
-      try {
-        var res = await api('/jobs/reassess', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ min_score: minScore }),
-        });
-        if (!res.ok) throw new Error(errorMessage(await res.json(), 'reassess_failed'));
-        var data = await readNdjson(res, function (event) {
-          statusEl.textContent = 'Re-checking… ' + event.done + ' of ' + event.total;
-        });
-        statusEl.textContent = data.assessed
-          ? 'Re-checked ' + data.assessed + ' match' + (data.assessed === 1 ? '' : 'es') + ' against your updated preferences.'
-          : 'Nothing at or above ' + minScore + '% to re-check.';
-        statusEl.className = (data.errors || []).length ? 'status error' : 'status success';
-        await loadJobs();
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      } finally {
-        button.disabled = false;
-      }
-    });
-
     function renderDocuments(docs) {
       var list = document.getElementById('documents-list');
       list.innerHTML = '';
@@ -5650,7 +5571,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         String(company.scan_note || '').indexOf('Board read failed:') === 0;
     }
 
-    var companiesView = 'added';
+    var companiesView = 'find';
 
     function renderCompanyRows(list, companies) {
       companies.forEach(function (company) {
@@ -5714,6 +5635,11 @@ const DASHBOARD_PAGE = `<!doctype html>
     }
 
     function renderCompanies() {
+      var finding = companiesView === 'find';
+      document.getElementById('companies-find-panel').style.display = finding ? 'block' : 'none';
+      document.getElementById('companies-list-section').style.display = finding ? 'none' : 'block';
+      if (finding) return;
+
       var needle = document.getElementById('companies-filter').value.trim();
       var list = document.getElementById('companies-list');
       list.innerHTML = '';
@@ -5730,7 +5656,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       if (!visible.length) {
         list.appendChild(el('p', {
           className: 'empty',
-          textContent: !allCompanies.length ? 'No companies yet — run a search on the left.'
+          textContent: !allCompanies.length ? 'No companies yet — use the Find tab to add some.'
             : (matching.length ? 'No companies in this category.' : 'No companies match that filter.'),
         }));
         return;
@@ -5738,38 +5664,10 @@ const DASHBOARD_PAGE = `<!doctype html>
       renderCompanyRows(list, visible);
     }
 
-    function renderCompanyLocations() {
-      var host = document.getElementById('companies-locations');
-      host.innerHTML = '';
-      var counts = {};
-      allCompanies.forEach(function (c) {
-        var key = (c.location || 'Unknown').trim() || 'Unknown';
-        counts[key] = (counts[key] || 0) + 1;
-      });
-      var keys = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; });
-      if (!keys.length) {
-        host.appendChild(el('p', { className: 'empty', textContent: 'No companies yet.' }));
-        return;
-      }
-      var wrap = el('div', { className: 'location-list' });
-      keys.forEach(function (key) {
-        var chip = el('button', {
-          className: 'location-chip', type: 'button', textContent: key + ' (' + counts[key] + ')',
-        });
-        chip.addEventListener('click', function () {
-          document.getElementById('companies-filter').value = key === 'Unknown' ? '' : key;
-          renderCompanies();
-        });
-        wrap.appendChild(chip);
-      });
-      host.appendChild(wrap);
-    }
-
     async function loadCompanies() {
       var res = await api('/companies');
       var data = await res.json();
       allCompanies = data.companies || [];
-      var withJobs = allCompanies.filter(function (c) { return c.open_jobs > 0; }).length;
       var unscannableCount = allCompanies.filter(isUnscannable).length;
       var removedCount = allCompanies.filter(function (c) { return c.status === 'dismissed'; }).length;
       var addedCount = allCompanies.filter(function (c) { return c.status !== 'dismissed' && !isUnscannable(c); }).length;
@@ -5777,40 +5675,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       document.getElementById('companies-added-count').textContent = '(' + addedCount + ')';
       document.getElementById('companies-unscannable-count').textContent = '(' + unscannableCount + ')';
       document.getElementById('companies-removed-count').textContent = '(' + removedCount + ')';
-      document.getElementById('companies-summary').innerHTML = '';
-      var summaryChildren = [
-        el('strong', { textContent: String(allCompanies.length) }),
-        el('span', { textContent: ' compan' + (allCompanies.length === 1 ? 'y' : 'ies') +
-          ' · ' + withJobs + ' with open roles · ' + addedCount + ' added · ' +
-          unscannableCount + ' unscannable · ' + removedCount + ' removed · ' }),
-      ];
-      summaryChildren.push(el('span', { textContent:
-        (data.off_target ? data.off_target + ' outside your locations · ' : '') +
-        (data.desired_locations ? 'limited to ' + data.desired_locations : 'no location limit set') }));
-      document.getElementById('companies-summary').appendChild(el('span', {}, summaryChildren));
-      renderCompanyLocations();
       renderCompanies();
-      renderScanSummary();
-    }
-
-    function renderScanSummary() {
-      var host = document.getElementById('jobs-scan-summary');
-      if (!host) return;
-      var scannedAt = allCompanies
-        .map(function (c) { return c.last_scanned_at; })
-        .filter(Boolean)
-        .sort()
-        .pop();
-      var eligible = allCompanies.filter(function (c) { return c.status !== 'dismissed'; }).length;
-      var unscanned = allCompanies.filter(function (c) { return c.status !== 'dismissed' && !c.last_scanned_at; }).length;
-      host.innerHTML = '';
-      host.appendChild(el('span', {}, [
-        el('span', {
-          textContent: (scannedAt ? 'Last scanned ' + new Date(scannedAt).toLocaleString() : 'Never scanned yet') +
-            ' · ' + eligible + ' compan' + (eligible === 1 ? 'y' : 'ies') + ' on your list' +
-            (unscanned ? ' · ' + unscanned + ' not scanned yet' : ''),
-        }),
-      ]));
     }
 
     document.getElementById('companies-filter').addEventListener('input', renderCompanies);
@@ -5896,69 +5761,6 @@ const DASHBOARD_PAGE = `<!doctype html>
       }
     });
 
-    document.getElementById('jobs-scan-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('jobs-scan-status');
-      var button = this;
-      var wantsAll = document.getElementById('jobs-scan-count').value === '500';
-      button.disabled = true;
-      statusEl.textContent = 'Reading job boards…';
-      statusEl.className = 'status';
-      try {
-        var totalScanned = 0;
-        var totalNew = 0;
-        var round = 0;
-        var data;
-        // A single request only gets through as many companies as safely fit in one call. "All"
-        // means the user shouldn't have to click again to get the rest, so it re-fires on their
-        // behalf until nothing's left -- capped so a real server problem can't spin forever.
-        do {
-          round += 1;
-          var res = await api('/companies/scan', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              limit: Number(document.getElementById('jobs-scan-count').value),
-              force: document.getElementById('jobs-scan-force').checked,
-            }),
-          });
-          if (!res.ok) throw new Error(errorMessage(await res.json(), 'scan_failed'));
-          data = await readNdjson(res, function (event) {
-            statusEl.textContent =
-              (round > 1 ? 'Round ' + round + ': ' : '') +
-              'Scanning… ' + event.done + ' of ' + event.total + ' compan' + (event.total === 1 ? 'y' : 'ies') +
-              ' (' + event.company + (event.new_jobs ? ', ' + event.new_jobs + ' new' : '') + ')';
-            // New listings land as unassessed the moment they're inserted -- grow the Search tab's
-            // pipeline diagram live as each company's board read completes, not only after this
-            // whole (possibly multi-round) scan finishes.
-            pfBumpScanned(event.new_jobs);
-          });
-          totalScanned += data.scanned;
-          totalNew += data.new_listings;
-        } while (wantsAll && data.unscanned > 0 && data.scanned > 0 && round < 25);
-        if (totalScanned === 0 && !document.getElementById('jobs-scan-force').checked) {
-          // The single most confusing outcome this button can produce: it looks identical to "ran
-          // fine, nothing new" whether that's actually true or every candidate was just skipped for
-          // already being scanned today -- say so explicitly instead of leaving that ambiguous.
-          statusEl.textContent = 'Nothing scanned -- every company on your list was already scanned today. ' +
-            'Check "Re-scan companies already read today too" above if you specifically need a fresh read right now.';
-        } else {
-          statusEl.textContent =
-            'Scanned ' + totalScanned + ' compan' + (totalScanned === 1 ? 'y' : 'ies') + ' — found ' +
-            totalNew + ' new listing' + (totalNew === 1 ? '' : 's') + '. ' +
-            (data.unscanned ? data.unscanned + ' compan' + (data.unscanned === 1 ? 'y' : 'ies') +
-              ' still to scan today, click again to continue.' : 'All companies scanned for today.');
-        }
-        statusEl.className = 'status success';
-        await loadCompanies();
-        await loadJobs();
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      } finally {
-        button.disabled = false;
-      }
-    });
-
     document.getElementById('company-form').addEventListener('submit', async function (event) {
       event.preventDefault();
       var statusEl = document.getElementById('company-add-status');
@@ -6033,24 +5835,38 @@ const DASHBOARD_PAGE = `<!doctype html>
       interested: { text: 'Interested', cls: 'strong' },
       applied: { text: 'Applied', cls: 'strong' },
     };
-    // Four buckets, kept visually and structurally separate so a fresh scan's unfiltered
-    // postings never get mixed in with results you've already reviewed:
-    //   judged matches (green)      -- shown by default
-    //   not filtered yet (yellow)   -- hidden by default, own toggle
-    //   ruled out (red)             -- hidden by default, own toggle
-    //   interested / applied        -- never shown here at all, each lives on its own tab instead
+    // Jindr still queues directly off the AI pipeline's own fit_status buckets -- it only ever
+    // shows already-rated, not-yet-decided postings, independent of the Jobs page's five subtabs.
     var QUEUED_STATUSES = { unassessed: true, screened_in: true };
     var RULED_OUT_STATUSES = { reject: true, screened_out: true };
-    var INTERESTED_STATUSES = { interested: true };
-    var APPLIED_STATUSES = { applied: true };
 
-    async function submitJobFit(jobId, action, reason) {
-      await api('/jobs/' + encodeURIComponent(jobId) + '/fit', {
+    var matchThreshold = 70;
+    var jobsView = 'good_match';
+
+    // Good Fit/Bad Fit/Interested/Removed. manual_status wins over everything else -- a rated
+    // posting only falls into Good or Bad Fit once it's *not* been manually moved. A posting with
+    // no fit_score yet (unassessed/screened_out/screened_in) counts as Bad Fit too -- the pipeline
+    // always ends by either screening a posting out or scoring it, so there's no separate "not
+    // rated yet" bucket to show. fit_score/fit_status are never written by a manual action, so this
+    // is always safe to recompute live, including after the threshold changes or a job is Re-added.
+    function jobCategory(job) {
+      if (job.manual_status === 'interested') return 'interested';
+      if (job.manual_status === 'removed') return 'removed';
+      return job.fit_score !== null && job.fit_score !== undefined && job.fit_score >= matchThreshold
+        ? 'good_match'
+        : 'bad_match';
+    }
+
+    async function submitJobFit(jobId, action, reason, reload) {
+      var res = await api('/jobs/' + encodeURIComponent(jobId) + '/fit', {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ action: action, reason: reason || '' }),
       });
-      await loadJobs();
+      if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'Could not update this job.'));
+      var data = await res.json();
+      if (reload !== false) await loadJobs();
+      return data;
     }
 
     // Jindr: the same judged-matches bucket the Jobs tab shows, one at a time instead of scrolled,
@@ -6064,8 +5880,7 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     function jindrBuildQueue() {
       jindrQueue = allJobs.filter(function (j) {
-        return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status]
-          && !INTERESTED_STATUSES[j.fit_status] && !APPLIED_STATUSES[j.fit_status];
+        return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status] && j.manual_status === 'normal';
       }).sort(jobSortComparator('score'));
       jindrIndex = 0;
       jindrLastSwipe = null;
@@ -6128,7 +5943,9 @@ const DASHBOARD_PAGE = `<!doctype html>
     function jindrSwipe(action) {
       if (jindrIndex >= jindrQueue.length) return;
       var job = jindrQueue[jindrIndex];
-      jindrLastSwipe = { job: JSON.parse(JSON.stringify(job)), action: action };
+      // Swipes only ever change manual_status/interested_at, never fit_score/fit_status, so undo
+      // just needs the job id to revert -- there's no AI-field snapshot to hold onto anymore.
+      jindrLastSwipe = job.id;
       jindrIndex += 1;
       renderJindrCard();
       // Fired after the UI has already moved on -- reviewing one posting shouldn't stall on a
@@ -6140,25 +5957,18 @@ const DASHBOARD_PAGE = `<!doctype html>
     }
 
     document.getElementById('jindr-interested').addEventListener('click', function () { jindrSwipe('interested'); });
-    document.getElementById('jindr-reject').addEventListener('click', function () { jindrSwipe('reject'); });
+    document.getElementById('jindr-reject').addEventListener('click', function () { jindrSwipe('removed'); });
 
     document.getElementById('jindr-undo').addEventListener('click', async function () {
       if (!jindrLastSwipe) return;
-      var snapshot = jindrLastSwipe.job;
+      var jobId = jindrLastSwipe;
       var button = this;
       button.disabled = true;
       try {
-        await api('/jobs/' + encodeURIComponent(snapshot.id) + '/fit', {
+        await api('/jobs/' + encodeURIComponent(jobId) + '/fit', {
           method: 'PATCH',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            action: 'restore_snapshot',
-            fit_status: snapshot.fit_status,
-            fit_score: snapshot.fit_score,
-            fit_reason: snapshot.fit_reason,
-            fit_missing_json: snapshot.fit_missing_json,
-            fit_detail_json: snapshot.fit_detail_json,
-          }),
+          body: JSON.stringify({ action: 'restore_snapshot' }),
         });
         jindrIndex -= 1;
         jindrLastSwipe = null;
@@ -6205,7 +6015,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (dx > THRESHOLD) {
           jindrSwipe('interested');
         } else if (dx < -THRESHOLD) {
-          jindrSwipe('reject');
+          jindrSwipe('removed');
         } else {
           card.style.transform = '';
         }
@@ -6217,77 +6027,125 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     document.querySelector('[data-tab="jindr"]').addEventListener('click', jindrBuildQueue);
 
-    function renderJobRows(list, jobs) {
+    // Shared title/badge/meta/facts/reason/missing block for Good/Bad/Unrated/Removed cards.
+    // "Unrated" always wins over the pipeline's own sub-state label (unassessed/screened_in/
+    // screened_out) -- the candidate only ever needs to know it hasn't got a match % yet.
+    function buildJobCardBody(job) {
+      var fitInfo = FIT_LABELS[job.fit_status] || FIT_LABELS.unassessed;
+      var hasScore = job.fit_score !== null && job.fit_score !== undefined;
+      var badgeText = hasScore ? job.fit_score + '% match' : 'Unrated';
+      var badgeCls = hasScore ? fitInfo.cls : 'queued';
+      var missing = [];
+      try { missing = JSON.parse(job.fit_missing_json || '[]'); } catch (e) { missing = []; }
+      var fitDetail = {};
+      try { fitDetail = JSON.parse(job.fit_detail_json || '{}'); } catch (e) { fitDetail = {}; }
+
+      var titleNode = job.source_url
+        ? el('a', {
+            className: 'row-title', href: job.source_url, target: '_blank', rel: 'noopener',
+            textContent: job.title,
+          })
+        : el('span', { className: 'row-title', textContent: job.title });
+      var titleLine = [titleNode, el('span', { className: ('badge ' + badgeCls).trim(), textContent: badgeText })];
+
+      var meta = [
+        job.company,
+        job.location,
+        job.posted_at ? 'posted ' + new Date(job.posted_at).toLocaleDateString() : '',
+        job.ats_provider || 'added by hand',
+      ].filter(Boolean).join(' · ');
+
+      var body = [el('div', { className: 'row-title-line' }, titleLine), el('div', { className: 'row-meta', textContent: meta })];
+      // Whatever the candidate said they care about (Roles tab, Criteria) -- one chip per fact, on
+      // its own line so a long value wraps instead of forcing the title line to overflow.
+      var facts = (fitDetail.facts || []).map(factChip).filter(Boolean);
+      if (facts.length) body.push(el('div', { className: 'row-facts' }, facts));
+      if (job.fit_reason) body.push(el('p', { className: 'job-reason', textContent: job.fit_reason }));
+      if (missing.length) body.push(el('p', { className: 'job-missing', textContent: 'Gaps: ' + missing.join('; ') }));
+      return body;
+    }
+
+    // Good Fit/Bad Fit: compact, immediate, no-confirmation actions to the right of the card --
+    // Interested (green) then Remove (red). Neither touches fit_score/fit_status; see setJobFit.
+    function renderMatchCards(list, jobs) {
       jobs.forEach(function (job) {
-        var fitInfo = FIT_LABELS[job.fit_status] || FIT_LABELS.unassessed;
-        // A numeric score means the strong tier (or a manual "Not for me", scored 0) actually
-        // rated this posting -- show the real number. Postings still queued or dropped by the
-        // cheap screen never reach that tier, so they keep the descriptive label instead.
-        var hasScore = job.fit_score !== null && job.fit_score !== undefined;
-        var badgeText = hasScore ? job.fit_score + '% match' : fitInfo.text;
-        var missing = [];
-        try { missing = JSON.parse(job.fit_missing_json || '[]'); } catch (e) { missing = []; }
-        var fitDetail = {};
-        try { fitDetail = JSON.parse(job.fit_detail_json || '{}'); } catch (e) { fitDetail = {}; }
+        var body = buildJobCardBody(job);
 
-        var titleNode = job.source_url
-          ? el('a', {
-              className: 'row-title', href: job.source_url, target: '_blank', rel: 'noopener',
-              textContent: job.title,
-            })
-          : el('span', { className: 'row-title', textContent: job.title });
-        var titleLine = [titleNode, el('span', { className: ('badge ' + fitInfo.cls).trim(), textContent: badgeText })];
-
-        var meta = [
-          job.company,
-          job.location,
-          job.posted_at ? 'posted ' + new Date(job.posted_at).toLocaleDateString() : '',
-          job.ats_provider || 'added by hand',
-        ].filter(Boolean).join(' · ');
-
-        var body = [el('div', { className: 'row-title-line' }, titleLine), el('div', { className: 'row-meta', textContent: meta })];
-        // Whatever the candidate said they care about (Roles tab, Criteria) -- one chip per fact, on
-        // its own line so a long value wraps instead of forcing the title line to overflow.
-        var facts = (fitDetail.facts || []).map(factChip).filter(Boolean);
-        if (facts.length) body.push(el('div', { className: 'row-facts' }, facts));
-        if (job.fit_reason) body.push(el('p', { className: 'job-reason', textContent: job.fit_reason }));
-        if (missing.length) body.push(el('p', { className: 'job-missing', textContent: 'Gaps: ' + missing.join('; ') }));
-
-        var actions = [];
-        if (job.fit_status === 'reject') {
-          var restore = el('button', { type: 'button', textContent: 'Restore' });
-          restore.addEventListener('click', function () { submitJobFit(job.id, 'restore'); });
-          actions.push(restore);
-        } else {
-          var reject = el('button', { type: 'button', textContent: 'Not for me' });
-          reject.addEventListener('click', function () {
-            var reason = window.prompt(
-              'Optional — why isn\\'t this a fit? (helps avoid similar postings later)',
-              job.fit_reason && job.fit_status !== 'unassessed' ? job.fit_reason : '',
-            );
-            if (reason === null) return;
-            submitJobFit(job.id, 'reject', reason);
-          });
-          actions.push(reject);
-        }
-        // Every row that reaches this list is, by construction, not yet interested -- once marked,
-        // a job is excluded from all three Jobs-tab buckets and only shows up on the Interested tab.
-        var interested = el('button', { type: 'button', textContent: 'Interested' });
+        var interested = el('button', { className: 'success', type: 'button', textContent: 'Interested' });
         interested.addEventListener('click', function () { submitJobFit(job.id, 'interested'); });
-        actions.push(interested);
-        var del = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
-        del.addEventListener('click', async function () {
-          await api('/jobs/' + encodeURIComponent(job.id), { method: 'DELETE' });
-          loadJobs();
-        });
-        actions.push(del);
+        var remove = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
+        remove.addEventListener('click', function () { submitJobFit(job.id, 'removed'); });
 
-        var muted = RULED_OUT_STATUSES[job.fit_status] || QUEUED_STATUSES[job.fit_status];
-        list.appendChild(el('div', { className: 'row-item' + (muted ? ' is-muted' : '') }, [
+        list.appendChild(el('div', { className: 'row-item' }, [
           el('div', { className: 'row' }, [
             el('div', {}, body),
-            el('div', { className: 'row-actions' }, actions),
+            el('div', { className: 'row-actions' }, [interested, remove]),
           ]),
+        ]));
+      });
+    }
+
+    // Removed: Re-add restores the job to wherever its untouched rating (or its prior Interested
+    // status) says it belongs. A submitted reason becomes a visibly locked, durable profile signal
+    // until the candidate deliberately chooses Edit reason.
+    function renderRemovedCards(list, jobs) {
+      jobs.forEach(function (job) {
+        var body = buildJobCardBody(job);
+
+        var readd = el('button', { className: 'success', type: 'button', textContent: 'Re-add' });
+        readd.addEventListener('click', function () { submitJobFit(job.id, 'readd'); });
+
+        var reasonInput = el('input', {
+          type: 'text', placeholder: 'Reason', value: job.removal_reason || '',
+          style: 'width:auto; flex:1; min-width:10rem; margin-top:0',
+        });
+        var submitReason = el('button', { className: 'secondary', type: 'button', textContent: 'Save reason' });
+        var reasonStatus = el('div', { className: 'status', role: 'status', 'aria-live': 'polite' });
+        var reasonActions = el('div', { className: 'row-actions', style: 'margin-top:0.5rem' }, [reasonInput, submitReason]);
+
+        function showSaved(reason) {
+          reasonInput.value = reason;
+          reasonInput.disabled = true;
+          submitReason.disabled = false;
+          submitReason.textContent = 'Edit reason';
+          reasonStatus.className = 'status success';
+          reasonStatus.textContent = reason
+            ? 'Saved to your profile: “' + reason + '”'
+            : 'Reason cleared from your profile.';
+        }
+        if (job.removal_reason) showSaved(job.removal_reason);
+
+        submitReason.addEventListener('click', async function () {
+          if (reasonInput.disabled) {
+            reasonInput.disabled = false;
+            submitReason.textContent = 'Save reason';
+            reasonStatus.textContent = '';
+            reasonInput.focus();
+            return;
+          }
+          submitReason.disabled = true;
+          submitReason.textContent = 'Saving…';
+          reasonStatus.className = 'status';
+          reasonStatus.textContent = 'Saving to your profile…';
+          try {
+            var result = await submitJobFit(job.id, 'set_removal_reason', reasonInput.value, false);
+            job.removal_reason = result.removal_reason || '';
+            showSaved(job.removal_reason);
+          } catch (err) {
+            submitReason.disabled = false;
+            submitReason.textContent = 'Save reason';
+            reasonStatus.className = 'status error';
+            reasonStatus.textContent = err instanceof Error ? err.message : 'Could not save this reason.';
+          }
+        });
+
+        list.appendChild(el('div', { className: 'row-item' }, [
+          el('div', { className: 'row' }, [
+            el('div', {}, body),
+            el('div', { className: 'row-actions' }, [readd]),
+          ]),
+          reasonActions,
+          reasonStatus,
         ]));
       });
     }
@@ -6330,86 +6188,151 @@ const DASHBOARD_PAGE = `<!doctype html>
       };
     }
 
+    var JOB_VIEWS = ['good_match', 'bad_match', 'interested', 'removed'];
+
     function renderJobs() {
       var needle = document.getElementById('jobs-filter').value.trim();
       var maxAgeDays = Number(document.getElementById('jobs-age').value) || 0;
       var minScore = Number(document.getElementById('jobs-min-score').value) || 0;
-      var showQueued = document.getElementById('jobs-show-unfiltered').checked;
-      var showRejected = document.getElementById('jobs-show-rejected').checked;
       var list = document.getElementById('jobs-list');
-      list.innerHTML = '';
 
-      var matching = allJobs.filter(function (job) {
+      // Shared across all five subtabs, same as Companies' text filter -- changing the search box
+      // filters within whichever subtab is currently active rather than needing five separate
+      // filter implementations.
+      var filtered = allJobs.filter(function (job) {
         return matchesFilter([job.title, job.company, job.location].join(' '), needle)
           && withinAge(job, maxAgeDays)
           && withinScore(job, minScore);
       });
-      // Kept as three separate groups rather than one filtered-and-sorted list, so a fresh
-      // scan's unreviewed postings can never end up sitting among ones you've already judged --
-      // each group only ever appears in its own block, gated by its own toggle.
-      var matches = matching.filter(function (j) {
-        return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status]
-          && !INTERESTED_STATUSES[j.fit_status] && !APPLIED_STATUSES[j.fit_status];
+
+      // Counts reflect the full, unfiltered set -- same convention Companies' segmented-control
+      // counts use -- so the badges don't shift just because the search box has something in it.
+      var counts = { good_match: 0, bad_match: 0, interested: 0, removed: 0 };
+      allJobs.forEach(function (job) {
+        var category = jobCategory(job);
+        if (category === 'interested' && job.applied_at) return; // applied jobs live on the Applied tab, not here
+        counts[category] += 1;
       });
-      var queued = matching.filter(function (j) { return QUEUED_STATUSES[j.fit_status]; });
-      var ruledOut = matching.filter(function (j) { return RULED_OUT_STATUSES[j.fit_status]; });
-      matches.sort(jobSortComparator(document.getElementById('jobs-sort').value));
+      JOB_VIEWS.forEach(function (view) {
+        document.getElementById('jobs-' + view + '-count').textContent = '(' + counts[view] + ')';
+      });
 
-      var queuedToggle = document.getElementById('jobs-show-unfiltered');
-      queuedToggle.parentElement.style.display = queued.length ? 'flex' : 'none';
-      document.getElementById('jobs-unfiltered-count').textContent =
-        'Show ' + queued.length + ' posting' + (queued.length === 1 ? '' : 's') + ' not filtered yet';
+      var showingInterested = jobsView === 'interested';
+      document.getElementById('jobs-interested-section').style.display = showingInterested ? 'block' : 'none';
+      list.style.display = showingInterested ? 'none' : 'block';
 
-      var rejectedToggle = document.getElementById('jobs-show-rejected');
-      rejectedToggle.parentElement.style.display = ruledOut.length ? 'flex' : 'none';
-      document.getElementById('jobs-rejected-count').textContent =
-        'Show ' + ruledOut.length + ' posting' + (ruledOut.length === 1 ? '' : 's') + ' marked not a fit';
+      if (showingInterested) {
+        renderInterestedList(filtered);
+        return;
+      }
 
-      if (!matches.length && !(showQueued && queued.length) && !(showRejected && ruledOut.length)) {
+      list.innerHTML = '';
+      var bucket = filtered.filter(function (job) { return jobCategory(job) === jobsView; });
+      if (jobsView === 'removed') {
+        bucket.sort(function (a, b) { return new Date(b.removed_at || 0) - new Date(a.removed_at || 0); });
+      } else {
+        bucket.sort(jobSortComparator(document.getElementById('jobs-sort').value));
+      }
+
+      if (!bucket.length) {
         list.appendChild(el('p', {
           className: 'empty',
-          textContent: allJobs.length
-            ? (matching.length ? 'Nothing to show — try the checkboxes above to reveal filtered-out postings.' : 'No postings match that filter.')
-            : 'No job postings yet — add target companies and scan their boards.',
+          textContent: allJobs.length ? 'No postings match that filter.' : 'No job postings yet — add target companies and scan their boards.',
         }));
         return;
       }
 
-      renderJobRows(list, matches);
-
-      if (showQueued && queued.length) {
-        list.appendChild(el('h3', { className: 'subhead', textContent: 'Not filtered yet' }));
-        renderJobRows(list, queued);
-      }
-      if (showRejected && ruledOut.length) {
-        list.appendChild(el('h3', { className: 'subhead', textContent: 'Marked not a fit' }));
-        renderJobRows(list, ruledOut);
-      }
+      if (jobsView === 'removed') renderRemovedCards(list, bucket);
+      else renderMatchCards(list, bucket);
     }
 
     document.getElementById('jobs-filter').addEventListener('input', renderJobs);
     document.getElementById('jobs-age').addEventListener('change', renderJobs);
     document.getElementById('jobs-min-score').addEventListener('change', renderJobs);
     document.getElementById('jobs-sort').addEventListener('change', renderJobs);
-    document.getElementById('jobs-show-unfiltered').addEventListener('change', renderJobs);
-    document.getElementById('jobs-show-rejected').addEventListener('change', renderJobs);
 
-    document.getElementById('jobs-assess-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('jobs-assess-status');
+    document.querySelectorAll('[data-jobs-view]').forEach(function (button) {
+      button.addEventListener('click', function () {
+        jobsView = button.dataset.jobsView;
+        document.querySelectorAll('[data-jobs-view]').forEach(function (item) {
+          item.classList.remove('active');
+          item.setAttribute('aria-pressed', 'false');
+        });
+        button.classList.add('active');
+        button.setAttribute('aria-pressed', 'true');
+        renderJobs();
+      });
+    });
+
+    // Buckets update immediately on every keystroke/spinner click; the PATCH that persists the
+    // value is debounced a moment behind so typing a two-digit number doesn't fire one request per
+    // digit.
+    var jobsMatchThresholdSaveTimer = null;
+    document.getElementById('jobs-match-threshold').addEventListener('input', function () {
+      var value = Number(this.value);
+      if (!Number.isFinite(value)) return;
+      value = Math.min(Math.max(Math.round(value), 0), 100);
+      matchThreshold = value;
+      renderJobs();
+
+      clearTimeout(jobsMatchThresholdSaveTimer);
+      jobsMatchThresholdSaveTimer = setTimeout(function () {
+        api('/jobs/match-threshold', {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ match_threshold: value }),
+        }).catch(function (err) {
+          var statusEl = document.getElementById('jobs-match-threshold-status');
+          statusEl.textContent = 'Error saving threshold: ' + err.message;
+          statusEl.className = 'status error';
+        });
+      }, 400);
+    });
+
+    // Find Jobs: one action, the whole pipeline -- scan every company's board (regardless of when
+    // it was last read), then screen and score whatever's new (plus anything still queued from a
+    // previous run), sharing one status line and feeding the same live pipeline diagram throughout.
+    document.getElementById('jobs-find-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('jobs-find-status');
       var button = this;
       button.disabled = true;
-      statusEl.textContent = 'Screening listings, then assessing the ones worth a closer look…';
+      statusEl.textContent = 'Reading job boards…';
       statusEl.className = 'status';
       pfBeginRun();
       try {
+        // Stage 1: scan boards. One request only gets through as many companies as safely fit in
+        // one call, so it re-fires on your behalf until every company's been reached this run --
+        // capped so a real server problem can't spin forever.
+        var totalCompaniesScanned = 0, totalNewListings = 0;
+        var scanRound = 0;
+        var scanData;
+        do {
+          scanRound += 1;
+          var scanRes = await api('/companies/scan', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ limit: 500 }),
+          });
+          if (!scanRes.ok) throw new Error(errorMessage(await scanRes.json(), 'scan_failed'));
+          scanData = await readNdjson(scanRes, function (event) {
+            statusEl.textContent =
+              (scanRound > 1 ? 'Round ' + scanRound + ': ' : '') +
+              'Reading job boards… ' + event.done + ' of ' + event.total + ' compan' + (event.total === 1 ? 'y' : 'ies') +
+              ' (' + event.company + (event.new_jobs ? ', ' + event.new_jobs + ' new' : '') + ')';
+            // New listings land as unassessed the moment they're inserted -- grow the pipeline
+            // diagram live as each company's board read completes, not only once scanning is done.
+            pfBumpScanned(event.new_jobs);
+          });
+          totalCompaniesScanned += scanData.scanned;
+          totalNewListings += scanData.new_listings;
+        } while (scanData.scanned > 0 && totalCompaniesScanned < scanData.eligible_total && scanRound < 25);
+
+        // Stage 2: screen + score. Same re-firing pattern, now against whatever the scan just
+        // added plus anything still queued from before.
+        statusEl.textContent = 'Screening listings, then assessing the ones worth a closer look…';
         var totalScreened = 0, totalScreenedOut = 0, totalAssessed = 0, totalRecommended = 0, allErrors = [];
         var round = 0;
         var data;
-        // Same reasoning as "Scan company boards": one request only gets through as much of the
-        // backlog as the server's own per-call budget safely allows, so it re-fires on your
-        // behalf until nothing's left rather than making you click through a big backlog by
-        // hand -- capped so a real server problem, or a backlog that genuinely stops shrinking,
-        // can't spin forever.
         do {
           round += 1;
           // Assessment progress reports a cumulative recommendation count for this request.
@@ -6421,21 +6344,18 @@ const DASHBOARD_PAGE = `<!doctype html>
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ provider: document.getElementById('jobs-provider').value }),
           });
-          if (!res.ok) throw new Error(errorMessage(await res.json(), 'process_failed'));
+          if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'process_failed'));
           data = await readNdjson(res, function (event) {
+            if (event.type === 'pipeline') {
+              pfApplyPipelineEvent(event);
+              return;
+            }
             if (event.stage === 'assess') roundRecommended = event.recommended || 0;
             statusEl.textContent = (round > 1 ? 'Round ' + round + ': ' : '') + (event.stage === 'screen'
-              ? 'Step 1 of 2 — quick screen: '
-              : 'Step 2 of 2 — detailed scoring: ') + event.done + ' of ' + event.total +
+              ? 'Screening: '
+              : 'Scoring: ') + event.done + ' of ' + event.total +
               (event.stage === 'assess' ? ' · ' + roundRecommended + ' newly recommended' : '');
-            // Real per-batch accept/reject counts, not a guess from done/total -- see
-            // pfApplyRunEvent. This is what makes the pipeline diagram move live, batch by batch,
-            // while this run is still in flight rather than only jumping once at the very end.
-            pfApplyRunEvent(event);
           });
-          // The server's own authoritative counts, reconciling away any drift the live per-batch
-          // deltas above might have accumulated.
-          setPfCounts(data.counts || {});
           totalScreened += data.screened || 0;
           totalScreenedOut += data.screened_out || 0;
           totalAssessed += data.assessed || 0;
@@ -6450,15 +6370,18 @@ const DASHBOARD_PAGE = `<!doctype html>
         var counts = data.counts || {};
         var left = (counts.unassessed || 0) + (counts.screened_in || 0);
         var parts = [];
+        parts.push('Scanned ' + totalCompaniesScanned + ' compan' + (totalCompaniesScanned === 1 ? 'y' : 'ies') +
+          ', found ' + totalNewListings + ' new listing' + (totalNewListings === 1 ? '' : 's') + '.');
         if (totalScreened) parts.push('Screened ' + totalScreened + ', dropped ' + totalScreenedOut + ' as clear misses.');
         if (totalAssessed) parts.push('Assessed ' + totalAssessed + ' in detail; ' + totalRecommended + ' newly recommended.');
-        if (!parts.length) parts.push('Nothing left to process.');
         // Only reachable if the loop stopped without actually clearing the backlog: a real error,
         // the round cap, or a round that made no progress at all -- genuinely worth a click to retry.
-        parts.push(left ? left + ' still queued — click again to continue.' : 'All caught up.');
+        parts.push(left ? left + ' still queued — click Find Jobs again to continue.' : 'All caught up.');
         if (allErrors.length) parts.push('Some batches failed: ' + allErrors.join('; '));
         statusEl.textContent = parts.join(' ');
         statusEl.className = allErrors.length ? 'status error' : 'status success';
+        await pfWaitForIdle();
+        await loadCompanies();
         await loadJobs();
       } catch (err) {
         statusEl.textContent = 'Error: ' + err.message;
@@ -6469,10 +6392,9 @@ const DASHBOARD_PAGE = `<!doctype html>
     });
 
     // ---- Pipeline flow diagram (Search tab) --------------------------------------------------
-    // A live sankey of where scanned postings currently sit, built once as persistent SVG nodes
-    // and then only ever mutated -- not rebuilt from scratch on every update -- so a change can be
-    // eased smoothly instead of jumping. Two real branch points: the cheap screen (screened out /
-    // screened in), then the detailed pass on whatever passed it (ruled out / recommended).
+    // A live liquid pipeline. Waiting work is always upstream of the gate that will process it;
+    // only completed decisions flow downstream. Backend pipeline events remove real postings from
+    // queue reservoirs at dispatch and release them from gates when their real batch resolves.
     // Not-interested/Interested/Applied aren't shown -- this page is about finding matches, not
     // the human review funnel after it; Interested/Applied postings are folded into "Recommended"
     // here since that's still what they were found as.
@@ -6480,34 +6402,36 @@ const DASHBOARD_PAGE = `<!doctype html>
     // setPfCounts() is the single entry point, same idea as a real-events-call-decideNext design:
     // it's called with the authoritative shape jobPipelineCounts() returns (every full /jobs load
     // reconciles from it), and nudged with real per-batch deltas while a scan or a Find-my-matches
-    // run is actively in flight, via pfBumpScanned() and pfApplyRunEvent() below. No probability or
-    // random weighting is needed anywhere here, unlike a simulation that has to guess outcomes in
-    // advance -- the real split is already known by the time a batch finishes, so it's just assigned.
+    // run is actively in flight, via pfBumpScanned() and pfApplyPipelineEvent() below. No
+    // probability or random weighting is used: dispatch and outcome events come from real work.
     var PF_NODES = [
-      { id: 'scanned', label: 'Scanned postings', stage: 0, kind: 'neutral' },
-      { id: 'screen_pending', label: 'Not screened yet', stage: 1, kind: 'pending' },
+      { id: 'screen_gate', label: 'Pre-screen', stage: 0, kind: 'gate' },
       { id: 'screen_rejected', label: 'Screened out', stage: 1, kind: 'reject' },
-      { id: 'screen_accepted', label: 'Passed screening', stage: 1, kind: 'neutral' },
-      { id: 'fit_pending', label: 'Awaiting review', stage: 2, kind: 'pending' },
-      { id: 'fit_rejected', label: 'Ruled out', stage: 2, kind: 'reject' },
-      { id: 'fit_recommended', label: 'Recommended', stage: 2, kind: 'success' },
+      { id: 'review_queue', label: 'Awaiting review', stage: 1, kind: 'queue' },
+      { id: 'fit_gate', label: 'AI Review', stage: 2, kind: 'gate' },
+      { id: 'fit_rejected', label: 'Ruled out', stage: 3, kind: 'reject' },
+      { id: 'fit_recommended', label: 'Recommended', stage: 3, kind: 'success' },
+      { id: 'human_interested', label: 'Interested', stage: 4, kind: 'success' },
+      { id: 'human_removed', label: 'Removed', stage: 4, kind: 'reject' },
     ];
     var PF_BRANCHES = {
-      scanned: ['screen_pending', 'screen_rejected', 'screen_accepted'],
-      screen_accepted: ['fit_pending', 'fit_rejected', 'fit_recommended'],
+      screen_gate: ['screen_rejected', 'review_queue'],
+      review_queue: ['fit_gate'],
+      fit_gate: ['fit_rejected', 'fit_recommended'],
+      fit_recommended: ['human_interested', 'human_removed'],
     };
-    var PF_STAGE_TITLES = ['Scanned', 'Screening', 'Fit review'];
-    var PF_KIND_COLOR = { neutral: 'var(--text-muted)', pending: 'var(--warning)', reject: 'var(--error)', success: 'var(--success)' };
+    var PF_STAGE_TITLES = ['Screening', 'Screen result', 'AI Review', 'Fit', 'Human input'];
+    var PF_KIND_COLOR = { queue: 'var(--warning)', gate: 'var(--accent)', reject: 'var(--error)', success: 'var(--success)' };
 
-    var PF_VB_W = 900, PF_VB_H = 340;
+    var PF_VB_W = 1320, PF_VB_H = 340;
     var PF_MARGIN_TOP = 26, PF_MARGIN_BOTTOM = 8;
     var PF_USABLE_H = PF_VB_H - PF_MARGIN_TOP - PF_MARGIN_BOTTOM;
     var PF_NODE_W = 10;
-    var PF_MIN_H = 6;
+    var PF_MIN_H = 12;
     var PF_ROW_GAP = 26; // generous on purpose: each node's 2-line label needs real clearance from its neighbors, not just its own (possibly tiny) bar height
-    var PF_SOURCE_HEIGHT = 200; // the fixed 100% reference height "Scanned postings" renders at
-    var PF_COL_MARGIN = 14;
-    var PF_COL_STEP = 300;
+    var PF_SOURCE_HEIGHT = 200;
+    var PF_COL_MARGIN = 66;
+    var PF_COL_STEP = 285;
     var PF_SMOOTH_RATE = 6;
 
     var pfNodeMap = {};
@@ -6518,8 +6442,11 @@ const DASHBOARD_PAGE = `<!doctype html>
       n.dispHeight = PF_MIN_H;
       n.y = PF_MARGIN_TOP; n.cy = PF_MARGIN_TOP;
     });
-    var pfStageGroups = [[], [], []];
-    PF_NODES.forEach(function (n) { pfStageGroups[n.stage].push(n.id); });
+    var pfStageGroups = PF_STAGE_TITLES.map(function () { return []; });
+    PF_NODES.forEach(function (n) {
+      if (!pfStageGroups[n.stage]) pfStageGroups[n.stage] = [];
+      pfStageGroups[n.stage].push(n.id);
+    });
 
     var pfEdges = {};
     var pfChildEdges = {}; var pfParentEdges = {};
@@ -6534,18 +6461,20 @@ const DASHBOARD_PAGE = `<!doctype html>
     });
 
     var pfSourceTotal = 0;
+    var pfNodeCounts = {};
+    var pfScreenWaiting = 0;
+    var pfScreenProcessing = 0;
     var pfLastCountsPayload = null;
     var pfAnimating = false;
     var pfLastFrame = 0;
+    var pfReservoirCounts = {};
+    var pfReservoirDisplay = {};
 
     function pfDerivedTotal(nodeId) {
-      if (nodeId === 'scanned') return pfSourceTotal;
-      var edges = pfParentEdges[nodeId], sum = 0;
-      for (var i = 0; i < edges.length; i++) sum += edges[i].committed;
-      return sum;
+      return pfNodeCounts[nodeId] || 0;
     }
     function pfTargetHeight(n) {
-      if (n.id === 'scanned') return PF_SOURCE_HEIGHT;
+      if (n.kind === 'gate' && n.id !== 'screen_gate') return Math.max(34, Math.min(82, 34 + pfDerivedTotal(n.id) * 2));
       return Math.max(PF_MIN_H, (pfDerivedTotal(n.id) / Math.max(1, pfSourceTotal)) * PF_SOURCE_HEIGHT);
     }
 
@@ -6557,8 +6486,6 @@ const DASHBOARD_PAGE = `<!doctype html>
     // both meaningless and overwhelming.
     function setPfCounts(counts) {
       var isFirstLoad = pfLastCountsPayload === null;
-      var prevCommitted = {};
-      Object.keys(pfEdges).forEach(function (key) { prevCommitted[key] = pfEdges[key].committed; });
 
       pfLastCountsPayload = counts;
       var unassessed = counts.unassessed || 0;
@@ -6566,30 +6493,50 @@ const DASHBOARD_PAGE = `<!doctype html>
       var screenedIn = counts.screened_in || 0;
       var reject = counts.reject || 0;
       var recommended = (counts.strong || 0) + (counts.possible || 0) + (counts.interested || 0) + (counts.applied || 0);
-      var screenAccepted = screenedIn + reject + recommended;
+      var humanInterested = counts.manual_interested || 0;
+      var humanRemoved = counts.manual_removed || 0;
+      var allRecommended = recommended + humanInterested + humanRemoved;
+      var screenAccepted = screenedIn + reject + allRecommended;
+      pfSourceTotal = unassessed + screenedOut + screenedIn + reject + allRecommended;
+      pfScreenWaiting = unassessed;
+      pfScreenProcessing = 0;
+      pfNodeCounts.screen_gate = unassessed;
+      pfNodeCounts.screen_rejected = screenedOut;
+      pfNodeCounts.review_queue = screenedIn;
+      pfNodeCounts.fit_gate = 0;
+      pfNodeCounts.fit_rejected = reject;
+      pfNodeCounts.fit_recommended = recommended;
+      pfNodeCounts.human_interested = humanInterested;
+      pfNodeCounts.human_removed = humanRemoved;
+      pfEdges['screen_gate->screen_rejected'].committed = screenedOut;
+      pfEdges['screen_gate->review_queue'].committed = screenedIn + reject + allRecommended;
+      pfEdges['review_queue->fit_gate'].committed = screenedIn;
+      pfEdges['fit_gate->fit_rejected'].committed = reject;
+      pfEdges['fit_gate->fit_recommended'].committed = allRecommended;
+      pfEdges['fit_recommended->human_interested'].committed = humanInterested;
+      pfEdges['fit_recommended->human_removed'].committed = humanRemoved;
 
-      pfSourceTotal = unassessed + screenedOut + screenAccepted;
-      pfEdges['scanned->screen_pending'].committed = unassessed;
-      pfEdges['scanned->screen_rejected'].committed = screenedOut;
-      pfEdges['scanned->screen_accepted'].committed = screenAccepted;
-      pfEdges['screen_accepted->fit_pending'].committed = screenedIn;
-      pfEdges['screen_accepted->fit_rejected'].committed = reject;
-      pfEdges['screen_accepted->fit_recommended'].committed = recommended;
-
-      if (!isFirstLoad) {
-        Object.keys(pfEdges).forEach(function (key) {
-          var delta = pfEdges[key].committed - prevCommitted[key];
-          if (delta > 0) pfBurst(key, delta);
-        });
-      }
+      // Reservoirs mirror the currently retained volume at each destination. On first load there
+      // is no historical trip to replay, so begin full. Later decreases reconcile immediately;
+      // increases are deposited only when their visible droplets actually arrive below.
+      PF_NODES.forEach(function (node) {
+        if (node.kind === 'gate' && node.id !== 'screen_gate') return;
+        var actual = node.id === 'screen_gate' ? pfScreenWaiting : pfDerivedTotal(node.id);
+        if (isFirstLoad || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+          pfReservoirCounts[node.id] = actual;
+          pfReservoirDisplay[node.id] = actual;
+        } else if ((pfReservoirCounts[node.id] || 0) > actual) {
+          pfReservoirCounts[node.id] = actual;
+        }
+      });
 
       document.getElementById('jobs-pipeline-summary').textContent =
-        recommended + ' match' + (recommended === 1 ? '' : 'es') +
+        allRecommended + ' match' + (allRecommended === 1 ? '' : 'es') +
         ', ' + (unassessed + screenedIn) + ' waiting to be filtered' +
         ', ' + screenedOut + ' dropped in screening' +
         ', ' + reject + ' ruled out.';
       document.getElementById('pfStatScanned').textContent = String(pfSourceTotal);
-      document.getElementById('pfStatRecommended').textContent = String(recommended);
+      document.getElementById('pfStatRecommended').textContent = String(allRecommended);
       var totalScreened = screenedOut + screenAccepted;
       document.getElementById('pfStatScreenRate').textContent = totalScreened ? Math.round(100 * screenAccepted / totalScreened) + '%' : '—';
       var processed = pfSourceTotal ? Math.round(100 * (pfSourceTotal - unassessed - screenedIn) / pfSourceTotal) : 0;
@@ -6599,44 +6546,99 @@ const DASHBOARD_PAGE = `<!doctype html>
       pfWake();
     }
 
-    // Freezes the counts as of the moment a Find-my-matches run starts, so live per-batch deltas
-    // during that run (see pfApplyRunEvent) have a stable base to add onto rather than drifting
-    // against whatever setPfCounts happened to see last.
-    var pfRunSnapshot = null;
-    var pfRunAssessBase = null;
-    function pfBeginRun() {
-      pfRunSnapshot = pfLastCountsPayload
-        ? Object.assign({}, pfLastCountsPayload)
-        : { unassessed: 0, screened_out: 0, screened_in: 0, reject: 0, strong: 0, possible: 0, interested: 0, applied: 0 };
-      pfRunAssessBase = null;
+    function pfBeginRun() { /* Pipeline events carry the real transient state. */ }
+
+    function pfSyncLiveEdges() {
+      pfEdges['screen_gate->screen_rejected'].committed = pfNodeCounts.screen_rejected || 0;
+      pfEdges['screen_gate->review_queue'].committed = (pfNodeCounts.review_queue || 0) +
+        (pfNodeCounts.fit_gate || 0) + (pfNodeCounts.fit_rejected || 0) + (pfNodeCounts.fit_recommended || 0) +
+        (pfNodeCounts.human_interested || 0) + (pfNodeCounts.human_removed || 0);
+      pfEdges['review_queue->fit_gate'].committed = pfNodeCounts.review_queue || 0;
+      pfEdges['fit_gate->fit_rejected'].committed = pfNodeCounts.fit_rejected || 0;
+      pfEdges['fit_gate->fit_recommended'].committed = (pfNodeCounts.fit_recommended || 0) +
+        (pfNodeCounts.human_interested || 0) + (pfNodeCounts.human_removed || 0);
+      pfEdges['fit_recommended->human_interested'].committed = pfNodeCounts.human_interested || 0;
+      pfEdges['fit_recommended->human_removed'].committed = pfNodeCounts.human_removed || 0;
+      pfLayoutColumns();
+      pfRecomputeEdgeSlices();
+      pfRender();
+      pfWake();
     }
-    function pfApplyRunEvent(event) {
-      if (!pfRunSnapshot) return;
-      var next = Object.assign({}, pfLastCountsPayload || pfRunSnapshot);
-      if (event.stage === 'screen') {
-        next.unassessed = Math.max(0, pfRunSnapshot.unassessed - event.done);
-        next.screened_out = pfRunSnapshot.screened_out + (event.screened_out || 0);
-        next.screened_in = pfRunSnapshot.screened_in + (event.screened_in || 0);
-      } else if (event.stage === 'assess') {
-        // Frozen the instant assess events start, from whatever screened_in ended up at when the
-        // screen stage (above) finished -- not the pre-run snapshot, which would still include
-        // postings this same run only just moved out of "not screened yet".
-        if (pfRunAssessBase === null) pfRunAssessBase = next.screened_in;
-        next.screened_in = Math.max(0, pfRunAssessBase - event.done);
-        next.reject = pfRunSnapshot.reject + (event.discarded || 0);
-        next.possible = pfRunSnapshot.possible + (event.recommended || 0);
+
+    function pfApplyPipelineEvent(event) {
+      var count = (event.ids || event.outcomes || []).length;
+      if (!count) return;
+      if (event.phase === 'dispatched') {
+        if (event.stage === 'screen') {
+          pfScreenWaiting = Math.max(0, pfScreenWaiting - count);
+          pfScreenProcessing += count;
+          pfNodeCounts.screen_gate = pfScreenWaiting + pfScreenProcessing;
+          pfReservoirCounts.screen_gate = pfScreenWaiting;
+          pfSyncLiveEdges();
+          pfBurstIntoGate('screen_gate', count);
+          return;
+        }
+        var queue = 'review_queue';
+        var gate = 'fit_gate';
+        pfNodeCounts[queue] = Math.max(0, (pfNodeCounts[queue] || 0) - count);
+        pfReservoirCounts[queue] = pfNodeCounts[queue];
+        pfNodeCounts[gate] = (pfNodeCounts[gate] || 0) + count;
+        pfSyncLiveEdges();
+        pfBurst(queue + '->' + gate, count, false, false);
+        return;
       }
-      setPfCounts(next);
+      if (event.phase === 'failed') {
+        if (event.stage === 'screen') {
+          pfScreenProcessing = Math.max(0, pfScreenProcessing - count);
+          pfScreenWaiting += count;
+          pfNodeCounts.screen_gate = pfScreenWaiting + pfScreenProcessing;
+          pfReservoirCounts.screen_gate = pfScreenWaiting;
+          pfSyncLiveEdges();
+          return;
+        }
+        var failedQueue = 'review_queue';
+        var failedGate = 'fit_gate';
+        pfNodeCounts[failedGate] = Math.max(0, (pfNodeCounts[failedGate] || 0) - count);
+        pfNodeCounts[failedQueue] = (pfNodeCounts[failedQueue] || 0) + count;
+        pfSyncLiveEdges();
+        pfBurst(failedQueue + '->' + failedGate, count, true, false);
+        return;
+      }
+      if (event.phase === 'resolved') {
+        var resolvedGate = event.stage === 'screen' ? 'screen_gate' : 'fit_gate';
+        if (event.stage === 'screen') {
+          pfScreenProcessing = Math.max(0, pfScreenProcessing - count);
+          pfNodeCounts.screen_gate = pfScreenWaiting + pfScreenProcessing;
+        } else {
+          pfNodeCounts[resolvedGate] = Math.max(0, (pfNodeCounts[resolvedGate] || 0) - count);
+        }
+        var grouped = {};
+        event.outcomes.forEach(function (item) { grouped[item.outcome] = (grouped[item.outcome] || 0) + 1; });
+        if (event.stage === 'screen') {
+          pfNodeCounts.screen_rejected += grouped.rejected || 0;
+          pfNodeCounts.review_queue += grouped.passed || 0;
+          pfSyncLiveEdges();
+          if (grouped.rejected) pfBurst('screen_gate->screen_rejected', grouped.rejected, false, false);
+          if (grouped.passed) pfBurst('screen_gate->review_queue', grouped.passed, false, false);
+        } else {
+          pfNodeCounts.fit_rejected += grouped.rejected || 0;
+          pfNodeCounts.fit_recommended += grouped.recommended || 0;
+          pfSyncLiveEdges();
+          if (grouped.rejected) pfBurst('fit_gate->fit_rejected', grouped.rejected, false, false);
+          if (grouped.recommended) pfBurst('fit_gate->fit_recommended', grouped.recommended, false, false);
+        }
+      }
     }
     // Scanning company boards finds new postings before any screening happens -- they land
     // straight in "not screened yet", growing the Scanned total live as each company's board read
     // completes, same idea as the assess-run deltas above but simpler (only one bucket changes).
     function pfBumpScanned(newJobs) {
       if (!newJobs) return;
-      var base = pfLastCountsPayload || { unassessed: 0, screened_out: 0, screened_in: 0, reject: 0, strong: 0, possible: 0, interested: 0, applied: 0 };
-      var next = Object.assign({}, base);
-      next.unassessed = (base.unassessed || 0) + newJobs;
-      setPfCounts(next);
+      pfSourceTotal += newJobs;
+      pfScreenWaiting += newJobs;
+      pfNodeCounts.screen_gate = pfScreenWaiting + pfScreenProcessing;
+      pfReservoirCounts.screen_gate = pfScreenWaiting;
+      pfSyncLiveEdges();
     }
 
     function pfLayoutColumns() {
@@ -6652,20 +6654,25 @@ const DASHBOARD_PAGE = `<!doctype html>
         });
       });
     }
+    function pfEdgeWeight(edge) {
+      // Every declared transition is a permanent channel. A value of one is only the visual
+      // floor; labels and statistics continue to show the truthful zero count.
+      return Math.max(1, edge.committed);
+    }
     function pfRecomputeEdgeSlices() {
       PF_NODES.forEach(function (n) {
         var outs = pfChildEdges[n.id].slice().sort(function (a, b) { return pfNodeMap[a.target].cy - pfNodeMap[b.target].cy; });
-        var outDenom = 0; outs.forEach(function (e) { outDenom += e.committed; }); outDenom = Math.max(1, outDenom);
+        var outDenom = 0; outs.forEach(function (e) { outDenom += pfEdgeWeight(e); }); outDenom = Math.max(1, outDenom);
         var cum = 0;
         outs.forEach(function (e) {
-          var h = (e.committed / outDenom) * n.dispHeight;
+          var h = (pfEdgeWeight(e) / outDenom) * n.dispHeight;
           e.sy0 = n.y + cum; e.sy1 = e.sy0 + h; cum += h;
         });
         var ins = pfParentEdges[n.id].slice().sort(function (a, b) { return pfNodeMap[a.source].cy - pfNodeMap[b.source].cy; });
-        var inDenom = 0; ins.forEach(function (e) { inDenom += e.committed; }); inDenom = Math.max(1, inDenom);
+        var inDenom = 0; ins.forEach(function (e) { inDenom += pfEdgeWeight(e); }); inDenom = Math.max(1, inDenom);
         cum = 0;
         ins.forEach(function (e) {
-          var h = (e.committed / inDenom) * n.dispHeight;
+          var h = (pfEdgeWeight(e) / inDenom) * n.dispHeight;
           e.ty0 = n.y + cum; e.ty1 = e.ty0 + h; cum += h;
         });
       });
@@ -6695,47 +6702,149 @@ const DASHBOARD_PAGE = `<!doctype html>
       pfPathByKey[key] = path;
     });
 
-    var PF_BURST_MAX = 18; // visual cap -- a real delta can be up to a full batch (60 for screen),
-                            // and 60 individual dots at once reads as noise, not motion.
-    var PF_BURST_DUR_MIN = 0.8, PF_BURST_DUR_RANGE = 0.5;
-    var PF_BURST_STAGGER = 0.06; // seconds between each dot's start, so a burst arrives as a
-                                  // trickle rather than a single-frame pop of simultaneous dots.
+    // Pools sit above ribbons but below labels/nodes. Their right edge is fixed to the receiving
+    // wall; added volume expands leftward, making each impact visibly accumulate instead of simply
+    // vanishing at the destination.
+    var pfReservoirLayer = pfEl('g', {});
+    pfSvg.appendChild(pfReservoirLayer);
+    var pfReservoirByNode = {};
+    PF_NODES.forEach(function (node) {
+      if (node.kind === 'gate' && node.id !== 'screen_gate') return;
+      var pool = pfEl('rect', {
+        class: 'pf-reservoir' + (node.kind === 'queue' || node.id === 'screen_gate' ? ' pf-reservoir-queue' : ''), x: node.x, y: node.y, width: 0, height: node.dispHeight,
+        rx: 2, fill: PF_KIND_COLOR[node.kind], 'fill-opacity': 0.72,
+      });
+      pfReservoirLayer.appendChild(pool);
+      pfReservoirByNode[node.id] = pool;
+    });
+
+    var PF_BURST_MAX = 60; // SCREEN_BATCH_SIZE: one visible droplet per posting in a real batch
+    var PF_BURST_STAGGER = 30; // milliseconds between releases, so droplets visibly peel away
+    var PF_GRAVITY_X = 620; // SVG units / second²: zero-speed release, then acceleration right
+    var PF_POOL_MAX_W = 46;
+    var pfParticles = [];
+    var pfSplashes = [];
+    var pfParticleAnimating = false;
+    var pfIdleWaiters = [];
+
+    function pfDeposit(nodeId, amount, addCount) {
+      if (addCount) pfNodeCounts[nodeId] = (pfNodeCounts[nodeId] || 0) + amount;
+      pfReservoirCounts[nodeId] = Math.min(pfDerivedTotal(nodeId), (pfReservoirCounts[nodeId] || 0) + amount);
+      pfSyncLiveEdges();
+      pfWake();
+    }
+
+    function pfWaitForIdle() {
+      if (!pfParticleAnimating) return Promise.resolve();
+      return new Promise(function (resolve) { pfIdleWaiters.push(resolve); });
+    }
+
+    function pfBurstIntoGate(nodeId, count) {
+      var gate = pfNodeMap[nodeId];
+      var n = Math.max(1, Math.min(PF_BURST_MAX, Math.round(count)));
+      var now = performance.now();
+      var x1 = gate.x, x0 = gate.x - PF_POOL_MAX_W - 8;
+      for (var i = 0; i < n; i++) {
+        var y = gate.y + Math.random() * gate.dispHeight;
+        var dot = pfEl('circle', { r: 2.8, class: 'pf-dot', fill: PF_KIND_COLOR.gate, cx: x0, cy: y });
+        pfFlowLayer.appendChild(dot);
+        pfParticles.push({
+          el: dot, target: nodeId, color: PF_KIND_COLOR.gate, volume: count / n,
+          addCount: false, releaseGate: null, noDeposit: true,
+          x0: x0, x1: x1, dx: x1 - x0, y0: y, y1: y,
+          distance: Math.max(1, x1 - x0), drift: (Math.random() - 0.5) * 5,
+          start: now + i * PF_BURST_STAGGER,
+        });
+      }
+      if (!pfParticleAnimating) { pfParticleAnimating = true; requestAnimationFrame(pfParticleFrame); }
+    }
+
+    function pfSplash(x, y, color, now) {
+      for (var j = 0; j < 3; j++) {
+        var circle = pfEl('circle', { r: 1.5, class: 'pf-splash', fill: color });
+        pfFlowLayer.appendChild(circle);
+        pfSplashes.push({
+          el: circle, x: x, y: y, vx: -18 - Math.random() * 34,
+          vy: (j - 1) * 28 + (Math.random() - 0.5) * 10, born: now, life: 310,
+        });
+      }
+    }
+
+    function pfParticleFrame(now) {
+      for (var i = pfParticles.length - 1; i >= 0; i--) {
+        var p = pfParticles[i];
+        if (now < p.start) continue;
+        var elapsed = (now - p.start) / 1000;
+        var progress = Math.min(1, (0.5 * PF_GRAVITY_X * elapsed * elapsed) / p.distance);
+        var easedY = progress * progress * (3 - 2 * progress);
+        p.el.setAttribute('cx', p.x0 + p.dx * progress);
+        p.el.setAttribute('cy', p.y0 + (p.y1 - p.y0) * easedY + Math.sin(progress * Math.PI) * p.drift);
+        if (progress >= 1) {
+          p.el.remove();
+          pfParticles.splice(i, 1);
+          if (p.releaseGate) pfNodeCounts[p.releaseGate] = Math.max(0, (pfNodeCounts[p.releaseGate] || 0) - p.volume);
+          if (!p.noDeposit) pfDeposit(p.target, p.volume, p.addCount);
+          pfSplash(p.x1, p.y1, p.color, now);
+        }
+      }
+      for (var s = pfSplashes.length - 1; s >= 0; s--) {
+        var splash = pfSplashes[s];
+        var age = now - splash.born;
+        if (age >= splash.life) {
+          splash.el.remove(); pfSplashes.splice(s, 1); continue;
+        }
+        var seconds = age / 1000;
+        splash.el.setAttribute('cx', splash.x + splash.vx * seconds);
+        splash.el.setAttribute('cy', splash.y + splash.vy * seconds);
+        splash.el.setAttribute('fill-opacity', String(1 - age / splash.life));
+      }
+      if (pfParticles.length || pfSplashes.length) requestAnimationFrame(pfParticleFrame);
+      else {
+        pfParticleAnimating = false;
+        while (pfIdleWaiters.length) pfIdleWaiters.shift()();
+      }
+    }
 
     // Fires once per real increase (see setPfCounts), never on a timer or a loop: a handful of
     // dots -- proportional to, capped at a readable count of, exactly how much this specific edge
     // just grew by -- ride their OWN random path across the current ribbon band (computed fresh
     // from the edge's live sy0/sy1/ty0/ty1, so a burst mid-transition still starts and ends on the
-    // ribbon as it actually is right now) and are discarded once they land. No shared guide path
-    // or indefinite animation needed -- SMIL's animateMotion takes a path directly.
-    function pfBurst(key, delta) {
+    // ribbon as it actually is right now). Each begins at rest and accelerates horizontally, then
+    // deposits its share of the real delta into the destination pool and makes a tiny splash.
+    function pfBurst(key, delta, reverse, addCount, releaseGate) {
       var e = pfEdges[key];
       if (!e) return;
-      var s = pfNodeMap[e.source], t = pfNodeMap[e.target];
-      var x0 = s.x + s.width, x1 = t.x, midX = (x0 + x1) / 2;
+      var source = pfNodeMap[e.source], target = pfNodeMap[e.target];
+      if (reverse) { var swap = source; source = target; target = swap; }
+      var x0 = reverse ? source.x : source.x + source.width;
+      var x1 = reverse ? target.x + target.width : target.x;
       var n = Math.max(1, Math.min(PF_BURST_MAX, Math.round(delta)));
-      var color = PF_KIND_COLOR[t.kind] || 'var(--text-muted)';
+      var color = PF_KIND_COLOR[target.kind] || 'var(--text-muted)';
+      var now = performance.now();
       for (var i = 0; i < n; i++) {
         // One random vertical fraction per dot, reused at both ends, so each dot cuts its own
         // straight-ish diagonal through the band instead of every dot sharing one centerline.
         var frac = Math.random();
-        var y0 = e.sy0 + frac * (e.sy1 - e.sy0);
-        var y1 = e.ty0 + frac * (e.ty1 - e.ty0);
-        var d = 'M' + x0 + ',' + y0 + ' C' + midX + ',' + y0 + ' ' + midX + ',' + y1 + ' ' + x1 + ',' + y1;
-        var dur = PF_BURST_DUR_MIN + Math.random() * PF_BURST_DUR_RANGE;
-        var begin = i * PF_BURST_STAGGER + Math.random() * (PF_BURST_STAGGER / 2);
-        var dot = pfEl('circle', { r: 2.6, class: 'pf-dot', fill: color });
-        var anim = pfEl('animateMotion', { path: d, dur: dur + 's', begin: begin + 's', fill: 'freeze' });
-        dot.appendChild(anim);
+        var y0 = (reverse ? e.ty0 : e.sy0) + frac * ((reverse ? e.ty1 : e.sy1) - (reverse ? e.ty0 : e.sy0));
+        var y1 = (reverse ? e.sy0 : e.ty0) + frac * ((reverse ? e.sy1 : e.ty1) - (reverse ? e.sy0 : e.ty0));
+        var dot = pfEl('circle', { r: 2.8, class: 'pf-dot', fill: color, cx: x0, cy: y0 });
         pfFlowLayer.appendChild(dot);
-        (function (el, life) { setTimeout(function () { el.remove(); }, life * 1000); })(dot, begin + dur + 0.15);
+        pfParticles.push({
+          el: dot, target: target.id, color: color, volume: delta / n,
+          addCount: Boolean(addCount), releaseGate: releaseGate || null,
+          x0: x0, x1: x1, dx: x1 - x0, y0: y0, y1: y1, distance: Math.max(1, Math.abs(x1 - x0)),
+          drift: (Math.random() - 0.5) * 9,
+          start: now + i * PF_BURST_STAGGER + Math.random() * PF_BURST_STAGGER * 0.35,
+        });
       }
+      if (!pfParticleAnimating) { pfParticleAnimating = true; requestAnimationFrame(pfParticleFrame); }
     }
 
     var pfNodeLayer = pfEl('g', {});
     pfSvg.appendChild(pfNodeLayer);
     var pfNodeVisuals = {};
     PF_NODES.forEach(function (n) {
-      var rect = pfEl('rect', { class: 'pf-node-rect', x: n.x, y: n.y, width: n.width, height: n.dispHeight, rx: 2, fill: 'var(--surface-2)', stroke: PF_KIND_COLOR[n.kind] });
+      var rect = pfEl('rect', { class: 'pf-node-rect' + (n.kind === 'gate' ? ' pf-node-gate' : ''), x: n.x, y: n.y, width: n.width, height: n.dispHeight, rx: 2, fill: n.kind === 'gate' ? 'var(--accent-soft)' : 'var(--surface-2)', stroke: PF_KIND_COLOR[n.kind] });
       var tx = n.x + n.width + 8;
       // A label can end up sitting inside a wide ribbon (e.g. "Scanned postings", dead center of
       // the diagram, with three stacked col1 ribbons passing directly behind it) -- a halo behind
@@ -6759,8 +6868,17 @@ const DASHBOARD_PAGE = `<!doctype html>
         v.label.setAttribute('y', n.cy - 2);
         v.meta.setAttribute('y', n.cy + 12);
         var total = Math.round(pfDerivedTotal(n.id));
-        var pct = n.id === 'scanned' ? 'total' : (pfSourceTotal ? (100 * total / pfSourceTotal).toFixed(1) + '%' : '0%');
+        var pct = pfSourceTotal ? (100 * total / pfSourceTotal).toFixed(1) + '%' : '0%';
         v.meta.textContent = total + ' · ' + pct;
+        var pool = pfReservoirByNode[n.id];
+        if (pool) {
+          var poolCount = Math.min(total, pfReservoirDisplay[n.id] || 0);
+          var poolWidth = PF_POOL_MAX_W * (poolCount / Math.max(1, pfSourceTotal));
+          pool.setAttribute('x', n.x - poolWidth);
+          pool.setAttribute('y', n.y);
+          pool.setAttribute('width', poolWidth);
+          pool.setAttribute('height', n.dispHeight);
+        }
       });
       Object.keys(pfEdges).forEach(function (key) {
         var e = pfEdges[key];
@@ -6769,8 +6887,13 @@ const DASHBOARD_PAGE = `<!doctype html>
         var d = 'M' + x0 + ',' + e.sy0 + ' C' + midX + ',' + e.sy0 + ' ' + midX + ',' + e.ty0 + ' ' + x1 + ',' + e.ty0 +
           ' L' + x1 + ',' + e.ty1 + ' C' + midX + ',' + e.ty1 + ' ' + midX + ',' + e.sy1 + ' ' + x0 + ',' + e.sy1 + ' Z';
         pfPathByKey[key].setAttribute('d', d);
-        pfPathByKey[key].setAttribute('fill', PF_KIND_COLOR[t.kind] || 'var(--text-muted)');
-        pfPathByKey[key].setAttribute('fill-opacity', 0.4);
+        var edgeColor = PF_KIND_COLOR[t.kind] || 'var(--text-muted)';
+        var empty = e.committed <= 0;
+        pfPathByKey[key].setAttribute('fill', edgeColor);
+        pfPathByKey[key].setAttribute('fill-opacity', empty ? 0.16 : 0.4);
+        pfPathByKey[key].setAttribute('stroke', edgeColor);
+        pfPathByKey[key].setAttribute('stroke-opacity', empty ? 0.5 : 0);
+        pfPathByKey[key].setAttribute('stroke-width', empty ? 1.25 : 0);
       });
     }
 
@@ -6783,6 +6906,12 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (Math.abs(target - n.dispHeight) > 0.3) settled = false;
         var alpha = 1 - Math.exp(-dt * PF_SMOOTH_RATE);
         n.dispHeight += (target - n.dispHeight) * alpha;
+      });
+      Object.keys(pfReservoirByNode).forEach(function (nodeId) {
+        var target = pfReservoirCounts[nodeId] || 0;
+        var shown = pfReservoirDisplay[nodeId] || 0;
+        if (Math.abs(target - shown) > 0.03) settled = false;
+        pfReservoirDisplay[nodeId] = shown + (target - shown) * (1 - Math.exp(-dt * 9));
       });
       pfLayoutColumns();
       pfRecomputeEdgeSlices();
@@ -6810,9 +6939,11 @@ const DASHBOARD_PAGE = `<!doctype html>
       var res = await api('/jobs');
       var data = await res.json();
       allJobs = data.jobs || [];
+      matchThreshold = Number.isFinite(data.match_threshold) ? data.match_threshold : 70;
+      document.getElementById('jobs-match-threshold').value = matchThreshold;
       renderJobPipeline(data.counts || {});
+      // renderJobs() also drives the Interested subtab (via renderInterestedList) when it's active.
       renderJobs();
-      renderInterestedList();
       renderAppliedList();
     }
 
@@ -6939,7 +7070,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     function renderAppliedList() {
       var list = document.getElementById('applied-list');
       list.innerHTML = '';
-      var appliedJobs = allJobs.filter(function (j) { return j.fit_status === 'applied'; });
+      var appliedJobs = allJobs.filter(function (j) { return Boolean(j.applied_at); });
       appliedJobs.sort(function (a, b) { return new Date(b.applied_at || 0) - new Date(a.applied_at || 0); });
 
       document.getElementById('applied-summary').textContent = appliedJobs.length
@@ -6983,10 +7114,15 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
     }
 
-    function renderInterestedList() {
+    // candidateJobs is renderJobs()'s already-search/age/score-filtered array, so the Interested
+    // subtab's list respects the same shared filter controls as the other four subtabs.
+    function renderInterestedList(candidateJobs) {
       var list = document.getElementById('interested-list');
       list.innerHTML = '';
-      var interestedJobs = allJobs.filter(function (j) { return j.fit_status === 'interested'; });
+      // Applied jobs stay manual_status='interested' (applying only ever happens from this
+      // workspace) but live on the separate Applied tab, not here -- same exclusion this list has
+      // always had, back when applying overwrote fit_status away from 'interested'.
+      var interestedJobs = candidateJobs.filter(function (j) { return j.manual_status === 'interested' && !j.applied_at; });
       // Most recently marked first -- this is the "what did I just decide to go after" list, not
       // a freshness-of-posting one, so it sorts on interested_at rather than posted_at/fit_score.
       interestedJobs.sort(function (a, b) { return new Date(b.interested_at || 0) - new Date(a.interested_at || 0); });
@@ -6994,7 +7130,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       if (!interestedJobs.length) {
         list.appendChild(el('p', {
           className: 'empty',
-          textContent: 'No interested jobs yet — mark one from the Jobs tab.',
+          textContent: 'No interested jobs yet — mark one Interested from Good Match, Bad Match, or Unrated.',
         }));
         document.getElementById('interested-detail-section').style.display = 'none';
         activeInterestedJobId = null;
@@ -7025,8 +7161,8 @@ const DASHBOARD_PAGE = `<!doctype html>
 
         var view = el('button', { type: 'button', textContent: 'View' });
         view.addEventListener('click', function () { showInterestedDetail(job); });
-        var remove = el('button', { className: 'danger', type: 'button', textContent: 'Remove interest' });
-        remove.addEventListener('click', function () { submitJobFit(job.id, 'uninterested'); });
+        var remove = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
+        remove.addEventListener('click', function () { submitJobFit(job.id, 'removed'); });
 
         list.appendChild(el('div', { className: 'row-item' }, [
           el('div', { className: 'row' }, [
@@ -7278,7 +7414,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
       host.appendChild(list);
 
-      var alreadyApplied = job.fit_status === 'applied';
+      var alreadyApplied = Boolean(job.applied_at);
       var button = document.getElementById('interested-apply-mark');
       button.textContent = alreadyApplied ? 'Already applied' : 'Mark as applied';
       button.disabled = alreadyApplied;
@@ -7517,7 +7653,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         { id: 'resumes', name: 'Resume versions', note: 'Generated resumes and their PDFs.' },
         { id: 'cover_letters', name: 'Cover letters', note: 'Generated cover letters for interested jobs.' },
         { id: 'notes', name: 'Notes', note: 'Freeform and pasted resume text on Resume > Notes.' },
-        { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Roles tab (Notes sub-tab).' },
+        { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Roles tab (Targets sub-tab).' },
       ].forEach(function (collection) {
         var del = el('button', { className: 'destructive', type: 'button', textContent: 'Delete' });
         del.addEventListener('click', async function () {
@@ -7693,7 +7829,10 @@ async function devConsole(request: Request, env: Env, url: URL): Promise<Respons
     return json(await costSummary(env.DB, days));
   }
   if (method === "GET" && path === "/dev/langfuse") {
-    return json({ configured: langfuseConfigured(env), host: env.LANGFUSE_HOST || "https://cloud.langfuse.com" });
+    return json({
+      configured: langfuseConfigured(env),
+      host: env.LANGFUSE_BASE_URL || env.LANGFUSE_HOST || "https://cloud.langfuse.com",
+    });
   }
 
   const traceMatch = path.match(/^\/dev\/traces\/(.+)$/);
@@ -7856,7 +7995,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "GET" && url.pathname === "/jobs") return listJobs(request, env);
     if (request.method === "POST" && url.pathname === "/jobs") return createJob(request, env);
     if (request.method === "POST" && url.pathname === "/jobs/process") return processJobs(request, env, ctx);
-    if (request.method === "POST" && url.pathname === "/jobs/reassess") return reassessTopMatches(request, env, ctx);
+    if (request.method === "PATCH" && url.pathname === "/jobs/match-threshold") return setMatchThreshold(request, env);
     if (request.method === "GET" && url.pathname === "/data") return dataSummary(request, env);
     if (request.method === "POST" && url.pathname === "/data/purge-stage") return purgeStage(request, env);
     if (request.method === "POST" && url.pathname === "/data/purge-collection") return purgeCollection(request, env);

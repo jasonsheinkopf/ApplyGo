@@ -4,16 +4,13 @@
  * llm.ts's traced() wrapper is already the single choke point every model call passes through --
  * see its own header comment -- and it already captures everything a call needs (task, provider,
  * model, tier, prompt, response, tokens, cost, latency, ok/error). This module's only job is to
- * shape that into Langfuse's ingestion event format and POST it.
+ * shape that into one OTLP/HTTP JSON span and POST it.
  *
- * Deliberately raw `fetch` against Langfuse's documented ingestion endpoint
- * (`POST /api/public/ingestion`), not the `langfuse` npm SDK. The published v3 SDK is marked
- * deprecated in favor of a v4 rewrite built on OpenTelemetry, and wiring a generic OTEL SDK
- * correctly inside a Cloudflare Workers isolate -- where a naive setup can leak span context
- * across concurrent requests sharing the same isolate -- is a real correctness hazard this app
- * already reasons carefully about elsewhere (see index.ts's attachTraceSink comment). A single
- * stateless POST per call sidesteps that entirely and matches how the rest of this file already
- * talks to every other provider.
+ * Deliberately raw `fetch` against Langfuse's OTLP/HTTP endpoint
+ * (`POST /api/public/otel/v1/traces`), not a process-global OpenTelemetry SDK. A generic SDK's
+ * ambient span context can leak across concurrent requests sharing a Cloudflare Workers isolate.
+ * Building one standards-compliant OTLP JSON envelope per completed call keeps this exporter
+ * stateless while using Langfuse's current v4 ingestion path.
  *
  * Every function here follows the same rule llm.ts's own record() does: observability must never
  * be able to break the call it's observing. Nothing in this file throws; a Langfuse outage or a
@@ -25,7 +22,9 @@ import type { LlmTrace } from "./llm";
 export interface LangfuseEnv {
   LANGFUSE_PUBLIC_KEY?: string;
   LANGFUSE_SECRET_KEY?: string;
-  /** Defaults to Langfuse Cloud's EU region. Set to https://us.cloud.langfuse.com for the US region, or a self-hosted URL. */
+  /** Standard Langfuse SDK setting. Preferred over the legacy ApplyGo-specific HOST alias. */
+  LANGFUSE_BASE_URL?: string;
+  /** Backward-compatible alias. Defaults to Langfuse Cloud's EU region when neither URL is set. */
   LANGFUSE_HOST?: string;
 }
 
@@ -34,15 +33,30 @@ export function langfuseConfigured(env: LangfuseEnv): boolean {
 }
 
 function host(env: LangfuseEnv): string {
-  return (env.LANGFUSE_HOST || "https://cloud.langfuse.com").replace(/\/$/, "");
+  return (env.LANGFUSE_BASE_URL || env.LANGFUSE_HOST || "https://cloud.langfuse.com").replace(/\/$/, "");
 }
 
 function authHeader(env: LangfuseEnv): string {
   return `Basic ${btoa(`${env.LANGFUSE_PUBLIC_KEY}:${env.LANGFUSE_SECRET_KEY}`)}`;
 }
 
+function randomHex(bytes: number): string {
+  const value = crypto.getRandomValues(new Uint8Array(bytes));
+  return Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function attribute(key: string, value: string | number | string[]) {
+  if (typeof value === "string") return { key, value: { stringValue: value } };
+  if (typeof value === "number") return { key, value: { doubleValue: value } };
+  return { key, value: { arrayValue: { values: value.map((item) => ({ stringValue: item })) } } };
+}
+
+function unixNanos(date: Date): string {
+  return (BigInt(date.getTime()) * 1_000_000n).toString();
+}
+
 /**
- * One LLM call becomes one Langfuse trace with a single generation observation inside it. Batched
+ * One LLM call becomes one Langfuse trace with a single root generation observation. Batched
  * calls (screenJobsBatch, assessJobFitBatch) already cover many postings in one call, so this is
  * naturally the right granularity for "one thing that happened" without threading a request-scoped
  * session id through the dozen-plus call sites that currently just pass `env` straight through.
@@ -57,56 +71,59 @@ export async function sendToLangfuse(
 ): Promise<string | null> {
   if (!langfuseConfigured(env)) return null;
 
-  const traceId = crypto.randomUUID();
+  // OTLP requires a 16-byte lowercase-hex trace id and an 8-byte span id.
+  const traceId = randomHex(16);
+  const spanId = randomHex(8);
   const endTime = new Date();
   const startTime = new Date(endTime.getTime() - Math.max(0, trace.latencyMs));
-
-  const batch = [
-    {
-      id: crypto.randomUUID(),
-      timestamp: endTime.toISOString(),
-      type: "trace-create" as const,
-      body: {
-        id: traceId,
-        timestamp: startTime.toISOString(),
-        name: trace.task,
-        input: trace.prompt,
-        output: trace.ok ? trace.response : null,
-        tags: [trace.provider, trace.tier, trace.ok ? "ok" : "error"],
-        metadata: { provider: trace.provider, tier: trace.tier },
-      },
-    },
-    {
-      id: crypto.randomUUID(),
-      timestamp: endTime.toISOString(),
-      type: "generation-create" as const,
-      body: {
-        id: crypto.randomUUID(),
-        traceId,
-        name: trace.task,
-        startTime: startTime.toISOString(),
-        endTime: endTime.toISOString(),
-        model: trace.model,
-        input: trace.prompt,
-        output: trace.ok ? trace.response : null,
-        usageDetails: { input: trace.inputTokens, output: trace.outputTokens },
-        ...(trace.costUsd != null ? { costDetails: { total: trace.costUsd } } : {}),
-        level: trace.ok ? "DEFAULT" : "ERROR",
-        ...(trace.ok ? {} : { statusMessage: trace.error ?? "error" }),
-        metadata: { tier: trace.tier },
-      },
-    },
+  const attributes = [
+    attribute("langfuse.trace.name", trace.task),
+    attribute("langfuse.trace.tags", [trace.provider, trace.tier, trace.ok ? "ok" : "error"]),
+    attribute("langfuse.observation.type", "generation"),
+    attribute("langfuse.observation.input", JSON.stringify(trace.prompt)),
+    attribute("langfuse.observation.model.name", trace.model),
+    attribute("langfuse.observation.usage_details", JSON.stringify({ input: trace.inputTokens, output: trace.outputTokens })),
+    attribute("langfuse.observation.level", trace.ok ? "DEFAULT" : "ERROR"),
+    attribute("langfuse.observation.metadata.provider", trace.provider),
+    attribute("langfuse.observation.metadata.tier", trace.tier),
   ];
+  if (trace.ok) attributes.push(attribute("langfuse.observation.output", JSON.stringify(trace.response)));
+  if (trace.costUsd != null) {
+    attributes.push(attribute("langfuse.observation.cost_details", JSON.stringify({ total: trace.costUsd })));
+  }
+  if (!trace.ok) attributes.push(attribute("langfuse.observation.status_message", trace.error ?? "error"));
+
+  const payload = {
+    resourceSpans: [{
+      resource: { attributes: [attribute("service.name", "applygo")] },
+      scopeSpans: [{
+        scope: { name: "langfuse-sdk", version: "applygo-otlp-v1" },
+        spans: [{
+          traceId,
+          spanId,
+          traceFlags: 1,
+          name: trace.task,
+          kind: 1,
+          startTimeUnixNano: unixNanos(startTime),
+          endTimeUnixNano: unixNanos(endTime),
+          attributes,
+          status: trace.ok ? { code: 0 } : { code: 2, message: trace.error ?? "error" },
+        }],
+      }],
+    }],
+  };
 
   try {
-    const res = await fetch(`${host(env)}/api/public/ingestion`, {
+    const res = await fetch(`${host(env)}/api/public/otel/v1/traces`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: authHeader(env) },
-      body: JSON.stringify({ batch }),
+      headers: {
+        "content-type": "application/json",
+        authorization: authHeader(env),
+        "x-langfuse-ingestion-version": "4",
+      },
+      body: JSON.stringify(payload),
     });
-    // The ingestion endpoint can 207 partial-success a batch -- either way, the trace id we
-    // generated is what future links point at, so there's nothing more to extract from the body.
-    if (!res.ok && res.status !== 207) return null;
+    if (!res.ok) return null;
     return traceId;
   } catch {
     return null;

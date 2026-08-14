@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "dev": "concurrently --kill-others --names renderer,worker \"npm:dev:renderer\" \"npm:dev:worker\"",
     "dev:renderer": "node scripts/local-render.mjs",
-    "dev:worker": "wrangler dev --env=\"\" --port 8787",
+    "dev:worker": "wrangler dev --env=\"\" --env-file ../.env --env-file .dev.vars --port 8787",
     "deploy": "wrangler deploy --env=\"\"",
     "deploy:production": "wrangler deploy --env production",
     "migrate:local": "wrangler d1 migrations apply applygo --local --env=\"\"",
