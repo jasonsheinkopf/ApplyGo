@@ -537,6 +537,34 @@ That's the entire setup — no other config, no schema to define on the Langfuse
 
 **Failure handling.** Every function in `langfuse.ts` follows the same rule `record()` in `llm.ts` already does: observability must never be able to break the call it's observing. `sendToLangfuse()` and the project-id lookup both swallow their own errors and return `null` rather than throwing — a Langfuse outage, a wrong key, or no configuration at all just means nothing gets sent that time, silently, with the LLM call itself unaffected.
 
+## Gmail reply-checking (optional, read-only)
+
+The Applied tab can check the candidate's own Gmail inbox for replies from companies they've applied to — "did anyone from Acme email me back?" — without ever sending, modifying, or deleting anything. This is the app's first three-legged OAuth integration; everything else external (Anthropic, OpenAI, Langfuse) is a static API key.
+
+Gmail is entirely optional — the rest of ApplyGo works without it. Connecting it only enables the "Check for replies" button on the Applied tab.
+
+Because ApplyGo is self-hosted, there's no shared Google OAuth app every installation can use — Google ties an OAuth client to one app identity, and a single shared one would mean every ApplyGo user's Gmail grant lived behind the same credentials. Instead, **each installation registers its own Google OAuth app and enters its own Client ID/Secret**, entirely through the UI:
+
+**Settings → Email → follow the built-in "How do I get these?" walkthrough → paste the Client ID and Client Secret → Connect Gmail.**
+
+No `.env`/`.dev.vars` editing, no `wrangler secret put`, no redeploying — the walkthrough is written for someone who has never opened Google Cloud Console before, includes the exact **Authorized redirect URI** this installation needs (with a Copy button — it differs between `http://localhost:8787` and a deployed domain, so the app computes it from the live request rather than hardcoding one), and Settings → Email shows one of four states (**Not configured** / **Ready to connect** / **Connected** / **Connection expired**) so it's always clear what to do next.
+
+**How it's wired.** `src/gmail.ts` holds the OAuth token exchange/refresh and the Gmail search call; the actual routes (`/gmail/credentials`, `/gmail/connect`, `/gmail/callback`, `/gmail/status`, `/gmail/disconnect`, `/gmail/check-replies`) live in `index.ts` like every other handler. Two things are stored on `candidate_profiles`, in separate columns from each other and from `preferences_json`:
+- `google_oauth_json` — the OAuth app registration (Client ID/Secret) entered in Settings → Email. Effectively permanent once set; disconnecting Gmail never clears it.
+- `gmail_json` — the actual connection (access/refresh token, expiry, connected address, and a `needs_reconnect` flag). Cleared on Disconnect; the app registration above survives that.
+
+Both are kept out of `preferences_json` on purpose: that column is echoed close to verbatim in `GET /profile`'s response, so anything sensitive has to live somewhere `getProfile()`'s query never selects. `GET /gmail/status` is the only reader of either column, and it only ever returns a secret-free shape — connection state, the (non-secret) Client ID, and the redirect URI. The Client Secret is never sent back to the browser once saved, never logged, and never appears in a Langfuse trace or error message; `POST /gmail/credentials` accepts it once, writes it, and returns nothing but a confirmation.
+
+`GET /gmail/status` is also a passive read — it never attempts a live token refresh — because the frontend's global `api()` helper treats *any* HTTP 401 from *any* endpoint as "the session is dead, log out," and a Gmail-specific problem must never trigger that. A stale/expired connection is instead discovered the next time `POST /gmail/check-replies` actually tries to use it, which persists a `needs_reconnect` flag rather than just returning an error, so Settings → Email shows "Connection expired" on its next load without needing to run a check first.
+
+"Check for replies" (Applied tab) is one click that, for every applied job, searches Gmail for `"<normalized company name>" after:<applied date>`, using the same `companyNameKey()` punctuation/legal-suffix stripping the Companies tab already uses for dedup. Results are **not persisted** — they exist only in the browser for that page load, re-running the check just re-queries Gmail. Very short/generic company names (≤3 characters after normalization) are skipped rather than searched, since a short name matches too much unrelated mail to be a useful signal.
+
+**About the 7-day reconnect.** `gmail.readonly` — the only scope this app ever requests — is one of Google's *sensitive* scopes. While your OAuth app's publishing status is **Testing** (the guided setup's default, and the recommended path for a personal installation), Google expires refresh tokens **7 days** after they're issued; when that happens, Settings → Email shows "Connection expired" and a Reconnect Gmail button — nothing is lost, it's a one click fix. Moving your OAuth app out of Testing status requires completing Google's sensitive-scope verification (a privacy policy, domain ownership verification, and a Google review) — real overhead intended for apps with outside users, not something a personal single-user tool needs. Staying in Testing and reconnecting occasionally is the recommended default for this first version.
+
+**Advanced: environment-variable configuration.** For developers or automated deployments, `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` can still be set the conventional way (`.dev.vars` locally, `wrangler secret put ... --env production`) instead of through Settings → Email. Credentials entered in Settings → Email always take precedence over the environment variables if both are present — `resolveGoogleOAuthClient()` in `index.ts` is the one place that decides which wins.
+
+**Failure handling.** No `/gmail/*` route ever returns a bare HTTP 401 — the frontend's `api()` helper treats any 401 from *any* endpoint as "the whole app session is dead, log out," and a Gmail-specific problem (not connected, needs reconnecting) must never trigger that. `GET /gmail/status` is a passive read with no live refresh attempt; `POST /gmail/check-replies` surfaces a stale/expired connection as `{error:"gmail_reconnect_required"}` on a 400, which the client shows as a prompt to reconnect rather than a generic error.
+
 ## Eval harness (`/dev`, Evals tab)
 
 Traces make a prompt visible; the eval harness is what makes changing one accountable. A **case** is a saved prompt worth testing repeatedly — usually promoted from a real trace, sometimes hand-authored. A **run** is one execution of a case against a chosen provider/model, scored by an LLM judge. Both live in `src/evals.ts`, `migrations/0016_evals.sql`, and the Evals tab in `src/devconsole.ts`.
@@ -588,6 +616,7 @@ Checkboxes keep their small box and get the height on the surrounding `<label>` 
 - No Cloudflare API token, GitHub token, or model-provider key is ever sent to browser JavaScript.
 - Automatic GitHub deployment uses Cloudflare Workers Builds' native Git integration, which does not require storing a Cloudflare API token in GitHub Actions secrets.
 - `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` (see "Langfuse tracing" above) are Worker secrets like every other credential here — never committed, never sent to the browser. Every prompt and response this app sends is also sent to Langfuse when configured, exactly as it's already written to `llm_traces`, so treat a Langfuse project the same as the `/dev` console: real candidate data, not a throwaway debug feed.
+- Google OAuth Client ID/Secret (see "Gmail reply-checking" above) are normally entered through Settings → Email and stored in `candidate_profiles.google_oauth_json`, not as Worker secrets — `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` env vars remain supported as an advanced/developer fallback. Either way, the Client Secret is never sent back to the browser once saved, never logged, and never appears in a trace or error message. The Gmail access/refresh tokens the flow obtains are stored separately in `candidate_profiles.gmail_json` — real credentials capable of reading the connected inbox, kept out of `preferences_json` specifically so neither column is ever included in `GET /profile`'s response to the browser.
 
 ### Deploy-before-migrate safety
 

@@ -1,0 +1,13 @@
+-- The user's own Google OAuth Client ID/Secret for the Gmail integration (see src/gmail.ts,
+-- Settings > Email). Self-hosted ApplyGo has no shared OAuth app to fall back on -- each
+-- installation registers its own with Google -- so these are entered through Settings > Email's
+-- guided setup and stored here, not required as Worker secrets/.dev.vars for normal use.
+--
+-- Deliberately a separate column from gmail_json: this is the OAuth *app registration*
+-- (client_id/client_secret, effectively permanent once set), while gmail_json is the *user's
+-- grant* to that app (access/refresh tokens, which disconnecting clears). Keeping them apart means
+-- disconnecting Gmail never forces re-entering the Google credentials, and vice versa. Same
+-- isolation-from-preferences_json rule as gmail_json: never added to getProfile()'s SELECT list,
+-- since that response is echoed to the browser -- only a token/secret-free derived shape from
+-- GET /gmail/status ever reaches the frontend.
+ALTER TABLE candidate_profiles ADD COLUMN google_oauth_json TEXT NOT NULL DEFAULT '{}';

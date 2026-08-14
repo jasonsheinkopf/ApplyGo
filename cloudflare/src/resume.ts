@@ -673,9 +673,10 @@ function base64ToBytes(value: string): Uint8Array {
 
 /**
  * Local development does not require a Cloudflare account. `npm run dev` starts a tiny companion
- * renderer that drives the machine's installed Chrome directly. Miniflare's Browser binding is
- * still tried first, but if its bundled browser cannot spawn we hand the same HTML to that local
- * renderer. Production has no LOCAL_RENDER_URL and therefore continues to use Cloudflare only.
+ * renderer that drives the machine's installed Chrome directly. When LOCAL_RENDER_URL is present
+ * it is the primary renderer: asking Miniflare to launch its Browser binding first can abort the
+ * loopback request at the runtime layer before application-level fallback code gets control.
+ * Production has no LOCAL_RENDER_URL and therefore continues to use Cloudflare only.
  */
 async function renderWithLocalChrome(env: ResumeEnv, html: string): Promise<Omit<RenderResult, "pdfKey">> {
   if (!env.LOCAL_RENDER_URL) throw new Error("local_renderer_not_configured");
@@ -693,42 +694,53 @@ async function renderWithLocalChrome(env: ResumeEnv, html: string): Promise<Omit
   return { pdfBytes: base64ToBytes(data.pdf_base64), screenshotBase64: data.screenshot_base64 };
 }
 
+async function renderWithCloudflareBrowser(
+  env: ResumeEnv,
+  html: string,
+): Promise<Omit<RenderResult, "pdfKey">> {
+  const browser = await launchBrowser(env);
+  try {
+    const page = await browser.newPage();
+    // 8.5in x 11in at 96dpi, so CSS inches map to the real page.
+    await page.setViewport({ width: 816, height: 1056 });
+    await page.setContent(html, { waitUntil: "networkidle0" });
+    await page.emulateMediaType("print");
+    const pdf = await page.pdf({
+      format: "letter",
+      printBackground: true,
+      margin: { top: "0in", bottom: "0in", left: "0in", right: "0in" },
+    });
+    const shot = await page.screenshot({ type: "jpeg", quality: 80, fullPage: true });
+    return {
+      pdfBytes: new Uint8Array(pdf),
+      screenshotBase64: bytesToBase64(new Uint8Array(shot)),
+    };
+  } finally {
+    await browser.close();
+  }
+}
+
 /**
  * One browser session produces both the PDF and the print-media screenshot, so the image the
  * vision reviewer sees is the same rendering the PDF came from.
  */
 export async function renderResumeArtifacts(env: ResumeEnv, resumeId: string, html: string): Promise<RenderResult> {
   let artifacts: Omit<RenderResult, "pdfKey">;
-  try {
-    const browser = await launchBrowser(env);
-    try {
-      const page = await browser.newPage();
-      // 8.5in x 11in at 96dpi, so CSS inches map to the real page.
-      await page.setViewport({ width: 816, height: 1056 });
-      await page.setContent(html, { waitUntil: "networkidle0" });
-      await page.emulateMediaType("print");
-      const pdf = await page.pdf({
-        format: "letter",
-        printBackground: true,
-        margin: { top: "0in", bottom: "0in", left: "0in", right: "0in" },
-      });
-      const shot = await page.screenshot({ type: "jpeg", quality: 80, fullPage: true });
-      artifacts = {
-        pdfBytes: new Uint8Array(pdf),
-        screenshotBase64: bytesToBase64(new Uint8Array(shot)),
-      };
-    } finally {
-      await browser.close();
-    }
-  } catch (cloudflareError) {
+  if (env.LOCAL_RENDER_URL) {
     try {
       artifacts = await renderWithLocalChrome(env, html);
     } catch (localError) {
-      throw new Error(
-        `Cloudflare browser failed: ${(cloudflareError as Error).message}. ` +
-        `Local Chrome fallback failed: ${(localError as Error).message}`,
-      );
+      try {
+        artifacts = await renderWithCloudflareBrowser(env, html);
+      } catch (cloudflareError) {
+        throw new Error(
+          `Local Chrome renderer failed: ${(localError as Error).message}. ` +
+          `Cloudflare browser fallback failed: ${(cloudflareError as Error).message}`,
+        );
+      }
     }
+  } else {
+    artifacts = await renderWithCloudflareBrowser(env, html);
   }
 
   const pdfKey = `resumes/${resumeId}.pdf`;

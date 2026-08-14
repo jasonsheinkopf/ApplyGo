@@ -327,7 +327,7 @@ export async function proposeCompanies(
     .filter((c) => c.name && c.website);
 }
 
-async function fetchWithTimeout(url: string, ms: number, init: RequestInit = {}): Promise<Response | null> {
+export async function fetchWithTimeout(url: string, ms: number, init: RequestInit = {}): Promise<Response | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {
