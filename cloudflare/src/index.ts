@@ -613,40 +613,134 @@ async function ensureCareAboutTopics(
   }
 }
 
-/** One distinct role family the analysis thinks the candidate is suited for. */
-type RoleAnalysisEntry = { title: string; description: string };
+/**
+ * One distinct role family the analysis thinks the candidate should search for.
+ *
+ * `title` and `alternate_titles` are deliberately real job-market categories rather than
+ * descriptions of the person: they exist to be matched against actual postings, and a title nobody
+ * posts matches nothing. `search_title_terms` is narrower still -- the literal words a deterministic
+ * title filter compares against, kept separate from `search_keywords` (body terms) because the two
+ * are consumed by different stages with different precision requirements.
+ */
+type RoleAnalysisEntry = {
+  title: string;
+  alternate_titles: string[];
+  fit_summary: string;
+  why_this_fits: { claim: string; evidence: string[] }[];
+  seniority: string;
+  domains: string[];
+  must_have_characteristics: string[];
+  nice_to_have_characteristics: string[];
+  search_title_terms: string[];
+  search_keywords: string[];
+  possible_gaps_or_cautions: string[];
+};
 
 /**
- * The structured output of `roles.analyze`: a non-role-specific summary (location, what to avoid,
- * what matters) plus the distinct role types it identified. Regenerated wholesale by Reanalyze --
- * there's no per-field merge, since re-deriving from the current notes/preferences is the point.
+ * The structured output of `roles.analyze`: a role-independent search summary plus the distinct
+ * role families it identified. Regenerated wholesale by Reanalyze -- there's no per-field merge,
+ * since re-deriving from the current profile and preferences is the point.
+ *
+ * Market data lives in a sibling table rather than in here (see `role_market_research`), because it
+ * comes from a different process with a different failure mode: candidate reasoning must stay
+ * stable and reproducible when a labor-statistics provider is down.
  */
 type RoleAnalysis = { summary: string; roles: RoleAnalysisEntry[] };
 
+/** Fills in any field an older stored analysis predates, so v1 records render without guarding. */
+function normalizeRoleAnalysisEntry(raw: Record<string, unknown>): RoleAnalysisEntry {
+  const list = (value: unknown): string[] =>
+    Array.isArray(value) ? value.map((v) => String(v ?? "").trim()).filter(Boolean) : [];
+  return {
+    title: String(raw.title ?? "").trim(),
+    alternate_titles: list(raw.alternate_titles),
+    // Older analyses stored a single `description`; surfacing it as the fit summary keeps a
+    // pre-refactor record readable instead of blank.
+    fit_summary: String(raw.fit_summary ?? raw.description ?? "").trim(),
+    why_this_fits: (Array.isArray(raw.why_this_fits) ? raw.why_this_fits : [])
+      .map((w) => {
+        const item = (w ?? {}) as Record<string, unknown>;
+        return { claim: String(item.claim ?? "").trim(), evidence: list(item.evidence) };
+      })
+      .filter((w) => w.claim),
+    seniority: String(raw.seniority ?? "").trim(),
+    domains: list(raw.domains),
+    must_have_characteristics: list(raw.must_have_characteristics),
+    nice_to_have_characteristics: list(raw.nice_to_have_characteristics),
+    search_title_terms: list(raw.search_title_terms),
+    search_keywords: list(raw.search_keywords),
+    possible_gaps_or_cautions: list(raw.possible_gaps_or_cautions),
+  };
+}
+
+function normalizeRoleAnalysis(raw: unknown): RoleAnalysis {
+  const input = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const roles = Array.isArray(input.roles) ? input.roles : [];
+  return {
+    summary: String(input.summary ?? "").trim(),
+    roles: roles
+      .map((r) => normalizeRoleAnalysisEntry((r ?? {}) as Record<string, unknown>))
+      .filter((r) => r.title),
+  };
+}
+
 function readRoleAnalysis(preferencesJson: string): RoleAnalysis | null {
   try {
-    const analysis = (JSON.parse(preferencesJson || "{}") as { role_analysis?: RoleAnalysis }).role_analysis;
-    return analysis && Array.isArray(analysis.roles) ? analysis : null;
+    const analysis = (JSON.parse(preferencesJson || "{}") as { role_analysis?: unknown }).role_analysis;
+    if (!analysis || typeof analysis !== "object") return null;
+    const normalized = normalizeRoleAnalysis(analysis);
+    return normalized.roles.length ? normalized : null;
   } catch {
     return null;
   }
 }
 
 /**
- * Renders the structured analysis back into the same kind of plain-text block the fit/screen/resume
- * prompts have always taken as `desiredRoles` -- one heading + description per distinct role family.
- * Keeps every downstream consumer of that string unchanged while the candidate-facing side of this
- * became structured.
+ * Renders the structured analysis into the flat `desired_roles` string every downstream stage
+ * already consumes -- company discovery, board filtering, prescreening, deep fit, resume targeting.
+ *
+ * Deliberately search-oriented rather than descriptive. The old version flattened each role's prose
+ * description, which meant the cheap title filter downstream was deriving match terms from
+ * sentences and picking up whatever generic words happened to appear in them. Emitting the explicit
+ * title/alternate-title/search-term vocabulary instead gives that filter something precise to work
+ * with, and keeps prose that would only add noise (fit rationale, cautions, and especially market
+ * and salary text) out of a string whose entire job is finding relevant postings.
  */
 function flattenRoleAnalysis(analysis: RoleAnalysis): string {
-  return analysis.roles.map((r) => `## ${r.title}\n${r.description}`).join("\n\n");
+  return analysis.roles
+    .map((r) => {
+      const lines = [`## ${r.title}`];
+      if (r.alternate_titles.length) lines.push(`Also posted as: ${r.alternate_titles.join(", ")}`);
+      if (r.seniority) lines.push(`Seniority: ${r.seniority}`);
+      if (r.domains.length) lines.push(`Domains: ${r.domains.join(", ")}`);
+      if (r.search_title_terms.length) lines.push(`Title terms: ${r.search_title_terms.join(", ")}`);
+      if (r.search_keywords.length) lines.push(`Keywords: ${r.search_keywords.join(", ")}`);
+      if (r.must_have_characteristics.length) lines.push(`Must have: ${r.must_have_characteristics.join("; ")}`);
+      return lines.join("\n");
+    })
+    .join("\n\n");
 }
 
 /**
- * Reads the stored profile, transparently lifting a pre-refactor record into the canonical shape.
- * See `readCareerProfile` in src/profile.ts -- old data loads, it just loads as a thin v1 record
- * until the candidate regenerates from their documents.
+ * The explicit title vocabulary for the cheap deterministic board filter, in matchable form.
+ * Kept structured (rather than re-parsed out of the flattened string above) so the filter never has
+ * to guess which words in a block of prose were meant to be title terms.
  */
+function roleTitleTerms(analysis: RoleAnalysis | null): string[] {
+  if (!analysis) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const role of analysis.roles) {
+    for (const term of [role.title, ...role.alternate_titles, ...role.search_title_terms]) {
+      const cleaned = term.trim().toLowerCase();
+      if (cleaned.length < 3 || seen.has(cleaned)) continue;
+      seen.add(cleaned);
+      out.push(cleaned);
+    }
+  }
+  return out;
+}
+
 function readStructuredProfile(structuredJson: string): StructuredProfile | null {
   return readCareerProfile(structuredJson);
 }
@@ -1094,6 +1188,8 @@ function formatRoleExamplesForPrompt(examples: RoleExampleRow[]): string {
     .join("\n\n");
 }
 
+const strArrayProp = (description: string) => ({ type: "array", items: { type: "string" }, description });
+
 const ROLE_ANALYSIS_SCHEMA = {
   type: "object",
   properties: {
@@ -1111,21 +1207,50 @@ const ROLE_ANALYSIS_SCHEMA = {
         properties: {
           title: {
             type: "string",
-            description: "A short, concrete job title a posting would actually use (e.g. 'Applied AI Engineer'), not a sentence.",
-          },
-          description: {
-            type: "string",
             description:
-              "Role family/titles, seniority, domain, must-have vs nice-to-have aspects, and enough concrete " +
-              "keywords that a simple keyword match could find it.",
+              "A real, recognizable job title employers actually post (e.g. 'Applied AI Engineer'), not a " +
+              "sentence and not an invented hybrid of several different careers.",
           },
+          alternate_titles: strArrayProp(
+            "Other real titles employers commonly use for substantially the same job.",
+          ),
+          fit_summary: {
+            type: "string",
+            description: "One or two sentences on why this path makes sense for this specific person.",
+          },
+          why_this_fits: {
+            type: "array",
+            description:
+              "Each claim paired with the concrete evidence from the candidate's background that supports it. " +
+              "Never assert fit without citing what they actually did.",
+            items: {
+              type: "object",
+              properties: {
+                claim: { type: "string" },
+                evidence: strArrayProp("Specific things from their record that back this claim up."),
+              },
+              required: ["claim"],
+            },
+          },
+          seniority: { type: "string", description: "The level they could plausibly enter at, e.g. 'Mid to senior'." },
+          domains: strArrayProp("Industries or subject areas where this role fits their background."),
+          must_have_characteristics: strArrayProp("What a posting must have for this to be a genuine match."),
+          nice_to_have_characteristics: strArrayProp("What would make a posting an especially good match."),
+          search_title_terms: strArrayProp(
+            "Literal title words to match against posting titles. Short, common, recall-oriented -- these feed a " +
+              "cheap deterministic filter, not a model.",
+          ),
+          search_keywords: strArrayProp("Body keywords that indicate this kind of role."),
+          possible_gaps_or_cautions: strArrayProp(
+            "Honest weaknesses for this path and what would strengthen it. Do not flatter.",
+          ),
         },
-        required: ["title", "description"],
+        required: ["title", "fit_summary"],
       },
       description:
         "Each genuinely distinct role family the candidate should be shown -- not variations on one title. Do " +
         "not blend different fields into one hybrid role that doesn't exist in the job market; a posting only " +
-        "has to match ONE entry to be worth surfacing.",
+        "has to match ONE entry to be worth surfacing. Typically 3-8 entries.",
     },
   },
   required: ["summary", "roles"],
@@ -1148,9 +1273,9 @@ async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response
 
   const profileId = await getOrCreateProfileId(env);
   const [profileRow, signals, exampleRows] = await Promise.all([
-    env.DB.prepare("SELECT preferences_json, match_profile FROM candidate_profiles WHERE id = ?")
+    env.DB.prepare("SELECT preferences_json, match_profile, structured_json FROM candidate_profiles WHERE id = ?")
       .bind(profileId)
-      .first<{ preferences_json: string; match_profile: string }>(),
+      .first<{ preferences_json: string; match_profile: string; structured_json: string }>(),
     env.DB.prepare(
       "SELECT claim FROM candidate_evidence WHERE profile_id = ? AND category = 'role_signal' ORDER BY created_at ASC",
     )
@@ -1164,7 +1289,18 @@ async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response
       .all<RoleExampleRow>(),
   ]);
 
-  const matchProfile = (profileRow?.match_profile ?? "").trim();
+  // Career analysis gets the FULL record, not the compact match profile.
+  //
+  // The compact rendering exists to make hundreds of cheap prescreen calls affordable, and it earns
+  // that by dropping exactly what this call needs most: project work, accomplishments, mentoring,
+  // stakeholder contact, leadership. Analyzing careers from it produced recommendations that could
+  // only restate titles the candidate had already typed, because the evidence that would suggest an
+  // unfamiliar-but-plausible path had been summarized away before the model saw it. This call runs
+  // once per meaningful preference change, so the extra tokens are cheap and the lost evidence is
+  // not. Falls back to the compact string only when there is no structured profile at all.
+  const structuredProfile = readStructuredProfile(profileRow?.structured_json ?? "{}");
+  const fullBackground = structuredProfile ? renderCareerProfile(structuredProfile) : "";
+  const matchProfile = fullBackground || (profileRow?.match_profile ?? "").trim();
   const notes = signals.results.map((s) => s.claim);
   const goodExamples = exampleRows.results.filter((r) => r.type === "good");
   const badExamples = exampleRows.results.filter((r) => r.type === "bad");
@@ -1177,30 +1313,45 @@ async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response
   const dealbreakers = readDealbreakers(preferencesJson);
   const careAbout = readCareAbout(preferencesJson);
 
-  const prompt = await getManagedPrompt(env, "roles/analyze", {
-    candidate_background: matchProfile ? `CANDIDATE BACKGROUND:\n${matchProfile}` : "",
-    notes_and_links: notes.length ? `NOTES AND LINKS:\n${notes.map((c) => `- ${c}`).join("\n")}` : "",
-    locations: desiredLocations ? `LOCATIONS THEY'LL WORK IN:\n${desiredLocations}` : "",
-    dealbreakers: dealbreakers ? `DEALBREAKERS:\n${dealbreakers}` : "",
-    criteria: careAbout ? `WHAT THEY SAID THEY CARE ABOUT:\n${careAbout}` : "",
-    // Not yet referenced by the production "roles/analyze" Langfuse prompt -- see the
-    // formatRoleExamplesForPrompt doc comment. Passed unconditionally so the prompt can start
-    // using {{good_examples}}/{{bad_examples}} without a code change once it's edited there.
-    good_examples: goodExamples.length ? `GOOD EXAMPLES (roles the candidate wants):\n${formatRoleExamplesForPrompt(goodExamples)}` : "",
-    bad_examples: badExamples.length ? `BAD EXAMPLES (roles the candidate does not want):\n${formatRoleExamplesForPrompt(badExamples)}` : "",
-  });
+  const prompt = await getManagedPrompt(
+    env,
+    "roles/analyze",
+    {
+      candidate_background: matchProfile,
+      // Product terminology is now "Preferences", but the variable name is unchanged: renaming it
+      // would break any Langfuse template still referencing {{notes_and_links}}, and the variable is
+      // not candidate-visible. The heading inside the value carries the new wording.
+      notes_and_links: notes.length
+        ? `STATED PREFERENCES (desired direction, in the candidate's own words):\n${notes.map((c) => `- ${c}`).join("\n")}`
+        : "",
+      locations: desiredLocations ? `LOCATIONS THEY'LL WORK IN:\n${desiredLocations}` : "",
+      dealbreakers: dealbreakers ? `DEALBREAKERS (hard constraints):\n${dealbreakers}` : "",
+      criteria: careAbout ? `PRIORITIES (what they want surfaced and compared):\n${careAbout}` : "",
+      good_examples: goodExamples.length
+        ? `GOOD EXAMPLES (postings representing work they want):\n${formatRoleExamplesForPrompt(goodExamples)}`
+        : "",
+      bad_examples: badExamples.length
+        ? `BAD EXAMPLES (postings representing work they do not want):\n${formatRoleExamplesForPrompt(badExamples)}`
+        : "",
+    },
+    ROLES_ANALYZE_PROMPT,
+  );
 
   let analysis: RoleAnalysis;
   try {
-    analysis = await callStructured<RoleAnalysis>(
+    const raw = await callStructured<unknown>(
       env,
       provider,
       "roles.analyze",
       prompt,
       ROLE_ANALYSIS_SCHEMA,
       "submit_role_analysis",
-      3000,
+      // Several role families, each carrying evidence-backed claims and search vocabulary, needs
+      // materially more room than the old title+description pair.
+      8000,
     );
+    analysis = normalizeRoleAnalysis(raw);
+    if (!analysis.roles.length) throw new Error("no_roles_returned");
   } catch (err) {
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
@@ -2233,6 +2384,7 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
     .bind(profileId)
     .first<{ preferences_json: string }>();
   const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
+  const titleTerms = roleTitleTerms(readRoleAnalysis(profileRow?.preferences_json ?? "{}"));
   const locationTerms = parseLocationFilter(readDesiredLocations(profileRow?.preferences_json ?? "{}"));
 
   // This bounds how many candidate rows the query below considers, which is cheap -- the actual
@@ -2289,7 +2441,7 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
         if (budget.remaining <= 2) return null;
         // scanOneCompany already writes each company's listings to the database before returning,
         // so a company already reported here is durably saved even if others in flight never finish.
-        return scanOneCompany(env, company, desiredRoles, locationTerms, budget);
+        return scanOneCompany(env, company, desiredRoles, locationTerms, budget, titleTerms);
       },
       async (company, outcome) => {
         if (!outcome) return;
@@ -2333,6 +2485,7 @@ async function scanOneCompany(
   desiredRoles: string,
   locationTerms: string[],
   budget: { remaining: number },
+  titleTerms: string[] = [],
 ): Promise<{ jobs: number; newJobs: number; note: string }> {
   let provider = company.ats_provider as AtsProvider | "" | "none";
   let token = company.ats_token;
@@ -2392,7 +2545,7 @@ async function scanOneCompany(
   // A company can qualify on location while most of its postings don't, so each posting is
   // checked on its own rather than inherited from the company.
   const inArea = scanned.filter((job) => locationMatches(job.location, locationTerms));
-  const relevant = filterJobsByRoles(inArea, desiredRoles)
+  const relevant = filterJobsByRoles(inArea, desiredRoles, titleTerms)
     .filter((job) => job.title && job.external_id)
     .map((job) => ({ ...job, id: crypto.randomUUID() }));
 
