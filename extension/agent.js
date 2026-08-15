@@ -117,6 +117,7 @@ class ApplicationAgent {
       ask_user: (question) => this.askUser(question),
       save_answer: (payload) => apiCall('/applications/answer', 'POST', payload),
       generate_answer: (payload) => apiCall('/applications/generate-answer', 'POST', payload),
+      resolve_option: (payload) => apiCall('/applications/resolve-option', 'POST', payload),
       report_completion: (report) => this.set({ status: 'complete', shiba: 'done', finalReport: report }),
     };
   }
@@ -271,10 +272,9 @@ class ApplicationAgent {
 
       this.tools.scroll_to_field(answer.name);
       this.tools.highlight_field(answer.name, true);
-      const filled = await this.tools.fill_field(answer.name, answer.value);
+      const { check, value } = await this.fillAndVerify(field, answer.value);
       await delay(CADENCE_MS);
 
-      const check = filled ? this.tools.verify_field(answer.name, answer.value) : { ok: false, reason: 'fill_failed' };
       this.tools.highlight_field(answer.name, false);
       // The outline only ever turns green or red here, after verify_field has actually looked --
       // never at the moment of the fill attempt, which is what let a dropdown that silently didn't
@@ -282,6 +282,7 @@ class ApplicationAgent {
       this.tools.mark_result(answer.name, check.ok);
       this.updateField(answer.name, {
         status: check.ok ? 'verified' : 'failed',
+        value,
         verifyReason: check.ok ? null : check.reason || 'not_accepted',
       });
       this.record(check.ok ? 'field_filled' : 'field_fill_failed', answer.name, {
@@ -291,6 +292,38 @@ class ApplicationAgent {
         reason: check.ok ? undefined : check.reason,
       });
     }
+  }
+
+  /**
+   * Fills a field and verifies it, retrying once via model-assisted option resolution when a
+   * direct fill fails for a fixed-choice field with real options. content.js's own fast, rule-
+   * based matching (findOptionMatch) handles the great majority of cases; this exists for the
+   * remainder, where a decorated option ("United States+1", not "United States") or an
+   * unanticipated phrasing defeats a plain synonym table without being genuinely ambiguous to a
+   * reasoning pass over the employer's own real list. Never asked to invent a choice -- the model
+   * picks from the exact options given, and re-checks server-side that it did; a field this can't
+   * confidently resolve either way falls through to asking the candidate exactly as it already
+   * would have. Returns the value that actually ended up being used, which can differ from what
+   * was passed in when resolution substituted the matching option text.
+   */
+  async fillAndVerify(field, value) {
+    let filled = await this.tools.fill_field(field.name, value);
+    let check = filled ? this.tools.verify_field(field.name, value) : { ok: false, reason: 'fill_failed' };
+    let usedValue = value;
+
+    const isChoiceField = field && (field.type === 'radio' || field.type === 'select') && (field.options || []).length > 0;
+    if (!check.ok && isChoiceField) {
+      const resolved = await this.tools.resolve_option({ label: field.label, value, options: field.options });
+      if (resolved?.ok && resolved.data?.confident && resolved.data?.option) {
+        this.record('option_resolved', field.name, { to: resolved.data.option });
+        usedValue = resolved.data.option;
+        filled = await this.tools.fill_field(field.name, usedValue);
+        check = filled ? this.tools.verify_field(field.name, usedValue) : { ok: false, reason: 'fill_failed' };
+      } else if (resolved && resolved.ok === false) {
+        this.record('option_resolve_failed', field.name, { error: resolved.error });
+      }
+    }
+    return { check, value: usedValue };
   }
 
   updateField(name, patch) {
@@ -495,14 +528,13 @@ class ApplicationAgent {
 
   /** Fill: use the candidate's answer on this application only. No backend write except the audit event. */
   async fillOnly(field, value) {
-    const filled = await this.tools.fill_field(field.name, value);
-    const check = filled ? this.tools.verify_field(field.name, value) : { ok: false, reason: 'fill_failed' };
+    const { check, value: usedValue } = await this.fillAndVerify(field, value);
     this.tools.mark_result(field.name, check.ok);
     this.updateField(field.name, {
       status: check.ok ? 'verified' : 'failed',
       source: 'user',
       confidence: 'high',
-      value,
+      value: usedValue,
       verifyReason: check.ok ? null : check.reason,
       saveMessage: null,
     });
@@ -545,14 +577,13 @@ class ApplicationAgent {
     }
 
     this.record('answer_stored', field.name, { storage: data.storage, category: data.category, stored: data.stored });
-    const filled = await this.tools.fill_field(field.name, value);
-    const check = filled ? this.tools.verify_field(field.name, value) : { ok: false, reason: 'fill_failed' };
+    const { check, value: usedValue } = await this.fillAndVerify(field, value);
     this.tools.mark_result(field.name, check.ok);
     this.updateField(field.name, {
       status: check.ok ? 'verified' : 'failed',
       source: 'user',
       confidence: 'high',
-      value,
+      value: usedValue,
       verifyReason: check.ok ? null : check.reason,
       saveMessage: data.stored ? data.message : null,
     });

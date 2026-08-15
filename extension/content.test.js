@@ -146,6 +146,58 @@ test('react-select without aria-controls: menu and selected-value text render as
   assert.equal(check.actual, 'United States');
 });
 
+test('hidden shadow input sharing an attribute with the visible combobox: the visible one always wins', async () => {
+  // The exact bug behind "it shows me the options, I pick one, it still doesn't accept it": a real
+  // Greenhouse field had a hidden <input name="country"> holding the actual submitted value
+  // alongside the visible combobox, which had id="country" but no name of its own. readForm()
+  // correctly scans the visible element directly and reports its real options -- but resolving
+  // "country" back to an element by name-then-id as two separate sequential tiers found the hidden
+  // input first (it matched on name) and never even looked at the visible one (which only matches
+  // on id), so every fill silently targeted an element that can't actually be clicked or read.
+  const { ApplyGoDom, window } = loadContentJs(`
+    <label id="country-label">Country</label>
+    <input type="hidden" name="country" value="">
+    <div class="select__control">
+      <div class="select__value-container">
+        <div class="select__input-container" data-value="">
+          <input class="select__input" id="country" type="text" tabindex="0"
+            aria-autocomplete="list" aria-expanded="false" aria-haspopup="true"
+            aria-labelledby="country-label" aria-required="false" role="combobox" value="">
+        </div>
+      </div>
+    </div>
+  `);
+
+  const input = window.document.getElementById('country');
+  input.addEventListener('click', () => {
+    if (window.document.querySelector('.select__menu')) return;
+    const menu = window.document.createElement('div');
+    menu.className = 'select__menu';
+    menu.setAttribute('role', 'listbox');
+    menu.innerHTML = '<div role="option">United States+1</div><div role="option">Canada+1</div>';
+    window.document.querySelector('.select__control').insertAdjacentElement('afterend', menu);
+  });
+  window.document.addEventListener('click', (event) => {
+    if (event.target.getAttribute && event.target.getAttribute('role') === 'option') {
+      const valueContainer = window.document.querySelector('.select__value-container');
+      const singleValue = window.document.createElement('div');
+      singleValue.className = 'select__single-value';
+      singleValue.textContent = event.target.textContent;
+      valueContainer.insertBefore(singleValue, valueContainer.firstChild);
+      window.document.querySelector('.select__menu')?.remove();
+    }
+  });
+
+  const fields = ApplyGoDom.readForm();
+  assert.equal(fields.length, 1, 'the hidden shadow input must not also be read as its own separate field');
+
+  const ok = await ApplyGoDom.fillField(fields[0].name, 'United States+1');
+  assert.equal(ok, true, 'must resolve to the visible combobox, not the hidden input matched by name');
+
+  const check = ApplyGoDom.verifyField(fields[0].name, 'United States+1');
+  assert.equal(check.ok, true);
+});
+
 test('fillField: exact option match on a native <select> selects it, dispatches change, and verifies', () => {
   const { ApplyGoDom, window } = loadContentJs(`
     <select name="country">
@@ -179,6 +231,35 @@ test('fillField: normalized/synonym match ("usa" -> "United States") resolves un
   assert.equal(ok, true);
   const check = ApplyGoDom.verifyField('country', 'usa');
   assert.equal(check.ok, true);
+});
+
+test('fillField: synonym match still resolves when the real option is decorated with extra text', async () => {
+  // Real Greenhouse options weren't bare country names -- a combined country/dial-code picker
+  // rendered "United States+1", not "United States", and the old exact-equality-only synonym check
+  // missed it entirely even though the match was unambiguous.
+  const { ApplyGoDom, window } = loadContentJs(`
+    <select name="country">
+      <option value="">Please select</option>
+      <option value="us">United States+1</option>
+      <option value="ca">Canada+1</option>
+      <option value="af">Afghanistan+93</option>
+    </select>
+  `);
+  const ok = await ApplyGoDom.fillField('country', 'USA');
+  assert.equal(ok, true);
+  assert.equal(window.document.querySelector('select').value, 'us');
+});
+
+test('fillField: still refuses to guess when a decorated option text makes the synonym ambiguous', async () => {
+  const { ApplyGoDom } = loadContentJs(`
+    <select name="country">
+      <option value="">Please select</option>
+      <option value="us">United States+1</option>
+      <option value="um">United States Minor Outlying Islands+246</option>
+    </select>
+  `);
+  const ok = await ApplyGoDom.fillField('country', 'USA');
+  assert.equal(ok, false, 'both options contain "united states" -- must not silently pick one');
 });
 
 test('fillField: case-insensitive yes/no synonym match on a radio group', async () => {

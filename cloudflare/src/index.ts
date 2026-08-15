@@ -3877,6 +3877,32 @@ const GENERATE_ANSWER_SCHEMA = {
 } as const;
 
 /**
+ * Which of the employer's own real options matches the candidate's already-known answer, for the
+ * on-demand /applications/resolve-option call -- see extension/agent.js, which only ever reaches
+ * for this after its own fast, rule-based synonym matching (content.js) has already tried and
+ * failed. Never a place to invent a choice: the model picks from the exact list it's given or says
+ * so isn't confident, and the server re-checks the returned text is actually one of those options
+ * before trusting it either way.
+ */
+const RESOLVE_OPTION_SCHEMA = {
+  type: "object",
+  properties: {
+    option: {
+      type: ["string", "null"],
+      description:
+        "The exact text of the one option, copied verbatim from the provided list, that the candidate's " +
+        "answer clearly means. null if none of the options unambiguously match -- do not guess or pick " +
+        "the closest-sounding one when it's genuinely unclear.",
+    },
+    confident: {
+      type: "boolean",
+      description: "true only if the match is obvious and unambiguous, not merely plausible.",
+    },
+  },
+  required: ["option", "confident"],
+} as const;
+
+/**
  * Fields whose answer is a fact about the person that is legally or personally consequential, and
  * which a model must never infer. Work authorization, sponsorship, and the EEO questions have real
  * consequences if answered wrongly, and "probably yes" is not a defensible basis for any of them.
@@ -4203,6 +4229,65 @@ async function generateApplicationAnswer(request: Request, env: Env): Promise<Re
     return json({ answer: (result.answer ?? "").trim(), grounded: Boolean(result.grounded) });
   } catch (err) {
     return json({ error: "generation_failed", message: (err as Error).message }, 502);
+  }
+}
+
+/**
+ * Which of a fixed-choice field's real options the candidate's already-known answer means -- the
+ * last, model-assisted step before the extension gives up and asks the candidate directly (see
+ * extension/agent.js). Reached only after content.js's own fast, rule-based synonym matching has
+ * already tried and failed: a decorated option ("United States+1" rather than "United States") or
+ * an unanticipated phrasing shouldn't force a human into the loop when the match is genuinely
+ * obvious. Never invents a choice -- the model picks from the exact list it's given, and this
+ * re-checks its answer is actually one of those options before trusting it, the same "grounded or
+ * explicitly not" discipline generateApplicationAnswer already applies to narrative drafts.
+ */
+async function resolveApplicationOption(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    provider?: string;
+    label?: string;
+    value?: string;
+    options?: string[];
+  };
+  const label = (body.label ?? "").trim();
+  const value = (body.value ?? "").trim();
+  const options = (body.options ?? []).filter((o) => typeof o === "string" && o.trim());
+  if (!label || !value || !options.length) return json({ error: "label_value_options_required" }, 400);
+  // Re-checked here rather than trusted from the client -- the same actual safeguard
+  // generateApplicationAnswer applies, not just relying on the extension's own gating.
+  if (NEVER_INFER.test(label)) return json({ error: "field_not_resolvable" }, 400);
+
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  try {
+    const prompt = await getManagedPrompt(env, "applications/resolve_option", {
+      question: label,
+      candidate_answer: value,
+      options: options.map((o) => `- ${o}`).join("\n"),
+    });
+    // Cheap/fast tier: this is picking from a small closed set, not open-ended reasoning, the same
+    // category of task the bulk job-screen pass already uses this tier for.
+    const result = await callStructured<{ option: string | null; confident: boolean }>(
+      env,
+      provider,
+      "application.resolve_option",
+      prompt,
+      RESOLVE_OPTION_SCHEMA,
+      "submit_resolved_option",
+      500,
+      "screen",
+    );
+    // The model's own echo of the option text is never trusted over the real list -- if it doesn't
+    // exactly match one of the options given, that's the same as "no confident match" rather than a
+    // risk of introducing a value that was never actually on the employer's form.
+    const matched = result.option && options.includes(result.option) ? result.option : null;
+    return json({ option: matched, confident: Boolean(result.confident) && Boolean(matched) });
+  } catch (err) {
+    return json({ error: "resolution_failed", message: (err as Error).message }, 502);
   }
 }
 
@@ -8905,6 +8990,7 @@ const EXTENSION_CORS_PATHS = [
   /^\/applications\/match$/,
   /^\/applications\/answer$/,
   /^\/applications\/generate-answer$/,
+  /^\/applications\/resolve-option$/,
   /^\/applications\/events$/,
   /^\/application-answers$/,
   /^\/jobs$/,
@@ -8926,9 +9012,9 @@ function corsHeaders(origin: string): Record<string, string> {
  * Which JSON Schema (and tool name / token budget) a task's structured call uses, so a saved eval
  * case's prompt can be resent without duplicating that wiring per case. Kept here rather than in
  * evals.ts because every schema it needs is already in scope in this file or imported above --
- * evals.ts staying schema-agnostic avoids a circular import back into index.ts for the four schemas
+ * evals.ts staying schema-agnostic avoids a circular import back into index.ts for the five schemas
  * that are defined here (STRUCTURED_PROFILE_JSON_SCHEMA, RESUME_BASE_SCHEMA, COVER_LETTER_SCHEMA,
- * GENERATE_ANSWER_SCHEMA).
+ * GENERATE_ANSWER_SCHEMA, RESOLVE_OPTION_SCHEMA).
  *
  * `resume.design_review` (needs a screenshot, never stored) and `evals.judge` (not a savable case)
  * fall through to null, matching `replayable: false` in tasks.ts.
@@ -8961,6 +9047,8 @@ function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "structured", schema: COVER_LETTER_SCHEMA, toolName: "submit_cover_letter", maxTokens: 2000 };
     case "application.generate_answer":
       return { kind: "structured", schema: GENERATE_ANSWER_SCHEMA, toolName: "submit_drafted_answer", maxTokens: 1200 };
+    case "application.resolve_option":
+      return { kind: "structured", schema: RESOLVE_OPTION_SCHEMA, toolName: "submit_resolved_option", maxTokens: 500 };
     default:
       return null;
   }
@@ -9227,6 +9315,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "POST" && url.pathname === "/gmail/check-replies") return checkGmailReplies(request, env, ctx);
     if (request.method === "POST" && url.pathname === "/applications/match") return matchApplication(request, env);
     if (request.method === "POST" && url.pathname === "/applications/generate-answer") return generateApplicationAnswer(request, env);
+    if (request.method === "POST" && url.pathname === "/applications/resolve-option") return resolveApplicationOption(request, env);
     if (request.method === "POST" && url.pathname === "/applications/answer") return saveApplicationAgentAnswer(request, env);
     if (request.method === "POST" && url.pathname === "/applications/events") return recordAgentEvents(request, env);
     if (request.method === "POST" && url.pathname === "/artifacts") return uploadArtifact(request, env);

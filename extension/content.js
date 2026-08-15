@@ -217,7 +217,13 @@ function findOptionMatch(options, want, textOf) {
   const group = synonymGroup(wantNorm);
   const exact = options.filter((o) => {
     const t = textOf(o).trim().toLowerCase();
-    return t === wantNorm || Boolean(group && group.includes(t));
+    // Containment, not just equality, against a synonym group member -- a real option is routinely
+    // decorated with something extra ("United States+1" for a combined country/dial-code picker),
+    // and requiring an exact match against "united states" would miss it entirely even though the
+    // match is unambiguous. Still never a plain substring of the raw answer at this tier: matching
+    // only through a *known* synonym group keeps "US" from ever resolving to an unrelated option
+    // that merely happens to contain those two letters.
+    return t === wantNorm || Boolean(group && group.some((g) => t === g || t.includes(g)));
   });
   if (exact.length === 1) return exact[0];
   if (exact.length > 1) return null;
@@ -308,20 +314,36 @@ function setNative(el, value) {
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
+/** Every element matching a CSS attribute selector, minus the sidebar's own controls. */
+function allMatching(selector) {
+  return [...document.querySelectorAll(selector)].filter((el) => !el.closest('#applygo-agent-root'));
+}
+
+/**
+ * The one candidate that's actually usable when several elements could all plausibly answer to a
+ * field's identity. Two real patterns collide here: a combobox trigger button typically has
+ * neither name nor id of its own, so readForm() falls back to its aria-controls value (which is
+ * also, by construction, the id of the element it controls -- resolving that string by id alone
+ * would find the controlled dialog/listbox, not the button); and some combobox libraries pair a
+ * visible styled control with a hidden native input carrying the real submitted value, matchable
+ * only by a *different* attribute than the visible one (a real Greenhouse field had a hidden input
+ * with name="country" alongside a visible combobox with id="country" and no name at all -- checking
+ * name and id as separate sequential tiers, first-non-empty-wins, kept resolving to the hidden
+ * input purely because its tier happened to be checked first). Pooling every candidate from every
+ * lookup together and picking whichever one is actually visible handles both correctly regardless
+ * of which specific attribute each element happened to match on.
+ */
+function preferVisible(matches) {
+  return matches.find((el) => isVisible(el)) || matches[0] || null;
+}
+
 function findElement(name) {
   const escaped = CSS.escape(name);
-  const named = [...document.querySelectorAll(`[name="${escaped}"]`)].find((el) => !el.closest('#applygo-agent-root'));
-  if (named) return named;
-  // Checked ahead of plain getElementById: a combobox trigger button typically has neither name
-  // nor id, so readForm() falls back to its aria-controls value as the field's identity (see
-  // there) -- and that value is, by construction, also the id of the element the button controls.
-  // getElementById(name) would resolve to that controlled dialog/listbox instead of the button
-  // itself, so the relationship has to be checked first, not as a fallback after id already matched
-  // the wrong element.
-  const byAriaControls = [...document.querySelectorAll(`[aria-controls="${escaped}"]`)].find((el) => !el.closest('#applygo-agent-root'));
-  if (byAriaControls) return byAriaControls;
-  const byId = document.getElementById(name);
-  return byId && !byId.closest('#applygo-agent-root') ? byId : null;
+  const candidates = [
+    ...allMatching(`[name="${escaped}"], #${escaped}`),
+    ...allMatching(`[aria-controls="${escaped}"]`),
+  ];
+  return candidates.length ? preferVisible(candidates) : null;
 }
 
 // Outline color is now decided entirely by verify_field's result (see markResult below), never by
