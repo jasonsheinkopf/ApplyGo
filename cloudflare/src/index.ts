@@ -3491,8 +3491,12 @@ async function listResumes(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
   const profileId = await getOrCreateProfileId(env);
   const rows = await env.DB.prepare(
-    `SELECT id, name, instructions, template, revision, checks_json, critique, is_master, created_at
-     FROM resumes WHERE profile_id = ? ORDER BY created_at DESC`,
+    `SELECT r.id, r.name, r.instructions, r.template, r.revision, r.checks_json, r.critique,
+            r.is_master, r.role_family, r.job_id, r.created_at,
+            j.title AS job_title, j.company AS job_company
+     FROM resumes r
+     LEFT JOIN job_postings j ON j.id = r.job_id
+     WHERE r.profile_id = ? ORDER BY r.created_at DESC`,
   )
     .bind(profileId)
     .all();
@@ -3623,14 +3627,32 @@ async function createResume(request: Request, env: Env): Promise<Response> {
     provider?: string;
     template?: string;
     max_pages?: number;
+    role_family?: string;
   };
   const instructions = (body.instructions ?? "").trim();
+  const roleFamily = (body.role_family ?? "").trim();
   const provider = normalizeProvider(body.provider);
   const keyError = providerKeyMissing(env, provider);
   if (keyError) return json({ error: keyError }, 501);
 
   const profile = await loadProfileForResume(env);
   if (profile instanceof Response) return profile;
+
+  /**
+   * A career resume targets ONE role family, not the whole analysis.
+   *
+   * Passing every discovered family as the target is what produces a resume hedging across
+   * unrelated careers -- the exact fictional-hybrid problem the analysis works to avoid. So when a
+   * family is chosen, the target narrows to that entry alone; the evidence source is unchanged
+   * either way, since selection is presentation and the Profile remains the only factual authority.
+   */
+  const analysis = readRoleAnalysis(
+    (await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+      .bind(profile.profileId)
+      .first<{ preferences_json: string }>())?.preferences_json ?? "{}",
+  );
+  const chosen = roleFamily ? analysis?.roles.find((r) => r.title === roleFamily) : undefined;
+  const target = chosen ? flattenRoleAnalysis({ summary: analysis?.summary ?? "", roles: [chosen] }) : profile.desiredRoles;
 
   const layout = normalizeLayout({
     ...defaultLayout(normalizeTemplate(body.template)),
@@ -3645,7 +3667,7 @@ async function createResume(request: Request, env: Env): Promise<Response> {
       id,
       provider,
       profile.structured,
-      profile.desiredRoles,
+      target,
       instructions,
       layout,
       "",
@@ -3654,10 +3676,10 @@ async function createResume(request: Request, env: Env): Promise<Response> {
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 
-  const name = instructions ? instructions.slice(0, 60) : `Resume ${new Date().toISOString().slice(0, 10)}`;
+  const name = roleFamily || (instructions ? instructions.slice(0, 60) : `Resume ${new Date().toISOString().slice(0, 10)}`);
   await env.DB.prepare(
-    `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json, role_family)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       id,
@@ -3669,10 +3691,11 @@ async function createResume(request: Request, env: Env): Promise<Response> {
       layout.template,
       JSON.stringify(layout),
       JSON.stringify(built.checks),
+      roleFamily,
     )
     .run();
 
-  return json({ id, name, template: layout.template, revision: 1, checks: built.checks }, 201);
+  return json({ id, name, role_family: roleFamily, template: layout.template, revision: 1, checks: built.checks }, 201);
 }
 
 /**
@@ -6172,10 +6195,10 @@ const DASHBOARD_PAGE = `<!doctype html>
   <script>
     document.querySelectorAll('nav .tab').forEach(function (tabButton) {
       tabButton.addEventListener('click', function () {
-        // Leaving the Roles tab with unsaved edits (or having never analyzed at all) is exactly
-        // when a stale/missing analysis would otherwise silently sit there -- see maybeReanalyzeRoles.
-        var leavingRolesDirty = tabButton.dataset.tab !== 'roles'
-          && document.getElementById('panel-roles').classList.contains('active');
+        // Leaving Careers with unsaved edits (or having never analyzed at all) is exactly when a
+        // stale/missing analysis would otherwise silently sit there -- see maybeReanalyzeRoles.
+        var leavingRolesDirty = tabButton.dataset.tab !== 'careers'
+          && document.getElementById('panel-careers').classList.contains('active');
         document.querySelectorAll('nav .tab').forEach(function (b) { b.classList.remove('active'); });
         document.querySelectorAll('.panel').forEach(function (p) { p.classList.remove('active'); });
         tabButton.classList.add('active');
@@ -6937,6 +6960,7 @@ const DASHBOARD_PAGE = `<!doctype html>
             provider: document.getElementById('resume-provider').value,
             template: selectedTemplate,
             max_pages: Number(document.getElementById('resume-pages').value),
+            role_family: (document.getElementById('resume-role-family') || {}).value || '',
           }),
         });
         var data = await res.json();
