@@ -16,6 +16,13 @@
 import { type LlmEnv, type Provider, callStructured } from "./llm.ts";
 import { getManagedPrompt } from "./langfuse.ts";
 
+export const MAX_COMPANY_DISCOVERY_COUNT = 100;
+
+/** Keeps the browser and API on the same 1-100 discovery range. */
+export function normalizeCompanyDiscoveryCount(value: unknown): number {
+  return Math.min(Math.max(Number(value) || 10, 1), MAX_COMPANY_DISCOVERY_COUNT);
+}
+
 // Every ATS this app recognizes on a careers page, whether or not it can actually read job
 // listings from it. Recognizing a platform is worth doing even without a read path: it's the
 // difference between telling a candidate "no job board found" (implying there's nothing to see)
@@ -294,7 +301,9 @@ export async function proposeCompanies(
     prompt,
     COMPANY_LIST_SCHEMA,
     "submit_companies",
-    4000,
+    // Twenty proposals fit comfortably in the historical 4k cap. Larger user-requested batches
+    // need proportionally more response room or Anthropic can truncate otherwise-valid JSON.
+    Math.max(4000, Math.min(24000, count * 200)),
   );
 
   return (result.companies ?? [])

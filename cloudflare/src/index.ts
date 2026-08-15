@@ -57,6 +57,7 @@ import {
 import {
   type AtsProvider,
   COMPANY_LIST_SCHEMA,
+  normalizeCompanyDiscoveryCount,
   atsDisplayName,
   companyNameKey,
   fetchBoardJobs,
@@ -2376,7 +2377,7 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
 
   const desiredLocations = readDesiredLocations(profileRow?.preferences_json ?? "{}");
   const locationTerms = parseLocationFilter(desiredLocations);
-  const count = Math.min(Math.max(Number(body.count) || 10, 1), 20);
+  const count = normalizeCompanyDiscoveryCount(body.count);
   const focus = (body.focus ?? "").trim();
 
   return ndjsonResponse(ctx, async (emit) => {
@@ -5925,8 +5926,11 @@ Let me check the placeholder embraces like a variable name, gets its value when 
           <label for="company-count">How many</label>
           <select id="company-count">
             <option value="10">10</option>
-            <option value="15">15</option>
             <option value="20">20</option>
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="75">75</option>
+            <option value="100">100</option>
           </select>
         </div>
         <div>
