@@ -246,16 +246,45 @@ function isComboboxTrigger(el) {
 }
 
 /**
+ * Ancestors of an element, nearest first, up to a bounded depth -- shared by comboboxListbox and
+ * verifyField's combobox branch, both of which need to look outward from the control for state
+ * (an open listbox, the visible selected-value text) that a real form often renders as a sibling of
+ * some ancestor rather than a descendant of the nearest narrowly-classed wrapper around the control
+ * itself.
+ */
+function ancestors(el, maxDepth) {
+  const nodes = [];
+  let node = el.parentElement;
+  for (let depth = 0; node && depth < maxDepth; depth++, node = node.parentElement) nodes.push(node);
+  return nodes;
+}
+
+/**
  * The listbox behind a combobox, found via the ARIA relationship the library itself declares
  * (`aria-controls`/`aria-owns` pointing at a `role="listbox"`) rather than any vendor-specific class
- * name. Falls back to the nearest `role="listbox"` in an obviously-related ancestor for the few
- * libraries that skip the ARIA reference but still render accessibly.
+ * name. Not every instance of a given library actually sets that reference -- react-select only
+ * adds aria-controls under some configurations, and a real Greenhouse field was found missing it
+ * entirely -- so this also walks up from the input a few levels, since the open menu is typically
+ * rendered as a sibling of an ancestor one or two levels up (react-select's own `select__control`,
+ * for instance), not necessarily inside the *nearest* ancestor whose own class happens to mention
+ * "select" (a narrower inner wrapper like `select__input-container` routinely is not).
  */
 function comboboxListbox(el) {
   const listboxId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
-  return (listboxId && document.getElementById(listboxId))
-    || el.closest('[class*="select" i],[class*="dropdown" i],[class*="combobox" i]')?.querySelector('[role="listbox"]')
-    || null;
+  if (listboxId) {
+    const byId = document.getElementById(listboxId);
+    if (byId) return byId;
+  }
+  for (const node of ancestors(el, 6)) {
+    const listbox = node.querySelector('[role="listbox"]');
+    if (listbox) return listbox;
+  }
+  // Last resort: some libraries portal the open menu straight onto <body>, entirely outside the
+  // control's own DOM subtree. This is only ever called right after this specific control was
+  // clicked open (see fillCombobox/discoverComboboxOptions), and opening one dropdown normally
+  // closes any other that was already open, so the one listbox in the whole document at that
+  // moment is a reasonable bet.
+  return document.querySelector('[role="listbox"]');
 }
 
 /** The clickable option nodes behind a combobox, when the listbox is already in the DOM. */
@@ -441,15 +470,17 @@ function verifyField(name, expected) {
 
   if (isComboboxTrigger(el)) {
     // Many of these libraries never write the selection into the trigger's own .value -- the
-    // selected label shows up as visible text in a sibling element, or (for a button trigger that
-    // shows a flag/icon with no readable text, like intl-tel-input's country picker) only in its
-    // own updated aria-label -- so both are checked before falling back to .value for the
-    // libraries that do use it.
-    const container = fieldContainer(el);
-    const text = clean(container.textContent);
+    // selected label shows up as visible text instead, and not necessarily inside the nearest
+    // narrowly-classed wrapper around the control: react-select routinely renders it as a sibling
+    // of the input's container (e.g. a "select__single-value" div next to
+    // "select__input-container"), which .textContent on just the input's own container would never
+    // see. A button trigger that shows a flag/icon with no readable text (intl-tel-input's country
+    // picker) instead reflects the choice only in its own updated aria-label, checked first.
     const ariaLabel = (el.getAttribute('aria-label') || '').trim();
-    if (expected && (textMatchesAnswer(text, expected) || textMatchesAnswer(ariaLabel, expected))) {
-      return { ok: true, actual: text || ariaLabel };
+    if (expected && textMatchesAnswer(ariaLabel, expected)) return { ok: true, actual: ariaLabel };
+    for (const node of ancestors(el, 4)) {
+      const text = clean(node.textContent);
+      if (expected && textMatchesAnswer(text, expected)) return { ok: true, actual: text };
     }
     const inputValue = String(el.value ?? '').trim();
     if (inputValue) return { ok: true, actual: inputValue, rewritten: true };

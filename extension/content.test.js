@@ -91,6 +91,61 @@ test('button+dialog combobox (intl-tel-input\'s country picker pattern): detecte
   assert.equal(check.ok, true, 'verification must accept the post-selection aria-label as evidence, not just visible text or .value');
 });
 
+test('react-select without aria-controls: menu and selected-value text render as siblings several levels up, not inside the input\'s own narrow wrapper', async () => {
+  // Pulled directly from a real Greenhouse "Country" field that kept failing after the earlier
+  // react-select fix: this specific instance has no aria-controls/aria-owns at all (contradicting
+  // what the library's own source suggested elsewhere), and its open menu + selected-value text
+  // both render as siblings of "select__control", not descendants of the input's immediate
+  // "select__input-container" wrapper -- the exact wrapper comboboxListbox()'s old single-level
+  // .closest() lookup would have matched and then found nothing useful inside.
+  const { ApplyGoDom, window } = loadContentJs(`
+    <label id="country-label">Country</label>
+    <div class="select__control">
+      <div class="select__value-container">
+        <div class="select__input-container" data-value="">
+          <input class="select__input" id="country" type="text" tabindex="0"
+            aria-autocomplete="list" aria-expanded="false" aria-haspopup="true"
+            aria-labelledby="country-label" aria-required="false" role="combobox" value="">
+        </div>
+      </div>
+    </div>
+  `);
+
+  const input = window.document.getElementById('country');
+  // Simulates react-select's real behavior: the menu mounts as a sibling of select__control on
+  // open, and picking an option renders the selected label as a sibling of the input's own
+  // container rather than inside it.
+  input.addEventListener('click', () => {
+    if (window.document.querySelector('.select__menu')) return;
+    const menu = window.document.createElement('div');
+    menu.className = 'select__menu';
+    menu.setAttribute('role', 'listbox');
+    menu.innerHTML = '<div role="option">United States</div><div role="option">Canada</div>';
+    window.document.querySelector('.select__control').insertAdjacentElement('afterend', menu);
+  });
+  window.document.addEventListener('click', (event) => {
+    if (event.target.getAttribute && event.target.getAttribute('role') === 'option') {
+      const valueContainer = window.document.querySelector('.select__value-container');
+      const singleValue = window.document.createElement('div');
+      singleValue.className = 'select__single-value';
+      singleValue.textContent = event.target.textContent;
+      valueContainer.insertBefore(singleValue, valueContainer.firstChild);
+      window.document.querySelector('.select__menu')?.remove();
+    }
+  });
+
+  const fields = ApplyGoDom.readForm();
+  assert.equal(fields.length, 1);
+  assert.equal(fields[0].label, 'Country');
+
+  const ok = await ApplyGoDom.fillField(fields[0].name, 'usa');
+  assert.equal(ok, true, 'must find the menu by walking outward, not just the nearest "select"-classed ancestor');
+
+  const check = ApplyGoDom.verifyField(fields[0].name, 'usa');
+  assert.equal(check.ok, true, 'must find the selected-value text as a sibling, not require it inside the input\'s own container');
+  assert.equal(check.actual, 'United States');
+});
+
 test('fillField: exact option match on a native <select> selects it, dispatches change, and verifies', () => {
   const { ApplyGoDom, window } = loadContentJs(`
     <select name="country">
