@@ -614,7 +614,7 @@ function decodeEntities(value: string): string {
  * Block-level tags become newlines rather than spaces so a heading stays attached to what follows
  * it ("Base Salary Range:\n$199,000 - $331,000") instead of dissolving into one long run-on line.
  */
-function htmlToText(value: string): string {
+export function htmlToText(value: string): string {
   const decoded = decodeEntities(String(value ?? ""));
   const withBreaks = decoded
     .replace(/<\s*br\s*\/?\s*>/gi, "\n")
