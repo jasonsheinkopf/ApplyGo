@@ -13,47 +13,17 @@
 import { type LlmEnv, type Provider, callStructured } from "./llm";
 import { getManagedPrompt } from "./langfuse";
 
-/** The subset of the profile that matters for judging a job. Structurally compatible with StructuredProfile. */
-type ProfileForMatching = {
-  headline?: string;
-  narrative_summary?: string;
-  skills?: string[];
-  experience?: { company: string; title: string; start: string; end: string }[];
-  education?: { school: string; degree: string; field: string; end_year: string }[];
-};
-
 /**
- * A short rendering of the profile, used as the candidate half of every match call.
+ * The compact candidate rendering used by high-volume prescreening lives in src/profile.ts, next to
+ * the canonical CareerProfile it summarizes, and is re-exported here so this module stays the one
+ * import site for "everything about judging a job".
  *
- * Built deterministically rather than generated: it costs nothing, it is identical on every run,
- * and it cannot drift out of sync with the profile it describes the way a cached LLM summary
- * would. The full structured profile runs several thousand characters and gets re-sent with
- * every screening batch, which is exactly the input worth shrinking.
+ * Which rendering a call gets is a deliberate cost/fidelity decision, not an implementation detail:
+ * the compact form is for the cheap screen that re-sends the candidate with every batch of
+ * postings, while deep assessment and career analysis take the full record from
+ * `renderCareerProfile` -- see its header comment for why that trade runs the way it does.
  */
-export function buildMatchProfile(profile: ProfileForMatching): string {
-  const lines: string[] = [];
-  if (profile.headline) lines.push(profile.headline);
-
-  const summary = (profile.narrative_summary ?? "").trim();
-  if (summary) lines.push(summary.length > 400 ? summary.slice(0, 400).trimEnd() + "…" : summary);
-
-  const roles = (profile.experience ?? []).slice(0, 6).map((e) => {
-    const span = [e.start, e.end].filter(Boolean).join("–");
-    return `${e.title} at ${e.company}${span ? ` (${span})` : ""}`;
-  });
-  if (roles.length) lines.push(`Experience: ${roles.join("; ")}`);
-
-  const degrees = (profile.education ?? []).slice(0, 3).map((e) => {
-    const what = [e.degree, e.field].filter(Boolean).join(" in ");
-    return `${what || "Study"}, ${e.school}${e.end_year ? ` ${e.end_year}` : ""}`;
-  });
-  if (degrees.length) lines.push(`Education: ${degrees.join("; ")}`);
-
-  const skills = (profile.skills ?? []).slice(0, 40);
-  if (skills.length) lines.push(`Skills: ${skills.join(", ")}`);
-
-  return lines.join("\n").slice(0, 2000);
-}
+export { buildMatchProfile } from "./profile";
 
 export type FitVerdict = "strong" | "possible" | "reject";
 

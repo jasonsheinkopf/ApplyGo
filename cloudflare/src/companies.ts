@@ -13,8 +13,8 @@
 // resolve is marked unreachable rather than silently trusted, because a model listing plausible
 // employers will occasionally invent or misremember one.
 
-import { type LlmEnv, type Provider, callStructured } from "./llm";
-import { getManagedPrompt } from "./langfuse";
+import { type LlmEnv, type Provider, callStructured } from "./llm.ts";
+import { getManagedPrompt } from "./langfuse.ts";
 
 // Every ATS this app recognizes on a careers page, whether or not it can actually read job
 // listings from it. Recognizing a platform is worth doing even without a read path: it's the
@@ -614,7 +614,7 @@ function decodeEntities(value: string): string {
  * Block-level tags become newlines rather than spaces so a heading stays attached to what follows
  * it ("Base Salary Range:\n$199,000 - $331,000") instead of dissolving into one long run-on line.
  */
-function htmlToText(value: string): string {
+export function htmlToText(value: string): string {
   const decoded = decodeEntities(String(value ?? ""));
   const withBreaks = decoded
     .replace(/<\s*br\s*\/?\s*>/gi, "\n")
@@ -888,14 +888,43 @@ export async function fetchMissingDescriptions(
 }
 
 /** Keeps obviously irrelevant postings out of the Jobs tab without needing a model call. */
-export function filterJobsByRoles(jobs: ScannedJob[], desiredRoles: string): ScannedJob[] {
-  const terms = Array.from(
-    new Set(
-      String(desiredRoles ?? "")
-        .toLowerCase()
-        .match(/[a-z][a-z+#.]{2,}/g) ?? [],
-    ),
-  ).filter((t) => !STOPWORDS.has(t));
+export function filterJobsByRoles(
+  jobs: ScannedJob[],
+  desiredRoles: string,
+  /**
+   * The explicit title vocabulary from the role analysis (canonical titles, alternate titles,
+   * search title terms). Strongly preferred over `desiredRoles` when present.
+   *
+   * Deriving match terms by scraping words out of prose is what this parameter exists to replace:
+   * a role description is written for a human, so word-extraction picked up whatever incidental
+   * vocabulary the sentences happened to contain and matched postings on it. Explicit terms are
+   * chosen for exactly this purpose, so they both admit more real variants and reject more noise.
+   */
+  titleTerms: string[] = [],
+): ScannedJob[] {
+  const explicit = titleTerms
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => t.length >= 3 && !STOPWORDS.has(t));
+
+  // A multi-word term ("developer advocate") is matched as a phrase, but its individual content
+  // words are also kept as separate candidates. That is deliberate for recall: this filter runs
+  // before any model sees the posting, so its job is to drop the obviously irrelevant, not to be
+  // precise. "Staff Developer Advocate, Platform" must survive to reach the prescreen.
+  const terms = explicit.length
+    ? Array.from(
+        new Set([
+          ...explicit,
+          ...explicit.flatMap((term) => term.split(/[^a-z0-9+#.]+/).filter((w) => w.length > 3 && !STOPWORDS.has(w))),
+        ]),
+      )
+    : Array.from(
+        new Set(
+          String(desiredRoles ?? "")
+            .toLowerCase()
+            .match(/[a-z][a-z+#.]{2,}/g) ?? [],
+        ),
+      ).filter((t) => !STOPWORDS.has(t));
+
   if (terms.length < 3) return jobs;
   return jobs.filter((job) => {
     const title = job.title.toLowerCase();

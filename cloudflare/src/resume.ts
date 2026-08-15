@@ -20,6 +20,11 @@ import {
   callStructuredWithImage,
 } from "./llm";
 import { getManagedPrompt } from "./langfuse";
+import {
+  type CareerProfile,
+  profileEvidenceStrings,
+  renderCareerProfile,
+} from "./profile";
 
 export interface ResumeEnv extends LlmEnv {
   FILES: R2Bucket;
@@ -27,14 +32,15 @@ export interface ResumeEnv extends LlmEnv {
   LOCAL_RENDER_URL?: string;
 }
 
-/** The candidate evidence model: everything a resume may draw on, and nothing it may invent. */
-export type StructuredProfile = {
-  headline: string;
-  narrative_summary: string;
-  education: { school: string; degree: string; field: string; start_year: string; end_year: string }[];
-  experience: { company: string; title: string; start: string; end: string; highlights: string[] }[];
-  skills: string[];
-};
+/**
+ * The candidate evidence model: everything a resume may draw on, and nothing it may invent.
+ *
+ * Now an alias for the canonical `CareerProfile` (see src/profile.ts). The alias is kept rather
+ * than renamed at every call site because "the thing a resume is grounded in" is genuinely this
+ * file's concept, and the indirection makes the one place that would need to change if that ever
+ * diverges again obvious.
+ */
+export type StructuredProfile = CareerProfile;
 
 /** One rendered resume's content. Distinct from the profile: selected, ordered, and rewritten. */
 export type ResumeDoc = {
@@ -213,7 +219,7 @@ async function composePrompt(
     return getManagedPrompt(env, "resume/compose_master", {
       user_instructions: instructions ? `USER INSTRUCTIONS:\n${instructions}` : "",
       revision_feedback: feedback ? `\nREVISION FEEDBACK -- address this specifically:\n${feedback}` : "",
-      candidate_profile: JSON.stringify(profile),
+      candidate_profile: renderCareerProfile(profile),
     });
   }
 
@@ -230,7 +236,7 @@ async function composePrompt(
       ? `USER INSTRUCTIONS FOR THIS VERSION (these take priority over the strong defaults):\n${instructions}`
       : "USER INSTRUCTIONS: none.",
     revision_feedback: feedback ? `\nREVISION FEEDBACK -- address this specifically in your rewrite:\n${feedback}` : "",
-    candidate_profile: JSON.stringify(profile),
+    candidate_profile: renderCareerProfile(profile),
   });
 }
 
@@ -281,8 +287,8 @@ function normalizeForMatch(value: string): string {
  */
 export function checkGrounding(doc: ResumeDoc, profile: StructuredProfile): ResumeCheck[] {
   const checks: ResumeCheck[] = [];
-  const knownCompanies = new Set(profile.experience.map((e) => normalizeForMatch(e.company)));
-  const knownSchools = new Set(profile.education.map((e) => normalizeForMatch(e.school)));
+  const knownCompanies = new Set(profile.work_experience.map((e) => normalizeForMatch(e.organization)));
+  const knownSchools = new Set(profile.education.map((e) => normalizeForMatch(e.institution)));
 
   const inventedCompanies = doc.experience
     .map((e) => e.company)

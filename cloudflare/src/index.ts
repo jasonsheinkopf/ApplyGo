@@ -34,6 +34,17 @@ import {
 } from "./evals";
 import { taskInfo } from "./tasks";
 import {
+  CAREER_PROFILE_SCHEMA,
+  CAREER_PROFILE_SCHEMA_VERSION,
+  type CareerProfile,
+  careerProfileHasContent,
+  normalizeCareerProfile,
+  readCareerProfile,
+  renderCareerProfile,
+} from "./profile";
+import { PROFILE_STRUCTURE_PROMPT, ROLES_ANALYZE_PROMPT } from "./prompts";
+import { MARKET_RESEARCH_TTL_DAYS, marketCacheKey, researchRoleMarket } from "./market";
+import {
   type EvidencePlan,
   type JobRequirements,
   PLAN_SCHEMA,
@@ -50,7 +61,9 @@ import {
   companyNameKey,
   fetchBoardJobs,
   fetchMissingDescriptions,
+  fetchWithTimeout,
   filterJobsByRoles,
+  htmlToText,
   isReadableAtsProvider,
   locationMatches,
   parseLocationFilter,
@@ -296,6 +309,50 @@ const ADDITIVE_COLUMNS = [
   "ALTER TABLE job_postings ADD COLUMN requirements_json TEXT NOT NULL DEFAULT '{}'",
   // 0018_langfuse.sql
   "ALTER TABLE llm_traces ADD COLUMN langfuse_trace_id TEXT",
+  // 0025_career_refactor.sql
+  "ALTER TABLE resumes ADD COLUMN role_family TEXT NOT NULL DEFAULT ''",
+];
+
+/**
+ * Tables this build's code reads, created at runtime if they aren't there yet.
+ *
+ * Same deploy-path reasoning as ADDITIVE_COLUMNS above, for the case that list cannot cover. A
+ * `CREATE TABLE IF NOT EXISTS` is idempotent and backward compatible in both directions in exactly
+ * the way an `ADD COLUMN` is -- older code ignores the table, newer code finds it, and running it
+ * twice or against a database that already has it does nothing -- so it belongs to the same safety
+ * net rather than to the deliberate `wrangler d1 migrations apply` step.
+ *
+ * The charter stays narrow on purpose: IF NOT EXISTS creates only. Anything that reshapes or
+ * rewrites existing rows still needs a human deciding when it happens.
+ *
+ * These mirror the CREATE TABLE statements in migrations/; the migration files remain the canonical
+ * schema for a fresh database.
+ */
+const ADDITIVE_TABLES = [
+  // 0024_role_examples.sql
+  `CREATE TABLE IF NOT EXISTS role_examples (
+     id TEXT PRIMARY KEY,
+     profile_id TEXT NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
+     type TEXT NOT NULL CHECK (type IN ('good', 'bad')),
+     source_url TEXT NOT NULL,
+     reason TEXT NOT NULL DEFAULT '',
+     parsed_job_json TEXT NOT NULL DEFAULT '{}',
+     fetch_status TEXT NOT NULL DEFAULT 'pending',
+     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+   )`,
+  "CREATE INDEX IF NOT EXISTS idx_role_examples_profile ON role_examples(profile_id, type, created_at DESC)",
+  // 0025_career_refactor.sql
+  `CREATE TABLE IF NOT EXISTS role_market_research (
+     id TEXT PRIMARY KEY,
+     profile_id TEXT NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
+     cache_key TEXT NOT NULL,
+     role_title TEXT NOT NULL,
+     locations TEXT NOT NULL DEFAULT '',
+     research_json TEXT NOT NULL DEFAULT '{}',
+     researched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+   )`,
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_role_market_key ON role_market_research(profile_id, cache_key)",
 ];
 
 /**
@@ -309,7 +366,7 @@ const ADDITIVE_COLUMNS = [
 let schemaReady: Promise<void> | null = null;
 
 async function applyAdditiveColumns(env: Env): Promise<void> {
-  for (const statement of ADDITIVE_COLUMNS) {
+  for (const statement of [...ADDITIVE_TABLES, ...ADDITIVE_COLUMNS]) {
     try {
       await env.DB.prepare(statement).run();
     } catch {
@@ -602,73 +659,185 @@ async function ensureCareAboutTopics(
   }
 }
 
-/** One distinct role family the analysis thinks the candidate is suited for. */
-type RoleAnalysisEntry = { title: string; description: string };
+/**
+ * One distinct role family the analysis thinks the candidate should search for.
+ *
+ * `title` and `alternate_titles` are deliberately real job-market categories rather than
+ * descriptions of the person: they exist to be matched against actual postings, and a title nobody
+ * posts matches nothing. `search_title_terms` is narrower still -- the literal words a deterministic
+ * title filter compares against, kept separate from `search_keywords` (body terms) because the two
+ * are consumed by different stages with different precision requirements.
+ */
+type RoleAnalysisEntry = {
+  title: string;
+  alternate_titles: string[];
+  fit_summary: string;
+  why_this_fits: { claim: string; evidence: string[] }[];
+  seniority: string;
+  domains: string[];
+  must_have_characteristics: string[];
+  nice_to_have_characteristics: string[];
+  search_title_terms: string[];
+  search_keywords: string[];
+  possible_gaps_or_cautions: string[];
+};
 
 /**
- * The structured output of `roles.analyze`: a non-role-specific summary (location, what to avoid,
- * what matters) plus the distinct role types it identified. Regenerated wholesale by Reanalyze --
- * there's no per-field merge, since re-deriving from the current notes/preferences is the point.
+ * The structured output of `roles.analyze`: a role-independent search summary plus the distinct
+ * role families it identified. Regenerated wholesale by Reanalyze -- there's no per-field merge,
+ * since re-deriving from the current profile and preferences is the point.
+ *
+ * Market data lives in a sibling table rather than in here (see `role_market_research`), because it
+ * comes from a different process with a different failure mode: candidate reasoning must stay
+ * stable and reproducible when a labor-statistics provider is down.
  */
 type RoleAnalysis = { summary: string; roles: RoleAnalysisEntry[] };
 
+/** Fills in any field an older stored analysis predates, so v1 records render without guarding. */
+function normalizeRoleAnalysisEntry(raw: Record<string, unknown>): RoleAnalysisEntry {
+  const list = (value: unknown): string[] =>
+    Array.isArray(value) ? value.map((v) => String(v ?? "").trim()).filter(Boolean) : [];
+  return {
+    title: String(raw.title ?? "").trim(),
+    alternate_titles: list(raw.alternate_titles),
+    // Older analyses stored a single `description`; surfacing it as the fit summary keeps a
+    // pre-refactor record readable instead of blank.
+    fit_summary: String(raw.fit_summary ?? raw.description ?? "").trim(),
+    why_this_fits: (Array.isArray(raw.why_this_fits) ? raw.why_this_fits : [])
+      .map((w) => {
+        const item = (w ?? {}) as Record<string, unknown>;
+        return { claim: String(item.claim ?? "").trim(), evidence: list(item.evidence) };
+      })
+      .filter((w) => w.claim),
+    seniority: String(raw.seniority ?? "").trim(),
+    domains: list(raw.domains),
+    must_have_characteristics: list(raw.must_have_characteristics),
+    nice_to_have_characteristics: list(raw.nice_to_have_characteristics),
+    search_title_terms: list(raw.search_title_terms),
+    search_keywords: list(raw.search_keywords),
+    possible_gaps_or_cautions: list(raw.possible_gaps_or_cautions),
+  };
+}
+
+function normalizeRoleAnalysis(raw: unknown): RoleAnalysis {
+  const input = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const roles = Array.isArray(input.roles) ? input.roles : [];
+  return {
+    summary: String(input.summary ?? "").trim(),
+    roles: roles
+      .map((r) => normalizeRoleAnalysisEntry((r ?? {}) as Record<string, unknown>))
+      .filter((r) => r.title),
+  };
+}
+
 function readRoleAnalysis(preferencesJson: string): RoleAnalysis | null {
   try {
-    const analysis = (JSON.parse(preferencesJson || "{}") as { role_analysis?: RoleAnalysis }).role_analysis;
-    return analysis && Array.isArray(analysis.roles) ? analysis : null;
+    const analysis = (JSON.parse(preferencesJson || "{}") as { role_analysis?: unknown }).role_analysis;
+    if (!analysis || typeof analysis !== "object") return null;
+    const normalized = normalizeRoleAnalysis(analysis);
+    return normalized.roles.length ? normalized : null;
   } catch {
     return null;
   }
 }
 
 /**
- * Renders the structured analysis back into the same kind of plain-text block the fit/screen/resume
- * prompts have always taken as `desiredRoles` -- one heading + description per distinct role family.
- * Keeps every downstream consumer of that string unchanged while the candidate-facing side of this
- * became structured.
+ * Renders the structured analysis into the flat `desired_roles` string every downstream stage
+ * already consumes -- company discovery, board filtering, prescreening, deep fit, resume targeting.
+ *
+ * Deliberately search-oriented rather than descriptive. The old version flattened each role's prose
+ * description, which meant the cheap title filter downstream was deriving match terms from
+ * sentences and picking up whatever generic words happened to appear in them. Emitting the explicit
+ * title/alternate-title/search-term vocabulary instead gives that filter something precise to work
+ * with, and keeps prose that would only add noise (fit rationale, cautions, and especially market
+ * and salary text) out of a string whose entire job is finding relevant postings.
  */
 function flattenRoleAnalysis(analysis: RoleAnalysis): string {
-  return analysis.roles.map((r) => `## ${r.title}\n${r.description}`).join("\n\n");
+  return analysis.roles
+    .map((r) => {
+      const lines = [`## ${r.title}`];
+      if (r.alternate_titles.length) lines.push(`Also posted as: ${r.alternate_titles.join(", ")}`);
+      if (r.seniority) lines.push(`Seniority: ${r.seniority}`);
+      if (r.domains.length) lines.push(`Domains: ${r.domains.join(", ")}`);
+      if (r.search_title_terms.length) lines.push(`Title terms: ${r.search_title_terms.join(", ")}`);
+      if (r.search_keywords.length) lines.push(`Keywords: ${r.search_keywords.join(", ")}`);
+      if (r.must_have_characteristics.length) lines.push(`Must have: ${r.must_have_characteristics.join("; ")}`);
+      return lines.join("\n");
+    })
+    .join("\n\n");
+}
+
+/**
+ * The explicit title vocabulary for the cheap deterministic board filter, in matchable form.
+ * Kept structured (rather than re-parsed out of the flattened string above) so the filter never has
+ * to guess which words in a block of prose were meant to be title terms.
+ */
+function roleTitleTerms(analysis: RoleAnalysis | null): string[] {
+  if (!analysis) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const role of analysis.roles) {
+    for (const term of [role.title, ...role.alternate_titles, ...role.search_title_terms]) {
+      const cleaned = term.trim().toLowerCase();
+      if (cleaned.length < 3 || seen.has(cleaned)) continue;
+      seen.add(cleaned);
+      out.push(cleaned);
+    }
+  }
+  return out;
 }
 
 function readStructuredProfile(structuredJson: string): StructuredProfile | null {
-  try {
-    const parsed = JSON.parse(structuredJson || "{}");
-    return Object.keys(parsed).length > 0 ? parsed : null;
-  } catch {
-    return null;
-  }
+  return readCareerProfile(structuredJson);
 }
 
-// Deterministic safety net on top of prompting: even if the model doesn't perfectly follow
-// "don't drop entries," any old education/experience entry whose key doesn't reappear in the
-// new output is re-added, so regenerating can only add or correct, never silently lose data.
-function mergeStructuredProfiles(existing: StructuredProfile | null, incoming: StructuredProfile): StructuredProfile {
-  if (!existing) return incoming;
-  function mergeByKey<T>(oldList: T[], newList: T[], keyFn: (item: T) => string): T[] {
-    const newKeys = new Set((newList ?? []).map(keyFn));
-    const preserved = (oldList ?? []).filter((item) => !newKeys.has(keyFn(item)));
-    return [...(newList ?? []), ...preserved];
-  }
-  function mergeSkills(oldSkills: string[], newSkills: string[]): string[] {
-    const seen = new Set<string>();
-    const merged: string[] = [];
-    for (const skill of [...(newSkills ?? []), ...(oldSkills ?? [])]) {
-      const key = skill.trim().toLowerCase();
-      if (key && !seen.has(key)) {
-        seen.add(key);
-        merged.push(skill.trim());
-      }
-    }
-    return merged;
-  }
-  return {
-    headline: incoming.headline || existing.headline,
-    narrative_summary: incoming.narrative_summary || existing.narrative_summary,
-    education: mergeByKey(existing.education, incoming.education, (e) => `${e.school}|${e.degree}`.toLowerCase()),
-    experience: mergeByKey(existing.experience, incoming.experience, (e) => `${e.company}|${e.title}`.toLowerCase()),
-    skills: mergeSkills(existing.skills, incoming.skills),
-  };
+/**
+ * Guards a regeneration against losing real evidence, without freezing old mistakes in place.
+ *
+ * The previous implementation force-merged every old education/experience entry back into each new
+ * generation. That was the right safety net for the old schema, where the model was told to treat
+ * the existing profile as a baseline to extend. It is the wrong one now: the model is deliberately
+ * rebuilding the whole record from the source documents, so union-ing the old objects back in
+ * re-introduces exactly what regeneration is supposed to fix -- duplicate entries for one job
+ * described across three resumes, and stale categorization that no amount of better source material
+ * could ever dislodge.
+ *
+ * So this validates rather than merges. A regeneration that came back with materially less career
+ * history than the record it replaces is treated as a failed generation (a truncated response, a
+ * model that lost its place mid-output) and the existing profile is kept. A regeneration that holds
+ * its ground is accepted whole, duplicates collapsed and categories corrected. The source documents
+ * remain on file either way, so the recovery path for a rejected generation is simply to run it
+ * again rather than to reconstruct anything by hand.
+ */
+function acceptRegeneratedProfile(
+  existing: StructuredProfile | null,
+  incoming: StructuredProfile,
+): { profile: StructuredProfile; rejected: boolean } {
+  if (!existing) return { profile: incoming, rejected: false };
+
+  // Deliberately counts organizations and institutions rather than entries: collapsing three
+  // duplicate descriptions of one employer into one entry is a *correct* regeneration that must not
+  // trip this, while genuinely dropping an employer must.
+  const namesOf = (profile: StructuredProfile) =>
+    new Set(
+      [
+        ...profile.work_experience.map((e) => e.organization),
+        ...profile.education.map((e) => e.institution),
+      ]
+        .map((name) => name.trim().toLowerCase())
+        .filter(Boolean),
+    );
+
+  const before = namesOf(existing);
+  const after = namesOf(incoming);
+  const lost = [...before].filter((name) => !after.has(name));
+
+  // One dropped organization out of many is plausibly a correct merge of two spellings of the same
+  // employer; losing a large share of them is not something a good regeneration does.
+  const lostTooMuch = before.size > 0 && lost.length > Math.max(1, Math.floor(before.size * 0.34));
+  if (lostTooMuch) return { profile: existing, rejected: true };
+
+  return { profile: incoming, rejected: false };
 }
 
 async function getProfile(request: Request, env: Env): Promise<Response> {
@@ -701,7 +870,10 @@ async function saveStructuredProfile(request: Request, env: Env): Promise<Respon
   if (!body.structured || typeof body.structured !== "object") {
     return json({ error: "structured_required" }, 400);
   }
-  const structured = body.structured as StructuredProfile;
+  // Normalized rather than trusted as-is: this endpoint accepts a body from the browser, and the
+  // stored record is what every downstream stage indexes into without guarding. Normalizing here
+  // also stamps the current schema version, so stored data always says which generation it is.
+  const structured = normalizeCareerProfile(body.structured);
   const profileId = await getOrCreateProfileId(env);
   // Recomputed on every save so the compact matching profile can never lag the real one.
   await env.DB.prepare(
@@ -710,7 +882,7 @@ async function saveStructuredProfile(request: Request, env: Env): Promise<Respon
   )
     .bind(
       JSON.stringify(structured),
-      (structured.narrative_summary ?? "").slice(0, 4000),
+      structured.career_summary.narrative_summary.slice(0, 4000),
       buildMatchProfile(structured),
       profileId,
     )
@@ -842,6 +1014,228 @@ async function deleteRoleSignal(request: Request, env: Env, id: string): Promise
   return json({ deleted: result.meta.changes > 0 });
 }
 
+// ---------------------------------------------------------------------------
+// Role examples -- Good/Bad job postings the candidate points at as concrete evidence of what they
+// do and don't want, alongside the Description notes above. See docs on the `role_examples` table
+// (migrations/0024_role_examples.sql) for why this is its own table rather than another
+// candidate_evidence category or a job_postings row.
+// ---------------------------------------------------------------------------
+
+type RoleExampleType = "good" | "bad";
+
+/** Best-effort structured read of a posting fetched from a URL. Every field is optional -- a
+ * partial or empty result just means a thinner example, never a reason to fail the save. */
+type ParsedJobExample = {
+  title?: string;
+  company?: string;
+  location?: string;
+  employment_type?: string;
+  description?: string;
+  responsibilities?: string[];
+  qualifications?: string[];
+  skills?: string[];
+};
+
+const JOB_EXAMPLE_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string", description: "The job title as the posting states it." },
+    company: { type: "string", description: "The hiring company's name." },
+    location: { type: "string", description: "Where the role is based, as the posting states it (city, region, or 'Remote')." },
+    employment_type: { type: "string", description: "e.g. Full-time, Contract, Remote, Hybrid, Onsite -- whatever the posting specifies." },
+    description: { type: "string", description: "A short prose summary of what the role actually is." },
+    responsibilities: { type: "array", items: { type: "string" }, description: "The core duties, one per entry." },
+    qualifications: { type: "array", items: { type: "string" }, description: "Required and preferred qualifications, one per entry." },
+    skills: { type: "array", items: { type: "string" }, description: "Named technologies, tools, or skills the posting calls out." },
+  },
+  required: ["title", "company"],
+} as const;
+
+/** Caps how much of a fetched page's text is sent to the model or kept in the description. */
+const JOB_EXAMPLE_TEXT_CAP = 12000;
+
+/**
+ * Fetches a job posting URL and asks the model to read it into structured fields, for a Good/Bad
+ * example the candidate is pointing at. Every failure mode -- unreachable URL, a non-HTML error
+ * page, a scraping block, a missing provider key, a malformed model response -- resolves to `null`
+ * rather than throwing, because none of them should stop the example (URL + reason) from saving;
+ * see createRoleExample below.
+ */
+async function fetchRoleExampleJob(
+  env: Env,
+  provider: Provider,
+  sourceUrl: string,
+): Promise<ParsedJobExample | null> {
+  if (providerKeyMissing(env, provider)) return null;
+  try {
+    const res = await fetchWithTimeout(sourceUrl, 10000, { redirect: "follow" });
+    if (!res || !res.ok) return null;
+    const html = await res.text();
+    const text = htmlToText(html).slice(0, JOB_EXAMPLE_TEXT_CAP);
+    if (!text) return null;
+
+    const prompt = await getManagedPrompt(env, "roles/extract_example", {
+      source_url: sourceUrl,
+      posting_text: text,
+    });
+    const parsed = await callStructured<ParsedJobExample>(
+      env,
+      provider,
+      "roles.extract_example",
+      prompt,
+      JOB_EXAMPLE_SCHEMA,
+      "submit_job_example",
+      2000,
+    );
+    return parsed && parsed.title ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+type RoleExampleRow = {
+  id: string;
+  type: RoleExampleType;
+  source_url: string;
+  reason: string;
+  parsed_job_json: string;
+  fetch_status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+function shapeRoleExample(row: RoleExampleRow) {
+  let parsed: ParsedJobExample = {};
+  try {
+    parsed = JSON.parse(row.parsed_job_json || "{}");
+  } catch {
+    parsed = {};
+  }
+  return {
+    id: row.id,
+    type: row.type,
+    source_url: row.source_url,
+    reason: row.reason,
+    fetch_status: row.fetch_status,
+    job: Object.keys(parsed).length ? parsed : null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+async function listRoleExamples(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const rows = await env.DB.prepare(
+    `SELECT id, type, source_url, reason, parsed_job_json, fetch_status, created_at, updated_at
+     FROM role_examples WHERE profile_id = ? ORDER BY created_at DESC`,
+  )
+    .bind(profileId)
+    .all<RoleExampleRow>();
+  const shaped = rows.results.map(shapeRoleExample);
+  return json({
+    good: shaped.filter((r) => r.type === "good"),
+    bad: shaped.filter((r) => r.type === "bad"),
+  });
+}
+
+async function createRoleExample(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    type?: string;
+    source_url?: string;
+    reason?: string;
+    provider?: string;
+  };
+  const type: RoleExampleType | null = body.type === "good" || body.type === "bad" ? body.type : null;
+  const sourceUrl = (body.source_url ?? "").trim();
+  const reason = (body.reason ?? "").trim();
+  if (!type) return json({ error: "type_required" }, 400);
+  if (!sourceUrl) return json({ error: "source_url_required" }, 400);
+
+  const provider = normalizeProvider(body.provider);
+  const parsed = await fetchRoleExampleJob(env, provider, sourceUrl);
+
+  const profileId = await getOrCreateProfileId(env);
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO role_examples (id, profile_id, type, source_url, reason, parsed_job_json, fetch_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(id, profileId, type, sourceUrl, reason, JSON.stringify(parsed ?? {}), parsed ? "ok" : "failed")
+    .run();
+
+  return json(
+    shapeRoleExample({
+      id,
+      type,
+      source_url: sourceUrl,
+      reason,
+      parsed_job_json: JSON.stringify(parsed ?? {}),
+      fetch_status: parsed ? "ok" : "failed",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }),
+    201,
+  );
+}
+
+async function updateRoleExample(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { reason?: string };
+  if (typeof body.reason !== "string") return json({ error: "reason_required" }, 400);
+  const result = await env.DB.prepare(
+    "UPDATE role_examples SET reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+  )
+    .bind(body.reason.trim(), id)
+    .run();
+  return json({ updated: result.meta.changes > 0 });
+}
+
+async function deleteRoleExample(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const result = await env.DB.prepare("DELETE FROM role_examples WHERE id = ?").bind(id).run();
+  return json({ deleted: result.meta.changes > 0 });
+}
+
+/**
+ * Renders one type's examples (good or bad) into the plain-text block analyzeDesiredRoles feeds
+ * the model, in the same "one heading + body" shape as everything else in that prompt. The job's
+ * parsed fields matter more than the reason -- the reason is supplementary context, the job itself
+ * is evidence -- so the posting is described first and the candidate's own words follow.
+ */
+function formatRoleExamplesForPrompt(examples: RoleExampleRow[]): string {
+  return examples
+    .map((row) => {
+      let parsed: ParsedJobExample = {};
+      try {
+        parsed = JSON.parse(row.parsed_job_json || "{}");
+      } catch {
+        parsed = {};
+      }
+      const headline = parsed.title
+        ? `${parsed.title}${parsed.company ? ` at ${parsed.company}` : ""}`
+        : row.source_url;
+      const lines = [`- ${headline}`];
+      if (parsed.location) lines.push(`  Location: ${parsed.location}`);
+      if (parsed.employment_type) lines.push(`  Employment type: ${parsed.employment_type}`);
+      if (parsed.description) lines.push(`  Summary: ${parsed.description}`);
+      if (parsed.responsibilities?.length) lines.push(`  Responsibilities: ${parsed.responsibilities.join("; ")}`);
+      if (parsed.qualifications?.length) lines.push(`  Qualifications: ${parsed.qualifications.join("; ")}`);
+      if (parsed.skills?.length) lines.push(`  Skills: ${parsed.skills.join(", ")}`);
+      if (row.reason) lines.push(`  Why the candidate flagged this: ${row.reason}`);
+      lines.push(`  Source: ${row.source_url}`);
+      return lines.join("\n");
+    })
+    .join("\n\n");
+}
+
+const strArrayProp = (description: string) => ({ type: "array", items: { type: "string" }, description });
+
 const ROLE_ANALYSIS_SCHEMA = {
   type: "object",
   properties: {
@@ -859,21 +1253,50 @@ const ROLE_ANALYSIS_SCHEMA = {
         properties: {
           title: {
             type: "string",
-            description: "A short, concrete job title a posting would actually use (e.g. 'Applied AI Engineer'), not a sentence.",
-          },
-          description: {
-            type: "string",
             description:
-              "Role family/titles, seniority, domain, must-have vs nice-to-have aspects, and enough concrete " +
-              "keywords that a simple keyword match could find it.",
+              "A real, recognizable job title employers actually post (e.g. 'Applied AI Engineer'), not a " +
+              "sentence and not an invented hybrid of several different careers.",
           },
+          alternate_titles: strArrayProp(
+            "Other real titles employers commonly use for substantially the same job.",
+          ),
+          fit_summary: {
+            type: "string",
+            description: "One or two sentences on why this path makes sense for this specific person.",
+          },
+          why_this_fits: {
+            type: "array",
+            description:
+              "Each claim paired with the concrete evidence from the candidate's background that supports it. " +
+              "Never assert fit without citing what they actually did.",
+            items: {
+              type: "object",
+              properties: {
+                claim: { type: "string" },
+                evidence: strArrayProp("Specific things from their record that back this claim up."),
+              },
+              required: ["claim"],
+            },
+          },
+          seniority: { type: "string", description: "The level they could plausibly enter at, e.g. 'Mid to senior'." },
+          domains: strArrayProp("Industries or subject areas where this role fits their background."),
+          must_have_characteristics: strArrayProp("What a posting must have for this to be a genuine match."),
+          nice_to_have_characteristics: strArrayProp("What would make a posting an especially good match."),
+          search_title_terms: strArrayProp(
+            "Literal title words to match against posting titles. Short, common, recall-oriented -- these feed a " +
+              "cheap deterministic filter, not a model.",
+          ),
+          search_keywords: strArrayProp("Body keywords that indicate this kind of role."),
+          possible_gaps_or_cautions: strArrayProp(
+            "Honest weaknesses for this path and what would strengthen it. Do not flatter.",
+          ),
         },
-        required: ["title", "description"],
+        required: ["title", "fit_summary"],
       },
       description:
         "Each genuinely distinct role family the candidate should be shown -- not variations on one title. Do " +
         "not blend different fields into one hybrid role that doesn't exist in the job market; a posting only " +
-        "has to match ONE entry to be worth surfacing.",
+        "has to match ONE entry to be worth surfacing. Typically 3-8 entries.",
     },
   },
   required: ["summary", "roles"],
@@ -895,45 +1318,86 @@ async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response
   if (keyError) return json({ error: keyError }, 501);
 
   const profileId = await getOrCreateProfileId(env);
-  const [profileRow, signals] = await Promise.all([
-    env.DB.prepare("SELECT preferences_json, match_profile FROM candidate_profiles WHERE id = ?")
+  const [profileRow, signals, exampleRows] = await Promise.all([
+    env.DB.prepare("SELECT preferences_json, match_profile, structured_json FROM candidate_profiles WHERE id = ?")
       .bind(profileId)
-      .first<{ preferences_json: string; match_profile: string }>(),
+      .first<{ preferences_json: string; match_profile: string; structured_json: string }>(),
     env.DB.prepare(
       "SELECT claim FROM candidate_evidence WHERE profile_id = ? AND category = 'role_signal' ORDER BY created_at ASC",
     )
       .bind(profileId)
       .all<{ claim: string }>(),
+    env.DB.prepare(
+      `SELECT id, type, source_url, reason, parsed_job_json, fetch_status, created_at, updated_at
+       FROM role_examples WHERE profile_id = ? ORDER BY created_at ASC`,
+    )
+      .bind(profileId)
+      .all<RoleExampleRow>(),
   ]);
 
-  const matchProfile = (profileRow?.match_profile ?? "").trim();
+  // Career analysis gets the FULL record, not the compact match profile.
+  //
+  // The compact rendering exists to make hundreds of cheap prescreen calls affordable, and it earns
+  // that by dropping exactly what this call needs most: project work, accomplishments, mentoring,
+  // stakeholder contact, leadership. Analyzing careers from it produced recommendations that could
+  // only restate titles the candidate had already typed, because the evidence that would suggest an
+  // unfamiliar-but-plausible path had been summarized away before the model saw it. This call runs
+  // once per meaningful preference change, so the extra tokens are cheap and the lost evidence is
+  // not. Falls back to the compact string only when there is no structured profile at all.
+  const structuredProfile = readStructuredProfile(profileRow?.structured_json ?? "{}");
+  const fullBackground = structuredProfile ? renderCareerProfile(structuredProfile) : "";
+  const matchProfile = fullBackground || (profileRow?.match_profile ?? "").trim();
   const notes = signals.results.map((s) => s.claim);
-  if (!notes.length && !matchProfile) return json({ error: "no_source_material" }, 400);
+  const goodExamples = exampleRows.results.filter((r) => r.type === "good");
+  const badExamples = exampleRows.results.filter((r) => r.type === "bad");
+  if (!notes.length && !matchProfile && !goodExamples.length && !badExamples.length) {
+    return json({ error: "no_source_material" }, 400);
+  }
 
   const preferencesJson = profileRow?.preferences_json ?? "{}";
   const desiredLocations = readDesiredLocations(preferencesJson);
   const dealbreakers = readDealbreakers(preferencesJson);
   const careAbout = readCareAbout(preferencesJson);
 
-  const prompt = await getManagedPrompt(env, "roles/analyze", {
-    candidate_background: matchProfile ? `CANDIDATE BACKGROUND:\n${matchProfile}` : "",
-    notes_and_links: notes.length ? `NOTES AND LINKS:\n${notes.map((c) => `- ${c}`).join("\n")}` : "",
-    locations: desiredLocations ? `LOCATIONS THEY'LL WORK IN:\n${desiredLocations}` : "",
-    dealbreakers: dealbreakers ? `DEALBREAKERS:\n${dealbreakers}` : "",
-    criteria: careAbout ? `WHAT THEY SAID THEY CARE ABOUT:\n${careAbout}` : "",
-  });
+  const prompt = await getManagedPrompt(
+    env,
+    "roles/analyze",
+    {
+      candidate_background: matchProfile,
+      // Product terminology is now "Preferences", but the variable name is unchanged: renaming it
+      // would break any Langfuse template still referencing {{notes_and_links}}, and the variable is
+      // not candidate-visible. The heading inside the value carries the new wording.
+      notes_and_links: notes.length
+        ? `STATED PREFERENCES (desired direction, in the candidate's own words):\n${notes.map((c) => `- ${c}`).join("\n")}`
+        : "",
+      locations: desiredLocations ? `LOCATIONS THEY'LL WORK IN:\n${desiredLocations}` : "",
+      dealbreakers: dealbreakers ? `DEALBREAKERS (hard constraints):\n${dealbreakers}` : "",
+      criteria: careAbout ? `PRIORITIES (what they want surfaced and compared):\n${careAbout}` : "",
+      good_examples: goodExamples.length
+        ? `GOOD EXAMPLES (postings representing work they want):\n${formatRoleExamplesForPrompt(goodExamples)}`
+        : "",
+      bad_examples: badExamples.length
+        ? `BAD EXAMPLES (postings representing work they do not want):\n${formatRoleExamplesForPrompt(badExamples)}`
+        : "",
+    },
+    ROLES_ANALYZE_PROMPT,
+  );
 
   let analysis: RoleAnalysis;
   try {
-    analysis = await callStructured<RoleAnalysis>(
+    const raw = await callStructured<unknown>(
       env,
       provider,
       "roles.analyze",
       prompt,
       ROLE_ANALYSIS_SCHEMA,
       "submit_role_analysis",
-      3000,
+      // Several role families, each carrying evidence-backed claims and search vocabulary, needs
+      // materially more room than the old title+description pair.
+      8000,
     );
+    analysis = normalizeRoleAnalysis(raw);
+    if (!analysis.roles.length) throw new Error("no_roles_returned");
   } catch (err) {
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
@@ -952,6 +1416,67 @@ async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response
     .run();
 
   return json({ provider, role_analysis: analysis, desired_roles: desiredRoles });
+}
+
+/**
+ * Returns cached market research for the current role families, researching any that are missing or
+ * stale. Deliberately a separate endpoint from the analysis itself: the Roles page renders its
+ * cards from the analysis immediately and fills market context in afterwards, so a slow or failing
+ * data provider never delays the part of the page that is about the candidate.
+ */
+async function getRoleMarketResearch(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const url = new URL(request.url);
+  const refresh = url.searchParams.get("refresh") === "1";
+  const provider = normalizeProvider(url.searchParams.get("provider") ?? undefined);
+
+  const profileId = await getOrCreateProfileId(env);
+  const profileRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  const analysis = readRoleAnalysis(profileRow?.preferences_json ?? "{}");
+  if (!analysis) return json({ research: {} });
+
+  const locations = readDesiredLocations(profileRow?.preferences_json ?? "{}");
+  const cached = await env.DB.prepare(
+    "SELECT cache_key, research_json, researched_at FROM role_market_research WHERE profile_id = ?",
+  )
+    .bind(profileId)
+    .all<{ cache_key: string; research_json: string; researched_at: string }>();
+
+  const byKey = new Map(cached.results.map((row) => [row.cache_key, row]));
+  const ttlMs = MARKET_RESEARCH_TTL_DAYS * 24 * 60 * 60 * 1000;
+  const out: Record<string, unknown> = {};
+
+  for (const role of analysis.roles) {
+    const key = marketCacheKey(role.title, locations);
+    const row = byKey.get(key);
+    const fresh = row && Date.now() - Date.parse(row.researched_at + "Z") < ttlMs;
+    if (row && fresh && !refresh) {
+      try {
+        out[role.title] = JSON.parse(row.research_json);
+        continue;
+      } catch {
+        // Fall through and re-research rather than serving a corrupted cache row.
+      }
+    }
+
+    const research = await researchRoleMarket(env, provider, role, locations);
+    out[role.title] = research;
+    // Cached even when unavailable, so a provider that is blocking us isn't re-hammered on every
+    // page load. The TTL still expires it, so recovery is automatic.
+    await env.DB.prepare(
+      `INSERT INTO role_market_research (id, profile_id, cache_key, role_title, locations, research_json, researched_at)
+       VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(profile_id, cache_key) DO UPDATE SET
+         research_json = excluded.research_json, researched_at = CURRENT_TIMESTAMP`,
+    )
+      .bind(crypto.randomUUID(), profileId, key, role.title, locations, JSON.stringify(research))
+      .run();
+  }
+
+  return json({ research: out });
 }
 
 async function upsertProfile(request: Request, env: Env): Promise<Response> {
@@ -1070,8 +1595,12 @@ async function assessRowsBatched(
       if (failed) return null;
       await emit({ type: "pipeline", stage: "assess", phase: "dispatched", ids: batch.map((item) => item.id) });
       try {
+        // Deep assessment gets the FULL record. This is the stage that decides whether the
+        // candidate is genuinely plausible for a posting, so summarizing away their project work
+        // and per-role skills is exactly the wrong economy -- the cheap prescreen above is where
+        // token cost is worth optimizing, and it already uses the compact match profile.
         return await assessJobFitBatch(
-          env, provider, JSON.stringify(structured), desiredRoles, disqualifiers, dealbreakers, careAboutTopics, batch,
+          env, provider, renderCareerProfile(structured), desiredRoles, disqualifiers, dealbreakers, careAboutTopics, batch,
         );
       } catch (err) {
         errors.push(`assess: ${(err as Error).message}`);
@@ -1353,12 +1882,13 @@ async function dataSummary(request: Request, env: Env): Promise<Response> {
   const count = async (sql: string): Promise<number> =>
     (await env.DB.prepare(sql).first<{ n: number }>())?.n ?? 0;
 
-  const [companies, jobs, documents, notes, roleSignals, resumes, feedback, coverLetters, applicationAnswers, descBytes, docBytes] = await Promise.all([
+  const [companies, jobs, documents, notes, roleSignals, roleExamples, resumes, feedback, coverLetters, applicationAnswers, descBytes, docBytes] = await Promise.all([
     count("SELECT COUNT(*) AS n FROM companies"),
     count("SELECT COUNT(*) AS n FROM job_postings"),
     count("SELECT COUNT(*) AS n FROM source_documents"),
     count("SELECT COUNT(*) AS n FROM candidate_evidence WHERE category = 'note'"),
     count("SELECT COUNT(*) AS n FROM candidate_evidence WHERE category = 'role_signal'"),
+    count("SELECT COUNT(*) AS n FROM role_examples"),
     count("SELECT COUNT(*) AS n FROM resumes"),
     count("SELECT COUNT(*) AS n FROM job_feedback"),
     count("SELECT COUNT(*) AS n FROM cover_letters"),
@@ -1375,6 +1905,7 @@ async function dataSummary(request: Request, env: Env): Promise<Response> {
       documents,
       notes,
       role_signals: roleSignals,
+      role_examples: roleExamples,
       resumes,
       feedback,
       cover_letters: coverLetters,
@@ -1428,6 +1959,7 @@ async function purgeCollection(request: Request, env: Env): Promise<Response> {
     resumes: "DELETE FROM resumes",
     notes: "DELETE FROM candidate_evidence WHERE category = 'note'",
     role_signals: "DELETE FROM candidate_evidence WHERE category = 'role_signal'",
+    role_examples: "DELETE FROM role_examples",
     manual_jobs: "DELETE FROM job_postings WHERE company_id IS NULL",
     cover_letters: "DELETE FROM cover_letters",
     application_answers: "DELETE FROM application_answers",
@@ -1859,7 +2391,10 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
       proposals = await proposeCompanies(
         env,
         provider,
-        JSON.stringify(structured),
+        // The readable rendering rather than raw JSON: discovery is asking which employers hire
+        // this person, and the domains, project work and stakeholder context that question turns on
+        // read far more reliably as prose than as deep brace nesting.
+        structured ? renderCareerProfile(structured) : "",
         desiredRoles,
         existingNames,
         count,
@@ -1963,6 +2498,7 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
     .bind(profileId)
     .first<{ preferences_json: string }>();
   const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
+  const titleTerms = roleTitleTerms(readRoleAnalysis(profileRow?.preferences_json ?? "{}"));
   const locationTerms = parseLocationFilter(readDesiredLocations(profileRow?.preferences_json ?? "{}"));
 
   // This bounds how many candidate rows the query below considers, which is cheap -- the actual
@@ -2019,7 +2555,7 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
         if (budget.remaining <= 2) return null;
         // scanOneCompany already writes each company's listings to the database before returning,
         // so a company already reported here is durably saved even if others in flight never finish.
-        return scanOneCompany(env, company, desiredRoles, locationTerms, budget);
+        return scanOneCompany(env, company, desiredRoles, locationTerms, budget, titleTerms);
       },
       async (company, outcome) => {
         if (!outcome) return;
@@ -2063,6 +2599,7 @@ async function scanOneCompany(
   desiredRoles: string,
   locationTerms: string[],
   budget: { remaining: number },
+  titleTerms: string[] = [],
 ): Promise<{ jobs: number; newJobs: number; note: string }> {
   let provider = company.ats_provider as AtsProvider | "" | "none";
   let token = company.ats_token;
@@ -2122,7 +2659,7 @@ async function scanOneCompany(
   // A company can qualify on location while most of its postings don't, so each posting is
   // checked on its own rather than inherited from the company.
   const inArea = scanned.filter((job) => locationMatches(job.location, locationTerms));
-  const relevant = filterJobsByRoles(inArea, desiredRoles)
+  const relevant = filterJobsByRoles(inArea, desiredRoles, titleTerms)
     .filter((job) => job.title && job.external_id)
     .map((job) => ({ ...job, id: crypto.randomUUID() }));
 
@@ -2863,6 +3400,22 @@ const STRUCTURED_PROFILE_JSON_SCHEMA = {
 } as const;
 
 
+/**
+ * How much of one document's extracted text reaches the model.
+ *
+ * Was 8,000 characters, which is roughly three pages -- comfortably less than an ordinary two-page
+ * resume once formatting artifacts and extraction noise are counted, and far less than the long-form
+ * CVs, academic records and multi-role histories people actually upload. Everything past the cut was
+ * silently discarded, so the profile could never contain evidence from the back half of a document
+ * the candidate had successfully uploaded, and no part of the UI said so.
+ *
+ * 40,000 characters is about 8-10 pages of professional prose: enough that an ordinary resume or CV
+ * is never truncated at all, while still bounding a pathological input. The cap applies ONLY when
+ * building model input -- `source_documents.extracted_text` keeps the complete extraction, so
+ * raising this later re-reads the full text with no re-upload.
+ */
+const PROFILE_SOURCE_DOC_CHARS = 40000;
+
 async function generateProfile(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -2880,6 +3433,8 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   )
     .bind(profileId)
     .all<{ claim: string }>();
+  // Every document with text, every time -- regeneration reconsiders the whole record from all
+  // available evidence rather than layering the newest upload onto a previous interpretation.
   const docs = await env.DB.prepare(
     `SELECT original_name, extracted_text FROM source_documents
      WHERE profile_id = ? AND LENGTH(extracted_text) > 0 ORDER BY created_at ASC`,
@@ -2889,35 +3444,51 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
 
   const sourceParts: string[] = [];
   for (const note of notes.results) sourceParts.push(`Note: ${note.claim}`);
-  for (const doc of docs.results) sourceParts.push(`Document "${doc.original_name}":\n${doc.extracted_text.slice(0, 8000)}`);
+  for (const doc of docs.results) {
+    const text = doc.extracted_text.slice(0, PROFILE_SOURCE_DOC_CHARS);
+    const truncated = doc.extracted_text.length > PROFILE_SOURCE_DOC_CHARS;
+    sourceParts.push(
+      `Document "${doc.original_name}":\n${text}` +
+        (truncated ? `\n[Document truncated at ${PROFILE_SOURCE_DOC_CHARS} characters.]` : ""),
+    );
+  }
 
   if (sourceParts.length === 0) return json({ error: "no_source_material" }, 400);
 
   const existingStructured = readStructuredProfile(profile?.structured_json ?? "{}");
-  const prompt = await getManagedPrompt(env, "profile/structure", {
-    baseline_rule: existingStructured
-      ? "This candidate already has a profile (given below as 'Current profile'). Treat it as the baseline: " +
-        "keep every education and experience entry from it that the new material below does not contradict, even " +
-        "if the new material doesn't happen to repeat it. Only change a specific field, or add a new entry, when " +
-        "the new material below adds information or directly conflicts with what's already there. Never silently " +
-        "drop an entry just because it isn't mentioned again."
-      : "Base this on the material below.",
-    current_profile: existingStructured ? `Current profile:\n${JSON.stringify(existingStructured)}` : "",
-    source_material: sourceParts.join("\n\n"),
-  });
+  const prompt = await getManagedPrompt(
+    env,
+    "profile/structure",
+    {
+      // Kept supplied though the current prompt no longer uses it: an older Langfuse template still
+      // references {{baseline_rule}}, and compilePrompt throws on a variable the template wants and
+      // the code stopped sending. Supplying a superset is what lets the schema change deploy without
+      // being sequenced against a prompt promotion.
+      baseline_rule: "",
+      current_profile: existingStructured
+        ? `Current profile (previous interpretation, not authoritative):\n${JSON.stringify(existingStructured)}`
+        : "",
+      source_material: sourceParts.join("\n\n"),
+    },
+    PROFILE_STRUCTURE_PROMPT,
+  );
 
   try {
-    const raw = await callStructured<StructuredProfile>(
+    const raw = await callStructured<unknown>(
       env,
       provider,
       "profile.structure",
       prompt,
-      STRUCTURED_PROFILE_JSON_SCHEMA,
+      CAREER_PROFILE_SCHEMA,
       "submit_structured_profile",
-      2000,
+      // The canonical record is deliberately exhaustive, so it needs far more room to come back
+      // whole than the old five-field shape did. A truncated profile is the one failure mode that
+      // silently loses evidence every downstream stage depends on.
+      16000,
     );
-    const draft = mergeStructuredProfiles(existingStructured, raw);
-    return json({ provider, draft_structured: draft });
+    const normalized = normalizeCareerProfile(raw);
+    const { profile: draft, rejected } = acceptRegeneratedProfile(existingStructured, normalized);
+    return json({ provider, draft_structured: draft, rejected_incomplete: rejected });
   } catch (err) {
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
@@ -2928,8 +3499,12 @@ async function listResumes(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
   const profileId = await getOrCreateProfileId(env);
   const rows = await env.DB.prepare(
-    `SELECT id, name, instructions, template, revision, checks_json, critique, is_master, created_at
-     FROM resumes WHERE profile_id = ? ORDER BY created_at DESC`,
+    `SELECT r.id, r.name, r.instructions, r.template, r.revision, r.checks_json, r.critique,
+            r.is_master, r.role_family, r.job_id, r.created_at,
+            j.title AS job_title, j.company AS job_company
+     FROM resumes r
+     LEFT JOIN job_postings j ON j.id = r.job_id
+     WHERE r.profile_id = ? ORDER BY r.created_at DESC`,
   )
     .bind(profileId)
     .all();
@@ -3060,14 +3635,32 @@ async function createResume(request: Request, env: Env): Promise<Response> {
     provider?: string;
     template?: string;
     max_pages?: number;
+    role_family?: string;
   };
   const instructions = (body.instructions ?? "").trim();
+  const roleFamily = (body.role_family ?? "").trim();
   const provider = normalizeProvider(body.provider);
   const keyError = providerKeyMissing(env, provider);
   if (keyError) return json({ error: keyError }, 501);
 
   const profile = await loadProfileForResume(env);
   if (profile instanceof Response) return profile;
+
+  /**
+   * A career resume targets ONE role family, not the whole analysis.
+   *
+   * Passing every discovered family as the target is what produces a resume hedging across
+   * unrelated careers -- the exact fictional-hybrid problem the analysis works to avoid. So when a
+   * family is chosen, the target narrows to that entry alone; the evidence source is unchanged
+   * either way, since selection is presentation and the Profile remains the only factual authority.
+   */
+  const analysis = readRoleAnalysis(
+    (await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+      .bind(profile.profileId)
+      .first<{ preferences_json: string }>())?.preferences_json ?? "{}",
+  );
+  const chosen = roleFamily ? analysis?.roles.find((r) => r.title === roleFamily) : undefined;
+  const target = chosen ? flattenRoleAnalysis({ summary: analysis?.summary ?? "", roles: [chosen] }) : profile.desiredRoles;
 
   const layout = normalizeLayout({
     ...defaultLayout(normalizeTemplate(body.template)),
@@ -3082,7 +3675,7 @@ async function createResume(request: Request, env: Env): Promise<Response> {
       id,
       provider,
       profile.structured,
-      profile.desiredRoles,
+      target,
       instructions,
       layout,
       "",
@@ -3091,10 +3684,10 @@ async function createResume(request: Request, env: Env): Promise<Response> {
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 
-  const name = instructions ? instructions.slice(0, 60) : `Resume ${new Date().toISOString().slice(0, 10)}`;
+  const name = roleFamily || (instructions ? instructions.slice(0, 60) : `Resume ${new Date().toISOString().slice(0, 10)}`);
   await env.DB.prepare(
-    `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO resumes (id, profile_id, name, instructions, content_json, pdf_r2_key, template, layout_json, checks_json, role_family)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       id,
@@ -3106,10 +3699,11 @@ async function createResume(request: Request, env: Env): Promise<Response> {
       layout.template,
       JSON.stringify(layout),
       JSON.stringify(built.checks),
+      roleFamily,
     )
     .run();
 
-  return json({ id, name, template: layout.template, revision: 1, checks: built.checks }, 201);
+  return json({ id, name, role_family: roleFamily, template: layout.template, revision: 1, checks: built.checks }, 201);
 }
 
 /**
@@ -3821,7 +4415,8 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 
-  const name = profileRow?.label || profile.structured.headline || "Candidate";
+  const name = profileRow?.label || profile.structured.identity.name ||
+    profile.structured.career_summary.headline || "Candidate";
   const contentHtml = renderCoverLetterHtml(name, letterBody);
 
   try {
@@ -4687,12 +5282,40 @@ const DASHBOARD_PAGE = `<!doctype html>
     padding: 0.7rem 0.9rem; background: var(--surface-2); border: 1px solid var(--border);
     border-radius: var(--radius-sm);
   }
-  .role-analysis-role strong { display: block; margin-bottom: 0.25rem; font-size: 0.92rem; }
-  .role-analysis-role p { margin: 0; font-size: 0.85rem; color: var(--text-muted); line-height: 1.45; }
+  .role-analysis-role p { margin: 0 0 0.4rem; font-size: 0.85rem; color: var(--text-muted); line-height: 1.45; }
+  /* The collapsed card is a two-line scan target: title, then the one-line fit summary. With 5-10
+     role families on the page, anything taller stops being comparable at a glance. */
+  .role-analysis-role > summary { cursor: pointer; display: flex; flex-direction: column; gap: 0.15rem; align-items: flex-start; }
+  .role-analysis-role > summary::-webkit-details-marker { display: none; }
+  .role-card-title { font-weight: 650; font-size: 0.95rem; }
+  .role-card-fit { font-size: 0.85rem; color: var(--text-muted); line-height: 1.4; }
+  .role-card-body { margin-top: 0.7rem; padding-top: 0.7rem; border-top: 1px solid var(--border); }
+  .role-market { margin-top: 0.8rem; padding-top: 0.7rem; border-top: 1px dashed var(--border); }
+  .role-market .badge { margin-bottom: 0.35rem; }
+
+  /* Profile → Summary. The record is far larger than a resume, so nesting and collapsibility are
+     doing the work of keeping it reviewable rather than overwhelming. */
+  .profile-name { font-size: 1.15rem; font-weight: 700; }
+  .profile-group { margin-top: 0.9rem; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
+  .profile-group > summary {
+    cursor: pointer; padding: 0.6rem 0.8rem; display: flex; align-items: center; gap: 0.5rem;
+    justify-content: space-between; min-height: 44px;
+  }
+  .profile-group > summary::-webkit-details-marker { display: none; }
+  .profile-group-title { font-weight: 650; }
+  .profile-card { padding: 0.7rem 0.8rem; border-top: 1px solid var(--border); }
+  .profile-subcard { margin: 0.5rem 0 0 0.9rem; padding-left: 0.7rem; border-left: 2px solid var(--border); }
+  .profile-subcard-title { font-weight: 600; font-size: 0.88rem; }
+  .profile-field-label {
+    margin-top: 0.55rem; font-size: 0.74rem; font-weight: 700; letter-spacing: 0.04em;
+    text-transform: uppercase; color: var(--text-muted);
+  }
+  .profile-bullets { margin: 0.2rem 0 0; padding-left: 1.1rem; font-size: 0.85rem; color: var(--text-muted); line-height: 1.5; }
+  .raw-json { overflow-x: auto; font-size: 0.75rem; line-height: 1.4; white-space: pre-wrap; word-break: break-word; }
   section {
     margin: 0 0 1.1rem; padding: 1.15rem 1.25rem; background: var(--surface);
     border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
-  }
+Let me check the placeholder embraces like a variable name, gets its value when the prompt is compile careful. This is one of the prompts I'm using and the response first read it and let's talk about it. All right, so basically this gets used to analyze what kind of roles are suitable for you. So the idea would be you know if you are let's say you're a teacher and you put all your experience maybe it can like tell you that you're suitable for there's other rules suitable for you for me right I was a teacher and I did a lot of different snake things in tech I can't I'm not sure exactly what you know what what roles are suitable for me out like I don't know what those rules are so the idea is this is supposed to build a profile of like the kind of things my skills my strengths and stuff like that and then the next step is it's gonna take that and it's gonna analyze like what kind of roles I'm suitable for and explain what those roles are okay so right now this is just generating the profile and then you want to take out somewhere else and have it run against potential jobs so even before that I'm going to have another language model call that's basically going to look at this and say like okay like I'm trying to basically work through if you actually went in imagine you went into a service that helps you find a job and you paid them a lot of money and they're super professional I imagine the first thing you would do is they'd want to know like tell me everything about you tell me everything you've done before all your past history and like everything like this and it builds a profile of your skills and everything and then the next step after that is okay now I know everything about you now let me look at the job market and see what kind of roles actually exist that match that which is that makes sense yeah so what kind of helps you on here so basically I want to restructure this prompt like you could see the prompt and I agree the writing style completely be gone that's not necessary that's a mistake but I like of course we don't want to invent stuff but like basically what we want to do is like create a complete you know profile of them and I don't know like I guess maybe if we I don't know the example of the perfect structured output but maybe that's a good idea for us to have I suppose but like what would you suggest like if would it make sense for this to be structured for the next language models to look at let me take us like and think through a concrete structure i think your instinct is right here so separating out the steps into something like evidence to profile to career analysis to role generation each step is clean and focused and you build on each step in order and then the final job evaluation step compare jobs against that structured profile plus the preferences and then your first prompt is just about building that deep profile not focused on optimized for job matching yet the profiles richer than a resume right shouldn't this profile should be structured and so like wouldn't it make sense because like of course your resume is not going to include a lot of stuff but like later on like for example what I'm gonna want to do is have an agent that like talks to you like when you make a resume there's certain like later on there's certain things you need like you know did a project with seven percent growth like you you you want to like say certain stuff people don't know to add that so like here you're just kind of putting everything to everything like you're saying it's like you go to your taxes here's everything I have you know you ingest it you make a structured profile that I guess you know it's pretty obvious we should have like school a category for school like I guess it would be all the different categories of things that go into a resume like written in a way where it's easy later for someone who's good at like putting together the resume to grab pieces from it and so we probably want to be structured so what would be like the standard structure you would have like you know education and then for each education you have like what the school is when you went there you know what like what you what you majored in like all like yeah all this kind of stuff and then it would be like education previous roles skills you know maybe maybe like technical skills not technical skills like so can you can you right now I'm gonna turn off voice mode I want you to basically suggest a structured profile that would like encapsulate everything even with I guess in other category that everything should go absolutely okay this is good but not specifically just for me like I don't know if maybe like mentoring but like mentoring if you're mentoring it would be within a specific job so the idea here is like within each job you know these things like anything you do that is mentoring should be within a job you know like everything should be related to that job because like later what we're gonna do is probably pick the jobs that matter like the jobs to include that matter and same thing it's like I guess awards and honors are like if you get an award and an honor and it's you know inside school it goes with that school but it makes sense that where's honors are here outside school community outreach is good actually this is pretty good okay great so now I want you now we need to make the prompt and I think for the prompt we probably want to give it the correct schema so I'm going to give you the prompt we have now because that'll show the variables and I suppose you need to give the exact schema with like an example with fake information and make sure you have something for each so it knows the format so like make something up for each section and like it should know how to do it if there's multiple for example if there's two schools that should be clear if there's projects and research make a full prompt that gives that example in it actually before you do that can you tell me if I'm giving an example schema and I am working in lag fuse what's the smart way to have the example schema because I suppose it's gonna like scored for how well it matches like how good should I just manually build it in here or does it go somewhere else I ordered some CBD oh thank you so that's what I currently have for the prompt so you want you to fix the prompt based on this but I think if the current profile doesn't match the schema make sure the new one does, but maybe we don't even need to say that actually you have a connector can you connect to GitHub and you check this project apply go and check this for me so I'm worried I'm looking here and I see it gives you the current profile and source material for new material question is when this prompt is going through when it gives you the new material is that all of the material or only the stuff that's been added recently because I'm worried if you if this generate if this did a bad job before then we're only looking at like the structured profile although we do need the structured profile so my question is currently does the source material everything or just the new stuff and what should we do about that so just answer me that how do I erase so like when I put answers into apply go hello yeah like the pull down tab it shows a check mark first name checkmark last name and I think my problem is I wrote down it's like recalling the wrong thing like when's the earliest you want to start working with us and so it's gotten its memory how to answer these questions and some of these are pulled down tabs and for the pull down tabs it didn't it's I think it's still not recognizing them am I doing something wrong like I got to reload the extension okay hold on a second it's still not recognizing that pull down tab for country if I click it it shows different countries but we need to figure out a better way of extracting like you know doing these pull downs you can see it I like that it shows it didn't accept it but I need a way to do this I need a way can you find a way to make it automatic also you said there were other changes that were not committed can you check them and if you think they're a good idea tell me what they are and then commit them if you think they're a good idea okay do let's change it like you said and let's also get rid of that character limit or at least make it a character limit I think no one's gonna upload pages that are you know more than five pages so any document that's more than five pages worth of characters you can get rid of it you can truncate it or maybe ten pages no no one's gonna do it but do that and so I think all you need to do is give me the prompt yeah the prompt and the config which I think you're saying is the structured output so if you can give me first the prompt autonik config is for like an example structure so where are we supposed to add the example structure it's supposed to be in the prompt okay knowing all that give me the perfect prompt that's totally complete right now this one is supposed to find rolls like the result supposed to tell you like what kind of jobs what kind of job roles like imagine you don't really know what jobs are called like what job roles are actually probably a decent fit the ones that are worth like worth looking for like basically yeah the result the result of this will support company discovery so which kind of companies should even look for but then also which kind of jobs are suitable like it'll do like a filter you know and only pull back jobs that like are like this that are similar to this also you have access to the repo so take a look and I want you to find the meaning of these variables I'm assuming candidate background is their profile but I'm not sure notes locations deal breakers these are all like the criteria for what they want to do so I think the idea here is yeah I want you to look through the repo and make sure this all still makes sense right now I have two language model calls I think profile structure and rolesanalyze I think that's right is that it's creating your profile. Let's talk about can you check the workflow of all this so you understand where the information comes from and then let's talk about it all right let's kind of think this through together and I think what we're going to do is come up with a plan and I'm going to give this to like Claude Opus and have it make these changes and also like connect to update the prompts like automatically and lang fuse let's think about this so the idea I had was like you go in order forced rolls then resume then companies so it's like okay roles but I guess the question really is with the current way we're doing this if you go in order then you're looking through roles and try to come up with roles before it looks at your resume right right yeah so really you'd want the resume first the full picture and then roll second then companies is that what you're getting at I wonder if we should change roles like call roles to profile maybe and but we do kind of want like people come if they want a job it's like there's the concept of like your profile and then there's like what is it you want and then we work on resumes so like the idea is currently the resume tab now the idea was you know you upload everything all the your resume stuff and then it makes your master resume and that kind of like has everything and then from there you have like custom resumes for each job where their master resume you would never send that out but it's just like basically has kind of everything for each job even if it's not formatted the correct way I mean it's formatted the correct way but you know all that information does it make sense even to have a master resume like that i think there's a cleaner separation than what you have right now where roles becomes your profile first like who is this candidate and that's fed by resume and notes and then after that you go into career direction which is like what kinds of roles and companies should we target and then after that you can get to resume tailoring which is just about presentation and not about changing the underlying data and on your master resume point I'd probably rename that to a master career profile not a resume just to remove the idea of page limits and marketing constraints and then just keep it as a canonical data record then you can generate tailored resumes from that without losing any of the source information in the process of tailoring all right so for the tabs what are you saying right now it's rolls resume what do you think for the first tab should be I call the first tab profile and make it the canonical career record like your structured facts about the person then the second could be brolls and targets or maybe career direction something that makes it clear that it's about discovery and not just titles and then resumes come after that as a presentation layer that ordering lines up with the actual table profile careers resume oh yeah that's even cleaner profile is talk about what goes in profile profile is yeah profile would include your work history details accomplishments responsibilities skills education media short narrative arc but it's all factual no preferences or job targets just the evidence so profile should be where you upload your documents like your resume exactly upload everything there your resume CV notes anything and that builds the structure profile underneath okay so let's talk about then the careers tab so in profile right now like in resume I have a documents tab so let's imagine that's going to move into profile okay so within profile docs makes sense as one subtab then another could be structured profile where you see and can lightly edit what the system extract it keep it minimal but transparent how about it's yeah docs should be the one where you okay so there's one tab docs and there you just it works just like the resume documents tab now where you're basically choosing a file and uploading it and that's it yeah that works simple upload extra logs like the from the resume we have the notes tab this is where they can also just paste in information paste more stuff they can add you know a bunch of notes they can also invoice go voice to text and just talk so like this is where they're just adding like text instead of a document yeah nice so within profile choose subtops dogs for files notes for free form text or voice under the hood both feed into the same structured profile builder you have those two and then let's talk about what happens you so you add those two and you would want to like then see your structured profile like it's basically should take those because now it has everything about yeah but if like your profile so so for example your profile doesn't include you want to work remotely that's more to do with like job right so profile is purely background that's like super structure that has your job your all the colleges you went to and everything that's it that's where the education job skills accomplishments live no preferences yet okay so then how how are we going to get it like I guess we want to like generate it and have to be able to see it in some nice pretty printed JSON format and yeah totally after Docs and notes are processed show the structured profile in a breedable JSON due blood people notes and then a third tab is what we call it because we shouldn't call it profile because we're already on the profile tab should be something analysis analysis or maybe extracted profile something that signals this is what we understood what are some more options sure parsed profile profile preview structured view review and confirm for like put it all together consolidate profile or unified profile how about summary just summary short and clear summary when you go to the summary tab now there's like a little button you press that's basically like regenerate or generate if you've never generated a regenerate profile and then it does this prompt this prompt that takes that information and then consolidates it and like make makes that structure json file and it's not formatted like a resume but it's in that structure like exactly the structure we saw and it shouldn't show like you know curly braces like it should look pretty printed should look really nice with with like you know the indentations are good like really easy for human to read right a clean human friendly view with I'm sorry but you've reached your daily GPT Live One limit for today you can continue with GPT Live One can hear me loud and clear what's on your mind so do you remember what we were just talking about quick summary what did we just talk about right we were talking about reorganizing the apt tabs so that it's profile careers resume and within profile subtops for docs uploads do careers and so for careers here this is like what it is that you want which comes from like the roles and so if you look at current what we have for roles it was like what are you looking for pace job links and so I think what we want is a couple we want we want one of them which is like you kind of you would be able to write you know unstructured text about what kind of jobs you're looking for as you might know so what do we call that not targets but like maybe desired roles or role role preferences something like that it signals what you want without forcing a specific drop type that's good preferences and then here the idea is like here you're supposed to loosely write about you know it's okay you can just basically say what jobs you want so you can say you can say the exact name of the role the official name or you could say like oh I want to roll where I do this and this and I get to do this and this so it needs to be able to be loose but also like give you the exact answer if you give the exact answer or they can be like loose either one and that's that's this first one right okay maybe call that roll signals or roll notes do what I said I said career preferences call it preferences in the next one preferences let's have it be examples and then this is the one where there's like good like you can you it's optional but you can put in job links you found that are good and like basically you can add one add to like good or bad or desired or undesired and then you can like put a job link and you can have like a text optional where you explain why and then for example you could say oh i don't like this job because it requires you know such and such experience so you can add those so this is like examples of good jobs and bad jobs checking i like that so in careers you'd have preferences for free form wants like exact titles or things to avoid then examples good and bad job postings with URLs and notes and location which is already what we have in roles but this isn't careers same thing deal breakers and then also criterion works the way it works now and then we need you know to and then the idea here is like okay that its own subtap call the button analyze careers it takes profile plus all careers inputs and outputs a rolls subtab then roll shows a summary role families keywords and why they fit with a re analyze button and maybe rename criteria to priori yeah you're right rename criteria to priorities this is good and then for analysis yeah i guess we'll put it yeah let's call it rolls because i think we're not using that now so instead of what it currently says analysis it says rolls and then that kind of operates like it does now where you analyze or reanalyze and it takes everything and it tells you like the kind of careers that you're looking for and I think what actually would be a good idea is like to say like for each one like for example I got I got a result of applied A engineer and it explains what it is and that's good but maybe like you said maybe like it shows that it gives the name of the job the kind of the job title and then maybe we should do the thing where you like click it and expand so imagine you've got ten of them you click it and expands and there it should show like why it shows it for you it should show like you know like analysis of like if this is a career that is you know increasing you know with government reports or whatever in that location and also like the expected salary for you know for your experience level checking yeah I like that extended cards per roll default shows role title and a short match summary span to see so now we said we have profile what was it profile career and what was the next one resume resume we've already uploaded everything so the current resume tab we don't need the documents anymore and I guess we don't need the notes anymore because we already added that somewhere else checking right so resume becomes just generate application documents so a master resume tailored resumes per job and cover letters that keeps profile as the canonical data it probably doesn't maybe it didn't make sense to be said to have like one giant master resume that's like five pages long I think right so maybe it just makes sense I don't know maybe we don't need sub tabs like basically all the resumes but then I think it would make sense is like we're I think we're gonna have a lot of different resumes but I think it would make sense is like for each of those job roles to generate a resume for that job role keep a general resume as the default then generate tailored versions per roll posting profile is the source of true let's say it puts you to like five different types of jobs five different like roles I would like to have a way where it makes your you make a resume for like to start with you make a resume for each roll type right so after analyzed careers generate a base resume per role type like applied AI engineer resume and then tailor from that you could also link each expandable role card in the roles page to generate resume button yeah how about that in the careers in the role yeah in the careers page under roles like where we were expanding each one no you know what maybe let's not do that let's do it in the resume page we got to have this in the resumes page we've got why don't we have like a rolls we think I'm trying to find a way to organize it checking I shift to organizing the resumes themselves so you see cards for each resume with roll tags attached symbolists no extra subtabs for example applied AI engineer resume last updated today open or regenerate then you can have career resumes as base versions and job specific resumes clearly linked back to those I think something like that makes sense I think you can use your best judgment on that because I'm going to have to make you have you make a prompt for that but I think that's what we want to do and what I want you to do now okay so I want you to do now is I'm going to ask you to make a prompt for opus so this can be like a big task and this is basically going to make all those changes and make sure like the it looks at the prompts and make you know and the prompts lying fuse and like actually updates everything this is going to be like kind of a big restructure to do all this check in I think this war in a big refactor pumped for opus make it an architecture migration restructure Ui tabs to profile I think I might go shopping so that's my credits replenish in ten minutes and I can send a big job in or I need bread cheese we have mayonise I'm sure covers are good here wipes tonight we don't use to do it tomorrow right tomorrow is Sunday we really don't have any food huh so maybe I'll cook once twice pork chip I get chicken again pork chicken we went rice right progress I see it read them now but it should be pretty obvious like it should know like basically it should have the line I want the language model to think about it and answer it should be pretty obvious which of these is America and if it's not only if it's not obvious ask me sort of like a virtual world I think and you and other people walk around and sort of maybe solve puzzles I've never played but we'll check it out and let you know do you want to go in a couple minutes you don't what y'all go about a new arrival by myself again this cookies for me actually a problem here is like it showed me all these to pick from and I picked it but it still didn't accept it so somehow like even though it's reading them it's not able to write them all right let's do it what's that package only a meat can be here so where do we go beans and broke always first I have a lot of that give me one of the lives do you have plugin everything away it's on drink back probably  }
   h2 { font-size: 1.0rem; font-weight: 650; margin: 0 0 0.7rem; letter-spacing: -0.01em; }
   h3 { font-size: 0.92rem; font-weight: 650; margin: 1.4rem 0 0.5rem; }
   p.hint { color: var(--text-muted); font-size: 0.85rem; line-height: 1.45; margin: -0.35rem 0 0.85rem; }
@@ -4768,6 +5391,35 @@ const DASHBOARD_PAGE = `<!doctype html>
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.24), inset 0 0 0 1px rgba(255, 255, 255, 0.18);
   }
   .segmented-control button:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--accent); outline-offset: -1px; }
+  /* Mobile replacement for a .segmented-control: a row of pagination dots plus the current
+     subsection's name, with horizontal swipe doing the actual navigating (see the
+     initMobileSubnav script below). Hidden by default -- the media query below is what turns
+     it on and hides the segmented control it stands in for, only on screens too narrow to fit
+     every sub-tab label on one line. */
+  .mobile-subnav { display: none; }
+  @media (max-width: 640px) {
+    /* Visually hidden rather than display:none -- the buttons still do the real navigating
+       (the dots/swipe are cosmetic, see initMobileSubnav below), so a screen reader or keyboard
+       user needs them to stay reachable even though sighted mobile users no longer see them. */
+    .segmented-control.has-mobile-subnav {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+      clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
+    .mobile-subnav {
+      display: flex; flex-direction: column; align-items: center; gap: 0.3rem; margin-bottom: 1rem;
+    }
+    .mobile-subnav-dots { display: flex; align-items: center; gap: 0.4rem; }
+    .mobile-subnav-dot {
+      width: 6px; height: 6px; border-radius: 50%; background: var(--border-strong); padding: 0;
+      transition: background 0.12s ease, transform 0.12s ease;
+    }
+    .mobile-subnav-dot.active { background: var(--accent); transform: scale(1.25); }
+    .mobile-subnav-label { font-size: 0.95rem; font-weight: 650; color: var(--text); }
+  }
+  /* Settings tab's gear icon replaces its text label but keeps the same button box, so it needs
+     to center the icon the way a short text label centers itself. */
+  nav button.tab-icon { display: inline-flex; align-items: center; justify-content: center; }
+  nav button.tab-icon svg { display: block; }
   details.disclosure {
     margin-top: 1.1rem; border-top: 1px solid var(--border); padding-top: 0.9rem;
   }
@@ -5018,37 +5670,81 @@ const DASHBOARD_PAGE = `<!doctype html>
   </header>
 
   <nav id="workflow-nav">
-    <button class="tab active" data-tab="roles" type="button">Roles</button>
+    <button class="tab active" data-tab="profile" type="button">Profile</button>
+    <button class="tab" data-tab="careers" type="button">Careers</button>
     <button class="tab" data-tab="resume" type="button">Resume</button>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
     <button class="tab" data-tab="jindr" type="button">Jindr</button>
-    <button class="tab" data-tab="settings" type="button">Settings</button>
+    <button class="tab tab-icon" data-tab="settings" type="button" aria-label="Settings" title="Settings">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+      </svg>
+      <span class="sr-only">Settings</span>
+    </button>
   </nav>
 
-  <div id="panel-roles" class="panel active">
-    <div class="segmented-control" role="group" aria-label="Role sections">
-      <button class="subtab active" data-subtab="notes" type="button">Targets</button>
+  <div id="panel-careers" class="panel">
+    <div class="segmented-control" role="group" aria-label="Careers sections">
+      <button class="subtab active" data-subtab="notes" type="button">Preferences</button>
+      <button class="subtab" data-subtab="examples" type="button">Examples</button>
       <button class="subtab" data-subtab="locations" type="button">Location</button>
       <button class="subtab" data-subtab="dealbreakers" type="button">Deal Breakers</button>
-      <button class="subtab" data-subtab="criteria" type="button">Criteria</button>
-      <button class="subtab" data-subtab="analysis" type="button">Analysis</button>
+      <button class="subtab" data-subtab="criteria" type="button">Priorities</button>
+      <button class="subtab" data-subtab="analysis" type="button">Roles</button>
     </div>
 
     <div id="subpanel-notes" class="subpanel active">
       <section id="role-signals-section">
-        <h2>What are you looking for?</h2>
-        <p class="hint">Paste job links, or write loosely about what you want next. The more you add, the better the analysis on the Analysis tab.</p>
+        <h2>What kind of work do you want?</h2>
+        <p class="hint">Describe the direction you want your career to go, in your own words. Knowing the exact title is fine ("Applied AI Engineer"), and so is only knowing how you want the work to feel ("technical, building prototypes, explaining things to customers, not infrastructure all day"). This is preference data, not proof of qualification -- what you <em>can</em> do comes from your Profile. The more you add, the better the Roles tab gets.</p>
         <details id="role-signals-details" class="disclosure">
           <summary id="role-signals-summary">Notes on file</summary>
           <div id="role-signals-list"><p class="empty">Loading…</p></div>
         </details>
         <form id="role-signal-form">
-          <label for="role-signal-text">Add a note or link</label>
-          <textarea id="role-signal-text" required placeholder="e.g. a link to a posting, or 'I want senior IC roles in applied AI, remote-friendly, not pure infra'"></textarea>
+          <label for="role-signal-text">Add a preference</label>
+          <textarea id="role-signal-text" required placeholder="e.g. 'Applied AI Engineer or Solutions Engineer working with AI products, hands-on prototyping rather than pure research, customer-facing technical work'"></textarea>
           <button type="submit">Add</button>
         </form>
         <p id="role-signal-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="subpanel-examples" class="subpanel">
+      <section id="role-examples-good-section">
+        <h2>Good examples</h2>
+        <p class="hint">Jobs that represent the kind of opportunity you want -- open, closed, old, already applied to, or purely illustrative, it doesn't matter. Paste a link and we'll try to read the posting; if it can't be fetched, your reason alone still counts.</p>
+        <details id="role-examples-good-details" class="disclosure">
+          <summary id="role-examples-good-summary">Good examples on file</summary>
+          <div id="role-examples-good-list"><p class="empty">Loading…</p></div>
+        </details>
+        <form id="role-example-good-form">
+          <label for="role-example-good-url">Job URL</label>
+          <input id="role-example-good-url" type="url" required placeholder="https://...">
+          <label for="role-example-good-reason">Why is this a good fit? (optional)</label>
+          <textarea id="role-example-good-reason" placeholder="e.g. This is almost exactly what I want because it combines applied AI development with customer-facing technical work."></textarea>
+          <button type="submit">Add</button>
+        </form>
+        <p id="role-example-good-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+
+      <section id="role-examples-bad-section">
+        <h2>Bad examples</h2>
+        <p class="hint">Jobs that represent the kind of opportunity you don't want. Same idea -- the posting is evidence, and the reason is supplementary context.</p>
+        <details id="role-examples-bad-details" class="disclosure">
+          <summary id="role-examples-bad-summary">Bad examples on file</summary>
+          <div id="role-examples-bad-list"><p class="empty">Loading…</p></div>
+        </details>
+        <form id="role-example-bad-form">
+          <label for="role-example-bad-url">Job URL</label>
+          <input id="role-example-bad-url" type="url" required placeholder="https://...">
+          <label for="role-example-bad-reason">Why is this a poor fit? (optional)</label>
+          <textarea id="role-example-bad-reason" placeholder="e.g. Too much pure infrastructure work and not enough product or customer interaction."></textarea>
+          <button type="submit">Add</button>
+        </form>
+        <p id="role-example-bad-status" class="status" role="status" aria-live="polite"></p>
       </section>
     </div>
 
@@ -5076,8 +5772,8 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     <div id="subpanel-criteria" class="subpanel">
       <section id="criteria-section">
-        <h2>Criteria</h2>
-        <p class="hint">What do you care about? Write it however you'd say it out loud -- saving reads what you meant and turns it into the fact columns below, so you don't have to phrase it as labels. These are the topics you want at a glance for every posting, not targets to filter on (Dealbreakers is where you rule things out), and they never affect the score.</p>
+        <h2>Priorities</h2>
+        <p class="hint">What do you care about? Write it however you'd say it out loud -- saving reads what you meant and turns it into the fact columns below, so you don't have to phrase it as labels. These are the topics you want surfaced and compared at a glance for every posting, not filters (Deal Breakers is where you rule things out), and they never affect the score.</p>
         <label for="care-about">What do you care about? (optional)</label>
         <textarea id="care-about" placeholder="e.g. Salary, years of experience required, remote or in office, typical hours"></textarea>
         <div id="care-about-topics" class="row-facts"></div>
@@ -5088,32 +5784,31 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     <div id="subpanel-analysis" class="subpanel">
       <section id="role-analysis-section">
-        <h2>Analysis</h2>
-        <p class="hint">What the model thinks you're suited for, based on your notes, your profile, and the Locations/Dealbreakers/Criteria tabs. This is what filters which postings you even see. Editing the other tabs and switching away reanalyzes automatically; use Reanalyze to force a fresh pass right now.</p>
+        <h2>Roles</h2>
+        <p class="hint">The distinct role families worth searching for, reasoned from your full Profile together with your Preferences, Examples, Location, Deal Breakers and Priorities. A posting only has to match one of these strongly to be worth surfacing. This is what filters which postings you see. Editing the other tabs and switching away re-runs this automatically.</p>
         <label for="role-analysis-provider">Analyze using</label>
         <select id="role-analysis-provider">
           <option value="anthropic">Anthropic (Claude)</option>
           <option value="openai">OpenAI</option>
         </select>
-        <button id="role-analysis-button" class="secondary" type="button"><span class="ai-icon" aria-hidden="true"></span>Reanalyze</button>
+        <button id="role-analysis-button" class="secondary" type="button"><span class="ai-icon" aria-hidden="true"></span>Analyze Careers</button>
         <p id="role-analysis-status" class="status" role="status" aria-live="polite"></p>
-        <div id="role-analysis-view"><p class="empty">Not analyzed yet -- click Reanalyze, or add a note on the Notes tab and switch tabs.</p></div>
+        <div id="role-analysis-view"><p class="empty">Not analyzed yet -- click Reanalyze, or add something on the Description or Examples tab and switch tabs.</p></div>
       </section>
     </div>
   </div>
 
-  <div id="panel-resume" class="panel">
-    <div class="segmented-control" role="group" aria-label="Resume sections">
-      <button class="active" data-resume-subtab="documents" type="button">Documents</button>
-      <button data-resume-subtab="notes" type="button">Notes</button>
-      <button data-resume-subtab="master" type="button">Master</button>
-      <button data-resume-subtab="versions" type="button">Resumes</button>
+  <div id="panel-profile" class="panel active">
+    <div class="segmented-control" role="group" aria-label="Profile sections">
+      <button class="subtab active" data-profile-subtab="docs" type="button">Docs</button>
+      <button class="subtab" data-profile-subtab="notes" type="button">Notes</button>
+      <button class="subtab" data-profile-subtab="summary" type="button">Summary</button>
     </div>
 
-    <div id="resume-subpanel-documents" class="subpanel active">
+    <div id="profile-subpanel-docs" class="subpanel active">
       <section id="material-section">
         <h2>Documents</h2>
-        <p class="hint">Upload resumes, cover letters, or other career material. PDF, Word (.doc and .docx), plain text, and Markdown are supported.</p>
+        <p class="hint">Upload resumes, CVs, and other professional documents. Everything you upload here is read in full when your Profile is generated -- not just the newest file. PDF, Word (.doc and .docx), plain text, and Markdown are supported.</p>
         <div id="documents-list"><p class="empty">Loading…</p></div>
         <form id="document-form">
           <label for="document-file">Choose a document</label>
@@ -5124,82 +5819,93 @@ const DASHBOARD_PAGE = `<!doctype html>
       </section>
     </div>
 
-    <div id="resume-subpanel-notes" class="subpanel">
+    <div id="profile-subpanel-notes" class="subpanel">
       <section id="notes-section">
         <h2>Notes</h2>
-        <p class="hint">Paste a complete resume, or add accomplishments, updates, context, and experience that may not appear in your formal documents.</p>
+        <p class="hint">Factual career evidence in your own words -- type it, paste it, or dictate it with your device's voice-to-text. Good things to add: what you actually did in a role, accomplishments and numbers, projects and the technologies behind them, education, awards, independent work. Anything a resume left out belongs here. This is about what you <em>have done</em>; what you <em>want next</em> goes under Careers.</p>
         <div id="notes-list"><p class="empty">Loading…</p></div>
         <form id="note-form">
-          <label for="note-text">Paste resume text or add a note</label>
-          <textarea id="note-text" required style="min-height:14rem" placeholder="Paste plain-text resume content, or write anything the master resume should know about…"></textarea>
+          <label for="note-text">Add factual career evidence</label>
+          <textarea id="note-text" required style="min-height:14rem" placeholder="e.g. At Acme I ran the migration off the legacy pipeline — 4 engineers, 9 months, cut nightly batch time from 6h to 40min. Also onboarded every new hire on the data team."></textarea>
           <button type="submit">Add</button>
         </form>
         <p id="note-status" class="status" role="status" aria-live="polite"></p>
       </section>
     </div>
 
-    <div id="resume-subpanel-master" class="subpanel">
-      <div class="split">
-        <div>
-        <section id="resume-master-section">
-          <h2>Master resume</h2>
-          <p class="hint">Builds a structured profile from all Documents and Notes, then creates one deliberately oversized resume containing everything. This is the source for future tailored versions, not a document to submit.</p>
-          <label for="resume-provider">Build using</label>
-          <select id="resume-provider">
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI</option>
-          </select>
-          <button id="resume-master-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Build or update master</button>
-          <p id="resume-master-status" class="status" role="status" aria-live="polite"></p>
-        </section>
-        <section id="master-profile-section">
-          <h2>Structured source</h2>
-          <p class="hint">Generated automatically as part of the master build and used by matching and tailored resumes.</p>
-          <div id="resume-profile-view"><p class="empty">Build the master resume to create this source.</p></div>
-        </section>
-        </div>
-        <section id="master-preview-section" style="display:none">
-          <h2>Master preview</h2>
-          <iframe id="master-preview-frame" style="width:100%; min-height:75vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
-          <div id="master-checks"></div>
-        </section>
+    <div id="profile-subpanel-summary" class="subpanel">
+      <section id="career-profile-section">
+        <h2>Summary</h2>
+        <p class="hint">Your career evidence record, built from every document and note above. This is the factual source of truth the whole app reads from -- career analysis, job matching, and every resume. It is deliberately far more complete than any single resume would be; a resume selects from this, it never replaces it.</p>
+        <label for="profile-provider">Generate using</label>
+        <select id="profile-provider">
+          <option value="anthropic">Anthropic (Claude)</option>
+          <option value="openai">OpenAI</option>
+        </select>
+        <button id="profile-generate-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Generate Profile</button>
+        <p id="profile-generate-status" class="status" role="status" aria-live="polite"></p>
+        <div id="career-profile-view"><p class="empty">Loading…</p></div>
+        <details id="career-profile-raw-details" class="disclosure" style="display:none">
+          <summary>Raw structured data</summary>
+          <pre id="career-profile-raw" class="raw-json"></pre>
+        </details>
+      </section>
+    </div>
+  </div>
+
+  <div id="panel-resume" class="panel">
+    <section id="resume-generate-section">
+      <h2>Resumes</h2>
+      <p class="hint">A resume selects and rewrites evidence from your Profile for one target. It never adds anything your Profile doesn't already support. Build one baseline per career path, then tailor per job from the Jobs tab.</p>
+      <div id="resume-no-profile" class="empty" style="display:none">Generate your Profile first — resumes are built from it.</div>
+
+      <div id="resume-build-controls">
+        <label for="resume-role-family">Career path</label>
+        <select id="resume-role-family"></select>
+        <label for="resume-template">Template</label>
+        <div id="resume-template-choices" class="template-choices"></div>
+        <label for="resume-instructions">Instructions for this version (optional)</label>
+        <textarea id="resume-instructions" placeholder="e.g. keep it to one page, emphasize leadership, target a backend-heavy role"></textarea>
+        <label for="resume-pages">Length</label>
+        <select id="resume-pages">
+          <option value="1">One page</option>
+          <option value="2">Up to two pages</option>
+        </select>
+        <label for="resume-provider">Build using</label>
+        <select id="resume-provider">
+          <option value="anthropic">Anthropic (Claude)</option>
+          <option value="openai">OpenAI</option>
+        </select>
+        <button id="resume-generate-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Generate resume</button>
+        <p id="resume-generate-status" class="status" role="status" aria-live="polite"></p>
       </div>
-    </div>
+    </section>
 
-    <div id="resume-subpanel-versions" class="subpanel">
-        <section id="resume-generate-section">
-          <h2>Resume versions</h2>
-          <label for="resume-template">Template</label>
-          <div id="resume-template-choices" class="template-choices"></div>
-          <label for="resume-instructions">Instructions for this version (optional)</label>
-          <textarea id="resume-instructions" placeholder="e.g. keep it to one page, emphasize leadership, target a backend-heavy role"></textarea>
-          <label for="resume-pages">Length</label>
-          <select id="resume-pages">
-            <option value="1">One page</option>
-            <option value="2">Up to two pages</option>
-          </select>
-          <button id="resume-generate-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Generate new version</button>
-          <p id="resume-generate-status" class="status" role="status" aria-live="polite"></p>
-        </section>
+    <section id="resume-career-list-section">
+      <h2>Career resumes</h2>
+      <p class="hint">One baseline per career path from your Roles tab. Same evidence, different emphasis.</p>
+      <div id="resumes-career-list"><p class="empty">Loading…</p></div>
+    </section>
 
-        <section id="resume-list-section">
-          <div id="resumes-list"><p class="empty">Loading…</p></div>
-        </section>
+    <section id="resume-job-list-section">
+      <h2>Job-specific resumes</h2>
+      <p class="hint">Tailored to one posting. Created from a job on the Jobs tab.</p>
+      <div id="resumes-job-list"><p class="empty">Loading…</p></div>
+    </section>
 
-        <section id="resume-preview-section" style="display:none">
-          <h2>Preview</h2>
-          <iframe id="resume-preview-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
+    <section id="resume-preview-section" style="display:none">
+      <h2>Preview</h2>
+      <iframe id="resume-preview-frame" style="width:100%; min-height:70vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
 
-          <div id="resume-checks"></div>
+      <div id="resume-checks"></div>
 
-          <h3>Design review</h3>
-          <p class="hint">A vision model looks at the rendered page the way a designer would, then adjusts the layout — and rewrites the wording from your verified profile if that's the real problem. Add a comment to steer it, or leave it blank and just hit revise.</p>
-          <p id="resume-critique" class="critique" style="display:none"></p>
-          <textarea id="resume-review-comment" placeholder="Optional — e.g. too much white space at the bottom, make the skills section smaller"></textarea>
-          <button id="resume-review-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Revise this version</button>
-          <p id="resume-review-status" class="status" role="status" aria-live="polite"></p>
-        </section>
-    </div>
+      <h3>Design review</h3>
+      <p class="hint">A vision model looks at the rendered page the way a designer would, then adjusts the layout — and rewrites the wording from your verified profile if that's the real problem. Add a comment to steer it, or leave it blank and just hit revise.</p>
+      <p id="resume-critique" class="critique" style="display:none"></p>
+      <textarea id="resume-review-comment" placeholder="Optional — e.g. too much white space at the bottom, make the skills section smaller"></textarea>
+      <button id="resume-review-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Revise this version</button>
+      <p id="resume-review-status" class="status" role="status" aria-live="polite"></p>
+    </section>
   </div>
 
   <div id="panel-companies" class="panel">
@@ -5607,10 +6313,10 @@ const DASHBOARD_PAGE = `<!doctype html>
   <script>
     document.querySelectorAll('nav .tab').forEach(function (tabButton) {
       tabButton.addEventListener('click', function () {
-        // Leaving the Roles tab with unsaved edits (or having never analyzed at all) is exactly
-        // when a stale/missing analysis would otherwise silently sit there -- see maybeReanalyzeRoles.
-        var leavingRolesDirty = tabButton.dataset.tab !== 'roles'
-          && document.getElementById('panel-roles').classList.contains('active');
+        // Leaving Careers with unsaved edits (or having never analyzed at all) is exactly when a
+        // stale/missing analysis would otherwise silently sit there -- see maybeReanalyzeRoles.
+        var leavingRolesDirty = tabButton.dataset.tab !== 'careers'
+          && document.getElementById('panel-careers').classList.contains('active');
         document.querySelectorAll('nav .tab').forEach(function (b) { b.classList.remove('active'); });
         document.querySelectorAll('.panel').forEach(function (p) { p.classList.remove('active'); });
         tabButton.classList.add('active');
@@ -5625,12 +6331,12 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
     });
 
-    document.querySelectorAll('[data-resume-subtab]').forEach(function (subtabButton) {
+    document.querySelectorAll('[data-profile-subtab]').forEach(function (subtabButton) {
       subtabButton.addEventListener('click', function () {
-        document.querySelectorAll('[data-resume-subtab]').forEach(function (button) { button.classList.remove('active'); });
-        document.querySelectorAll('#panel-resume > .subpanel').forEach(function (panel) { panel.classList.remove('active'); });
+        document.querySelectorAll('[data-profile-subtab]').forEach(function (button) { button.classList.remove('active'); });
+        document.querySelectorAll('#panel-profile > .subpanel').forEach(function (panel) { panel.classList.remove('active'); });
         subtabButton.classList.add('active');
-        document.getElementById('resume-subpanel-' + subtabButton.dataset.resumeSubtab).classList.add('active');
+        document.getElementById('profile-subpanel-' + subtabButton.dataset.profileSubtab).classList.add('active');
       });
     });
 
@@ -5648,6 +6354,140 @@ const DASHBOARD_PAGE = `<!doctype html>
         document.getElementById('settings-subpanel-' + subtabButton.dataset.settingsSubtab).classList.add('active');
       });
     });
+
+    // Mobile replacement for a .segmented-control row of secondary tabs: pagination dots plus
+    // the current subsection's name, with the actual navigating done by a horizontal swipe
+    // anywhere in the page content. Desktop keeps the segmented control as-is (see the
+    // .has-mobile-subnav media query above) -- this only changes how the same buttons are
+    // reached on a screen too narrow to show every label at once.
+    //
+    // Deliberately built on top of the existing per-section click handlers rather than
+    // duplicating their logic: each subtab button already knows how to activate itself (toggle
+    // a subpanel, refetch a list, whatever), so swiping just clicks the next/previous button and
+    // lets that handler do its normal job. That also means the dots/label stay correct even when
+    // something other than a swipe changes the active button (a plain click, or code elsewhere
+    // calling .click()).
+    var mobileSwipeTargets = {};
+
+    // Pulls a button's own label text, ignoring nested elements like a live count badge
+    // ("Added <span id=...>3</span>") so the mobile label reads "Added", not "Added 3".
+    function subtabLabelText(button) {
+      var label = '';
+      button.childNodes.forEach(function (node) {
+        if (node.nodeType === Node.TEXT_NODE) label += node.textContent;
+      });
+      label = label.trim();
+      return label || button.textContent.trim();
+    }
+
+    function initMobileSubnav(container) {
+      if (!container) return null;
+      var buttons = Array.prototype.slice.call(container.children).filter(function (node) {
+        return node.tagName === 'BUTTON';
+      });
+      if (buttons.length < 2) return null;
+
+      container.classList.add('has-mobile-subnav');
+      var nav = el('div', { className: 'mobile-subnav' });
+      var dots = el('div', { className: 'mobile-subnav-dots' });
+      dots.setAttribute('role', 'tablist');
+      dots.setAttribute('aria-hidden', 'true');
+      var label = el('div', { className: 'mobile-subnav-label' });
+      label.setAttribute('aria-live', 'polite');
+      buttons.forEach(function () { dots.appendChild(el('span', { className: 'mobile-subnav-dot' })); });
+      nav.appendChild(dots);
+      nav.appendChild(label);
+      container.parentNode.insertBefore(nav, container);
+
+      function activeIndex() {
+        var idx = buttons.findIndex(function (b) { return b.classList.contains('active'); });
+        return idx === -1 ? 0 : idx;
+      }
+      function sync() {
+        var idx = activeIndex();
+        Array.prototype.forEach.call(dots.children, function (dot, i) { dot.classList.toggle('active', i === idx); });
+        label.textContent = subtabLabelText(buttons[idx]);
+      }
+      // Deferred rather than run inline: this listener is wired up before the section's own
+      // click handler that actually moves the .active class (e.g. the Companies/Jobs view
+      // handlers are registered much further down the script), so reading the active button
+      // synchronously here would always be one click stale. A zero-delay timeout runs after
+      // every click listener attached in the same tick has finished, including ones added later
+      // in the file, so the dots/label end up correct regardless of listener order.
+      buttons.forEach(function (button) { button.addEventListener('click', function () { setTimeout(sync, 0); }); });
+      sync();
+
+      return {
+        next: function () { var idx = activeIndex(); if (idx < buttons.length - 1) buttons[idx + 1].click(); },
+        prev: function () { var idx = activeIndex(); if (idx > 0) buttons[idx - 1].click(); },
+      };
+    }
+
+    [
+      ['panel-profile', document.querySelector('#panel-profile .segmented-control')],
+      ['panel-careers', document.querySelector('#panel-careers .segmented-control')],
+      ['panel-companies', document.getElementById('companies-view-tabs')],
+      ['panel-jobs', document.getElementById('jobs-view-tabs')],
+      ['panel-settings', document.querySelector('#panel-settings .segmented-control')],
+    ].forEach(function (entry) {
+      var controller = initMobileSubnav(entry[1]);
+      if (controller) mobileSwipeTargets[entry[0]] = controller;
+    });
+
+    // A touch is treated as a page-swipe candidate only when it starts outside any element that
+    // is already horizontally scrollable on its own (the primary nav, a .subtabs row, etc) --
+    // checked dynamically by scroll width rather than a hardcoded selector list, so it keeps
+    // working if more such rows are added later. Direction is locked in on the first move past a
+    // small deadzone by comparing |dx| to |dy|, so an intentional vertical scroll never gets
+    // reinterpreted as a swipe partway through.
+    (function () {
+      function isInsideHorizontalScroller(node) {
+        while (node && node !== document.body) {
+          if (node.scrollWidth > node.clientWidth + 1) {
+            var overflowX = getComputedStyle(node).overflowX;
+            if (overflowX === 'auto' || overflowX === 'scroll') return true;
+          }
+          node = node.parentElement;
+        }
+        return false;
+      }
+
+      var startX = 0, startY = 0, tracking = false, horizontal = null, controller = null;
+      var SWIPE_THRESHOLD = 50;
+      var DIRECTION_DEADZONE = 10;
+      var HORIZONTAL_RATIO = 1.5;
+
+      document.addEventListener('touchstart', function (e) {
+        tracking = false;
+        if (e.touches.length !== 1) return;
+        if (e.target.closest && (e.target.closest('input, textarea, select') || isInsideHorizontalScroller(e.target))) return;
+        var panel = document.querySelector('.panel.active');
+        controller = panel && mobileSwipeTargets[panel.id];
+        if (!controller) return;
+        startX = e.touches[0].clientX;
+        startY = e.touches[0].clientY;
+        horizontal = null;
+        tracking = true;
+      }, { passive: true });
+
+      document.addEventListener('touchmove', function (e) {
+        if (!tracking || horizontal !== null) return;
+        var dx = e.touches[0].clientX - startX;
+        var dy = e.touches[0].clientY - startY;
+        if (Math.abs(dx) > DIRECTION_DEADZONE || Math.abs(dy) > DIRECTION_DEADZONE) {
+          horizontal = Math.abs(dx) > Math.abs(dy) * HORIZONTAL_RATIO;
+        }
+      }, { passive: true });
+
+      document.addEventListener('touchend', function (e) {
+        if (!tracking) return;
+        tracking = false;
+        if (!horizontal || !controller) return;
+        var dx = e.changedTouches[0].clientX - startX;
+        if (Math.abs(dx) < SWIPE_THRESHOLD) return;
+        if (dx < 0) controller.next(); else controller.prev();
+      }, { passive: true });
+    })();
 
     // Drives the nav's edge fades (see .can-scroll-* above). Runs on scroll and on resize, plus
     // once at startup so the initial state is right before anything is touched.
@@ -5786,10 +6626,10 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     // --- Roles page: sub-tabs, the three raw preference inputs, and the derived analysis ---
 
-    document.querySelectorAll('#panel-roles [data-subtab]').forEach(function (subtabButton) {
+    document.querySelectorAll('#panel-careers [data-subtab]').forEach(function (subtabButton) {
       subtabButton.addEventListener('click', function () {
-        document.querySelectorAll('#panel-roles [data-subtab]').forEach(function (b) { b.classList.remove('active'); });
-        document.querySelectorAll('#panel-roles .subpanel').forEach(function (p) { p.classList.remove('active'); });
+        document.querySelectorAll('#panel-careers [data-subtab]').forEach(function (b) { b.classList.remove('active'); });
+        document.querySelectorAll('#panel-careers .subpanel').forEach(function (p) { p.classList.remove('active'); });
         subtabButton.classList.add('active');
         document.getElementById('subpanel-' + subtabButton.dataset.subtab).classList.add('active');
         if (subtabButton.dataset.subtab === 'analysis') maybeReanalyzeRoles();
@@ -5846,23 +6686,143 @@ const DASHBOARD_PAGE = `<!doctype html>
     // empty state and the auto-trigger conditions below key off this.
     var currentRoleAnalysis = null;
 
+    /** Market research keyed by role title, filled in asynchronously after the cards render. */
+    var roleMarketData = {};
+
+    function renderMarketSection(role, host) {
+      var market = roleMarketData[role.title];
+      var section = el('div', { className: 'role-market' });
+      section.appendChild(el('div', { className: 'profile-field-label', textContent: 'Market context' }));
+
+      if (!market) {
+        section.appendChild(el('div', { className: 'row-meta', textContent: 'Looking up market data…' }));
+        host.appendChild(section);
+        return;
+      }
+      // The honest empty state. Never replaced by a model's recollection of salary figures --
+      // see src/market.ts for why that distinction is load-bearing.
+      if (market.unavailable) {
+        section.appendChild(el('div', { className: 'row-meta', textContent: 'Market data not yet available for this role.' }));
+        host.appendChild(section);
+        return;
+      }
+
+      var direction = market.demand_direction || 'unclear';
+      section.appendChild(el('span', { className: 'badge ' + (direction === 'growing' ? 'strong' : 'queued'), textContent: 'Demand: ' + direction }));
+      if (market.outlook_summary) section.appendChild(el('p', { className: 'row-meta', textContent: market.outlook_summary }));
+      if (market.typical_salary_range) {
+        section.appendChild(el('div', { className: 'row-meta', textContent: 'Typical range: ' + market.typical_salary_range }));
+      }
+      if (market.salary_for_experience_level) {
+        section.appendChild(el('div', { className: 'row-meta', textContent: 'At your level: ' + market.salary_for_experience_level }));
+      }
+      if (market.geographic_notes) {
+        section.appendChild(el('div', { className: 'row-meta', textContent: 'Your locations: ' + market.geographic_notes }));
+      }
+      (market.caveats || []).forEach(function (caveat) {
+        section.appendChild(el('div', { className: 'row-meta', textContent: '⚠ ' + caveat }));
+      });
+      if (market.sources && market.sources.length) {
+        var sources = el('div', { className: 'row-meta' });
+        sources.appendChild(text('Sources: '));
+        market.sources.forEach(function (source, index) {
+          if (index) sources.appendChild(text(' · '));
+          sources.appendChild(el('a', { href: source.url, target: '_blank', rel: 'noopener', textContent: source.name }));
+        });
+        section.appendChild(sources);
+      }
+      host.appendChild(section);
+    }
+
+    /**
+     * Role families as compact expandable cards.
+     *
+     * Collapsed shows only title plus a one-line fit summary, because a candidate may end up with
+     * 5-10 of these and the list has to stay scannable enough to compare them at a glance. Every
+     * detail the analysis produced -- including the evidence behind each fit claim, which is what
+     * makes a surprising recommendation believable rather than arbitrary -- lives one tap away.
+     */
     function renderRoleAnalysis(analysis) {
       currentRoleAnalysis = analysis && analysis.roles && analysis.roles.length ? analysis : null;
       var host = document.getElementById('role-analysis-view');
       host.innerHTML = '';
       if (!currentRoleAnalysis) {
-        host.appendChild(el('p', { className: 'empty', textContent: 'Not analyzed yet -- click Reanalyze, or add a note on the Notes tab and switch tabs.' }));
+        host.appendChild(el('p', {
+          className: 'empty',
+          textContent: 'No careers analyzed yet — press Analyze Careers, or add something under Preferences or Examples and switch tabs.',
+        }));
         return;
       }
-      host.appendChild(el('p', { textContent: currentRoleAnalysis.summary }));
+      if (currentRoleAnalysis.summary) host.appendChild(el('p', { textContent: currentRoleAnalysis.summary }));
+
       var list = el('div', { className: 'role-analysis-roles' });
       currentRoleAnalysis.roles.forEach(function (role) {
-        var card = el('div', { className: 'role-analysis-role' });
-        card.appendChild(el('strong', { textContent: role.title }));
-        card.appendChild(el('p', { textContent: role.description }));
+        var card = el('details', { className: 'role-analysis-role' });
+        var summary = el('summary', {}, [
+          el('span', { className: 'role-card-title', textContent: role.title }),
+          el('span', { className: 'role-card-fit', textContent: role.fit_summary || '' }),
+        ]);
+        card.appendChild(summary);
+
+        var body = el('div', { className: 'role-card-body' });
+        if (role.alternate_titles && role.alternate_titles.length) {
+          body.appendChild(el('div', { className: 'profile-field-label', textContent: 'Also posted as' }));
+          body.appendChild(el('div', { className: 'row-meta', textContent: role.alternate_titles.join(' · ') }));
+        }
+        var meta = [role.seniority, (role.domains || []).join(', ')].filter(Boolean).join(' · ');
+        if (meta) body.appendChild(el('div', { className: 'row-meta', textContent: meta }));
+
+        if (role.why_this_fits && role.why_this_fits.length) {
+          body.appendChild(el('div', { className: 'profile-field-label', textContent: 'Why this fits you' }));
+          role.why_this_fits.forEach(function (item) {
+            var block = el('div', { className: 'profile-subcard' });
+            block.appendChild(el('div', { className: 'profile-subcard-title', textContent: item.claim }));
+            (item.evidence || []).forEach(function (evidence) {
+              block.appendChild(el('div', { className: 'row-meta', textContent: '• ' + evidence }));
+            });
+            body.appendChild(block);
+          });
+        }
+
+        profileBullets('Must have', role.must_have_characteristics, body);
+        profileBullets('Nice to have', role.nice_to_have_characteristics, body);
+        profileBullets('Gaps and cautions', role.possible_gaps_or_cautions, body);
+
+        var searchTerms = (role.search_title_terms || []).concat(role.search_keywords || []);
+        if (searchTerms.length) {
+          body.appendChild(el('div', { className: 'profile-field-label', textContent: 'Search terms' }));
+          var pills = el('div', { className: 'skills-list' });
+          searchTerms.forEach(function (term) {
+            pills.appendChild(el('span', { className: 'skill-pill', textContent: term }));
+          });
+          body.appendChild(pills);
+        }
+
+        renderMarketSection(role, body);
+        card.appendChild(body);
         list.appendChild(card);
       });
       host.appendChild(list);
+    }
+
+    /**
+     * Fetches market context after the cards are already on screen.
+     *
+     * Deliberately not awaited by the analysis flow: research hits external providers that can be
+     * slow or unreachable, and the candidate-facing half of this page must never wait on them.
+     */
+    async function loadRoleMarketData() {
+      if (!currentRoleAnalysis) return;
+      try {
+        var res = await api('/role-market?provider=' + encodeURIComponent(document.getElementById('role-analysis-provider').value));
+        var data = await res.json();
+        if (!res.ok) return;
+        roleMarketData = data.research || {};
+        renderRoleAnalysis(currentRoleAnalysis);
+      } catch (err) {
+        // Leaving the "looking up" line in place is a better failure than an error banner on a
+        // section that is supplementary to the actual recommendation.
+      }
     }
 
     // 'silent' is set by every auto-trigger path (page load, leaving the Roles tab, opening the
@@ -5889,6 +6849,8 @@ const DASHBOARD_PAGE = `<!doctype html>
           throw new Error(errorMessage(data, 'generation_failed'));
         }
         renderRoleAnalysis(data.role_analysis);
+        renderResumeRoleChoices(data.role_analysis);
+        loadRoleMarketData();
         if (!silent) {
           statusEl.textContent = 'Analyzed just now.';
           statusEl.className = 'status success';
@@ -5928,7 +6890,14 @@ const DASHBOARD_PAGE = `<!doctype html>
         document.getElementById('care-about').value = data.profile.care_about || '';
         renderCareAboutTopics(data.profile.care_about_topics);
         renderRoleAnalysis(data.profile.role_analysis);
-        renderStructuredProfileView('resume-profile-view', data.profile.structured);
+        renderResumeRoleChoices(data.profile.role_analysis);
+        renderStructuredProfileView('career-profile-view', data.profile.structured);
+        if (data.profile.role_analysis) loadRoleMarketData();
+        setProfileButtonMode(Boolean(data.profile.structured));
+        // Resumes are built from the profile, so the build controls are meaningless without one.
+        var hasProfile = Boolean(data.profile.structured);
+        document.getElementById('resume-no-profile').style.display = hasProfile ? 'none' : '';
+        document.getElementById('resume-build-controls').style.display = hasProfile ? '' : 'none';
         maybeReanalyzeRoles();
       }
     }
@@ -5984,43 +6953,69 @@ const DASHBOARD_PAGE = `<!doctype html>
       section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
 
+    /**
+     * Renders the resume list as two card groups: career baselines (one per role family) and
+     * job-specific tailored versions. Split rather than one flat list because the two answer
+     * different questions -- "which career am I presenting for?" versus "which application is this
+     * for?" -- and a single list mixed them into something you had to read the name to decode.
+     */
     async function loadResumes() {
       var res = await api('/resumes');
       var data = await res.json();
       if (data.templates) renderTemplateChoices(data.templates);
-      var list = document.getElementById('resumes-list');
+
+      // Master resumes are retired as a concept but old rows are deliberately not deleted, so they
+      // are filtered out of the UI rather than migrated or destroyed.
+      var all = (data.resumes || []).filter(function (resume) { return !resume.is_master; });
+      var career = all.filter(function (resume) { return !resume.job_id; });
+      var jobSpecific = all.filter(function (resume) { return Boolean(resume.job_id); });
+
+      renderResumeCards('resumes-career-list', career, 'No career resumes yet — pick a career path above and generate one.');
+      renderResumeCards('resumes-job-list', jobSpecific, 'No job-specific resumes yet — open a job on the Jobs tab to tailor one.');
+    }
+
+    function renderResumeCards(listId, resumes, emptyText) {
+      var list = document.getElementById(listId);
+      if (!list) return;
       list.innerHTML = '';
-      var master = data.resumes.find(function (resume) { return Boolean(resume.is_master); });
-      var versions = data.resumes.filter(function (resume) { return !resume.is_master; });
-      if (master) {
-        document.getElementById('master-preview-section').style.display = 'block';
-        document.getElementById('master-preview-frame').src =
-          '/resumes/' + encodeURIComponent(master.id) + '/file?v=' + Date.now();
-        var masterChecks = [];
-        try { masterChecks = JSON.parse(master.checks_json || '[]'); } catch (e) { masterChecks = []; }
-        renderChecks(masterChecks, 'master-checks');
-      }
-      if (!versions.length) {
-        list.appendChild(el('p', { className: 'empty', textContent: 'No resume versions yet — generate one above.' }));
+      if (!resumes.length) {
+        list.appendChild(el('p', { className: 'empty', textContent: emptyText }));
         return;
       }
-      versions.forEach(function (resume) {
-        var preview = el('a', {
+      resumes.forEach(function (resume) {
+        var title = el('a', {
           className: 'row-title',
           href: '/resumes/' + encodeURIComponent(resume.id) + '/file',
           target: '_blank',
           rel: 'noopener',
-          textContent: resume.name,
+          textContent: resume.role_family || resume.name,
         });
-        var previewInline = el('button', { type: 'button', textContent: 'Preview' });
-        previewInline.addEventListener('click', function () {
+        var subtitleText = resume.role_family
+          ? 'Base resume for this career path'
+          : (resume.job_title
+              ? 'Tailored for ' + resume.job_title + (resume.job_company ? ' at ' + resume.job_company : '')
+              : resume.name);
+        var meta = [
+          resume.template || 'classic',
+          'rev ' + (resume.revision || 1),
+          'updated ' + new Date(resume.created_at).toLocaleDateString(),
+        ].join(' · ');
+
+        var open = el('button', { type: 'button', textContent: 'Open' });
+        open.addEventListener('click', function () {
           var checks = [];
           try { checks = JSON.parse(resume.checks_json || '[]'); } catch (e) { checks = []; }
           showResumePreview(resume.id, checks, resume.critique);
         });
+        var regenerate = el('button', { className: 'secondary', type: 'button', textContent: 'Regenerate' });
+        regenerate.addEventListener('click', function () {
+          var select = document.getElementById('resume-role-family');
+          if (select && resume.role_family) select.value = resume.role_family;
+          document.getElementById('resume-generate-button').click();
+        });
         var rename = el('button', { type: 'button', textContent: 'Rename' });
         rename.addEventListener('click', async function () {
-          var name = window.prompt('New name for this resume version:', resume.name);
+          var name = window.prompt('New name for this resume:', resume.name);
           if (!name) return;
           await api('/resumes/' + encodeURIComponent(resume.id), {
             method: 'PATCH',
@@ -6034,65 +7029,41 @@ const DASHBOARD_PAGE = `<!doctype html>
           await api('/resumes/' + encodeURIComponent(resume.id), { method: 'DELETE' });
           loadResumes();
         });
-        var meta = [
-          resume.template || 'classic',
-          'rev ' + (resume.revision || 1),
-          new Date(resume.created_at).toLocaleString(),
-        ].join(' · ');
-        var row = el('div', { className: 'row' }, [
-          el('div', {}, [preview, el('div', { className: 'row-meta', textContent: meta })]),
-          el('div', { className: 'row-actions' }, [previewInline, rename, del]),
-        ]);
-        list.appendChild(el('div', { className: 'row-item' }, [row]));
+
+        var actions = [open];
+        if (resume.role_family) actions.push(regenerate);
+        actions.push(rename, del);
+
+        list.appendChild(el('div', { className: 'row-item' }, [
+          el('div', { className: 'row' }, [
+            el('div', {}, [
+              title,
+              el('div', { className: 'row-meta', textContent: subtitleText }),
+              el('div', { className: 'row-meta', textContent: meta }),
+            ]),
+            el('div', { className: 'row-actions' }, actions),
+          ]),
+        ]));
       });
     }
 
-    document.getElementById('resume-master-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('resume-master-status');
-      var provider = document.getElementById('resume-provider').value;
-      var button = this;
-      button.disabled = true;
-      statusEl.textContent = 'Reading your documents and notes, then building the master resume…';
-      statusEl.className = 'status';
-      try {
-        var profileRes = await api('/profile/generate', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ provider: provider }),
-        });
-        var profileData = await requireJsonResponse(profileRes, 'profile_generation_failed');
-
-        var saveRes = await api('/profile/structured', {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ structured: profileData.draft_structured }),
-        });
-        await requireJsonResponse(saveRes, 'profile_save_failed');
-        renderStructuredProfileView('resume-profile-view', profileData.draft_structured);
-        statusEl.textContent = 'Profile ready. Rendering the master resume…';
-
-        var res = await api('/resumes/master', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ provider: provider }),
-        });
-        var data = await requireJsonResponse(res, 'master_resume_generation_failed');
-        statusEl.textContent =
-          'Archive built: ' + data.roles + ' role' + (data.roles === 1 ? '' : 's') + ', ' +
-          data.bullets + ' accomplishment' + (data.bullets === 1 ? '' : 's') + ' on file.';
-        statusEl.className = 'status success';
-        await loadResumes();
-        document.getElementById('master-preview-section').style.display = 'block';
-        document.getElementById('master-preview-frame').src =
-          '/resumes/' + encodeURIComponent(data.id) + '/file?v=' + Date.now();
-        renderChecks(data.checks, 'master-checks');
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      } finally {
-        button.disabled = false;
+    /** Populates the career-path picker from the current role analysis. */
+    function renderResumeRoleChoices(analysis) {
+      var select = document.getElementById('resume-role-family');
+      if (!select) return;
+      var previous = select.value;
+      select.innerHTML = '';
+      var roles = (analysis && analysis.roles) || [];
+      if (!roles.length) {
+        select.appendChild(el('option', { value: '', textContent: 'General — no career paths analyzed yet' }));
+        return;
       }
-    });
+      select.appendChild(el('option', { value: '', textContent: 'General (all career paths)' }));
+      roles.forEach(function (role) {
+        select.appendChild(el('option', { value: role.title, textContent: role.title }));
+      });
+      if (previous) select.value = previous;
+    }
 
     document.getElementById('resume-generate-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('resume-generate-status');
@@ -6107,6 +7078,7 @@ const DASHBOARD_PAGE = `<!doctype html>
             provider: document.getElementById('resume-provider').value,
             template: selectedTemplate,
             max_pages: Number(document.getElementById('resume-pages').value),
+            role_family: (document.getElementById('resume-role-family') || {}).value || '',
           }),
         });
         var data = await res.json();
@@ -6183,51 +7155,313 @@ const DASHBOARD_PAGE = `<!doctype html>
       });
     }
 
+    // --- Profile → Summary: the canonical career record, rendered for a human ---
+
+    /** A labelled list of short strings, rendered as an indented bullet run. */
+    function profileBullets(label, items, host) {
+      if (!items || !items.length) return;
+      host.appendChild(el('div', { className: 'profile-field-label', textContent: label }));
+      var ul = el('ul', { className: 'profile-bullets' });
+      items.forEach(function (item) { ul.appendChild(el('li', { textContent: item })); });
+      host.appendChild(ul);
+    }
+
+    /** A collapsible group. Long sections start closed so the page stays scannable. */
+    function profileGroup(title, count, openByDefault) {
+      var details = el('details', { className: 'profile-group' });
+      details.open = Boolean(openByDefault);
+      var summary = el('summary', {}, [
+        el('span', { className: 'profile-group-title', textContent: title }),
+      ]);
+      if (count) summary.appendChild(el('span', { className: 'badge', textContent: String(count) }));
+      details.appendChild(summary);
+      return details;
+    }
+
+    function renderProfileProject(project, host) {
+      var card = el('div', { className: 'profile-subcard' });
+      card.appendChild(el('div', { className: 'profile-subcard-title', textContent: project.name }));
+      if (project.description) card.appendChild(el('p', { className: 'row-meta', textContent: project.description }));
+      if (project.problem_or_purpose) {
+        card.appendChild(el('p', { className: 'row-meta', textContent: 'Purpose: ' + project.problem_or_purpose }));
+      }
+      profileBullets('Work performed', project.work_performed, card);
+      profileBullets('Technologies', project.technologies_and_methods, card);
+      profileBullets('Outcomes', project.outcomes, card);
+      profileBullets('Metrics', project.metrics, card);
+      profileBullets('Awards', project.awards_and_honors, card);
+      profileBullets('Skills demonstrated', project.skills_demonstrated, card);
+      host.appendChild(card);
+    }
+
+    /** Aggregate sections (skills, tools, signals) all render the same way: claim + its evidence. */
+    function renderEvidencedSection(title, items, nameKey, host) {
+      if (!items || !items.length) return;
+      var group = profileGroup(title, items.length, false);
+      items.forEach(function (item) {
+        var row = el('div', { className: 'profile-subcard' });
+        row.appendChild(el('div', { className: 'profile-subcard-title', textContent: item[nameKey] || item.name || '' }));
+        if (item.evidence && item.evidence.length) {
+          row.appendChild(el('div', { className: 'row-meta', textContent: item.evidence.join(' · ') }));
+        }
+        group.appendChild(row);
+      });
+      host.appendChild(group);
+    }
+
+    function renderSimpleListSection(title, items, host) {
+      if (!items || !items.length) return;
+      var group = profileGroup(title, items.length, false);
+      items.forEach(function (item) {
+        group.appendChild(el('div', { className: 'profile-subcard' }, [
+          el('div', { className: 'row-meta', textContent: item }),
+        ]));
+      });
+      host.appendChild(group);
+    }
+
+    /**
+     * Renders the CareerProfile as a hierarchical, readable document rather than a JSON dump.
+     *
+     * The record is deliberately much larger than a resume, so the shape of this view is doing real
+     * work: sections are collapsible, the two the candidate most wants to verify (experience and
+     * education) start open, and evidence stays visually nested under the role or project it came
+     * from -- which is the same provenance rule the data model itself is built on. Raw JSON is still
+     * reachable behind a details element for debugging, but it is never the default experience.
+     */
     function renderStructuredProfileView(containerId, structured) {
       var container = document.getElementById(containerId);
+      if (!container) return;
       container.innerHTML = '';
+
       var hasContent = structured && (
-        structured.headline || structured.narrative_summary ||
-        (structured.education && structured.education.length) ||
-        (structured.experience && structured.experience.length) ||
-        (structured.skills && structured.skills.length)
+        (structured.career_summary && (structured.career_summary.headline || structured.career_summary.narrative_summary)) ||
+        (structured.work_experience && structured.work_experience.length) ||
+        (structured.education && structured.education.length)
       );
       if (!hasContent) {
-        container.appendChild(el('p', { className: 'empty', textContent: 'No structured profile yet — add material on the left and generate.' }));
+        container.appendChild(el('p', {
+          className: 'empty',
+          textContent: 'No profile yet — add documents and notes, then press Generate Profile.',
+        }));
         return;
       }
-      if (structured.headline) container.appendChild(el('div', { className: 'row-title', textContent: structured.headline }));
-      if (structured.narrative_summary) container.appendChild(el('p', { textContent: structured.narrative_summary }));
-      if (structured.education && structured.education.length) {
-        container.appendChild(el('h3', { className: 'subhead', textContent: 'Education' }));
-        structured.education.forEach(function (item) {
-          var line = [item.degree, item.field].filter(Boolean).join(' in ');
-          var years = [item.start_year, item.end_year].filter(Boolean).join('–');
-          container.appendChild(el('div', { className: 'row-item', textContent: [line, item.school, years].filter(Boolean).join(' · ') }));
-        });
+
+      var summary = structured.career_summary || {};
+      var identity = structured.identity || {};
+
+      if (identity.name) container.appendChild(el('div', { className: 'profile-name', textContent: identity.name }));
+      if (summary.headline) container.appendChild(el('div', { className: 'row-title', textContent: summary.headline }));
+      var idBits = [identity.location, identity.email, identity.phone].filter(Boolean);
+      if (identity.citizenship_or_work_authorization && identity.citizenship_or_work_authorization.length) {
+        idBits = idBits.concat(identity.citizenship_or_work_authorization);
       }
-      if (structured.experience && structured.experience.length) {
-        container.appendChild(el('h3', { className: 'subhead', textContent: 'Experience' }));
-        structured.experience.forEach(function (item) {
-          var years = [item.start, item.end].filter(Boolean).join('–');
-          var block = el('div', { className: 'row-item' }, [
-            el('div', { className: 'row-title', textContent: [item.title, item.company].filter(Boolean).join(' — ') + (years ? ' (' + years + ')' : '') }),
-          ]);
-          (item.highlights || []).forEach(function (h) {
-            block.appendChild(el('div', { className: 'row-meta', textContent: '• ' + h }));
+      if (idBits.length) container.appendChild(el('div', { className: 'row-meta', textContent: idBits.join(' · ') }));
+      if (identity.links && identity.links.length) {
+        var links = el('div', { className: 'row-meta' });
+        identity.links.forEach(function (link, index) {
+          if (index) links.appendChild(text(' · '));
+          links.appendChild(el('a', { href: link.url, target: '_blank', rel: 'noopener', textContent: link.label || link.url }));
+        });
+        container.appendChild(links);
+      }
+      if (summary.narrative_summary) container.appendChild(el('p', { textContent: summary.narrative_summary }));
+
+      // Experience -- the densest section, and the one worth opening by default.
+      if (structured.work_experience && structured.work_experience.length) {
+        var expGroup = profileGroup('Work experience', structured.work_experience.length, true);
+        structured.work_experience.forEach(function (role) {
+          var card = el('div', { className: 'profile-card' });
+          var span = [role.start_date, role.current ? 'Present' : role.end_date].filter(Boolean).join(' – ');
+          card.appendChild(el('div', {
+            className: 'row-title',
+            textContent: [role.title, role.organization].filter(Boolean).join(' — ') + (span ? ' (' + span + ')' : ''),
+          }));
+          var roleMeta = [role.location, role.employment_type].filter(Boolean).join(' · ');
+          if (roleMeta) card.appendChild(el('div', { className: 'row-meta', textContent: roleMeta }));
+          if (role.description) card.appendChild(el('p', { className: 'row-meta', textContent: role.description }));
+
+          profileBullets('Responsibilities', role.responsibilities, card);
+          (role.achievements || []).length && card.appendChild(el('div', { className: 'profile-field-label', textContent: 'Achievements' }));
+          (role.achievements || []).forEach(function (achievement) {
+            var line = achievement.description +
+              (achievement.metrics && achievement.metrics.length ? ' (' + achievement.metrics.join('; ') + ')' : '');
+            card.appendChild(el('div', { className: 'row-meta', textContent: '• ' + line }));
           });
-          container.appendChild(block);
+          profileBullets('Leadership and management', role.leadership_and_management, card);
+          profileBullets('Mentoring and teaching', role.mentoring_and_teaching, card);
+          profileBullets('Stakeholder and client work', role.stakeholder_and_client_work, card);
+          profileBullets('Communication and documentation', role.communication_and_documentation, card);
+          profileBullets('Technologies and methods', role.technologies_and_methods, card);
+          profileBullets('Skills demonstrated', role.skills_demonstrated, card);
+          (role.projects || []).forEach(function (project) { renderProfileProject(project, card); });
+
+          expGroup.appendChild(card);
         });
+        container.appendChild(expGroup);
       }
-      if (structured.skills && structured.skills.length) {
-        container.appendChild(el('h3', { className: 'subhead', textContent: 'Skills' }));
-        var pills = el('div', { className: 'skills-list' });
-        structured.skills.forEach(function (skill) {
-          pills.appendChild(el('span', { className: 'skill-pill', textContent: skill }));
+
+      if (structured.education && structured.education.length) {
+        var eduGroup = profileGroup('Education', structured.education.length, true);
+        structured.education.forEach(function (item) {
+          var card = el('div', { className: 'profile-card' });
+          var line = [item.degree, item.field_of_study].filter(Boolean).join(' in ');
+          var years = [item.start_date, item.end_date].filter(Boolean).join(' – ');
+          card.appendChild(el('div', {
+            className: 'row-title',
+            textContent: [line || 'Study', item.institution].filter(Boolean).join(' · ') + (years ? ' (' + years + ')' : ''),
+          }));
+          if (item.specialization) {
+            card.appendChild(el('div', { className: 'row-meta', textContent: 'Specialization: ' + item.specialization }));
+          }
+          profileBullets('Coursework', item.coursework, card);
+          profileBullets('Activities', item.activities, card);
+          profileBullets('Awards and honors', item.awards_and_honors, card);
+          (item.projects || []).forEach(function (project) { renderProfileProject(project, card); });
+          (item.research || []).forEach(function (research) {
+            var sub = el('div', { className: 'profile-subcard' });
+            sub.appendChild(el('div', { className: 'profile-subcard-title', textContent: research.topic }));
+            if (research.description) sub.appendChild(el('p', { className: 'row-meta', textContent: research.description }));
+            profileBullets('Contributions', research.contributions, sub);
+            profileBullets('Outcomes', research.outcomes, sub);
+            card.appendChild(sub);
+          });
+          eduGroup.appendChild(card);
         });
-        container.appendChild(pills);
+        container.appendChild(eduGroup);
+      }
+
+      if (structured.independent_projects && structured.independent_projects.length) {
+        var projGroup = profileGroup('Independent projects', structured.independent_projects.length, false);
+        structured.independent_projects.forEach(function (project) {
+          var card = el('div', { className: 'profile-card' });
+          card.appendChild(el('div', {
+            className: 'row-title',
+            textContent: project.name + (project.dates ? ' (' + project.dates + ')' : ''),
+          }));
+          if (project.project_type) card.appendChild(el('div', { className: 'row-meta', textContent: project.project_type }));
+          if (project.description) card.appendChild(el('p', { className: 'row-meta', textContent: project.description }));
+          if (project.problem_or_purpose) {
+            card.appendChild(el('p', { className: 'row-meta', textContent: 'Purpose: ' + project.problem_or_purpose }));
+          }
+          profileBullets('Work performed', project.work_performed, card);
+          profileBullets('Technologies', project.technologies_and_methods, card);
+          profileBullets('Outcomes', project.outcomes, card);
+          profileBullets('Metrics', project.metrics, card);
+          profileBullets('Skills demonstrated', project.skills_demonstrated, card);
+          projGroup.appendChild(card);
+        });
+        container.appendChild(projGroup);
+      }
+
+      if (structured.research_and_publications && structured.research_and_publications.length) {
+        var pubGroup = profileGroup('Research and publications', structured.research_and_publications.length, false);
+        structured.research_and_publications.forEach(function (item) {
+          var card = el('div', { className: 'profile-card' });
+          card.appendChild(el('div', { className: 'row-title', textContent: item.title }));
+          var pubMeta = [item.type, item.venue, item.date, item.authorship_role].filter(Boolean).join(' · ');
+          if (pubMeta) card.appendChild(el('div', { className: 'row-meta', textContent: pubMeta }));
+          profileBullets('Contributions', item.contributions, card);
+          profileBullets('Recognition', item.recognition, card);
+          pubGroup.appendChild(card);
+        });
+        container.appendChild(pubGroup);
+      }
+
+      renderEvidencedSection('Technical skills', structured.technical_skills, 'skill', container);
+      renderEvidencedSection('Tools and technologies', structured.tools_and_technologies, 'name', container);
+      renderEvidencedSection('Professional skills', structured.professional_skills, 'skill', container);
+      renderEvidencedSection('Domain knowledge', structured.domain_knowledge, 'domain', container);
+      renderEvidencedSection('Career signals', structured.career_signals, 'signal', container);
+
+      renderSimpleListSection('Certifications and training', structured.certifications_and_training, container);
+      renderSimpleListSection('Awards and honors', structured.independent_awards_and_honors, container);
+      renderSimpleListSection('Community and volunteer', structured.community_outreach_and_volunteer, container);
+      renderSimpleListSection('Professional memberships', structured.professional_memberships, container);
+      renderSimpleListSection('Languages', structured.languages, container);
+
+      if (structured.other && structured.other.length) {
+        var otherGroup = profileGroup('Other', structured.other.length, false);
+        structured.other.forEach(function (item) {
+          otherGroup.appendChild(el('div', { className: 'profile-subcard' }, [
+            el('div', { className: 'profile-subcard-title', textContent: item.category }),
+            el('div', { className: 'row-meta', textContent: item.description }),
+          ]));
+        });
+        container.appendChild(otherGroup);
+      }
+
+      // Gaps last: they are the app asking the candidate for more, not part of the record itself.
+      if (structured.evidence_gaps && structured.evidence_gaps.length) {
+        var gapGroup = profileGroup('What would strengthen this profile', structured.evidence_gaps.length, false);
+        gapGroup.appendChild(el('p', {
+          className: 'hint',
+          textContent: 'Nothing here is a problem with your profile — these are things the app could not determine from your documents. Answering any of them in Notes and regenerating will improve it.',
+        }));
+        structured.evidence_gaps.forEach(function (gap) {
+          var card = el('div', { className: 'profile-subcard' });
+          card.appendChild(el('div', { className: 'profile-subcard-title', textContent: gap.topic }));
+          if (gap.missing_information) card.appendChild(el('div', { className: 'row-meta', textContent: gap.missing_information }));
+          if (gap.why_it_matters) card.appendChild(el('div', { className: 'row-meta', textContent: 'Why it matters: ' + gap.why_it_matters }));
+          if (gap.suggested_question) card.appendChild(el('div', { className: 'row-meta', textContent: '→ ' + gap.suggested_question }));
+          gapGroup.appendChild(card);
+        });
+        container.appendChild(gapGroup);
+      }
+
+      var rawDetails = document.getElementById('career-profile-raw-details');
+      if (rawDetails) {
+        rawDetails.style.display = '';
+        document.getElementById('career-profile-raw').textContent = JSON.stringify(structured, null, 2);
       }
     }
+
+    /** Tracks whether a profile exists, so the button reads Generate vs Regenerate. */
+    var hasCareerProfile = false;
+
+    function setProfileButtonMode(exists) {
+      hasCareerProfile = Boolean(exists);
+      var button = document.getElementById('profile-generate-button');
+      if (button) button.textContent = hasCareerProfile ? 'Regenerate Profile' : 'Generate Profile';
+    }
+
+    document.getElementById('profile-generate-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('profile-generate-status');
+      var button = this;
+      var provider = document.getElementById('profile-provider').value;
+      button.disabled = true;
+      statusEl.textContent = 'Reading every document and note on file…';
+      statusEl.className = 'status';
+      try {
+        var genRes = await api('/profile/generate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ provider: provider }),
+        });
+        var genData = await requireJsonResponse(genRes, 'profile_generation_failed');
+
+        var saveRes = await api('/profile/structured', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ structured: genData.draft_structured }),
+        });
+        var saved = await requireJsonResponse(saveRes, 'profile_save_failed');
+
+        renderStructuredProfileView('career-profile-view', saved.structured);
+        setProfileButtonMode(true);
+        // A regeneration that came back with materially less history than the stored record is
+        // rejected server-side; saying so beats silently showing the unchanged profile.
+        statusEl.textContent = genData.rejected_incomplete
+          ? 'That regeneration came back incomplete, so your existing profile was kept. Try again.'
+          : 'Profile updated.';
+        statusEl.className = genData.rejected_incomplete ? 'status error' : 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
+      }
+    });
 
     async function loadRoleSignals() {
       var res = await api('/role-signals');
@@ -6265,6 +7499,122 @@ const DASHBOARD_PAGE = `<!doctype html>
         statusEl.className = 'status error';
       }
     });
+
+    // One line of identifying info when collapsed: the parsed job's title/company/location if the
+    // fetch succeeded, otherwise the bare URL the candidate pasted -- either way enough to tell
+    // examples apart without expanding each one.
+    function roleExampleSummaryLine(item) {
+      var job = item.job;
+      if (job && job.title) {
+        return job.title + (job.company ? ' at ' + job.company : '') + (job.location ? ' · ' + job.location : '');
+      }
+      return item.source_url;
+    }
+
+    function roleExampleFullText(item) {
+      var job = item.job;
+      var parts = [];
+      if (job && job.title) parts.push(job.title + (job.company ? ' at ' + job.company : ''));
+      if (job && job.location) parts.push(job.location);
+      if (job && job.employment_type) parts.push(job.employment_type);
+      if (job && job.description) parts.push(job.description);
+      if (job && job.responsibilities && job.responsibilities.length) parts.push('Responsibilities: ' + job.responsibilities.join('; '));
+      if (job && job.qualifications && job.qualifications.length) parts.push('Qualifications: ' + job.qualifications.join('; '));
+      if (job && job.skills && job.skills.length) parts.push('Skills: ' + job.skills.join(', '));
+      if (!job && item.fetch_status === 'failed') parts.push("Couldn't fetch this posting -- saved with the link and reason only.");
+      if (item.reason) parts.push('Reason: ' + item.reason);
+      parts.push(item.source_url);
+      return parts.join(' — ');
+    }
+
+    // Same collapsible-row shape as renderCollapsibleList, but the collapsed line is built from the
+    // parsed job rather than a raw claim string, and the expanded text pulls in every parsed field.
+    function renderRoleExampleList(listId, items, emptyText, onDelete) {
+      var list = document.getElementById(listId);
+      list.innerHTML = '';
+      if (!items || !items.length) {
+        list.appendChild(el('p', { className: 'empty', textContent: emptyText }));
+        return;
+      }
+      items.forEach(function (item) {
+        var summary = roleExampleSummaryLine(item);
+        var expanded = false;
+        var textEl = el('div', { className: 'collapsible-text', textContent: summary });
+        textEl.addEventListener('click', function () {
+          expanded = !expanded;
+          textEl.textContent = expanded ? roleExampleFullText(item) : summary;
+        });
+        var del = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
+        del.addEventListener('click', async function (event) {
+          event.stopPropagation();
+          await onDelete(item);
+        });
+        var row = el('div', { className: 'row' }, [el('div', {}, [textEl]), el('div', { className: 'row-actions' }, [del])]);
+        list.appendChild(el('div', { className: 'row-item' }, [row]));
+      });
+    }
+
+    // Good and bad examples are the same shape end to end (list/summary/form ids differ only by
+    // the 'good'/'bad' prefix), so one setup function drives both sections.
+    function setupRoleExampleSection(type) {
+      var listId = 'role-examples-' + type + '-list';
+      var summaryId = 'role-examples-' + type + '-summary';
+      var formId = 'role-example-' + type + '-form';
+      var urlId = 'role-example-' + type + '-url';
+      var reasonId = 'role-example-' + type + '-reason';
+      var statusId = 'role-example-' + type + '-status';
+      var noun = type === 'good' ? 'good example' : 'bad example';
+
+      async function load() {
+        var res = await api('/role-examples');
+        var data = await res.json();
+        var items = data[type] || [];
+        document.getElementById(summaryId).textContent =
+          items.length === 1 ? '1 ' + noun + ' on file' : items.length + ' ' + noun + 's on file';
+        renderRoleExampleList(listId, items, 'Nothing added yet.', async function (item) {
+          await api('/role-examples/' + encodeURIComponent(item.id), { method: 'DELETE' });
+          markRolesDirty();
+          load();
+        });
+      }
+
+      document.getElementById(formId).addEventListener('submit', async function (event) {
+        event.preventDefault();
+        var statusEl = document.getElementById(statusId);
+        statusEl.textContent = 'Adding…';
+        statusEl.className = 'status';
+        try {
+          var res = await api('/role-examples', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              type: type,
+              source_url: document.getElementById(urlId).value,
+              reason: document.getElementById(reasonId).value,
+              provider: document.getElementById('role-analysis-provider').value,
+            }),
+          });
+          var data = await res.json();
+          if (!res.ok) throw new Error(errorMessage(data, 'add_failed'));
+          statusEl.textContent = data.job
+            ? 'Added — read the posting successfully.'
+            : "Added — couldn't read the posting, saved the link and reason.";
+          statusEl.className = 'status success';
+          document.getElementById(formId).reset();
+          markRolesDirty();
+          load();
+        } catch (err) {
+          statusEl.textContent = 'Error: ' + err.message;
+          statusEl.className = 'status error';
+        }
+      });
+
+      return load;
+    }
+
+    var loadGoodRoleExamples = setupRoleExampleSection('good');
+    var loadBadRoleExamples = setupRoleExampleSection('bad');
+    function loadRoleExamples() { loadGoodRoleExamples(); loadBadRoleExamples(); }
 
     function renderDocuments(docs) {
       var list = document.getElementById('documents-list');
@@ -8635,7 +9985,8 @@ const DASHBOARD_PAGE = `<!doctype html>
       countsHost.appendChild(dataRow('Job description text', formatBytes(bytes.job_descriptions), 'Largest thing stored'));
       countsHost.appendChild(dataRow('Uploaded documents', String(counts.documents || 0), 'Extracted text: ' + formatBytes(bytes.document_text)));
       countsHost.appendChild(dataRow('Notes', String(counts.notes || 0)));
-      countsHost.appendChild(dataRow('Desired-role signals', String(counts.role_signals || 0)));
+      countsHost.appendChild(dataRow('Career preferences', String(counts.role_signals || 0)));
+      countsHost.appendChild(dataRow('Role examples', String(counts.role_examples || 0)));
       countsHost.appendChild(dataRow('Resume versions', String(counts.resumes || 0)));
       countsHost.appendChild(dataRow('Cover letters', String(counts.cover_letters || 0)));
       countsHost.appendChild(dataRow('Rejection reasons you taught it', String(counts.feedback || 0)));
@@ -8684,8 +10035,9 @@ const DASHBOARD_PAGE = `<!doctype html>
         { id: 'feedback', name: 'Rejection reasons', note: 'What you taught the filter by rejecting postings with a reason.' },
         { id: 'resumes', name: 'Resume versions', note: 'Generated resumes and their PDFs.' },
         { id: 'cover_letters', name: 'Cover letters', note: 'Generated cover letters for interested jobs.' },
-        { id: 'notes', name: 'Notes', note: 'Freeform and pasted resume text on Resume > Notes.' },
-        { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Roles tab (Targets sub-tab).' },
+        { id: 'notes', name: 'Notes', note: 'Freeform career evidence on Profile → Notes.' },
+        { id: 'role_signals', name: 'Career preferences', note: 'What you wrote on Careers → Preferences.' },
+        { id: 'role_examples', name: 'Career examples', note: 'Good/bad job examples on Careers → Examples.' },
       ].forEach(function (collection) {
         var del = el('button', { className: 'destructive', type: 'button', textContent: 'Delete' });
         del.addEventListener('click', async function () {
@@ -8935,6 +10287,7 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     loadProfile();
     loadRoleSignals();
+    loadRoleExamples();
     loadDocuments();
     loadNotes();
     loadResumes();
@@ -9286,8 +10639,14 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "POST" && url.pathname === "/role-signals") return createRoleSignal(request, env);
     const roleSignalMatch = url.pathname.match(/^\/role-signals\/([^/]+)$/);
     if (request.method === "DELETE" && roleSignalMatch) return deleteRoleSignal(request, env, roleSignalMatch[1]);
+    if (request.method === "GET" && url.pathname === "/role-examples") return listRoleExamples(request, env);
+    if (request.method === "POST" && url.pathname === "/role-examples") return createRoleExample(request, env);
+    const roleExampleMatch = url.pathname.match(/^\/role-examples\/([^/]+)$/);
+    if (request.method === "PATCH" && roleExampleMatch) return updateRoleExample(request, env, roleExampleMatch[1]);
+    if (request.method === "DELETE" && roleExampleMatch) return deleteRoleExample(request, env, roleExampleMatch[1]);
     if (request.method === "PUT" && url.pathname === "/desired-roles") return saveDesiredRoles(request, env);
     if (request.method === "POST" && url.pathname === "/desired-roles/analyze") return analyzeDesiredRoles(request, env);
+    if (request.method === "GET" && url.pathname === "/role-market") return getRoleMarketResearch(request, env);
     if (request.method === "GET" && url.pathname === "/resumes") return listResumes(request, env);
     if (request.method === "POST" && url.pathname === "/resumes") return createResume(request, env);
     // Ahead of the /resumes/:id routes below, which would otherwise capture "master" as an id.

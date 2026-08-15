@@ -51,6 +51,7 @@
 import { type LlmEnv, type Provider, callStructured } from "./llm";
 import { getManagedPrompt } from "./langfuse";
 import type { StructuredProfile } from "./resume";
+import { profileEvidenceStrings, renderCareerProfile } from "./profile";
 
 // ---------------------------------------------------------------------------
 // Requirements model -- what the target actually asks for
@@ -292,7 +293,7 @@ export async function planEvidence(
     target: targetLabel,
     role_summary: requirements.role_summary ? `WHAT THE ROLE IS: ${requirements.role_summary}` : "",
     requirements: requirements.requirements.map((r) => `- [${r.kind}] ${r.text}`).join("\n"),
-    candidate_profile: JSON.stringify(profile),
+    candidate_profile: renderCareerProfile(profile),
   });
 
   const raw = await callStructured<Partial<EvidencePlan>>(
@@ -335,11 +336,11 @@ export function normalizePlan(
     byRole.set(key, { level, rationale: String(r?.rationale ?? "").trim() });
   }
 
-  const roles: RolePlan[] = (profile.experience ?? []).map((e) => {
-    const decided = byRole.get(roleKey(e.company, e.title));
+  const roles: RolePlan[] = (profile.work_experience ?? []).map((e) => {
+    const decided = byRole.get(roleKey(e.organization, e.title));
     const level = decided?.level ?? "compress";
     return {
-      company: e.company,
+      company: e.organization,
       title: e.title,
       level,
       bullet_budget: BULLET_BUDGET[level],
@@ -388,24 +389,19 @@ function roleKey(company: string, title: string): string {
   return key === "|" ? "" : key;
 }
 
-/** Every word the profile actually contains, for checking that cited evidence isn't invented. */
+/**
+ * Every word the profile actually contains, for checking that cited evidence isn't invented.
+ *
+ * Sourced from `profileEvidenceStrings`, which walks the whole canonical record -- project work,
+ * outcomes, metrics, mentoring, per-role skills -- rather than the handful of fields the old flat
+ * profile exposed. That breadth matters here specifically: this set is what decides whether a
+ * `proven` coverage claim survives, so anything it cannot see is a real capability the candidate
+ * gets no credit for.
+ */
 function profileHaystack(profile: StructuredProfile): Set<string> {
   const words = new Set<string>();
-  const add = (value: string) => {
+  for (const value of profileEvidenceStrings(profile)) {
     for (const word of matchKey(value).split(" ")) if (word.length > 3) words.add(word);
-  };
-  add(profile.headline ?? "");
-  add(profile.narrative_summary ?? "");
-  for (const skill of profile.skills ?? []) add(skill);
-  for (const e of profile.experience ?? []) {
-    add(e.company);
-    add(e.title);
-    for (const h of e.highlights ?? []) add(h);
-  }
-  for (const e of profile.education ?? []) {
-    add(e.school);
-    add(e.degree);
-    add(e.field);
   }
   return words;
 }
