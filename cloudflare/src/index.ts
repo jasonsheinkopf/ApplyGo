@@ -6179,7 +6179,8 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     <div class="segmented-control" role="group" aria-label="Profile sections">
       <button class="subtab active" data-profile-subtab="docs" type="button">Docs</button>
       <button class="subtab" data-profile-subtab="notes" type="button">Notes</button>
-      <button class="subtab" data-profile-subtab="summary" type="button">Summary</button>
+      <button class="subtab" data-profile-subtab="summary" type="button">Create</button>
+      <button class="subtab" data-profile-subtab="improve" type="button">Improve</button>
     </div>
 
     <div id="profile-subpanel-docs" class="subpanel active">
@@ -6212,8 +6213,8 @@ Let me check the placeholder embraces like a variable name, gets its value when 
 
     <div id="profile-subpanel-summary" class="subpanel">
       <section id="career-profile-section">
-        <h2>Summary</h2>
-        <p class="hint">Your career evidence record, built from every document and note above. This is the factual source of truth the whole app reads from -- career analysis, job matching, and every resume. It is deliberately far more complete than any single resume would be; a resume selects from this, it never replaces it.</p>
+        <h2>Create</h2>
+        <p class="hint">Your career evidence record, built from every document and note above. This is the factual source of truth the whole app reads from -- career analysis, job matching, and every resume. It is deliberately far more complete than any single resume would be; a resume selects from this, it never replaces it. Optimized for completeness and structure, never for length or polish.</p>
         <label for="profile-provider">Generate using</label>
         <select id="profile-provider">
           <option value="anthropic">Anthropic (Claude)</option>
@@ -6226,6 +6227,28 @@ Let me check the placeholder embraces like a variable name, gets its value when 
           <summary>Raw structured data</summary>
           <pre id="career-profile-raw" class="raw-json"></pre>
         </details>
+      </section>
+    </div>
+
+    <div id="profile-subpanel-improve" class="subpanel">
+      <section id="improve-section">
+        <h2>Improve</h2>
+        <p class="hint">A guided interview that asks about specific, high-value gaps in your Career Evidence Record -- never generic "tell me more" prompts, and never resume-writing advice. Answer any question, several, or all, in any order, then apply them to fold the answers into your profile.</p>
+        <div id="improve-no-profile" class="empty" style="display:none">
+          Create your profile before improving it.
+          <button id="improve-go-to-create" class="secondary" type="button" style="margin-left:0.5rem">Go to Create</button>
+        </div>
+        <div id="improve-controls">
+          <div id="improve-progress" class="summary-line" style="display:none"></div>
+          <label for="improve-provider">Analyze using</label>
+          <select id="improve-provider">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI</option>
+          </select>
+          <button id="improve-action-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Find Improvements</button>
+          <p id="improve-status" class="status" role="status" aria-live="polite"></p>
+        </div>
+        <div id="improve-questions"></div>
       </section>
     </div>
   </div>
@@ -7278,6 +7301,8 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         var hasProfile = Boolean(data.profile.structured);
         document.getElementById('resume-no-profile').style.display = hasProfile ? 'none' : '';
         document.getElementById('resume-build-controls').style.display = hasProfile ? '' : 'none';
+        setImproveProfileAvailability(hasProfile);
+        if (hasProfile) loadImproveQuestions();
         maybeReanalyzeRoles();
       }
     }
@@ -7840,6 +7865,219 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         statusEl.className = 'status error';
       } finally {
         button.disabled = false;
+      }
+    });
+
+    // --- Profile → Improve: guided evidence interview ---
+    //
+    // One state-driven primary action button, per the spec: "Find Improvements" (no audit run yet,
+    // or the open questions have all been resolved), "Apply Answers & Continue" (at least one saved
+    // answer waiting to be integrated), "Improving Profile…" (a call is in flight), or
+    // "Check Again" (the last audit found nothing valuable). Never a chat UI, never separate
+    // technical buttons for "run audit" vs "integrate JSON".
+
+    var improveQuestions = [];
+    var improveHasAudited = false;
+    var improveBusy = false;
+
+    function improveCategoryLabel(category) {
+      return (category || 'other').replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+    }
+
+    function updateImproveButton() {
+      var button = document.getElementById('improve-action-button');
+      if (!button) return;
+      var answeredCount = improveQuestions.filter(function (q) { return q.status === 'answered'; }).length;
+      var pendingCount = improveQuestions.filter(function (q) { return q.status === 'pending'; }).length;
+      if (improveBusy) {
+        button.textContent = 'Improving Profile…';
+      } else if (answeredCount > 0) {
+        button.textContent = 'Apply Answers & Continue';
+      } else if (improveHasAudited && pendingCount === 0) {
+        button.textContent = 'Check Again';
+      } else {
+        button.textContent = 'Find Improvements';
+      }
+      button.disabled = improveBusy;
+
+      var progress = document.getElementById('improve-progress');
+      if (pendingCount === 0 && answeredCount === 0) {
+        progress.style.display = 'none';
+      } else {
+        progress.style.display = '';
+        progress.textContent = answeredCount + ' answered · ' + pendingCount + ' remaining';
+      }
+    }
+
+    function renderImproveQuestionCard(question) {
+      var card = el('div', { className: 'profile-card' });
+      var titleRow = el('div', { className: 'row-title-line', style: 'display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap' });
+      titleRow.appendChild(el('span', { className: 'badge', textContent: improveCategoryLabel(question.category) }));
+      if (question.status === 'answered') titleRow.appendChild(el('span', { className: 'badge', textContent: 'Answered', style: 'background:var(--success,#2e7d32);color:#fff' }));
+      card.appendChild(titleRow);
+      card.appendChild(el('p', { className: 'row-title', textContent: question.question, style: 'margin-top:0.4rem' }));
+      if (question.why_it_matters) {
+        card.appendChild(el('p', { className: 'row-meta', textContent: 'Why it matters: ' + question.why_it_matters }));
+      }
+      var textarea = el('textarea', {
+        placeholder: 'Your answer…',
+        value: question.answer || '',
+        style: 'min-height:4.5rem',
+      });
+      card.appendChild(textarea);
+      var actions = el('div', { className: 'row-actions', style: 'margin-top:0.5rem' });
+      var statusMsg = el('span', { className: 'status' });
+      var saveBtn = el('button', { type: 'button', textContent: question.status === 'answered' ? 'Update Answer' : 'Save' });
+      saveBtn.addEventListener('click', async function () {
+        var value = textarea.value.trim();
+        if (!value) { statusMsg.textContent = 'Enter an answer first.'; statusMsg.className = 'status error'; return; }
+        saveBtn.disabled = true;
+        try {
+          var res = await api('/profile/improve/questions/' + encodeURIComponent(question.id), {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ answer: value }),
+          });
+          var data = await requireJsonResponse(res, 'save_failed');
+          question.status = data.question.status;
+          question.answer = data.question.answer;
+          statusMsg.textContent = 'Saved.';
+          statusMsg.className = 'status success';
+          updateImproveButton();
+          renderImproveQuestions(improveQuestions);
+        } catch (err) {
+          statusMsg.textContent = 'Error: ' + err.message;
+          statusMsg.className = 'status error';
+          saveBtn.disabled = false;
+        }
+      });
+      var dismissBtn = el('button', { type: 'button', className: 'secondary', textContent: 'Skip / Dismiss' });
+      dismissBtn.addEventListener('click', async function () {
+        dismissBtn.disabled = true;
+        try {
+          await api('/profile/improve/questions/' + encodeURIComponent(question.id) + '/dismiss', { method: 'POST' });
+          improveQuestions = improveQuestions.filter(function (q) { return q.id !== question.id; });
+          updateImproveButton();
+          renderImproveQuestions(improveQuestions);
+        } catch (err) {
+          statusMsg.textContent = 'Error: ' + err.message;
+          statusMsg.className = 'status error';
+          dismissBtn.disabled = false;
+        }
+      });
+      actions.appendChild(saveBtn);
+      actions.appendChild(dismissBtn);
+      card.appendChild(actions);
+      card.appendChild(statusMsg);
+      return card;
+    }
+
+    /** Grouped by entity, highest-priority question in each group first, groups ordered by their
+     * own best question -- so the candidate sees the most valuable open thread first but can still
+     * jump straight to any other role or project's questions. */
+    function renderImproveQuestions(questions) {
+      var container = document.getElementById('improve-questions');
+      container.innerHTML = '';
+      if (!questions.length) {
+        if (improveHasAudited) {
+          container.appendChild(el('p', {
+            className: 'empty',
+            textContent: 'No high-value questions found right now. Your Career Evidence Record already contains strong detail across the areas this review checks.',
+          }));
+        }
+        return;
+      }
+      var groups = {};
+      var order = [];
+      questions.forEach(function (q) {
+        var key = q.entity_label || 'General';
+        if (!groups[key]) { groups[key] = []; order.push(key); }
+        groups[key].push(q);
+      });
+      order.sort(function (a, b) {
+        var maxA = Math.max.apply(null, groups[a].map(function (q) { return q.priority; }));
+        var maxB = Math.max.apply(null, groups[b].map(function (q) { return q.priority; }));
+        return maxB - maxA;
+      });
+      order.forEach(function (key) {
+        var items = groups[key].slice().sort(function (a, b) { return b.priority - a.priority; });
+        var group = profileGroup(key, items.length, true);
+        items.forEach(function (q) { group.appendChild(renderImproveQuestionCard(q)); });
+        container.appendChild(group);
+      });
+    }
+
+    /** Called from loadProfile so Improve reflects "no profile yet" (state A) without an extra
+     * round trip, and so a profile that already has open questions shows them immediately. */
+    function setImproveProfileAvailability(hasProfile) {
+      document.getElementById('improve-no-profile').style.display = hasProfile ? 'none' : '';
+      document.getElementById('improve-controls').style.display = hasProfile ? '' : 'none';
+      document.getElementById('improve-questions').style.display = hasProfile ? '' : 'none';
+    }
+
+    async function loadImproveQuestions() {
+      try {
+        var res = await api('/profile/improve/questions');
+        var data = await res.json();
+        improveQuestions = data.questions || [];
+        if (improveQuestions.length) improveHasAudited = true;
+        renderImproveQuestions(improveQuestions);
+        updateImproveButton();
+      } catch (err) {
+        // Best-effort on initial load; the action button still lets the candidate try explicitly.
+      }
+    }
+
+    document.getElementById('improve-go-to-create').addEventListener('click', function () {
+      document.querySelector('[data-profile-subtab="summary"]').click();
+    });
+
+    document.getElementById('improve-action-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('improve-status');
+      var provider = document.getElementById('improve-provider').value;
+      var answeredCount = improveQuestions.filter(function (q) { return q.status === 'answered'; }).length;
+      improveBusy = true;
+      updateImproveButton();
+      statusEl.textContent = answeredCount > 0
+        ? 'Integrating your answers into the profile…'
+        : 'Reviewing your Career Evidence Record for high-value gaps…';
+      statusEl.className = 'status';
+      try {
+        if (answeredCount > 0) {
+          var applyRes = await api('/profile/improve/apply', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ provider: provider }),
+          });
+          var applyData = await requireJsonResponse(applyRes, 'apply_failed');
+          renderStructuredProfileView('career-profile-view', applyData.structured);
+          setProfileButtonMode(true);
+          improveQuestions = applyData.questions || [];
+          improveHasAudited = true;
+          statusEl.textContent = applyData.applied_count + ' answer' + (applyData.applied_count === 1 ? '' : 's') +
+            ' applied to your profile.' + (applyData.reaudit_error ? ' (Could not check for new questions -- try Check Again.)' : '');
+          statusEl.className = 'status success';
+        } else {
+          var auditRes = await api('/profile/improve/audit', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ provider: provider }),
+          });
+          var auditData = await requireJsonResponse(auditRes, 'audit_failed');
+          improveQuestions = auditData.questions || [];
+          improveHasAudited = true;
+          statusEl.textContent = auditData.inserted > 0
+            ? 'Found ' + auditData.inserted + ' new question' + (auditData.inserted === 1 ? '' : 's') + '.'
+            : 'No new questions this time.';
+          statusEl.className = 'status success';
+        }
+        renderImproveQuestions(improveQuestions);
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      } finally {
+        improveBusy = false;
+        updateImproveButton();
       }
     });
 
