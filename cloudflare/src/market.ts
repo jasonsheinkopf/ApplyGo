@@ -16,10 +16,10 @@
  * pass that can fail on its own without taking the role list with it.
  */
 
-import { type LlmEnv, type Provider, callStructured, providerKeyMissing } from "./llm";
-import { getManagedPrompt } from "./langfuse";
-import { fetchWithTimeout, htmlToText } from "./companies";
-import { ROLES_RESEARCH_PROMPT } from "./prompts";
+import { type LlmEnv, type Provider, callStructured, providerKeyMissing } from "./llm.ts";
+import { getManagedPrompt } from "./langfuse.ts";
+import { fetchWithTimeout, htmlToText } from "./companies.ts";
+import { ROLES_RESEARCH_PROMPT } from "./prompts.ts";
 
 export type MarketSource = { name: string; url: string; text: string };
 

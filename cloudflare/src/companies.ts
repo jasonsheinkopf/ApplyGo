@@ -13,8 +13,8 @@
 // resolve is marked unreachable rather than silently trusted, because a model listing plausible
 // employers will occasionally invent or misremember one.
 
-import { type LlmEnv, type Provider, callStructured } from "./llm";
-import { getManagedPrompt } from "./langfuse";
+import { type LlmEnv, type Provider, callStructured } from "./llm.ts";
+import { getManagedPrompt } from "./langfuse.ts";
 
 // Every ATS this app recognizes on a careers page, whether or not it can actually read job
 // listings from it. Recognizing a platform is worth doing even without a read path: it's the
