@@ -275,22 +275,48 @@ function ancestors(el, maxDepth) {
  * for instance), not necessarily inside the *nearest* ancestor whose own class happens to mention
  * "select" (a narrower inner wrapper like `select__input-container` routinely is not).
  */
+/**
+ * Whether el's own menu is genuinely open right now, per the control itself -- not per whatever a
+ * search elsewhere in the DOM happens to turn up. The WAI-ARIA combobox pattern requires a
+ * combobox to keep aria-expanded in sync with its own popup state, and every real accessible
+ * implementation (react-select included) does; a control that still says aria-expanded="false"
+ * cannot be the one that owns some listbox found nearby, no matter how confidently unambiguous that
+ * search looked. Permissive (true) when the attribute is simply absent, since not every combobox
+ * pattern in the wild uses it (the button+dialog/aria-controls path never needs this at all) and
+ * there's nothing to contradict trusting the search in that case.
+ */
+function ownMenuIsOpen(el) {
+  const expanded = el.getAttribute('aria-expanded');
+  return expanded === null || expanded === 'true';
+}
+
 function comboboxListbox(el) {
   const listboxId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
   if (listboxId) {
     const byId = document.getElementById(listboxId);
     if (byId) return byId;
   }
+  if (!ownMenuIsOpen(el)) return null;
+  // Widening ancestor search, but never by grabbing "whichever listbox querySelector happens to see
+  // first" -- a wider ancestor is frequently a container shared by several fields (a <form>, or
+  // <body> itself), and a previous field's menu that didn't actually close (a synthetic Escape
+  // keydown doesn't always reach a library's real close handler) leaves a second, unrelated listbox
+  // sitting right there too. Because each wider ancestor's subtree is a superset of every narrower
+  // one already checked, the visible-listbox count here only ever grows as the loop widens: the
+  // first level with exactly one is the tightest, most-likely-correct match, and the moment a level
+  // finds two or more, every wider level (including the document-wide last resort below) is
+  // guaranteed to see at least that same ambiguity too -- so there's nothing to gain by continuing
+  // to widen, and this refuses to guess right away rather than silently reading a different field's
+  // stale menu. Same principle findOptionMatch already applies to answers.
   for (const node of ancestors(el, 6)) {
-    const listbox = node.querySelector('[role="listbox"]');
-    if (listbox) return listbox;
+    const found = [...node.querySelectorAll('[role="listbox"]')].filter((box) => isVisible(box));
+    if (found.length === 1) return found[0];
+    if (found.length > 1) return null;
   }
-  // Last resort: some libraries portal the open menu straight onto <body>, entirely outside the
-  // control's own DOM subtree. This is only ever called right after this specific control was
-  // clicked open (see fillCombobox/discoverComboboxOptions), and opening one dropdown normally
-  // closes any other that was already open, so the one listbox in the whole document at that
-  // moment is a reasonable bet.
-  return document.querySelector('[role="listbox"]');
+  // Last resort: some libraries portal the open menu straight onto <body>, entirely outside even a
+  // 6-level ancestor walk. Same single-visible-candidate requirement as above.
+  const visible = [...document.querySelectorAll('[role="listbox"]')].filter((node) => isVisible(node));
+  return visible.length === 1 ? visible[0] : null;
 }
 
 /** The clickable option nodes behind a combobox, when the listbox is already in the DOM. */
@@ -422,6 +448,22 @@ function setSelectValue(el, value) {
 }
 
 /**
+ * Closes an opened combobox as reliably as real dropdown libraries actually listen for. A
+ * synthetic Escape keydown alone isn't always enough -- React's synthetic event system doesn't
+ * uniformly pick up a manually dispatched native KeyboardEvent the way a real keypress arrives, so
+ * a library's own onKeyDown handler can simply never see it. A click outside the control is the
+ * more universally implemented close trigger (most of these libraries listen for it directly via a
+ * document-level "was that click outside me" handler, the same mechanism a real user closing the
+ * menu by clicking elsewhere relies on), so both are tried. A menu that doesn't actually close is
+ * exactly how the *next* field's discovery ends up reading a stale, unrelated dropdown's options
+ * instead of its own -- this exists to prevent that, not just to tidy up the page visually.
+ */
+function closeCombobox(el) {
+  el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  document.body.click();
+}
+
+/**
  * Selects the matching choice in a styled combobox by clicking it, the way a person actually would
  * -- setting the trigger's own text value directly leaves these libraries with a visible label that
  * doesn't match their real internal selection. Opens the control first if the option isn't already
@@ -443,7 +485,7 @@ async function fillCombobox(el, value) {
     match = findMatch();
   }
   if (!match) {
-    if (openedByUs) el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    if (openedByUs) closeCombobox(el);
     return false;
   }
   match.click();
@@ -467,7 +509,7 @@ async function discoverComboboxOptions(name) {
   el.click();
   await new Promise((resolve) => setTimeout(resolve, 150));
   const opened = comboboxOptions(el);
-  el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  closeCombobox(el);
   return opened;
 }
 
@@ -577,11 +619,23 @@ function markResult(name, ok) {
   return true;
 }
 
-/** The visible file input on the employer's form -- the one thing attach and verify both need. */
+/**
+ * The employer's real file input -- the one thing attach and verify both need. Deliberately does
+ * NOT require isVisible(): virtually every professional upload widget renders its own styled
+ * "Attach" button and hides the native `<input type="file">` behind it (clip-rect visually-hidden
+ * CSS, zero-size positioning, sometimes literal display:none), because the native file input's own
+ * appearance can't be styled. Setting `.files` via DataTransfer works on that hidden input directly
+ * -- there's no need to actually click the styled button -- so requiring visibility here only
+ * throws away the one element this needs to find. Still excludes a genuinely disabled input (not a
+ * real target) and one hidden via display:none on itself specifically, since a handful of forms do
+ * use that to mean "this input doesn't exist right now" (e.g. swapped out after a resume is already
+ * attached), which is a different thing from "hidden but functional."
+ */
 function resumeFileInput() {
-  return [...document.querySelectorAll('input[type="file"]')].find(
-    (el) => isVisible(el) && !el.closest('#applygo-agent-root'),
-  );
+  return [...document.querySelectorAll('input[type="file"]')].find((el) => {
+    if (el.disabled || el.closest('#applygo-agent-root')) return false;
+    return window.getComputedStyle(el).display !== 'none';
+  });
 }
 
 /** Attaches the resume PDF to a file input, which needs a real File on a DataTransfer. */
