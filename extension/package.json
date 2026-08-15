@@ -1,7 +1,7 @@
 {
   "name": "applygo-extension",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Regression tests for the ApplyGo Chrome extension's DOM layer and agent orchestration -- the extension itself ships unbundled, this package.json exists only to run its tests.",
   "type": "module",
   "scripts": {
