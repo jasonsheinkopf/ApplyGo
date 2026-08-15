@@ -41,7 +41,8 @@ import {
   readCareerProfile,
   renderCareerProfile,
 } from "./profile";
-import { PROFILE_STRUCTURE_PROMPT, ROLES_ANALYZE_PROMPT, ROLES_RESEARCH_PROMPT } from "./prompts";
+import { PROFILE_STRUCTURE_PROMPT, ROLES_ANALYZE_PROMPT } from "./prompts";
+import { MARKET_RESEARCH_TTL_DAYS, marketCacheKey, researchRoleMarket } from "./market";
 import {
   type EvidencePlan,
   type JobRequirements,
@@ -307,6 +308,50 @@ const ADDITIVE_COLUMNS = [
   "ALTER TABLE job_postings ADD COLUMN requirements_json TEXT NOT NULL DEFAULT '{}'",
   // 0018_langfuse.sql
   "ALTER TABLE llm_traces ADD COLUMN langfuse_trace_id TEXT",
+  // 0025_career_refactor.sql
+  "ALTER TABLE resumes ADD COLUMN role_family TEXT NOT NULL DEFAULT ''",
+];
+
+/**
+ * Tables this build's code reads, created at runtime if they aren't there yet.
+ *
+ * Same deploy-path reasoning as ADDITIVE_COLUMNS above, for the case that list cannot cover. A
+ * `CREATE TABLE IF NOT EXISTS` is idempotent and backward compatible in both directions in exactly
+ * the way an `ADD COLUMN` is -- older code ignores the table, newer code finds it, and running it
+ * twice or against a database that already has it does nothing -- so it belongs to the same safety
+ * net rather than to the deliberate `wrangler d1 migrations apply` step.
+ *
+ * The charter stays narrow on purpose: IF NOT EXISTS creates only. Anything that reshapes or
+ * rewrites existing rows still needs a human deciding when it happens.
+ *
+ * These mirror the CREATE TABLE statements in migrations/; the migration files remain the canonical
+ * schema for a fresh database.
+ */
+const ADDITIVE_TABLES = [
+  // 0024_role_examples.sql
+  `CREATE TABLE IF NOT EXISTS role_examples (
+     id TEXT PRIMARY KEY,
+     profile_id TEXT NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
+     type TEXT NOT NULL CHECK (type IN ('good', 'bad')),
+     source_url TEXT NOT NULL,
+     reason TEXT NOT NULL DEFAULT '',
+     parsed_job_json TEXT NOT NULL DEFAULT '{}',
+     fetch_status TEXT NOT NULL DEFAULT 'pending',
+     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+   )`,
+  "CREATE INDEX IF NOT EXISTS idx_role_examples_profile ON role_examples(profile_id, type, created_at DESC)",
+  // 0025_career_refactor.sql
+  `CREATE TABLE IF NOT EXISTS role_market_research (
+     id TEXT PRIMARY KEY,
+     profile_id TEXT NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
+     cache_key TEXT NOT NULL,
+     role_title TEXT NOT NULL,
+     locations TEXT NOT NULL DEFAULT '',
+     research_json TEXT NOT NULL DEFAULT '{}',
+     researched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+   )`,
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_role_market_key ON role_market_research(profile_id, cache_key)",
 ];
 
 /**
@@ -320,7 +365,7 @@ const ADDITIVE_COLUMNS = [
 let schemaReady: Promise<void> | null = null;
 
 async function applyAdditiveColumns(env: Env): Promise<void> {
-  for (const statement of ADDITIVE_COLUMNS) {
+  for (const statement of [...ADDITIVE_TABLES, ...ADDITIVE_COLUMNS]) {
     try {
       await env.DB.prepare(statement).run();
     } catch {
@@ -1370,6 +1415,67 @@ async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response
     .run();
 
   return json({ provider, role_analysis: analysis, desired_roles: desiredRoles });
+}
+
+/**
+ * Returns cached market research for the current role families, researching any that are missing or
+ * stale. Deliberately a separate endpoint from the analysis itself: the Roles page renders its
+ * cards from the analysis immediately and fills market context in afterwards, so a slow or failing
+ * data provider never delays the part of the page that is about the candidate.
+ */
+async function getRoleMarketResearch(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const url = new URL(request.url);
+  const refresh = url.searchParams.get("refresh") === "1";
+  const provider = normalizeProvider(url.searchParams.get("provider") ?? undefined);
+
+  const profileId = await getOrCreateProfileId(env);
+  const profileRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  const analysis = readRoleAnalysis(profileRow?.preferences_json ?? "{}");
+  if (!analysis) return json({ research: {} });
+
+  const locations = readDesiredLocations(profileRow?.preferences_json ?? "{}");
+  const cached = await env.DB.prepare(
+    "SELECT cache_key, research_json, researched_at FROM role_market_research WHERE profile_id = ?",
+  )
+    .bind(profileId)
+    .all<{ cache_key: string; research_json: string; researched_at: string }>();
+
+  const byKey = new Map(cached.results.map((row) => [row.cache_key, row]));
+  const ttlMs = MARKET_RESEARCH_TTL_DAYS * 24 * 60 * 60 * 1000;
+  const out: Record<string, unknown> = {};
+
+  for (const role of analysis.roles) {
+    const key = marketCacheKey(role.title, locations);
+    const row = byKey.get(key);
+    const fresh = row && Date.now() - Date.parse(row.researched_at + "Z") < ttlMs;
+    if (row && fresh && !refresh) {
+      try {
+        out[role.title] = JSON.parse(row.research_json);
+        continue;
+      } catch {
+        // Fall through and re-research rather than serving a corrupted cache row.
+      }
+    }
+
+    const research = await researchRoleMarket(env, provider, role, locations);
+    out[role.title] = research;
+    // Cached even when unavailable, so a provider that is blocking us isn't re-hammered on every
+    // page load. The TTL still expires it, so recovery is automatic.
+    await env.DB.prepare(
+      `INSERT INTO role_market_research (id, profile_id, cache_key, role_title, locations, research_json, researched_at)
+       VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(profile_id, cache_key) DO UPDATE SET
+         research_json = excluded.research_json, researched_at = CURRENT_TIMESTAMP`,
+    )
+      .bind(crypto.randomUUID(), profileId, key, role.title, locations, JSON.stringify(research))
+      .run();
+  }
+
+  return json({ research: out });
 }
 
 async function upsertProfile(request: Request, env: Env): Promise<Response> {
@@ -9963,6 +10069,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "DELETE" && roleExampleMatch) return deleteRoleExample(request, env, roleExampleMatch[1]);
     if (request.method === "PUT" && url.pathname === "/desired-roles") return saveDesiredRoles(request, env);
     if (request.method === "POST" && url.pathname === "/desired-roles/analyze") return analyzeDesiredRoles(request, env);
+    if (request.method === "GET" && url.pathname === "/role-market") return getRoleMarketResearch(request, env);
     if (request.method === "GET" && url.pathname === "/resumes") return listResumes(request, env);
     if (request.method === "POST" && url.pathname === "/resumes") return createResume(request, env);
     // Ahead of the /resumes/:id routes below, which would otherwise capture "master" as an id.
