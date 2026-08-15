@@ -33,6 +33,16 @@ import {
 } from "./evals";
 import { taskInfo } from "./tasks";
 import {
+  CAREER_PROFILE_SCHEMA,
+  CAREER_PROFILE_SCHEMA_VERSION,
+  type CareerProfile,
+  careerProfileHasContent,
+  normalizeCareerProfile,
+  readCareerProfile,
+  renderCareerProfile,
+} from "./profile";
+import { PROFILE_STRUCTURE_PROMPT, ROLES_ANALYZE_PROMPT, ROLES_RESEARCH_PROMPT } from "./prompts";
+import {
   type EvidencePlan,
   type JobRequirements,
   PLAN_SCHEMA,
@@ -632,44 +642,62 @@ function flattenRoleAnalysis(analysis: RoleAnalysis): string {
   return analysis.roles.map((r) => `## ${r.title}\n${r.description}`).join("\n\n");
 }
 
+/**
+ * Reads the stored profile, transparently lifting a pre-refactor record into the canonical shape.
+ * See `readCareerProfile` in src/profile.ts -- old data loads, it just loads as a thin v1 record
+ * until the candidate regenerates from their documents.
+ */
 function readStructuredProfile(structuredJson: string): StructuredProfile | null {
-  try {
-    const parsed = JSON.parse(structuredJson || "{}");
-    return Object.keys(parsed).length > 0 ? parsed : null;
-  } catch {
-    return null;
-  }
+  return readCareerProfile(structuredJson);
 }
 
-// Deterministic safety net on top of prompting: even if the model doesn't perfectly follow
-// "don't drop entries," any old education/experience entry whose key doesn't reappear in the
-// new output is re-added, so regenerating can only add or correct, never silently lose data.
-function mergeStructuredProfiles(existing: StructuredProfile | null, incoming: StructuredProfile): StructuredProfile {
-  if (!existing) return incoming;
-  function mergeByKey<T>(oldList: T[], newList: T[], keyFn: (item: T) => string): T[] {
-    const newKeys = new Set((newList ?? []).map(keyFn));
-    const preserved = (oldList ?? []).filter((item) => !newKeys.has(keyFn(item)));
-    return [...(newList ?? []), ...preserved];
-  }
-  function mergeSkills(oldSkills: string[], newSkills: string[]): string[] {
-    const seen = new Set<string>();
-    const merged: string[] = [];
-    for (const skill of [...(newSkills ?? []), ...(oldSkills ?? [])]) {
-      const key = skill.trim().toLowerCase();
-      if (key && !seen.has(key)) {
-        seen.add(key);
-        merged.push(skill.trim());
-      }
-    }
-    return merged;
-  }
-  return {
-    headline: incoming.headline || existing.headline,
-    narrative_summary: incoming.narrative_summary || existing.narrative_summary,
-    education: mergeByKey(existing.education, incoming.education, (e) => `${e.school}|${e.degree}`.toLowerCase()),
-    experience: mergeByKey(existing.experience, incoming.experience, (e) => `${e.company}|${e.title}`.toLowerCase()),
-    skills: mergeSkills(existing.skills, incoming.skills),
-  };
+/**
+ * Guards a regeneration against losing real evidence, without freezing old mistakes in place.
+ *
+ * The previous implementation force-merged every old education/experience entry back into each new
+ * generation. That was the right safety net for the old schema, where the model was told to treat
+ * the existing profile as a baseline to extend. It is the wrong one now: the model is deliberately
+ * rebuilding the whole record from the source documents, so union-ing the old objects back in
+ * re-introduces exactly what regeneration is supposed to fix -- duplicate entries for one job
+ * described across three resumes, and stale categorization that no amount of better source material
+ * could ever dislodge.
+ *
+ * So this validates rather than merges. A regeneration that came back with materially less career
+ * history than the record it replaces is treated as a failed generation (a truncated response, a
+ * model that lost its place mid-output) and the existing profile is kept. A regeneration that holds
+ * its ground is accepted whole, duplicates collapsed and categories corrected. The source documents
+ * remain on file either way, so the recovery path for a rejected generation is simply to run it
+ * again rather than to reconstruct anything by hand.
+ */
+function acceptRegeneratedProfile(
+  existing: StructuredProfile | null,
+  incoming: StructuredProfile,
+): { profile: StructuredProfile; rejected: boolean } {
+  if (!existing) return { profile: incoming, rejected: false };
+
+  // Deliberately counts organizations and institutions rather than entries: collapsing three
+  // duplicate descriptions of one employer into one entry is a *correct* regeneration that must not
+  // trip this, while genuinely dropping an employer must.
+  const namesOf = (profile: StructuredProfile) =>
+    new Set(
+      [
+        ...profile.work_experience.map((e) => e.organization),
+        ...profile.education.map((e) => e.institution),
+      ]
+        .map((name) => name.trim().toLowerCase())
+        .filter(Boolean),
+    );
+
+  const before = namesOf(existing);
+  const after = namesOf(incoming);
+  const lost = [...before].filter((name) => !after.has(name));
+
+  // One dropped organization out of many is plausibly a correct merge of two spellings of the same
+  // employer; losing a large share of them is not something a good regeneration does.
+  const lostTooMuch = before.size > 0 && lost.length > Math.max(1, Math.floor(before.size * 0.34));
+  if (lostTooMuch) return { profile: existing, rejected: true };
+
+  return { profile: incoming, rejected: false };
 }
 
 async function getProfile(request: Request, env: Env): Promise<Response> {
@@ -702,7 +730,10 @@ async function saveStructuredProfile(request: Request, env: Env): Promise<Respon
   if (!body.structured || typeof body.structured !== "object") {
     return json({ error: "structured_required" }, 400);
   }
-  const structured = body.structured as StructuredProfile;
+  // Normalized rather than trusted as-is: this endpoint accepts a body from the browser, and the
+  // stored record is what every downstream stage indexes into without guarding. Normalizing here
+  // also stamps the current schema version, so stored data always says which generation it is.
+  const structured = normalizeCareerProfile(body.structured);
   const profileId = await getOrCreateProfileId(env);
   // Recomputed on every save so the compact matching profile can never lag the real one.
   await env.DB.prepare(
@@ -711,7 +742,7 @@ async function saveStructuredProfile(request: Request, env: Env): Promise<Respon
   )
     .bind(
       JSON.stringify(structured),
-      (structured.narrative_summary ?? "").slice(0, 4000),
+      structured.career_summary.narrative_summary.slice(0, 4000),
       buildMatchProfile(structured),
       profileId,
     )
@@ -3102,6 +3133,22 @@ const STRUCTURED_PROFILE_JSON_SCHEMA = {
 } as const;
 
 
+/**
+ * How much of one document's extracted text reaches the model.
+ *
+ * Was 8,000 characters, which is roughly three pages -- comfortably less than an ordinary two-page
+ * resume once formatting artifacts and extraction noise are counted, and far less than the long-form
+ * CVs, academic records and multi-role histories people actually upload. Everything past the cut was
+ * silently discarded, so the profile could never contain evidence from the back half of a document
+ * the candidate had successfully uploaded, and no part of the UI said so.
+ *
+ * 40,000 characters is about 8-10 pages of professional prose: enough that an ordinary resume or CV
+ * is never truncated at all, while still bounding a pathological input. The cap applies ONLY when
+ * building model input -- `source_documents.extracted_text` keeps the complete extraction, so
+ * raising this later re-reads the full text with no re-upload.
+ */
+const PROFILE_SOURCE_DOC_CHARS = 40000;
+
 async function generateProfile(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
@@ -3119,6 +3166,8 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   )
     .bind(profileId)
     .all<{ claim: string }>();
+  // Every document with text, every time -- regeneration reconsiders the whole record from all
+  // available evidence rather than layering the newest upload onto a previous interpretation.
   const docs = await env.DB.prepare(
     `SELECT original_name, extracted_text FROM source_documents
      WHERE profile_id = ? AND LENGTH(extracted_text) > 0 ORDER BY created_at ASC`,
@@ -3128,35 +3177,51 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
 
   const sourceParts: string[] = [];
   for (const note of notes.results) sourceParts.push(`Note: ${note.claim}`);
-  for (const doc of docs.results) sourceParts.push(`Document "${doc.original_name}":\n${doc.extracted_text.slice(0, 8000)}`);
+  for (const doc of docs.results) {
+    const text = doc.extracted_text.slice(0, PROFILE_SOURCE_DOC_CHARS);
+    const truncated = doc.extracted_text.length > PROFILE_SOURCE_DOC_CHARS;
+    sourceParts.push(
+      `Document "${doc.original_name}":\n${text}` +
+        (truncated ? `\n[Document truncated at ${PROFILE_SOURCE_DOC_CHARS} characters.]` : ""),
+    );
+  }
 
   if (sourceParts.length === 0) return json({ error: "no_source_material" }, 400);
 
   const existingStructured = readStructuredProfile(profile?.structured_json ?? "{}");
-  const prompt = await getManagedPrompt(env, "profile/structure", {
-    baseline_rule: existingStructured
-      ? "This candidate already has a profile (given below as 'Current profile'). Treat it as the baseline: " +
-        "keep every education and experience entry from it that the new material below does not contradict, even " +
-        "if the new material doesn't happen to repeat it. Only change a specific field, or add a new entry, when " +
-        "the new material below adds information or directly conflicts with what's already there. Never silently " +
-        "drop an entry just because it isn't mentioned again."
-      : "Base this on the material below.",
-    current_profile: existingStructured ? `Current profile:\n${JSON.stringify(existingStructured)}` : "",
-    source_material: sourceParts.join("\n\n"),
-  });
+  const prompt = await getManagedPrompt(
+    env,
+    "profile/structure",
+    {
+      // Kept supplied though the current prompt no longer uses it: an older Langfuse template still
+      // references {{baseline_rule}}, and compilePrompt throws on a variable the template wants and
+      // the code stopped sending. Supplying a superset is what lets the schema change deploy without
+      // being sequenced against a prompt promotion.
+      baseline_rule: "",
+      current_profile: existingStructured
+        ? `Current profile (previous interpretation, not authoritative):\n${JSON.stringify(existingStructured)}`
+        : "",
+      source_material: sourceParts.join("\n\n"),
+    },
+    PROFILE_STRUCTURE_PROMPT,
+  );
 
   try {
-    const raw = await callStructured<StructuredProfile>(
+    const raw = await callStructured<unknown>(
       env,
       provider,
       "profile.structure",
       prompt,
-      STRUCTURED_PROFILE_JSON_SCHEMA,
+      CAREER_PROFILE_SCHEMA,
       "submit_structured_profile",
-      2000,
+      // The canonical record is deliberately exhaustive, so it needs far more room to come back
+      // whole than the old five-field shape did. A truncated profile is the one failure mode that
+      // silently loses evidence every downstream stage depends on.
+      16000,
     );
-    const draft = mergeStructuredProfiles(existingStructured, raw);
-    return json({ provider, draft_structured: draft });
+    const normalized = normalizeCareerProfile(raw);
+    const { profile: draft, rejected } = acceptRegeneratedProfile(existingStructured, normalized);
+    return json({ provider, draft_structured: draft, rejected_incomplete: rejected });
   } catch (err) {
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
@@ -4060,7 +4125,8 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
 
-  const name = profileRow?.label || profile.structured.headline || "Candidate";
+  const name = profileRow?.label || profile.structured.identity.name ||
+    profile.structured.career_summary.headline || "Candidate";
   const contentHtml = renderCoverLetterHtml(name, letterBody);
 
   try {
