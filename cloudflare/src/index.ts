@@ -49,7 +49,9 @@ import {
   companyNameKey,
   fetchBoardJobs,
   fetchMissingDescriptions,
+  fetchWithTimeout,
   filterJobsByRoles,
+  htmlToText,
   isReadableAtsProvider,
   locationMatches,
   parseLocationFilter,
@@ -841,6 +843,226 @@ async function deleteRoleSignal(request: Request, env: Env, id: string): Promise
   return json({ deleted: result.meta.changes > 0 });
 }
 
+// ---------------------------------------------------------------------------
+// Role examples -- Good/Bad job postings the candidate points at as concrete evidence of what they
+// do and don't want, alongside the Description notes above. See docs on the `role_examples` table
+// (migrations/0024_role_examples.sql) for why this is its own table rather than another
+// candidate_evidence category or a job_postings row.
+// ---------------------------------------------------------------------------
+
+type RoleExampleType = "good" | "bad";
+
+/** Best-effort structured read of a posting fetched from a URL. Every field is optional -- a
+ * partial or empty result just means a thinner example, never a reason to fail the save. */
+type ParsedJobExample = {
+  title?: string;
+  company?: string;
+  location?: string;
+  employment_type?: string;
+  description?: string;
+  responsibilities?: string[];
+  qualifications?: string[];
+  skills?: string[];
+};
+
+const JOB_EXAMPLE_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string", description: "The job title as the posting states it." },
+    company: { type: "string", description: "The hiring company's name." },
+    location: { type: "string", description: "Where the role is based, as the posting states it (city, region, or 'Remote')." },
+    employment_type: { type: "string", description: "e.g. Full-time, Contract, Remote, Hybrid, Onsite -- whatever the posting specifies." },
+    description: { type: "string", description: "A short prose summary of what the role actually is." },
+    responsibilities: { type: "array", items: { type: "string" }, description: "The core duties, one per entry." },
+    qualifications: { type: "array", items: { type: "string" }, description: "Required and preferred qualifications, one per entry." },
+    skills: { type: "array", items: { type: "string" }, description: "Named technologies, tools, or skills the posting calls out." },
+  },
+  required: ["title", "company"],
+} as const;
+
+/** Caps how much of a fetched page's text is sent to the model or kept in the description. */
+const JOB_EXAMPLE_TEXT_CAP = 12000;
+
+/**
+ * Fetches a job posting URL and asks the model to read it into structured fields, for a Good/Bad
+ * example the candidate is pointing at. Every failure mode -- unreachable URL, a non-HTML error
+ * page, a scraping block, a missing provider key, a malformed model response -- resolves to `null`
+ * rather than throwing, because none of them should stop the example (URL + reason) from saving;
+ * see createRoleExample below.
+ */
+async function fetchRoleExampleJob(
+  env: Env,
+  provider: Provider,
+  sourceUrl: string,
+): Promise<ParsedJobExample | null> {
+  if (providerKeyMissing(env, provider)) return null;
+  try {
+    const res = await fetchWithTimeout(sourceUrl, 10000, { redirect: "follow" });
+    if (!res || !res.ok) return null;
+    const html = await res.text();
+    const text = htmlToText(html).slice(0, JOB_EXAMPLE_TEXT_CAP);
+    if (!text) return null;
+
+    const prompt = await getManagedPrompt(env, "roles/extract_example", {
+      source_url: sourceUrl,
+      posting_text: text,
+    });
+    const parsed = await callStructured<ParsedJobExample>(
+      env,
+      provider,
+      "roles.extract_example",
+      prompt,
+      JOB_EXAMPLE_SCHEMA,
+      "submit_job_example",
+      2000,
+    );
+    return parsed && parsed.title ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+type RoleExampleRow = {
+  id: string;
+  type: RoleExampleType;
+  source_url: string;
+  reason: string;
+  parsed_job_json: string;
+  fetch_status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+function shapeRoleExample(row: RoleExampleRow) {
+  let parsed: ParsedJobExample = {};
+  try {
+    parsed = JSON.parse(row.parsed_job_json || "{}");
+  } catch {
+    parsed = {};
+  }
+  return {
+    id: row.id,
+    type: row.type,
+    source_url: row.source_url,
+    reason: row.reason,
+    fetch_status: row.fetch_status,
+    job: Object.keys(parsed).length ? parsed : null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+async function listRoleExamples(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const rows = await env.DB.prepare(
+    `SELECT id, type, source_url, reason, parsed_job_json, fetch_status, created_at, updated_at
+     FROM role_examples WHERE profile_id = ? ORDER BY created_at DESC`,
+  )
+    .bind(profileId)
+    .all<RoleExampleRow>();
+  const shaped = rows.results.map(shapeRoleExample);
+  return json({
+    good: shaped.filter((r) => r.type === "good"),
+    bad: shaped.filter((r) => r.type === "bad"),
+  });
+}
+
+async function createRoleExample(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    type?: string;
+    source_url?: string;
+    reason?: string;
+    provider?: string;
+  };
+  const type: RoleExampleType | null = body.type === "good" || body.type === "bad" ? body.type : null;
+  const sourceUrl = (body.source_url ?? "").trim();
+  const reason = (body.reason ?? "").trim();
+  if (!type) return json({ error: "type_required" }, 400);
+  if (!sourceUrl) return json({ error: "source_url_required" }, 400);
+
+  const provider = normalizeProvider(body.provider);
+  const parsed = await fetchRoleExampleJob(env, provider, sourceUrl);
+
+  const profileId = await getOrCreateProfileId(env);
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO role_examples (id, profile_id, type, source_url, reason, parsed_job_json, fetch_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(id, profileId, type, sourceUrl, reason, JSON.stringify(parsed ?? {}), parsed ? "ok" : "failed")
+    .run();
+
+  return json(
+    shapeRoleExample({
+      id,
+      type,
+      source_url: sourceUrl,
+      reason,
+      parsed_job_json: JSON.stringify(parsed ?? {}),
+      fetch_status: parsed ? "ok" : "failed",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }),
+    201,
+  );
+}
+
+async function updateRoleExample(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { reason?: string };
+  if (typeof body.reason !== "string") return json({ error: "reason_required" }, 400);
+  const result = await env.DB.prepare(
+    "UPDATE role_examples SET reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+  )
+    .bind(body.reason.trim(), id)
+    .run();
+  return json({ updated: result.meta.changes > 0 });
+}
+
+async function deleteRoleExample(request: Request, env: Env, id: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const result = await env.DB.prepare("DELETE FROM role_examples WHERE id = ?").bind(id).run();
+  return json({ deleted: result.meta.changes > 0 });
+}
+
+/**
+ * Renders one type's examples (good or bad) into the plain-text block analyzeDesiredRoles feeds
+ * the model, in the same "one heading + body" shape as everything else in that prompt. The job's
+ * parsed fields matter more than the reason -- the reason is supplementary context, the job itself
+ * is evidence -- so the posting is described first and the candidate's own words follow.
+ */
+function formatRoleExamplesForPrompt(examples: RoleExampleRow[]): string {
+  return examples
+    .map((row) => {
+      let parsed: ParsedJobExample = {};
+      try {
+        parsed = JSON.parse(row.parsed_job_json || "{}");
+      } catch {
+        parsed = {};
+      }
+      const headline = parsed.title
+        ? `${parsed.title}${parsed.company ? ` at ${parsed.company}` : ""}`
+        : row.source_url;
+      const lines = [`- ${headline}`];
+      if (parsed.location) lines.push(`  Location: ${parsed.location}`);
+      if (parsed.employment_type) lines.push(`  Employment type: ${parsed.employment_type}`);
+      if (parsed.description) lines.push(`  Summary: ${parsed.description}`);
+      if (parsed.responsibilities?.length) lines.push(`  Responsibilities: ${parsed.responsibilities.join("; ")}`);
+      if (parsed.qualifications?.length) lines.push(`  Qualifications: ${parsed.qualifications.join("; ")}`);
+      if (parsed.skills?.length) lines.push(`  Skills: ${parsed.skills.join(", ")}`);
+      if (row.reason) lines.push(`  Why the candidate flagged this: ${row.reason}`);
+      lines.push(`  Source: ${row.source_url}`);
+      return lines.join("\n");
+    })
+    .join("\n\n");
+}
+
 const ROLE_ANALYSIS_SCHEMA = {
   type: "object",
   properties: {
@@ -894,7 +1116,7 @@ async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response
   if (keyError) return json({ error: keyError }, 501);
 
   const profileId = await getOrCreateProfileId(env);
-  const [profileRow, signals] = await Promise.all([
+  const [profileRow, signals, exampleRows] = await Promise.all([
     env.DB.prepare("SELECT preferences_json, match_profile FROM candidate_profiles WHERE id = ?")
       .bind(profileId)
       .first<{ preferences_json: string; match_profile: string }>(),
@@ -903,11 +1125,21 @@ async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response
     )
       .bind(profileId)
       .all<{ claim: string }>(),
+    env.DB.prepare(
+      `SELECT id, type, source_url, reason, parsed_job_json, fetch_status, created_at, updated_at
+       FROM role_examples WHERE profile_id = ? ORDER BY created_at ASC`,
+    )
+      .bind(profileId)
+      .all<RoleExampleRow>(),
   ]);
 
   const matchProfile = (profileRow?.match_profile ?? "").trim();
   const notes = signals.results.map((s) => s.claim);
-  if (!notes.length && !matchProfile) return json({ error: "no_source_material" }, 400);
+  const goodExamples = exampleRows.results.filter((r) => r.type === "good");
+  const badExamples = exampleRows.results.filter((r) => r.type === "bad");
+  if (!notes.length && !matchProfile && !goodExamples.length && !badExamples.length) {
+    return json({ error: "no_source_material" }, 400);
+  }
 
   const preferencesJson = profileRow?.preferences_json ?? "{}";
   const desiredLocations = readDesiredLocations(preferencesJson);
@@ -920,6 +1152,11 @@ async function analyzeDesiredRoles(request: Request, env: Env): Promise<Response
     locations: desiredLocations ? `LOCATIONS THEY'LL WORK IN:\n${desiredLocations}` : "",
     dealbreakers: dealbreakers ? `DEALBREAKERS:\n${dealbreakers}` : "",
     criteria: careAbout ? `WHAT THEY SAID THEY CARE ABOUT:\n${careAbout}` : "",
+    // Not yet referenced by the production "roles/analyze" Langfuse prompt -- see the
+    // formatRoleExamplesForPrompt doc comment. Passed unconditionally so the prompt can start
+    // using {{good_examples}}/{{bad_examples}} without a code change once it's edited there.
+    good_examples: goodExamples.length ? `GOOD EXAMPLES (roles the candidate wants):\n${formatRoleExamplesForPrompt(goodExamples)}` : "",
+    bad_examples: badExamples.length ? `BAD EXAMPLES (roles the candidate does not want):\n${formatRoleExamplesForPrompt(badExamples)}` : "",
   });
 
   let analysis: RoleAnalysis;
@@ -1352,12 +1589,13 @@ async function dataSummary(request: Request, env: Env): Promise<Response> {
   const count = async (sql: string): Promise<number> =>
     (await env.DB.prepare(sql).first<{ n: number }>())?.n ?? 0;
 
-  const [companies, jobs, documents, notes, roleSignals, resumes, feedback, coverLetters, applicationAnswers, descBytes, docBytes] = await Promise.all([
+  const [companies, jobs, documents, notes, roleSignals, roleExamples, resumes, feedback, coverLetters, applicationAnswers, descBytes, docBytes] = await Promise.all([
     count("SELECT COUNT(*) AS n FROM companies"),
     count("SELECT COUNT(*) AS n FROM job_postings"),
     count("SELECT COUNT(*) AS n FROM source_documents"),
     count("SELECT COUNT(*) AS n FROM candidate_evidence WHERE category = 'note'"),
     count("SELECT COUNT(*) AS n FROM candidate_evidence WHERE category = 'role_signal'"),
+    count("SELECT COUNT(*) AS n FROM role_examples"),
     count("SELECT COUNT(*) AS n FROM resumes"),
     count("SELECT COUNT(*) AS n FROM job_feedback"),
     count("SELECT COUNT(*) AS n FROM cover_letters"),
@@ -1374,6 +1612,7 @@ async function dataSummary(request: Request, env: Env): Promise<Response> {
       documents,
       notes,
       role_signals: roleSignals,
+      role_examples: roleExamples,
       resumes,
       feedback,
       cover_letters: coverLetters,
@@ -1427,6 +1666,7 @@ async function purgeCollection(request: Request, env: Env): Promise<Response> {
     resumes: "DELETE FROM resumes",
     notes: "DELETE FROM candidate_evidence WHERE category = 'note'",
     role_signals: "DELETE FROM candidate_evidence WHERE category = 'role_signal'",
+    role_examples: "DELETE FROM role_examples",
     manual_jobs: "DELETE FROM job_postings WHERE company_id IS NULL",
     cover_letters: "DELETE FROM cover_letters",
     application_answers: "DELETE FROM application_answers",
@@ -4952,7 +5192,8 @@ const DASHBOARD_PAGE = `<!doctype html>
 
   <div id="panel-roles" class="panel active">
     <div class="segmented-control" role="group" aria-label="Role sections">
-      <button class="subtab active" data-subtab="notes" type="button">Targets</button>
+      <button class="subtab active" data-subtab="notes" type="button">Description</button>
+      <button class="subtab" data-subtab="examples" type="button">Examples</button>
       <button class="subtab" data-subtab="locations" type="button">Location</button>
       <button class="subtab" data-subtab="dealbreakers" type="button">Deal Breakers</button>
       <button class="subtab" data-subtab="criteria" type="button">Criteria</button>
@@ -4962,17 +5203,53 @@ const DASHBOARD_PAGE = `<!doctype html>
     <div id="subpanel-notes" class="subpanel active">
       <section id="role-signals-section">
         <h2>What are you looking for?</h2>
-        <p class="hint">Paste job links, or write loosely about what you want next. The more you add, the better the analysis on the Analysis tab.</p>
+        <p class="hint">Describe the kinds of roles you want, in your own words -- role families, seniority, hands-on vs. research, customer-facing vs. not, whatever matters to you. A link to a posting works too, but this isn't primarily about pasting links; it's preference data. The more you add, the better the analysis on the Analysis tab.</p>
         <details id="role-signals-details" class="disclosure">
           <summary id="role-signals-summary">Notes on file</summary>
           <div id="role-signals-list"><p class="empty">Loading…</p></div>
         </details>
         <form id="role-signal-form">
           <label for="role-signal-text">Add a note or link</label>
-          <textarea id="role-signal-text" required placeholder="e.g. a link to a posting, or 'I want senior IC roles in applied AI, remote-friendly, not pure infra'"></textarea>
+          <textarea id="role-signal-text" required placeholder="e.g. 'Applied AI Engineer or Solutions Engineer working with AI products, hands-on prototyping rather than pure research, customer-facing technical work'"></textarea>
           <button type="submit">Add</button>
         </form>
         <p id="role-signal-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+
+    <div id="subpanel-examples" class="subpanel">
+      <section id="role-examples-good-section">
+        <h2>Good examples</h2>
+        <p class="hint">Jobs that represent the kind of opportunity you want -- open, closed, old, already applied to, or purely illustrative, it doesn't matter. Paste a link and we'll try to read the posting; if it can't be fetched, your reason alone still counts.</p>
+        <details id="role-examples-good-details" class="disclosure">
+          <summary id="role-examples-good-summary">Good examples on file</summary>
+          <div id="role-examples-good-list"><p class="empty">Loading…</p></div>
+        </details>
+        <form id="role-example-good-form">
+          <label for="role-example-good-url">Job URL</label>
+          <input id="role-example-good-url" type="url" required placeholder="https://...">
+          <label for="role-example-good-reason">Why is this a good fit? (optional)</label>
+          <textarea id="role-example-good-reason" placeholder="e.g. This is almost exactly what I want because it combines applied AI development with customer-facing technical work."></textarea>
+          <button type="submit">Add</button>
+        </form>
+        <p id="role-example-good-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+
+      <section id="role-examples-bad-section">
+        <h2>Bad examples</h2>
+        <p class="hint">Jobs that represent the kind of opportunity you don't want. Same idea -- the posting is evidence, and the reason is supplementary context.</p>
+        <details id="role-examples-bad-details" class="disclosure">
+          <summary id="role-examples-bad-summary">Bad examples on file</summary>
+          <div id="role-examples-bad-list"><p class="empty">Loading…</p></div>
+        </details>
+        <form id="role-example-bad-form">
+          <label for="role-example-bad-url">Job URL</label>
+          <input id="role-example-bad-url" type="url" required placeholder="https://...">
+          <label for="role-example-bad-reason">Why is this a poor fit? (optional)</label>
+          <textarea id="role-example-bad-reason" placeholder="e.g. Too much pure infrastructure work and not enough product or customer interaction."></textarea>
+          <button type="submit">Add</button>
+        </form>
+        <p id="role-example-bad-status" class="status" role="status" aria-live="polite"></p>
       </section>
     </div>
 
@@ -5013,7 +5290,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     <div id="subpanel-analysis" class="subpanel">
       <section id="role-analysis-section">
         <h2>Analysis</h2>
-        <p class="hint">What the model thinks you're suited for, based on your notes, your profile, and the Locations/Dealbreakers/Criteria tabs. This is what filters which postings you even see. Editing the other tabs and switching away reanalyzes automatically; use Reanalyze to force a fresh pass right now.</p>
+        <p class="hint">What the model thinks you're suited for, based on your Description, your Good/Bad Examples, your profile, and the Location/Deal Breakers/Criteria tabs. This is what filters which postings you even see. Editing the other tabs and switching away reanalyzes automatically; use Reanalyze to force a fresh pass right now.</p>
         <label for="role-analysis-provider">Analyze using</label>
         <select id="role-analysis-provider">
           <option value="anthropic">Anthropic (Claude)</option>
@@ -5021,7 +5298,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         </select>
         <button id="role-analysis-button" class="secondary" type="button">Reanalyze</button>
         <p id="role-analysis-status" class="status" role="status" aria-live="polite"></p>
-        <div id="role-analysis-view"><p class="empty">Not analyzed yet -- click Reanalyze, or add a note on the Notes tab and switch tabs.</p></div>
+        <div id="role-analysis-view"><p class="empty">Not analyzed yet -- click Reanalyze, or add something on the Description or Examples tab and switch tabs.</p></div>
       </section>
     </div>
   </div>
@@ -5909,7 +6186,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       var host = document.getElementById('role-analysis-view');
       host.innerHTML = '';
       if (!currentRoleAnalysis) {
-        host.appendChild(el('p', { className: 'empty', textContent: 'Not analyzed yet -- click Reanalyze, or add a note on the Notes tab and switch tabs.' }));
+        host.appendChild(el('p', { className: 'empty', textContent: 'Not analyzed yet -- click Reanalyze, or add something on the Description or Examples tab and switch tabs.' }));
         return;
       }
       host.appendChild(el('p', { textContent: currentRoleAnalysis.summary }));
@@ -6323,6 +6600,122 @@ const DASHBOARD_PAGE = `<!doctype html>
         statusEl.className = 'status error';
       }
     });
+
+    // One line of identifying info when collapsed: the parsed job's title/company/location if the
+    // fetch succeeded, otherwise the bare URL the candidate pasted -- either way enough to tell
+    // examples apart without expanding each one.
+    function roleExampleSummaryLine(item) {
+      var job = item.job;
+      if (job && job.title) {
+        return job.title + (job.company ? ' at ' + job.company : '') + (job.location ? ' · ' + job.location : '');
+      }
+      return item.source_url;
+    }
+
+    function roleExampleFullText(item) {
+      var job = item.job;
+      var parts = [];
+      if (job && job.title) parts.push(job.title + (job.company ? ' at ' + job.company : ''));
+      if (job && job.location) parts.push(job.location);
+      if (job && job.employment_type) parts.push(job.employment_type);
+      if (job && job.description) parts.push(job.description);
+      if (job && job.responsibilities && job.responsibilities.length) parts.push('Responsibilities: ' + job.responsibilities.join('; '));
+      if (job && job.qualifications && job.qualifications.length) parts.push('Qualifications: ' + job.qualifications.join('; '));
+      if (job && job.skills && job.skills.length) parts.push('Skills: ' + job.skills.join(', '));
+      if (!job && item.fetch_status === 'failed') parts.push("Couldn't fetch this posting -- saved with the link and reason only.");
+      if (item.reason) parts.push('Reason: ' + item.reason);
+      parts.push(item.source_url);
+      return parts.join(' — ');
+    }
+
+    // Same collapsible-row shape as renderCollapsibleList, but the collapsed line is built from the
+    // parsed job rather than a raw claim string, and the expanded text pulls in every parsed field.
+    function renderRoleExampleList(listId, items, emptyText, onDelete) {
+      var list = document.getElementById(listId);
+      list.innerHTML = '';
+      if (!items || !items.length) {
+        list.appendChild(el('p', { className: 'empty', textContent: emptyText }));
+        return;
+      }
+      items.forEach(function (item) {
+        var summary = roleExampleSummaryLine(item);
+        var expanded = false;
+        var textEl = el('div', { className: 'collapsible-text', textContent: summary });
+        textEl.addEventListener('click', function () {
+          expanded = !expanded;
+          textEl.textContent = expanded ? roleExampleFullText(item) : summary;
+        });
+        var del = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
+        del.addEventListener('click', async function (event) {
+          event.stopPropagation();
+          await onDelete(item);
+        });
+        var row = el('div', { className: 'row' }, [el('div', {}, [textEl]), el('div', { className: 'row-actions' }, [del])]);
+        list.appendChild(el('div', { className: 'row-item' }, [row]));
+      });
+    }
+
+    // Good and bad examples are the same shape end to end (list/summary/form ids differ only by
+    // the 'good'/'bad' prefix), so one setup function drives both sections.
+    function setupRoleExampleSection(type) {
+      var listId = 'role-examples-' + type + '-list';
+      var summaryId = 'role-examples-' + type + '-summary';
+      var formId = 'role-example-' + type + '-form';
+      var urlId = 'role-example-' + type + '-url';
+      var reasonId = 'role-example-' + type + '-reason';
+      var statusId = 'role-example-' + type + '-status';
+      var noun = type === 'good' ? 'good example' : 'bad example';
+
+      async function load() {
+        var res = await api('/role-examples');
+        var data = await res.json();
+        var items = data[type] || [];
+        document.getElementById(summaryId).textContent =
+          items.length === 1 ? '1 ' + noun + ' on file' : items.length + ' ' + noun + 's on file';
+        renderRoleExampleList(listId, items, 'Nothing added yet.', async function (item) {
+          await api('/role-examples/' + encodeURIComponent(item.id), { method: 'DELETE' });
+          markRolesDirty();
+          load();
+        });
+      }
+
+      document.getElementById(formId).addEventListener('submit', async function (event) {
+        event.preventDefault();
+        var statusEl = document.getElementById(statusId);
+        statusEl.textContent = 'Adding…';
+        statusEl.className = 'status';
+        try {
+          var res = await api('/role-examples', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              type: type,
+              source_url: document.getElementById(urlId).value,
+              reason: document.getElementById(reasonId).value,
+              provider: document.getElementById('role-analysis-provider').value,
+            }),
+          });
+          var data = await res.json();
+          if (!res.ok) throw new Error(errorMessage(data, 'add_failed'));
+          statusEl.textContent = data.job
+            ? 'Added — read the posting successfully.'
+            : "Added — couldn't read the posting, saved the link and reason.";
+          statusEl.className = 'status success';
+          document.getElementById(formId).reset();
+          markRolesDirty();
+          load();
+        } catch (err) {
+          statusEl.textContent = 'Error: ' + err.message;
+          statusEl.className = 'status error';
+        }
+      });
+
+      return load;
+    }
+
+    var loadGoodRoleExamples = setupRoleExampleSection('good');
+    var loadBadRoleExamples = setupRoleExampleSection('bad');
+    function loadRoleExamples() { loadGoodRoleExamples(); loadBadRoleExamples(); }
 
     function renderDocuments(docs) {
       var list = document.getElementById('documents-list');
@@ -8694,6 +9087,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       countsHost.appendChild(dataRow('Uploaded documents', String(counts.documents || 0), 'Extracted text: ' + formatBytes(bytes.document_text)));
       countsHost.appendChild(dataRow('Notes', String(counts.notes || 0)));
       countsHost.appendChild(dataRow('Desired-role signals', String(counts.role_signals || 0)));
+      countsHost.appendChild(dataRow('Role examples', String(counts.role_examples || 0)));
       countsHost.appendChild(dataRow('Resume versions', String(counts.resumes || 0)));
       countsHost.appendChild(dataRow('Cover letters', String(counts.cover_letters || 0)));
       countsHost.appendChild(dataRow('Rejection reasons you taught it', String(counts.feedback || 0)));
@@ -8743,7 +9137,8 @@ const DASHBOARD_PAGE = `<!doctype html>
         { id: 'resumes', name: 'Resume versions', note: 'Generated resumes and their PDFs.' },
         { id: 'cover_letters', name: 'Cover letters', note: 'Generated cover letters for interested jobs.' },
         { id: 'notes', name: 'Notes', note: 'Freeform and pasted resume text on Resume > Notes.' },
-        { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Roles tab (Targets sub-tab).' },
+        { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Roles tab (Description sub-tab).' },
+        { id: 'role_examples', name: 'Role examples', note: 'Good/bad job examples on the Roles tab (Examples sub-tab).' },
       ].forEach(function (collection) {
         var del = el('button', { className: 'destructive', type: 'button', textContent: 'Delete' });
         del.addEventListener('click', async function () {
@@ -8993,6 +9388,7 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     loadProfile();
     loadRoleSignals();
+    loadRoleExamples();
     loadDocuments();
     loadNotes();
     loadResumes();
@@ -9341,6 +9737,11 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "POST" && url.pathname === "/role-signals") return createRoleSignal(request, env);
     const roleSignalMatch = url.pathname.match(/^\/role-signals\/([^/]+)$/);
     if (request.method === "DELETE" && roleSignalMatch) return deleteRoleSignal(request, env, roleSignalMatch[1]);
+    if (request.method === "GET" && url.pathname === "/role-examples") return listRoleExamples(request, env);
+    if (request.method === "POST" && url.pathname === "/role-examples") return createRoleExample(request, env);
+    const roleExampleMatch = url.pathname.match(/^\/role-examples\/([^/]+)$/);
+    if (request.method === "PATCH" && roleExampleMatch) return updateRoleExample(request, env, roleExampleMatch[1]);
+    if (request.method === "DELETE" && roleExampleMatch) return deleteRoleExample(request, env, roleExampleMatch[1]);
     if (request.method === "PUT" && url.pathname === "/desired-roles") return saveDesiredRoles(request, env);
     if (request.method === "POST" && url.pathname === "/desired-roles/analyze") return analyzeDesiredRoles(request, env);
     if (request.method === "GET" && url.pathname === "/resumes") return listResumes(request, env);
