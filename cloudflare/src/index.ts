@@ -1594,8 +1594,12 @@ async function assessRowsBatched(
       if (failed) return null;
       await emit({ type: "pipeline", stage: "assess", phase: "dispatched", ids: batch.map((item) => item.id) });
       try {
+        // Deep assessment gets the FULL record. This is the stage that decides whether the
+        // candidate is genuinely plausible for a posting, so summarizing away their project work
+        // and per-role skills is exactly the wrong economy -- the cheap prescreen above is where
+        // token cost is worth optimizing, and it already uses the compact match profile.
         return await assessJobFitBatch(
-          env, provider, JSON.stringify(structured), desiredRoles, disqualifiers, dealbreakers, careAboutTopics, batch,
+          env, provider, renderCareerProfile(structured), desiredRoles, disqualifiers, dealbreakers, careAboutTopics, batch,
         );
       } catch (err) {
         errors.push(`assess: ${(err as Error).message}`);
@@ -2386,7 +2390,10 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
       proposals = await proposeCompanies(
         env,
         provider,
-        JSON.stringify(structured),
+        // The readable rendering rather than raw JSON: discovery is asking which employers hire
+        // this person, and the domains, project work and stakeholder context that question turns on
+        // read far more reliably as prose than as deep brace nesting.
+        structured ? renderCareerProfile(structured) : "",
         desiredRoles,
         existingNames,
         count,
@@ -9867,7 +9874,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       countsHost.appendChild(dataRow('Job description text', formatBytes(bytes.job_descriptions), 'Largest thing stored'));
       countsHost.appendChild(dataRow('Uploaded documents', String(counts.documents || 0), 'Extracted text: ' + formatBytes(bytes.document_text)));
       countsHost.appendChild(dataRow('Notes', String(counts.notes || 0)));
-      countsHost.appendChild(dataRow('Desired-role signals', String(counts.role_signals || 0)));
+      countsHost.appendChild(dataRow('Career preferences', String(counts.role_signals || 0)));
       countsHost.appendChild(dataRow('Role examples', String(counts.role_examples || 0)));
       countsHost.appendChild(dataRow('Resume versions', String(counts.resumes || 0)));
       countsHost.appendChild(dataRow('Cover letters', String(counts.cover_letters || 0)));
@@ -9917,9 +9924,9 @@ const DASHBOARD_PAGE = `<!doctype html>
         { id: 'feedback', name: 'Rejection reasons', note: 'What you taught the filter by rejecting postings with a reason.' },
         { id: 'resumes', name: 'Resume versions', note: 'Generated resumes and their PDFs.' },
         { id: 'cover_letters', name: 'Cover letters', note: 'Generated cover letters for interested jobs.' },
-        { id: 'notes', name: 'Notes', note: 'Freeform and pasted resume text on Resume > Notes.' },
-        { id: 'role_signals', name: 'Desired-role signals', note: 'Links and notes on the Roles tab (Description sub-tab).' },
-        { id: 'role_examples', name: 'Role examples', note: 'Good/bad job examples on the Roles tab (Examples sub-tab).' },
+        { id: 'notes', name: 'Notes', note: 'Freeform career evidence on Profile → Notes.' },
+        { id: 'role_signals', name: 'Career preferences', note: 'What you wrote on Careers → Preferences.' },
+        { id: 'role_examples', name: 'Career examples', note: 'Good/bad job examples on Careers → Examples.' },
       ].forEach(function (collection) {
         var del = el('button', { className: 'destructive', type: 'button', textContent: 'Delete' });
         del.addEventListener('click', async function () {
