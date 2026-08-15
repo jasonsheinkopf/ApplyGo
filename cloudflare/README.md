@@ -624,6 +624,38 @@ every draft either way, so say so honestly rather than hiding it.
 
 Every `{{variable}}` above must stay present verbatim — `compilePrompt` throws `langfuse_prompt_missing_variables` if the code ever calls this prompt without supplying one, and throws `langfuse_prompt_unresolved_variable` if the template references one the code doesn't send. The code sends exactly these nine: `question`, `field_type`, `max_length`, `job`, `company`, `job_description`, `candidate_profile`, `review_context`, `saved_answers` (`generateApplicationAnswer` in `src/index.ts`). Model/provider routing and the response schema (`answer`, `grounded`) stay in code, not in this prompt, per the split described above.
 
+### Creating `applications/resolve_option`
+
+`POST /applications/resolve-option` (extension → last resort before asking the candidate about a fixed-choice field) fetches this prompt the same way and fails the same way until it exists. It's the model-assisted fallback for when content.js's own fast, rule-based synonym matching (`findOptionMatch`) can't confidently match a known answer to one of the employer's real options on its own — a decorated option ("United States+1" rather than "United States") or an unanticipated phrasing, not a case where ApplyGo doesn't know the answer.
+
+1. Langfuse → Prompts → New prompt → name it exactly `applications/resolve_option`, type **Text**.
+2. Paste the template below as the prompt content, then **Save as new version**.
+3. Promote that version's label to `production`.
+
+```
+You are matching a candidate's already-known answer to the correct choice on an employer's job
+application form. This is not a place to invent or guess a fact -- the candidate's answer is
+already given below, and every option you can choose from is copied verbatim from the employer's
+own form. Your only job is to say which one of those options is what the candidate's answer means,
+if that's actually obvious.
+
+Employer's question: {{question}}
+Candidate's answer: {{candidate_answer}}
+
+The employer's real options:
+{{options}}
+
+Pick the one option that the candidate's answer clearly and unambiguously means. Copy it back
+exactly as written above -- do not paraphrase, abbreviate, or alter it in any way. If more than one
+option could plausibly match, or if nothing on the list is a clear match, set option to null rather
+than guessing: the candidate will be asked to choose for themselves in that case, which is a much
+better outcome than a wrong answer silently submitted on their behalf.
+
+Set confident to true only when the match is obvious, not merely plausible.
+```
+
+The code sends exactly three variables: `question`, `candidate_answer`, `options` (`resolveApplicationOption` in `src/index.ts`). The server never trusts the model's echoed option text over the real list either — a returned value that doesn't exactly match one of the options given is treated the same as no confident match, so this can never introduce a choice that wasn't actually on the employer's form.
+
 ## Gmail reply-checking (optional, read-only)
 
 The Applied tab can check the candidate's own Gmail inbox for replies from companies they've applied to — "did anyone from Acme email me back?" — without ever sending, modifying, or deleting anything. This is the app's first three-legged OAuth integration; everything else external (Anthropic, OpenAI, Langfuse) is a static API key.

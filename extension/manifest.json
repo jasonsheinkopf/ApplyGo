@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ApplyGo Autofill",
-  "version": "0.1.0",
-  "description": "Fills a job application form from your ApplyGo profile, resume, and saved answers. Never submits for you.",
+  "version": "0.3.1",
+  "description": "An ApplyGo application assistant that fills job applications from your profile, resume, and saved answers. Never submits for you.",
   "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": [
     "https://boards.greenhouse.io/*",
@@ -12,10 +12,14 @@
     "https://jobs.ashbyhq.com/*",
     "https://careers.smartrecruiters.com/*",
     "https://jobs.smartrecruiters.com/*",
-    "https://applygo-prod.jasonsheinkopf.workers.dev/*"
+    "https://applygo-prod.jasonsheinkopf.workers.dev/*",
+    "http://localhost:8787/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
-    "default_title": "ApplyGo Autofill",
+    "default_title": "ApplyGo",
     "default_popup": "popup.html"
   },
   "content_scripts": [
@@ -29,8 +33,22 @@
         "https://careers.smartrecruiters.com/*",
         "https://jobs.smartrecruiters.com/*"
       ],
-      "js": ["content.js"],
+      "js": ["content.js", "agent.js", "sidebar.js"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["images/mon-chan-avatar.png", "images/applygo-logo.png"],
+      "matches": [
+        "https://boards.greenhouse.io/*",
+        "https://job-boards.greenhouse.io/*",
+        "https://jobs.lever.co/*",
+        "https://jobs.eu.lever.co/*",
+        "https://jobs.ashbyhq.com/*",
+        "https://careers.smartrecruiters.com/*",
+        "https://jobs.smartrecruiters.com/*"
+      ]
     }
   ]
 }

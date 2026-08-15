@@ -5,58 +5,50 @@
 <style>
   :root { color-scheme: light; }
   body {
-    width: 360px; margin: 0; padding: 14px;
+    width: 320px; margin: 0; padding: 14px;
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     color: #1a1a1a; background: #f7f7f8;
   }
-  h1 { font-size: 15px; margin: 0 0 10px; }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  h1 em { font-style: normal; color: #4f46e5; }
+  .lede { font-size: 12px; color: #52525b; margin: 0 0 12px; }
   button {
-    font: inherit; font-weight: 600; padding: 8px 12px; border-radius: 8px;
+    font: inherit; font-weight: 600; padding: 8px 12px; border-radius: 8px; width: 100%;
     border: 1px solid #4f46e5; background: #4f46e5; color: #fff; cursor: pointer;
   }
-  button.secondary { background: #fff; color: #1a1a1a; border-color: #d4d4d8; }
+  button.secondary { background: #fff; color: #1a1a1a; border-color: #d4d4d8; margin-top: 8px; }
   button:disabled { opacity: 0.55; cursor: default; }
   input { font: inherit; width: 100%; padding: 7px 9px; border: 1px solid #d4d4d8; border-radius: 8px; box-sizing: border-box; }
   label { display: block; font-size: 12px; color: #52525b; margin: 8px 0 3px; }
   .status { font-size: 12px; margin: 8px 0 0; min-height: 16px; }
   .status.error { color: #b91c1c; }
   .status.ok { color: #15803d; }
-  .missing { border-top: 1px solid #e4e4e7; margin-top: 12px; padding-top: 10px; }
-  .missing h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: #52525b; margin: 0 0 8px; }
-  .q { margin-bottom: 10px; }
-  .q p { margin: 0 0 4px; font-size: 13px; }
-  .row { display: flex; gap: 6px; }
-  .row input { flex: 1; }
-  .hint { font-size: 12px; color: #52525b; margin: 10px 0 0; }
+  .connected { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 10px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #15803d; flex: none; }
+  .hint { font-size: 11.5px; color: #71717a; margin: 10px 0 0; line-height: 1.45; }
 </style>
 </head>
 <body>
-  <h1>ApplyGo Autofill</h1>
+  <h1>Apply<em>Go</em></h1>
 
   <div id="setup" style="display:none">
-    <p class="hint">Paste an enrollment code from the ApplyGo dashboard (Devices tab) to connect this extension.</p>
+    <p class="lede">Connect this browser to your ApplyGo to turn on the in-page application assistant.</p>
     <label for="code">Enrollment code</label>
-    <input id="code" placeholder="code from the dashboard">
+    <input id="code" placeholder="from Settings › Devices">
     <label for="api">ApplyGo URL</label>
-    <input id="api" value="https://applygo-prod.jasonsheinkopf.workers.dev">
+    <input id="api" placeholder="http://localhost:8787">
     <p></p>
     <button id="connect" type="button">Connect</button>
     <p id="setup-status" class="status"></p>
   </div>
 
   <div id="main" style="display:none">
-    <button id="fill" type="button">Fill this form</button>
+    <div class="connected"><span class="dot"></span><span id="connected-to"></span></div>
+    <button id="open" type="button">Open the assistant on this page</button>
     <button id="signout" class="secondary" type="button">Disconnect</button>
     <p id="status" class="status"></p>
-    <div id="missing" class="missing" style="display:none">
-      <h2>Needs your answer</h2>
-      <div id="missing-list"></div>
-    </div>
-    <p class="hint">Nothing is ever submitted for you. Review the form, then submit it yourself.</p>
-    <div id="applied-block" style="display:none">
-      <p></p>
-      <button id="mark-applied" class="secondary" type="button">Mark as applied in ApplyGo</button>
-    </div>
+    <p class="hint">On a supported application page the assistant appears on its own, as a tab on
+      the right edge. Nothing is ever submitted for you.</p>
   </div>
 
   <script src="popup.js"></script>

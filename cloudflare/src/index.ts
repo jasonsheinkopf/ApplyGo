@@ -20,6 +20,7 @@ import {
   taskRollups,
 } from "./devconsole";
 import { getManagedPrompt, langfuseConfigured, langfuseTraceUrl } from "./langfuse";
+import { resumeFilenameFor } from "./resume-filename.ts";
 import {
   type ReplaySpec,
   createEvalCase,
@@ -56,6 +57,7 @@ import {
 import {
   type AtsProvider,
   COMPANY_LIST_SCHEMA,
+  normalizeCompanyDiscoveryCount,
   atsDisplayName,
   companyNameKey,
   fetchBoardJobs,
@@ -2375,7 +2377,7 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
 
   const desiredLocations = readDesiredLocations(profileRow?.preferences_json ?? "{}");
   const locationTerms = parseLocationFilter(desiredLocations);
-  const count = Math.min(Math.max(Number(body.count) || 10, 1), 20);
+  const count = normalizeCompanyDiscoveryCount(body.count);
   const focus = (body.focus ?? "").trim();
 
   return ndjsonResponse(ctx, async (emit) => {
@@ -4471,6 +4473,32 @@ const GENERATE_ANSWER_SCHEMA = {
 } as const;
 
 /**
+ * Which of the employer's own real options matches the candidate's already-known answer, for the
+ * on-demand /applications/resolve-option call -- see extension/agent.js, which only ever reaches
+ * for this after its own fast, rule-based synonym matching (content.js) has already tried and
+ * failed. Never a place to invent a choice: the model picks from the exact list it's given or says
+ * so isn't confident, and the server re-checks the returned text is actually one of those options
+ * before trusting it either way.
+ */
+const RESOLVE_OPTION_SCHEMA = {
+  type: "object",
+  properties: {
+    option: {
+      type: ["string", "null"],
+      description:
+        "The exact text of the one option, copied verbatim from the provided list, that the candidate's " +
+        "answer clearly means. null if none of the options unambiguously match -- do not guess or pick " +
+        "the closest-sounding one when it's genuinely unclear.",
+    },
+    confident: {
+      type: "boolean",
+      description: "true only if the match is obvious and unambiguous, not merely plausible.",
+    },
+  },
+  required: ["option", "confident"],
+} as const;
+
+/**
  * Fields whose answer is a fact about the person that is legally or personally consequential, and
  * which a model must never infer. Work authorization, sponsorship, and the EEO questions have real
  * consequences if answered wrongly, and "probably yes" is not a defensible basis for any of them.
@@ -4549,6 +4577,7 @@ function contactFactsFrom(label: string, contactLine: string): ContactFacts {
     website: find(/^https?:\/\//i) && !/linkedin\.com/i.test(find(/^https?:\/\//i)) ? find(/^https?:\/\//i) : "",
   };
 }
+
 
 /** Straight lookups. No model call, because there is nothing to reason about. */
 function deterministicAnswer(label: string, contact: ContactFacts): string | null {
@@ -4700,6 +4729,10 @@ async function matchApplication(request: Request, env: Env): Promise<Response> {
     answers,
     missing,
     resume_url: resumeRow ? `/resumes/${resumeRow.id}/file` : null,
+    // The name the extension uploads the resume as -- see resumeFilenameFor. Computed here rather
+    // than in the extension because the candidate's name and the job's company already live
+    // together in this one response; the extension never needs to know how the name is formatted.
+    resume_filename: resumeRow ? resumeFilenameFor(contact.name, jobMeta?.company ?? "") : null,
     cover_letter_text: letter ? stripHtmlToText(letter.content_html) : null,
     job: jobMeta ? { id: body.job_id, title: jobMeta.title, company: jobMeta.company } : null,
     // So the sidebar can say "I don't have a tailored resume for this job yet" and point back at
@@ -4792,6 +4825,65 @@ async function generateApplicationAnswer(request: Request, env: Env): Promise<Re
     return json({ answer: (result.answer ?? "").trim(), grounded: Boolean(result.grounded) });
   } catch (err) {
     return json({ error: "generation_failed", message: (err as Error).message }, 502);
+  }
+}
+
+/**
+ * Which of a fixed-choice field's real options the candidate's already-known answer means -- the
+ * last, model-assisted step before the extension gives up and asks the candidate directly (see
+ * extension/agent.js). Reached only after content.js's own fast, rule-based synonym matching has
+ * already tried and failed: a decorated option ("United States+1" rather than "United States") or
+ * an unanticipated phrasing shouldn't force a human into the loop when the match is genuinely
+ * obvious. Never invents a choice -- the model picks from the exact list it's given, and this
+ * re-checks its answer is actually one of those options before trusting it, the same "grounded or
+ * explicitly not" discipline generateApplicationAnswer already applies to narrative drafts.
+ */
+async function resolveApplicationOption(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    provider?: string;
+    label?: string;
+    value?: string;
+    options?: string[];
+  };
+  const label = (body.label ?? "").trim();
+  const value = (body.value ?? "").trim();
+  const options = (body.options ?? []).filter((o) => typeof o === "string" && o.trim());
+  if (!label || !value || !options.length) return json({ error: "label_value_options_required" }, 400);
+  // Re-checked here rather than trusted from the client -- the same actual safeguard
+  // generateApplicationAnswer applies, not just relying on the extension's own gating.
+  if (NEVER_INFER.test(label)) return json({ error: "field_not_resolvable" }, 400);
+
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  try {
+    const prompt = await getManagedPrompt(env, "applications/resolve_option", {
+      question: label,
+      candidate_answer: value,
+      options: options.map((o) => `- ${o}`).join("\n"),
+    });
+    // Cheap/fast tier: this is picking from a small closed set, not open-ended reasoning, the same
+    // category of task the bulk job-screen pass already uses this tier for.
+    const result = await callStructured<{ option: string | null; confident: boolean }>(
+      env,
+      provider,
+      "application.resolve_option",
+      prompt,
+      RESOLVE_OPTION_SCHEMA,
+      "submit_resolved_option",
+      500,
+      "screen",
+    );
+    // The model's own echo of the option text is never trusted over the real list -- if it doesn't
+    // exactly match one of the options given, that's the same as "no confident match" rather than a
+    // risk of introducing a value that was never actually on the employer's form.
+    const matched = result.option && options.includes(result.option) ? result.option : null;
+    return json({ option: matched, confident: Boolean(result.confident) && Boolean(matched) });
+  } catch (err) {
+    return json({ error: "resolution_failed", message: (err as Error).message }, 502);
   }
 }
 
@@ -5055,6 +5147,20 @@ function enrollPage(): Response {
   return new Response(ENROLL_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
+/**
+ * The two brand images (media/images/applygo-logo.png, mon-chan-avatar.png), inlined as base64 --
+ * this app has no static-asset pipeline (everything else in the dashboard is inline SVG), and
+ * adding one (an R2 route, a Workers Assets binding) for two small images would be a bigger change
+ * than "use the right logo" calls for. Pre-resized well below source resolution (the logo to 64px,
+ * Mon-chan to 40px) since these are display-small; embedding the originals would be 1-2MB apiece.
+ * Each string appears exactly once, here, and every use site in DASHBOARD_PAGE references it rather
+ * than repeating the payload inline.
+ */
+const APPLYGO_LOGO_B64 =
+  "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";
+const MON_CHAN_ICON_B64 =
+  "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";
+
 const DASHBOARD_PAGE = `<!doctype html>
 <html lang="en">
 <head>
@@ -5126,6 +5232,15 @@ const DASHBOARD_PAGE = `<!doctype html>
   .brand:hover { color: var(--text); }
   .brand svg { flex: none; }
   .brand .go { color: var(--accent); }
+  .brand-logo { flex: none; border-radius: 7px; object-fit: cover; display: block; }
+  /* The one small, consistent signal that a control triggers the language model rather than a plain
+     database action -- see the buttons that carry it: resume/cover-letter generation, role and job
+     analysis, company discovery. Never on navigation, deletes, or ordinary settings. */
+  .ai-icon {
+    display: inline-block; width: 15px; height: 15px; vertical-align: -3px; margin-right: 6px;
+    border-radius: 999px; flex: none; background-size: cover; background-position: center;
+    background-image: url('data:image/png;base64,${MON_CHAN_ICON_B64}');
+  }
   .header-actions { display: flex; align-items: center; }
   nav {
     display: flex; gap: 0.2rem; overflow-x: auto; padding: 0.25rem; margin-bottom: 1.1rem;
@@ -5201,7 +5316,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   section {
     margin: 0 0 1.1rem; padding: 1.15rem 1.25rem; background: var(--surface);
     border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
-  }
+Let me check the placeholder embraces like a variable name, gets its value when the prompt is compile careful. This is one of the prompts I'm using and the response first read it and let's talk about it. All right, so basically this gets used to analyze what kind of roles are suitable for you. So the idea would be you know if you are let's say you're a teacher and you put all your experience maybe it can like tell you that you're suitable for there's other rules suitable for you for me right I was a teacher and I did a lot of different snake things in tech I can't I'm not sure exactly what you know what what roles are suitable for me out like I don't know what those rules are so the idea is this is supposed to build a profile of like the kind of things my skills my strengths and stuff like that and then the next step is it's gonna take that and it's gonna analyze like what kind of roles I'm suitable for and explain what those roles are okay so right now this is just generating the profile and then you want to take out somewhere else and have it run against potential jobs so even before that I'm going to have another language model call that's basically going to look at this and say like okay like I'm trying to basically work through if you actually went in imagine you went into a service that helps you find a job and you paid them a lot of money and they're super professional I imagine the first thing you would do is they'd want to know like tell me everything about you tell me everything you've done before all your past history and like everything like this and it builds a profile of your skills and everything and then the next step after that is okay now I know everything about you now let me look at the job market and see what kind of roles actually exist that match that which is that makes sense yeah so what kind of helps you on here so basically I want to restructure this prompt like you could see the prompt and I agree the writing style completely be gone that's not necessary that's a mistake but I like of course we don't want to invent stuff but like basically what we want to do is like create a complete you know profile of them and I don't know like I guess maybe if we I don't know the example of the perfect structured output but maybe that's a good idea for us to have I suppose but like what would you suggest like if would it make sense for this to be structured for the next language models to look at let me take us like and think through a concrete structure i think your instinct is right here so separating out the steps into something like evidence to profile to career analysis to role generation each step is clean and focused and you build on each step in order and then the final job evaluation step compare jobs against that structured profile plus the preferences and then your first prompt is just about building that deep profile not focused on optimized for job matching yet the profiles richer than a resume right shouldn't this profile should be structured and so like wouldn't it make sense because like of course your resume is not going to include a lot of stuff but like later on like for example what I'm gonna want to do is have an agent that like talks to you like when you make a resume there's certain like later on there's certain things you need like you know did a project with seven percent growth like you you you want to like say certain stuff people don't know to add that so like here you're just kind of putting everything to everything like you're saying it's like you go to your taxes here's everything I have you know you ingest it you make a structured profile that I guess you know it's pretty obvious we should have like school a category for school like I guess it would be all the different categories of things that go into a resume like written in a way where it's easy later for someone who's good at like putting together the resume to grab pieces from it and so we probably want to be structured so what would be like the standard structure you would have like you know education and then for each education you have like what the school is when you went there you know what like what you what you majored in like all like yeah all this kind of stuff and then it would be like education previous roles skills you know maybe maybe like technical skills not technical skills like so can you can you right now I'm gonna turn off voice mode I want you to basically suggest a structured profile that would like encapsulate everything even with I guess in other category that everything should go absolutely okay this is good but not specifically just for me like I don't know if maybe like mentoring but like mentoring if you're mentoring it would be within a specific job so the idea here is like within each job you know these things like anything you do that is mentoring should be within a job you know like everything should be related to that job because like later what we're gonna do is probably pick the jobs that matter like the jobs to include that matter and same thing it's like I guess awards and honors are like if you get an award and an honor and it's you know inside school it goes with that school but it makes sense that where's honors are here outside school community outreach is good actually this is pretty good okay great so now I want you now we need to make the prompt and I think for the prompt we probably want to give it the correct schema so I'm going to give you the prompt we have now because that'll show the variables and I suppose you need to give the exact schema with like an example with fake information and make sure you have something for each so it knows the format so like make something up for each section and like it should know how to do it if there's multiple for example if there's two schools that should be clear if there's projects and research make a full prompt that gives that example in it actually before you do that can you tell me if I'm giving an example schema and I am working in lag fuse what's the smart way to have the example schema because I suppose it's gonna like scored for how well it matches like how good should I just manually build it in here or does it go somewhere else I ordered some CBD oh thank you so that's what I currently have for the prompt so you want you to fix the prompt based on this but I think if the current profile doesn't match the schema make sure the new one does, but maybe we don't even need to say that actually you have a connector can you connect to GitHub and you check this project apply go and check this for me so I'm worried I'm looking here and I see it gives you the current profile and source material for new material question is when this prompt is going through when it gives you the new material is that all of the material or only the stuff that's been added recently because I'm worried if you if this generate if this did a bad job before then we're only looking at like the structured profile although we do need the structured profile so my question is currently does the source material everything or just the new stuff and what should we do about that so just answer me that how do I erase so like when I put answers into apply go hello yeah like the pull down tab it shows a check mark first name checkmark last name and I think my problem is I wrote down it's like recalling the wrong thing like when's the earliest you want to start working with us and so it's gotten its memory how to answer these questions and some of these are pulled down tabs and for the pull down tabs it didn't it's I think it's still not recognizing them am I doing something wrong like I got to reload the extension okay hold on a second it's still not recognizing that pull down tab for country if I click it it shows different countries but we need to figure out a better way of extracting like you know doing these pull downs you can see it I like that it shows it didn't accept it but I need a way to do this I need a way can you find a way to make it automatic also you said there were other changes that were not committed can you check them and if you think they're a good idea tell me what they are and then commit them if you think they're a good idea okay do let's change it like you said and let's also get rid of that character limit or at least make it a character limit I think no one's gonna upload pages that are you know more than five pages so any document that's more than five pages worth of characters you can get rid of it you can truncate it or maybe ten pages no no one's gonna do it but do that and so I think all you need to do is give me the prompt yeah the prompt and the config which I think you're saying is the structured output so if you can give me first the prompt autonik config is for like an example structure so where are we supposed to add the example structure it's supposed to be in the prompt okay knowing all that give me the perfect prompt that's totally complete right now this one is supposed to find rolls like the result supposed to tell you like what kind of jobs what kind of job roles like imagine you don't really know what jobs are called like what job roles are actually probably a decent fit the ones that are worth like worth looking for like basically yeah the result the result of this will support company discovery so which kind of companies should even look for but then also which kind of jobs are suitable like it'll do like a filter you know and only pull back jobs that like are like this that are similar to this also you have access to the repo so take a look and I want you to find the meaning of these variables I'm assuming candidate background is their profile but I'm not sure notes locations deal breakers these are all like the criteria for what they want to do so I think the idea here is yeah I want you to look through the repo and make sure this all still makes sense right now I have two language model calls I think profile structure and rolesanalyze I think that's right is that it's creating your profile. Let's talk about can you check the workflow of all this so you understand where the information comes from and then let's talk about it all right let's kind of think this through together and I think what we're going to do is come up with a plan and I'm going to give this to like Claude Opus and have it make these changes and also like connect to update the prompts like automatically and lang fuse let's think about this so the idea I had was like you go in order forced rolls then resume then companies so it's like okay roles but I guess the question really is with the current way we're doing this if you go in order then you're looking through roles and try to come up with roles before it looks at your resume right right yeah so really you'd want the resume first the full picture and then roll second then companies is that what you're getting at I wonder if we should change roles like call roles to profile maybe and but we do kind of want like people come if they want a job it's like there's the concept of like your profile and then there's like what is it you want and then we work on resumes so like the idea is currently the resume tab now the idea was you know you upload everything all the your resume stuff and then it makes your master resume and that kind of like has everything and then from there you have like custom resumes for each job where their master resume you would never send that out but it's just like basically has kind of everything for each job even if it's not formatted the correct way I mean it's formatted the correct way but you know all that information does it make sense even to have a master resume like that i think there's a cleaner separation than what you have right now where roles becomes your profile first like who is this candidate and that's fed by resume and notes and then after that you go into career direction which is like what kinds of roles and companies should we target and then after that you can get to resume tailoring which is just about presentation and not about changing the underlying data and on your master resume point I'd probably rename that to a master career profile not a resume just to remove the idea of page limits and marketing constraints and then just keep it as a canonical data record then you can generate tailored resumes from that without losing any of the source information in the process of tailoring all right so for the tabs what are you saying right now it's rolls resume what do you think for the first tab should be I call the first tab profile and make it the canonical career record like your structured facts about the person then the second could be brolls and targets or maybe career direction something that makes it clear that it's about discovery and not just titles and then resumes come after that as a presentation layer that ordering lines up with the actual table profile careers resume oh yeah that's even cleaner profile is talk about what goes in profile profile is yeah profile would include your work history details accomplishments responsibilities skills education media short narrative arc but it's all factual no preferences or job targets just the evidence so profile should be where you upload your documents like your resume exactly upload everything there your resume CV notes anything and that builds the structure profile underneath okay so let's talk about then the careers tab so in profile right now like in resume I have a documents tab so let's imagine that's going to move into profile okay so within profile docs makes sense as one subtab then another could be structured profile where you see and can lightly edit what the system extract it keep it minimal but transparent how about it's yeah docs should be the one where you okay so there's one tab docs and there you just it works just like the resume documents tab now where you're basically choosing a file and uploading it and that's it yeah that works simple upload extra logs like the from the resume we have the notes tab this is where they can also just paste in information paste more stuff they can add you know a bunch of notes they can also invoice go voice to text and just talk so like this is where they're just adding like text instead of a document yeah nice so within profile choose subtops dogs for files notes for free form text or voice under the hood both feed into the same structured profile builder you have those two and then let's talk about what happens you so you add those two and you would want to like then see your structured profile like it's basically should take those because now it has everything about yeah but if like your profile so so for example your profile doesn't include you want to work remotely that's more to do with like job right so profile is purely background that's like super structure that has your job your all the colleges you went to and everything that's it that's where the education job skills accomplishments live no preferences yet okay so then how how are we going to get it like I guess we want to like generate it and have to be able to see it in some nice pretty printed JSON format and yeah totally after Docs and notes are processed show the structured profile in a breedable JSON due blood people notes and then a third tab is what we call it because we shouldn't call it profile because we're already on the profile tab should be something analysis analysis or maybe extracted profile something that signals this is what we understood what are some more options sure parsed profile profile preview structured view review and confirm for like put it all together consolidate profile or unified profile how about summary just summary short and clear summary when you go to the summary tab now there's like a little button you press that's basically like regenerate or generate if you've never generated a regenerate profile and then it does this prompt this prompt that takes that information and then consolidates it and like make makes that structure json file and it's not formatted like a resume but it's in that structure like exactly the structure we saw and it shouldn't show like you know curly braces like it should look pretty printed should look really nice with with like you know the indentations are good like really easy for human to read right a clean human friendly view with I'm sorry but you've reached your daily GPT Live One limit for today you can continue with GPT Live One can hear me loud and clear what's on your mind so do you remember what we were just talking about quick summary what did we just talk about right we were talking about reorganizing the apt tabs so that it's profile careers resume and within profile subtops for docs uploads do careers and so for careers here this is like what it is that you want which comes from like the roles and so if you look at current what we have for roles it was like what are you looking for pace job links and so I think what we want is a couple we want we want one of them which is like you kind of you would be able to write you know unstructured text about what kind of jobs you're looking for as you might know so what do we call that not targets but like maybe desired roles or role role preferences something like that it signals what you want without forcing a specific drop type that's good preferences and then here the idea is like here you're supposed to loosely write about you know it's okay you can just basically say what jobs you want so you can say you can say the exact name of the role the official name or you could say like oh I want to roll where I do this and this and I get to do this and this so it needs to be able to be loose but also like give you the exact answer if you give the exact answer or they can be like loose either one and that's that's this first one right okay maybe call that roll signals or roll notes do what I said I said career preferences call it preferences in the next one preferences let's have it be examples and then this is the one where there's like good like you can you it's optional but you can put in job links you found that are good and like basically you can add one add to like good or bad or desired or undesired and then you can like put a job link and you can have like a text optional where you explain why and then for example you could say oh i don't like this job because it requires you know such and such experience so you can add those so this is like examples of good jobs and bad jobs checking i like that so in careers you'd have preferences for free form wants like exact titles or things to avoid then examples good and bad job postings with URLs and notes and location which is already what we have in roles but this isn't careers same thing deal breakers and then also criterion works the way it works now and then we need you know to and then the idea here is like okay that its own subtap call the button analyze careers it takes profile plus all careers inputs and outputs a rolls subtab then roll shows a summary role families keywords and why they fit with a re analyze button and maybe rename criteria to priori yeah you're right rename criteria to priorities this is good and then for analysis yeah i guess we'll put it yeah let's call it rolls because i think we're not using that now so instead of what it currently says analysis it says rolls and then that kind of operates like it does now where you analyze or reanalyze and it takes everything and it tells you like the kind of careers that you're looking for and I think what actually would be a good idea is like to say like for each one like for example I got I got a result of applied A engineer and it explains what it is and that's good but maybe like you said maybe like it shows that it gives the name of the job the kind of the job title and then maybe we should do the thing where you like click it and expand so imagine you've got ten of them you click it and expands and there it should show like why it shows it for you it should show like you know like analysis of like if this is a career that is you know increasing you know with government reports or whatever in that location and also like the expected salary for you know for your experience level checking yeah I like that extended cards per roll default shows role title and a short match summary span to see so now we said we have profile what was it profile career and what was the next one resume resume we've already uploaded everything so the current resume tab we don't need the documents anymore and I guess we don't need the notes anymore because we already added that somewhere else checking right so resume becomes just generate application documents so a master resume tailored resumes per job and cover letters that keeps profile as the canonical data it probably doesn't maybe it didn't make sense to be said to have like one giant master resume that's like five pages long I think right so maybe it just makes sense I don't know maybe we don't need sub tabs like basically all the resumes but then I think it would make sense is like we're I think we're gonna have a lot of different resumes but I think it would make sense is like for each of those job roles to generate a resume for that job role keep a general resume as the default then generate tailored versions per roll posting profile is the source of true let's say it puts you to like five different types of jobs five different like roles I would like to have a way where it makes your you make a resume for like to start with you make a resume for each roll type right so after analyzed careers generate a base resume per role type like applied AI engineer resume and then tailor from that you could also link each expandable role card in the roles page to generate resume button yeah how about that in the careers in the role yeah in the careers page under roles like where we were expanding each one no you know what maybe let's not do that let's do it in the resume page we got to have this in the resumes page we've got why don't we have like a rolls we think I'm trying to find a way to organize it checking I shift to organizing the resumes themselves so you see cards for each resume with roll tags attached symbolists no extra subtabs for example applied AI engineer resume last updated today open or regenerate then you can have career resumes as base versions and job specific resumes clearly linked back to those I think something like that makes sense I think you can use your best judgment on that because I'm going to have to make you have you make a prompt for that but I think that's what we want to do and what I want you to do now okay so I want you to do now is I'm going to ask you to make a prompt for opus so this can be like a big task and this is basically going to make all those changes and make sure like the it looks at the prompts and make you know and the prompts lying fuse and like actually updates everything this is going to be like kind of a big restructure to do all this check in I think this war in a big refactor pumped for opus make it an architecture migration restructure Ui tabs to profile I think I might go shopping so that's my credits replenish in ten minutes and I can send a big job in or I need bread cheese we have mayonise I'm sure covers are good here wipes tonight we don't use to do it tomorrow right tomorrow is Sunday we really don't have any food huh so maybe I'll cook once twice pork chip I get chicken again pork chicken we went rice right progress I see it read them now but it should be pretty obvious like it should know like basically it should have the line I want the language model to think about it and answer it should be pretty obvious which of these is America and if it's not only if it's not obvious ask me sort of like a virtual world I think and you and other people walk around and sort of maybe solve puzzles I've never played but we'll check it out and let you know do you want to go in a couple minutes you don't what y'all go about a new arrival by myself again this cookies for me actually a problem here is like it showed me all these to pick from and I picked it but it still didn't accept it so somehow like even though it's reading them it's not able to write them all right let's do it what's that package only a meat can be here so where do we go beans and broke always first I have a lot of that give me one of the lives do you have plugin everything away it's on drink back probably  }
   h2 { font-size: 1.0rem; font-weight: 650; margin: 0 0 0.7rem; letter-spacing: -0.01em; }
   h3 { font-size: 0.92rem; font-weight: 650; margin: 1.4rem 0 0.5rem; }
   p.hint { color: var(--text-muted); font-size: 0.85rem; line-height: 1.45; margin: -0.35rem 0 0.85rem; }
@@ -5547,10 +5662,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   <div class="shell">
   <header>
     <a class="brand" href="/" aria-label="ApplyGo home">
-      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
-        <rect width="28" height="28" rx="8" fill="var(--accent)"/>
-        <path d="M8 15L13 20L21 9" stroke="var(--accent-contrast)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
+      <img class="brand-logo" width="28" height="28" alt="" src="data:image/png;base64,${APPLYGO_LOGO_B64}">
       <span>Apply<span class="go">Go</span></span>
     </a>
     <div class="header-actions" aria-label="Utilities">
@@ -5680,7 +5792,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           <option value="anthropic">Anthropic (Claude)</option>
           <option value="openai">OpenAI</option>
         </select>
-        <button id="role-analysis-button" class="secondary" type="button">Analyze Careers</button>
+        <button id="role-analysis-button" class="secondary" type="button"><span class="ai-icon" aria-hidden="true"></span>Analyze Careers</button>
         <p id="role-analysis-status" class="status" role="status" aria-live="polite"></p>
         <div id="role-analysis-view"><p class="empty">Not analyzed yet -- click Reanalyze, or add something on the Description or Examples tab and switch tabs.</p></div>
       </section>
@@ -5731,7 +5843,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           <option value="anthropic">Anthropic (Claude)</option>
           <option value="openai">OpenAI</option>
         </select>
-        <button id="profile-generate-button" type="button">Generate Profile</button>
+        <button id="profile-generate-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Generate Profile</button>
         <p id="profile-generate-status" class="status" role="status" aria-live="polite"></p>
         <div id="career-profile-view"><p class="empty">Loading…</p></div>
         <details id="career-profile-raw-details" class="disclosure" style="display:none">
@@ -5765,7 +5877,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           <option value="anthropic">Anthropic (Claude)</option>
           <option value="openai">OpenAI</option>
         </select>
-        <button id="resume-generate-button" type="button">Generate resume</button>
+        <button id="resume-generate-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Generate resume</button>
         <p id="resume-generate-status" class="status" role="status" aria-live="polite"></p>
       </div>
     </section>
@@ -5792,7 +5904,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       <p class="hint">A vision model looks at the rendered page the way a designer would, then adjusts the layout — and rewrites the wording from your verified profile if that's the real problem. Add a comment to steer it, or leave it blank and just hit revise.</p>
       <p id="resume-critique" class="critique" style="display:none"></p>
       <textarea id="resume-review-comment" placeholder="Optional — e.g. too much white space at the bottom, make the skills section smaller"></textarea>
-      <button id="resume-review-button" type="button">Revise this version</button>
+      <button id="resume-review-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Revise this version</button>
       <p id="resume-review-status" class="status" role="status" aria-live="polite"></p>
     </section>
   </div>
@@ -5814,8 +5926,11 @@ const DASHBOARD_PAGE = `<!doctype html>
           <label for="company-count">How many</label>
           <select id="company-count">
             <option value="10">10</option>
-            <option value="15">15</option>
             <option value="20">20</option>
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="75">75</option>
+            <option value="100">100</option>
           </select>
         </div>
         <div>
@@ -5826,7 +5941,7 @@ const DASHBOARD_PAGE = `<!doctype html>
           </select>
         </div>
       </div>
-      <button id="companies-discover-button" type="button">Find companies</button>
+      <button id="companies-discover-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Find companies</button>
       <p id="companies-discover-status" class="status" role="status" aria-live="polite"></p>
 
       <details class="disclosure">
@@ -5965,7 +6080,7 @@ const DASHBOARD_PAGE = `<!doctype html>
 
           <div id="interested-assistant-panel">
             <p id="interested-review-status" class="status" role="status" aria-live="polite"></p>
-            <button id="interested-review-button" type="button">Ask a question</button>
+            <button id="interested-review-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Ask a question</button>
             <div id="interested-review-section" style="display:none">
               <p id="interested-review-question" class="job-reason"></p>
               <textarea id="interested-review-answer" placeholder="Answer in your own words — this gets added to your profile evidence for this job."></textarea>
@@ -5976,7 +6091,7 @@ const DASHBOARD_PAGE = `<!doctype html>
 
           <div id="interested-resume-panel" style="display:none">
             <p id="interested-resume-status" class="status" role="status" aria-live="polite"></p>
-            <button id="interested-resume-button" type="button">Generate tailored resume</button>
+            <button id="interested-resume-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Generate tailored resume</button>
             <div id="interested-resume-section" style="display:none">
               <p class="hint">On some phones the preview below can't scroll or show a page break — if that happens, use the link to open the actual PDF instead.</p>
               <a id="interested-resume-open-link" class="row-title" target="_blank" rel="noopener">Open full PDF in a new tab</a>
@@ -5985,16 +6100,16 @@ const DASHBOARD_PAGE = `<!doctype html>
               <div id="interested-resume-checks"></div>
               <p id="interested-resume-critique" class="critique" style="display:none"></p>
               <textarea id="interested-resume-comment" placeholder="Optional — steer the revision, e.g. tighten the second bullet, or point out what still doesn't fit"></textarea>
-              <button id="interested-resume-revise" class="secondary" type="button">Revise this version</button>
+              <button id="interested-resume-revise" class="secondary" type="button"><span class="ai-icon" aria-hidden="true"></span>Revise this version</button>
             </div>
           </div>
 
           <div id="interested-cover-panel" style="display:none">
             <p id="interested-cover-status" class="status" role="status" aria-live="polite"></p>
-            <button id="interested-cover-button" type="button">Draft cover letter</button>
+            <button id="interested-cover-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Draft cover letter</button>
             <div id="interested-cover-section" style="display:none">
               <iframe id="interested-cover-frame" style="width:100%; min-height:60vh; border:1px solid var(--border); border-radius:0.5rem;"></iframe>
-              <button id="interested-cover-regenerate" class="secondary" type="button">Regenerate for this job</button>
+              <button id="interested-cover-regenerate" class="secondary" type="button"><span class="ai-icon" aria-hidden="true"></span>Regenerate for this job</button>
             </div>
           </div>
 
@@ -10232,6 +10347,7 @@ const EXTENSION_CORS_PATHS = [
   /^\/applications\/match$/,
   /^\/applications\/answer$/,
   /^\/applications\/generate-answer$/,
+  /^\/applications\/resolve-option$/,
   /^\/applications\/events$/,
   /^\/application-answers$/,
   /^\/jobs$/,
@@ -10253,9 +10369,9 @@ function corsHeaders(origin: string): Record<string, string> {
  * Which JSON Schema (and tool name / token budget) a task's structured call uses, so a saved eval
  * case's prompt can be resent without duplicating that wiring per case. Kept here rather than in
  * evals.ts because every schema it needs is already in scope in this file or imported above --
- * evals.ts staying schema-agnostic avoids a circular import back into index.ts for the four schemas
+ * evals.ts staying schema-agnostic avoids a circular import back into index.ts for the five schemas
  * that are defined here (STRUCTURED_PROFILE_JSON_SCHEMA, RESUME_BASE_SCHEMA, COVER_LETTER_SCHEMA,
- * GENERATE_ANSWER_SCHEMA).
+ * GENERATE_ANSWER_SCHEMA, RESOLVE_OPTION_SCHEMA).
  *
  * `resume.design_review` (needs a screenshot, never stored) and `evals.judge` (not a savable case)
  * fall through to null, matching `replayable: false` in tasks.ts.
@@ -10288,6 +10404,8 @@ function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "structured", schema: COVER_LETTER_SCHEMA, toolName: "submit_cover_letter", maxTokens: 2000 };
     case "application.generate_answer":
       return { kind: "structured", schema: GENERATE_ANSWER_SCHEMA, toolName: "submit_drafted_answer", maxTokens: 1200 };
+    case "application.resolve_option":
+      return { kind: "structured", schema: RESOLVE_OPTION_SCHEMA, toolName: "submit_resolved_option", maxTokens: 500 };
     default:
       return null;
   }
@@ -10560,6 +10678,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "POST" && url.pathname === "/gmail/check-replies") return checkGmailReplies(request, env, ctx);
     if (request.method === "POST" && url.pathname === "/applications/match") return matchApplication(request, env);
     if (request.method === "POST" && url.pathname === "/applications/generate-answer") return generateApplicationAnswer(request, env);
+    if (request.method === "POST" && url.pathname === "/applications/resolve-option") return resolveApplicationOption(request, env);
     if (request.method === "POST" && url.pathname === "/applications/answer") return saveApplicationAgentAnswer(request, env);
     if (request.method === "POST" && url.pathname === "/applications/events") return recordAgentEvents(request, env);
     if (request.method === "POST" && url.pathname === "/artifacts") return uploadArtifact(request, env);

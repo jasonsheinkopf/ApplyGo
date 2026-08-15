@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from applygo.config import Settings, get_settings
 from applygo.model_router import ModelRouter, ModelTask
+from applygo.prompt_management import get_text_prompt
 from applygo.models import CandidateEvidence, CandidateProfile, FitAssessment, JobPosting, ResumeVersion, SourceDocument
 
 PROMPT_VERSION = "fit-v2-routed"
@@ -75,7 +76,7 @@ def generate_profile_summary(session: Session, profile: CandidateProfile, settin
         "requirements": preferences,
         "source_evidence_ids": [item.id for item in evidence],
     }
-    instruction = "Return JSON only with headline, executive_summary, strengths, target_roles, requirements, and source_evidence_ids. Use only supplied approved evidence. Never invent experience."
+    instruction = get_text_prompt(settings, "legacy/profile/summary")
     result = ModelRouter(settings).invoke(ModelTask.DOCUMENT_EXTRACTION, instruction, {"approved_evidence": claims, "preferences": preferences, "current_summary": profile.summary}, mock_output=default_summary)
     profile.summary = str(result.output.get("executive_summary", default_summary["executive_summary"]))
     profile.preferences = {**preferences, "generated_profile": result.output, "profile_provider": result.provider, "profile_model": result.model}
@@ -90,7 +91,7 @@ def generate_resume_version(session: Session, profile: CandidateProfile, purpose
     name = profile.user.display_name
     mock_markdown = f"# {name}\n\n## Professional Summary\n{profile.summary or 'Grounded candidate profile pending generation.'}\n\n## Selected Experience\n" + "\n".join(f"- {item.claim}" for item in evidence[:8])
     mock = {"title": f"{name} — {purpose or 'General'}", "purpose": purpose or "General-purpose résumé", "content_markdown": mock_markdown, "source_evidence_ids": [item.id for item in evidence]}
-    instruction = "Return JSON only with title, purpose, content_markdown, and source_evidence_ids. Create a polished ATS-friendly resume using only approved evidence. Do not alter source documents or invent facts."
+    instruction = get_text_prompt(settings, "legacy/resume/draft")
     result = ModelRouter(settings).invoke(ModelTask.DOCUMENT_DRAFTING, instruction, {"candidate_name": name, "profile_summary": profile.summary, "preferences": profile.preferences, "approved_evidence": claims, "requested_purpose": purpose}, mock_output=mock)
     resume = ResumeVersion(profile_id=profile.id, title=str(result.output.get("title", mock["title"])), purpose=str(result.output.get("purpose", mock["purpose"])), content_markdown=str(result.output.get("content_markdown", mock_markdown)), provider=result.provider, model=result.model, source_evidence_ids=list(result.output.get("source_evidence_ids", mock["source_evidence_ids"])))
     session.add(resume)
@@ -128,7 +129,8 @@ class ModelGateway:
         baseline = deterministic_fit(profile, evidence, job)
         verified = [{"id": item.id, "claim": item.claim} for item in evidence if item.usable_in_applications and item.verification_status in {"verified", "user_confirmed"}]
         payload = {"candidate_summary": profile.summary, "verified_evidence": verified, "job": {"title": job.title, "company": job.company, "description": job.raw_description}, "required_output_shape": baseline}
-        result = self.router.invoke(ModelTask.FIT_ASSESSMENT, "Return JSON only. Evaluate fit using only verified_evidence. Never invent qualifications. Preserve every required_output_shape key.", payload, mock_output=baseline)
+        instruction = get_text_prompt(self.settings, "legacy/jobs/fit")
+        result = self.router.invoke(ModelTask.FIT_ASSESSMENT, instruction, payload, mock_output=baseline)
         return result.output, {**result.usage, "execution_mode": result.execution_mode.value}, result.provider, result.model
 
 
