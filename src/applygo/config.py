@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     openai_compatible_api_key: str = Field(default="local", validation_alias="OPENAI_COMPATIBLE_API_KEY")
     claude_routine_url: str | None = Field(default=None, validation_alias="CLAUDE_ROUTINE_URL")
     claude_routine_token: str | None = Field(default=None, validation_alias="CLAUDE_ROUTINE_TOKEN")
+    langfuse_public_key: str | None = Field(default=None, validation_alias="LANGFUSE_PUBLIC_KEY")
+    langfuse_secret_key: str | None = Field(default=None, validation_alias="LANGFUSE_SECRET_KEY")
+    langfuse_base_url: str = Field(default="https://cloud.langfuse.com", validation_alias="LANGFUSE_BASE_URL")
 
     @property
     def model_routes(self) -> dict[str, dict[str, Any]]:
