@@ -20,6 +20,7 @@ export type LlmTaskId =
   | "companies.discover"
   | "profile.structure"
   | "roles.analyze"
+  | "roles.research"
   | "review.question"
   | "resume.build"
   | "resume.requirements"
@@ -101,8 +102,8 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     name: "Structure the profile",
     stage: "Profile",
     tier: "reason",
-    what: "Turns uploaded documents and notes into the structured candidate profile everything else reads from.",
-    source: "src/index.ts -> saveStructuredProfile",
+    what: "Turns uploaded documents and notes into the canonical CareerProfile every later stage reads from.",
+    source: "src/index.ts -> generateProfile",
     batched: false,
     replayable: true,
   },
@@ -111,10 +112,20 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     name: "Analyze suitable roles",
     stage: "Profile",
     tier: "reason",
-    what: "Structured. Reads notes, locations, dealbreakers, criteria, and the structured profile; writes a non-role-specific summary plus a list of distinct role types the candidate is suited for.",
+    what: "Structured. Reads the full career profile plus preferences, good/bad examples, locations, deal breakers and priorities; writes a role-independent summary plus the distinct role families worth searching for.",
     source: "src/index.ts -> analyzeDesiredRoles",
     batched: false,
     replayable: true,
+  },
+  {
+    id: "roles.research",
+    name: "Research a role's market",
+    stage: "Profile",
+    tier: "reason",
+    what: "Structured. Reads labor-market documents retrieved from external sources and reports only what they support -- never salary or outlook figures recalled from training data.",
+    source: "src/market.ts -> researchRoleMarket",
+    batched: false,
+    replayable: false,
   },
   {
     id: "review.question",

@@ -103,14 +103,37 @@ async function writeCachedPrompt(env: LangfuseEnv, prompt: LangfuseTextPrompt): 
 }
 
 /**
+ * Whether a fetched template is current enough to use for the code calling it.
+ *
+ * A Langfuse template that never mentions a newly added variable still compiles cleanly --
+ * `compilePrompt` only fails in the other direction, on a variable the template wants and the code
+ * doesn't supply. That asymmetry means a release which changes a prompt's contract (new
+ * structured-output schema, new inputs) would otherwise run silently against the *old* production
+ * prompt: the model is told to do the old task while the schema forces the new shape, and nothing
+ * errors. Requiring at least one of the new contract's variables to appear is a cheap, specific
+ * test for "this template predates the current code" that no valid updated prompt can fail.
+ */
+function isPromptCompatible(template: string, requires: string[]): boolean {
+  if (!requires.length) return true;
+  return requires.some((name) => new RegExp(`{{\\s*${name}\\s*}}`).test(template));
+}
+
+/**
  * Fetches the production-labeled Langfuse prompt, with an isolate cache and a persistent D1
  * last-known-good fallback. Prompt bodies therefore have one source of truth without making a
  * temporary Langfuse outage break an already-running installation.
+ *
+ * When `fallback` is supplied, a bundled repo-side default (see src/prompts.ts) covers the two
+ * cases Langfuse cannot: no prompt reachable at all, and a reachable prompt that is too old for the
+ * calling code. Langfuse still wins whenever it holds a compatible version, so this does not move
+ * prompt ownership back into the repository -- it only stops a schema change from having to be
+ * deployed and promoted in the same instant to avoid a silent mismatch.
  */
 export async function getManagedPrompt(
   env: LangfuseEnv,
   name: string,
   variables: Record<string, string>,
+  fallback?: { text: string; requires: string[] },
 ): Promise<ManagedPrompt> {
   const key = `${host(env)}:${env.LANGFUSE_PUBLIC_KEY ?? ""}:${name}`;
   const memory = promptMemoryCache.get(key);
@@ -136,6 +159,19 @@ export async function getManagedPrompt(
   }
 
   if (!managed) managed = await readCachedPrompt(env, name);
+
+  // Checked against the D1 last-known-good copy too, not just a fresh fetch: a stale cached prompt
+  // is exactly as incompatible as a stale live one, and this is the "cannot leave an old prompt
+  // version active" guarantee the schema change depends on.
+  if (fallback && (!managed || !isPromptCompatible(managed.prompt, fallback.requires))) {
+    return {
+      text: compilePrompt(fallback.text, variables),
+      name: `${name} (bundled default)`,
+      version: 0,
+      id: null,
+    };
+  }
+
   if (!managed) {
     throw fetchError ?? new Error(`langfuse_prompt_unavailable:${name}`);
   }
