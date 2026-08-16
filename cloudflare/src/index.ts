@@ -65,10 +65,12 @@ import {
 } from "./philosophy";
 import {
   type AtsProvider,
-  COMPANY_LIST_SCHEMA,
-  normalizeCompanyDiscoveryCount,
+  type CompanySearchTerm,
+  type VerifyReason,
   atsDisplayName,
+  classifyVerification,
   companyNameKey,
+  companySearchTermsFromTitles,
   fetchBoardJobs,
   fetchMissingDescriptions,
   fetchWithTimeout,
@@ -76,11 +78,14 @@ import {
   htmlToText,
   isReadableAtsProvider,
   locationMatches,
+  mergeCompanySearchTerms,
   parseLocationFilter,
-  proposeCompanies,
   resolveBoard,
+  resolveCompanyDomain,
   verifyWebsite,
 } from "./companies";
+import { type AdzunaPosting, adzunaConfigured, aggregateCompanies, searchAdzunaPage } from "./adzuna";
+import { resolveWebsiteViaSearch } from "./websearch";
 import {
   CARE_ABOUT_TOPICS_SCHEMA,
   type CareAboutTopic,
@@ -156,6 +161,10 @@ interface Env {
   /** See src/gmail.ts. Unset means the Settings > Email "Connect Gmail" flow can't start. */
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
+  /** See src/adzuna.ts. Unset means "Find companies" can't run its primary discovery source. */
+  ADZUNA_APP_ID?: string;
+  ADZUNA_APP_KEY?: string;
+  ADZUNA_COUNTRY?: string;
 }
 
 type Session = {
@@ -321,6 +330,17 @@ const ADDITIVE_COLUMNS = [
   "ALTER TABLE llm_traces ADD COLUMN langfuse_trace_id TEXT",
   // 0025_career_refactor.sql
   "ALTER TABLE resumes ADD COLUMN role_family TEXT NOT NULL DEFAULT ''",
+  // 0026_companies_pipeline.sql
+  "ALTER TABLE companies ADD COLUMN fit_score INTEGER",
+  "ALTER TABLE companies ADD COLUMN fit_reason TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE companies ADD COLUMN fit_screened_at TEXT",
+  "ALTER TABLE companies ADD COLUMN signal TEXT NOT NULL DEFAULT ''",
+  // 0027_companies_verify_pipeline.sql
+  "ALTER TABLE companies ADD COLUMN verify_reason TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE companies ADD COLUMN last_verified_at TEXT",
+  // 0028_company_discovery_streams.sql
+  "ALTER TABLE companies ADD COLUMN website_source TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE companies ADD COLUMN website_confidence INTEGER",
 ];
 
 /**
@@ -363,7 +383,22 @@ const ADDITIVE_TABLES = [
      researched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
    )`,
   "CREATE UNIQUE INDEX IF NOT EXISTS idx_role_market_key ON role_market_research(profile_id, cache_key)",
-  // 0026_profile_improve.sql
+  // 0028_company_discovery_streams.sql
+  `CREATE TABLE IF NOT EXISTS company_discovery_streams (
+     id TEXT PRIMARY KEY,
+     profile_id TEXT NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
+     term TEXT NOT NULL,
+     location TEXT NOT NULL DEFAULT '',
+     next_page INTEGER NOT NULL DEFAULT 1,
+     exhausted INTEGER NOT NULL DEFAULT 0,
+     total_available INTEGER,
+     postings_seen INTEGER NOT NULL DEFAULT 0,
+     last_searched_at TEXT,
+     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+   )`,
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_streams_key ON company_discovery_streams(profile_id, term, location)",
+  "CREATE INDEX IF NOT EXISTS idx_discovery_streams_pending ON company_discovery_streams(profile_id, exhausted, last_searched_at)",
+  // 0029_profile_improve.sql
   `CREATE TABLE IF NOT EXISTS profile_improvement_questions (
      id TEXT PRIMARY KEY,
      profile_id TEXT NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
@@ -1882,6 +1917,76 @@ async function jobPipelineCounts(env: Env, threshold?: number): Promise<Record<s
   return counts;
 }
 
+/**
+ * Row/unit counts per Companies-pipeline stage -- Discovery / Verify / (existing) Pre-screen handoff
+ * -- used by the Companies status line, its pipeline visual, and the Data tab. There is deliberately
+ * no fit/score bucket here: a company's worth is never judged at this level (see companies.ts's
+ * header comment).
+ *
+ * The three stages are three different *units*, on purpose -- see the Companies Sankey's own header
+ * comment for why that's never blurred together:
+ * - `discovery_postings`: real Adzuna job POSTINGS looked at so far (summed across every search
+ *   stream), the raw discovery material itself -- not a company count. `discovery_companies` is the
+ *   unique-company count extracted from those postings, shown as a secondary figure alongside it.
+ * - `verified`/`unverified` (+ its per-reason breakdown, for the Unverified tab's filter chips) are
+ *   COMPANY counts, straight off `companies.status`/`verify_reason`.
+ * - `prescreen_jobs` counts JOBS, not companies -- the number of `job_postings` rows sourced from a
+ *   company that haven't completed Jobs' own screening yet (`fit_status = 'unassessed'`), the exact
+ *   same column/value Jobs' own pipeline counts treat as its own Pre-screen stage. This is
+ *   deliberate: Companies' Pre-screen number and Jobs' Pre-screen number must always agree, because
+ *   they're reading the same rows, not two independently computed totals that could drift apart.
+ */
+async function companiesPipelineCounts(env: Env, profileId: string): Promise<Record<string, number>> {
+  const rows = await env.DB.prepare(
+    `SELECT status, verify_reason, COUNT(*) AS n FROM companies
+     WHERE profile_id = ? GROUP BY status, verify_reason`,
+  )
+    .bind(profileId)
+    .all<{ status: string; verify_reason: string; n: number }>();
+
+  const counts: Record<string, number> = {
+    discovered: 0,
+    verified: 0,
+    unverified: 0,
+    unverified_no_website: 0,
+    unverified_no_job_board: 0,
+    unverified_unsupported_ats: 0,
+    unverified_board_unreachable: 0,
+    unverified_ambiguous: 0,
+    dismissed: 0,
+  };
+  let total = 0;
+  for (const row of rows.results ?? []) {
+    total += row.n;
+    if (row.status === "dismissed") counts.dismissed += row.n;
+    else if (row.status === "discovered") counts.discovered += row.n;
+    else if (row.status === "verified") counts.verified += row.n;
+    else if (row.status === "unverified") {
+      counts.unverified += row.n;
+      const key = `unverified_${row.verify_reason}`;
+      if (key in counts) counts[key] += row.n;
+    }
+  }
+  counts.total = total;
+  // "Unique companies discovered" for the Discovery stage's secondary stat -- everything that isn't
+  // dismissed (dismissed is a removal decision, not a discovery-stage concept).
+  counts.discovery_companies = total - counts.dismissed;
+
+  const streams = await env.DB.prepare(
+    "SELECT COALESCE(SUM(postings_seen), 0) AS n FROM company_discovery_streams WHERE profile_id = ?",
+  )
+    .bind(profileId)
+    .first<{ n: number }>();
+  counts.discovery_postings = streams?.n ?? 0;
+
+  const prescreen = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM job_postings WHERE company_id IS NOT NULL AND fit_status = 'unassessed'",
+  ).first<{ n: number }>();
+  counts.prescreen_jobs = prescreen?.n ?? 0;
+
+  return counts;
+}
+
 // ---------------------------------------------------------------------------
 // Stored data: inspection and stage-scoped resets
 // ---------------------------------------------------------------------------
@@ -1917,6 +2022,7 @@ const PIPELINE_STAGES = [
 async function dataSummary(request: Request, env: Env): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
 
   const count = async (sql: string): Promise<number> =>
     (await env.DB.prepare(sql).first<{ n: number }>())?.n ?? 0;
@@ -1951,6 +2057,7 @@ async function dataSummary(request: Request, env: Env): Promise<Response> {
       application_answers: applicationAnswers,
     },
     pipeline: await jobPipelineCounts(env),
+    company_pipeline: await companiesPipelineCounts(env, profileId),
     bytes: { job_descriptions: descBytes, document_text: docBytes },
   });
 }
@@ -2219,14 +2326,15 @@ async function listCompanies(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
   const profileId = await getOrCreateProfileId(env);
   const rows = await env.DB.prepare(
-    `SELECT id, name, website, careers_url, bio, location, why_fit, ats_provider, status, source,
-            scan_note, last_scanned_at, open_jobs, created_at
+    `SELECT id, name, website, careers_url, bio, ats_provider, status, verify_reason, source,
+            scan_note, last_scanned_at, last_verified_at, open_jobs, created_at, signal, location,
+            website_source, website_confidence
      FROM companies WHERE profile_id = ? ORDER BY name COLLATE NOCASE ASC`,
   )
     .bind(profileId)
     .all();
   const pending = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable') AND last_scanned_at IS NULL",
+    "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status = 'verified' AND last_scanned_at IS NULL",
   )
     .bind(profileId)
     .first<{ n: number }>();
@@ -2248,6 +2356,7 @@ async function listCompanies(request: Request, env: Env): Promise<Response> {
     unscanned: pending?.n ?? 0,
     desired_locations: desiredLocations,
     off_target: companies.filter((c) => c.off_target).length,
+    company_pipeline: await companiesPipelineCounts(env, profileId),
   });
 }
 
@@ -2260,16 +2369,17 @@ async function addCompanyRow(
     careers_url: string;
     bio: string;
     location: string;
-    why_fit: string;
     status: string;
     source: string;
+    verify_reason?: string;
     scan_note?: string;
+    signal?: string;
   },
 ): Promise<boolean> {
   const result = await env.DB.prepare(
     `INSERT OR IGNORE INTO companies
-       (id, profile_id, name, name_key, website, careers_url, bio, location, why_fit, status, source, scan_note)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, profile_id, name, name_key, website, careers_url, bio, location, status, verify_reason, source, scan_note, signal)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       crypto.randomUUID(),
@@ -2280,10 +2390,11 @@ async function addCompanyRow(
       company.careers_url,
       company.bio,
       company.location,
-      company.why_fit,
       company.status,
+      company.verify_reason ?? "",
       company.source,
       company.scan_note ?? "",
+      company.signal ?? "",
     )
     .run();
   return result.meta.changes > 0;
@@ -2308,8 +2419,7 @@ async function createCompany(request: Request, env: Env): Promise<Response> {
     careers_url: (body.careers_url ?? "").trim(),
     bio: (body.bio ?? "").trim(),
     location: (body.location ?? "").trim(),
-    why_fit: "",
-    status: "reachable",
+    status: "discovered",
     source: "manual",
   });
   return json({ added }, added ? 201 : 200);
@@ -2372,8 +2482,7 @@ async function bulkAddCompanies(request: Request, env: Env): Promise<Response> {
       careers_url: "",
       bio: "",
       location: "",
-      why_fit: "",
-      status: "reachable",
+      status: "discovered",
       source: "manual",
     });
     if (wasAdded) added += 1;
@@ -2381,143 +2490,331 @@ async function bulkAddCompanies(request: Request, env: Env): Promise<Response> {
   return json({ added, skipped: capped.length - added, total: capped.length }, 201);
 }
 
+// ---------------------------------------------------------------------------
+// Company search terms -- the visible, editable discovery input
+// ---------------------------------------------------------------------------
+
+function readCompanySearchTerms(preferencesJson: string): CompanySearchTerm[] {
+  try {
+    const raw = (JSON.parse(preferencesJson || "{}") as { company_search_terms?: unknown }).company_search_terms;
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((t) => ({
+        term: String((t as { term?: unknown })?.term ?? "").trim(),
+        source: (t as { source?: unknown })?.source === "manual" ? ("manual" as const) : ("generated" as const),
+      }))
+      .filter((t) => t.term);
+  } catch {
+    return [];
+  }
+}
+
+async function writeCompanySearchTerms(env: Env, profileId: string, terms: CompanySearchTerm[]): Promise<void> {
+  const existing = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  let prefs: Record<string, unknown> = {};
+  try {
+    prefs = JSON.parse(existing?.preferences_json || "{}");
+  } catch {
+    prefs = {};
+  }
+  prefs.company_search_terms = terms;
+  await env.DB.prepare("UPDATE candidate_profiles SET preferences_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(JSON.stringify(prefs), profileId)
+    .run();
+}
+
 /**
- * Proposes companies from the candidate's own profile, then checks each proposed site actually
- * resolves before trusting it. A model listing employers will occasionally invent or misremember
- * one, so nothing here is taken on faith.
+ * Deterministic, no LLM call -- reuses the exact same title/alternate-title/search-title-term
+ * extraction Adzuna discovery's own query-building and the board role-filter already use
+ * (roleTitleTerms), rather than running a second, possibly-inconsistent analysis just to name the
+ * same roles again. This is also *why* the visible search terms genuinely are what gets searched:
+ * they're not a friendly gloss over a separate hidden query, they're the literal terms. The actual
+ * capping/title-casing/tagging is companySearchTermsFromTitles (companies.ts) -- pure, so it's the
+ * part covered by tests, independent of readRoleAnalysis's DB-shaped input here.
+ */
+function generateCompanySearchTerms(preferencesJson: string): CompanySearchTerm[] {
+  return companySearchTermsFromTitles(roleTitleTerms(readRoleAnalysis(preferencesJson)));
+}
+
+/** GET /companies/search-terms -- lazily generates and persists a first suggested set if the
+ *  candidate has never had one, so this always has something to show without a separate "generate"
+ *  click being required before the terms are visible at all. */
+async function getCompanySearchTerms(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const row = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  const prefsJson = row?.preferences_json ?? "{}";
+  let terms = readCompanySearchTerms(prefsJson);
+  if (!terms.length) {
+    terms = generateCompanySearchTerms(prefsJson);
+    if (terms.length) await writeCompanySearchTerms(env, profileId, terms);
+  }
+  return json({ terms });
+}
+
+/** PUT /companies/search-terms {terms} -- the frontend owns the full list client-side (chips added/
+ *  edited/removed there) and syncs the whole thing back here, rather than this being a set of
+ *  granular add/remove/edit endpoints -- simpler on both ends for a list this small. */
+async function setCompanySearchTerms(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { terms?: unknown };
+  if (!Array.isArray(body.terms)) return json({ error: "invalid_terms" }, 400);
+  const terms: CompanySearchTerm[] = body.terms
+    .map((t) => ({
+      term: String((t as { term?: unknown })?.term ?? "").trim().slice(0, 80),
+      source: (t as { source?: unknown })?.source === "manual" ? ("manual" as const) : ("generated" as const),
+    }))
+    .filter((t) => t.term)
+    .slice(0, 50);
+  const profileId = await getOrCreateProfileId(env);
+  await writeCompanySearchTerms(env, profileId, terms);
+  return json({ terms });
+}
+
+/** POST /companies/search-terms/regenerate -- replaces only the source:'generated' terms with a
+ *  fresh extraction from the candidate's current Role Analysis; every source:'manual' term the
+ *  candidate typed in survives untouched. This is the explicit "Reset to suggested" action, never
+ *  run silently -- the candidate's own edits are otherwise never overwritten by a page load. */
+async function regenerateCompanySearchTerms(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const row = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  const prefsJson = row?.preferences_json ?? "{}";
+  const manual = readCompanySearchTerms(prefsJson).filter((t) => t.source === "manual");
+  const generated = generateCompanySearchTerms(prefsJson);
+  // Manual terms first -- the candidate's own deliberate additions read as the "primary" list, with
+  // suggestions filling in after, rather than a wall of generated chips burying the two they typed.
+  const terms = mergeCompanySearchTerms(manual, generated);
+  await writeCompanySearchTerms(env, profileId, terms);
+  return json({ terms });
+}
+
+// ---------------------------------------------------------------------------
+// Discovery
+// ---------------------------------------------------------------------------
+
+type DiscoveryStream = {
+  id: string;
+  term: string;
+  location: string;
+  next_page: number;
+  total_available: number | null;
+};
+
+/**
+ * Primary -- and only -- company discovery: deterministic, grounded in real current hiring activity
+ * via the Adzuna Job Search API (src/adzuna.ts), not LLM recall. No LLM call happens anywhere in
+ * this function -- company identity comes straight off Adzuna's structured `company` field, and a
+ * real domain is only ever trusted once resolveCompanyDomain's guess-and-verify has confirmed it
+ * responds.
+ *
+ * Resumable: every (search term, location) combination is its own persisted stream
+ * (company_discovery_streams) tracking which Adzuna page it's already read. A click processes a
+ * bounded batch of not-yet-exhausted streams and advances each one's cursor -- it never restarts a
+ * stream from page 1 just because a previous click didn't finish the whole configured search
+ * universe, and a stream Adzuna has confirmed has nothing left simply stops being selected.
  */
 async function discoverCompanies(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as {
-    provider?: string;
-    count?: number;
-    focus?: string;
-  };
-  const provider = normalizeProvider(body.provider);
-  const keyError = providerKeyMissing(env, provider);
-  if (keyError) return json({ error: keyError }, 501);
+  if (!adzunaConfigured(env)) return json({ error: "adzuna_not_configured" }, 501);
+
+  const body = (await request.json().catch(() => ({}))) as { focus?: string };
+  const focus = (body.focus ?? "").trim();
 
   const profileId = await getOrCreateProfileId(env);
-  const profileRow = await env.DB.prepare(
-    "SELECT preferences_json, structured_json FROM candidate_profiles WHERE id = ?",
+  const profileRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ preferences_json: string }>();
+  const prefsJson = profileRow?.preferences_json ?? "{}";
+  const desiredLocations = readDesiredLocations(prefsJson);
+  const locationTerms = parseLocationFilter(desiredLocations);
+
+  let searchTerms = readCompanySearchTerms(prefsJson);
+  if (!searchTerms.length) {
+    searchTerms = generateCompanySearchTerms(prefsJson);
+    if (searchTerms.length) await writeCompanySearchTerms(env, profileId, searchTerms);
+  }
+  if (!searchTerms.length) return json({ error: "no_search_terms" }, 400);
+  // Focus is appended to every term as typed by the candidate -- a separate broader-intent input
+  // from the concrete search terms above it, not itself one of the persisted terms.
+  const whatTerms = searchTerms.map((t) => (focus ? `${t.term} ${focus}` : t.term));
+  const whereTerms = locationTerms.length ? locationTerms : [""];
+
+  // Every (term, location) combination gets its own stream row, created once and reused by every
+  // future click -- no cap on how many combinations exist, since the per-click budget below (not
+  // this list) is what bounds a single request's cost.
+  for (const what of whatTerms) {
+    for (const where of whereTerms) {
+      await env.DB.prepare(
+        "INSERT OR IGNORE INTO company_discovery_streams (id, profile_id, term, location) VALUES (?, ?, ?, ?)",
+      )
+        .bind(crypto.randomUUID(), profileId, what, where)
+        .run();
+    }
+  }
+
+  const activeKeys = new Set(whatTerms.flatMap((what) => whereTerms.map((where) => `${what} ${where}`)));
+  const allStreams = await env.DB.prepare(
+    `SELECT id, term, location, next_page, total_available FROM company_discovery_streams
+     WHERE profile_id = ? AND exhausted = 0
+     ORDER BY last_searched_at IS NOT NULL, last_searched_at ASC`,
   )
     .bind(profileId)
-    .first<{ preferences_json: string; structured_json: string }>();
-  const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
-  if (!structured) return json({ error: "no_profile_yet" }, 400);
-  const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
+    .all<DiscoveryStream>();
+  // Only streams matching the *current* configured terms/locations are eligible -- a term the
+  // candidate has since removed just stops being picked, with no separate cleanup step needed.
+  const eligible = (allStreams.results ?? []).filter((s) => activeKeys.has(`${s.term} ${s.location}`));
+  // Bounded per click, same reasoning as the old fixed pair cap -- Adzuna's free tier is
+  // rate-limited, and one click should stay a handful of requests. Unlike the old cap, this only
+  // bounds *this round's* work: a stream not reached this click is exactly as eligible next click,
+  // in front of the line (least-recently-searched first), never silently dropped.
+  const batch = eligible.slice(0, 8);
 
   const existing = await env.DB.prepare("SELECT name FROM companies WHERE profile_id = ?")
     .bind(profileId)
     .all<{ name: string }>();
-  const existingNames = (existing.results ?? []).map((r) => r.name);
-
-  const desiredLocations = readDesiredLocations(profileRow?.preferences_json ?? "{}");
-  const locationTerms = parseLocationFilter(desiredLocations);
-  const count = normalizeCompanyDiscoveryCount(body.count);
-  const focus = (body.focus ?? "").trim();
+  const known = new Set((existing.results ?? []).map((r) => companyNameKey(r.name)));
 
   return ndjsonResponse(ctx, async (emit) => {
     await emit({
       type: "progress",
-      stage: "propose",
-      message: `Asking the model for ${count} compan${count === 1 ? "y" : "ies"}…`,
+      stage: "search",
+      message: `Searching ${batch.length} of ${eligible.length} remaining job-market quer${eligible.length === 1 ? "y" : "ies"}…`,
     });
 
-    let proposals;
-    try {
-      proposals = await proposeCompanies(
-        env,
-        provider,
-        // The readable rendering rather than raw JSON: discovery is asking which employers hire
-        // this person, and the domains, project work and stakeholder context that question turns on
-        // read far more reliably as prose than as deep brace nesting.
-        structured ? renderCareerProfile(structured) : "",
-        desiredRoles,
-        existingNames,
-        count,
-        focus,
-        desiredLocations,
-      );
-    } catch (err) {
-      throw new Error(friendlyMessage(err));
-    }
+    const queryErrors: string[] = [];
+    const allPostings: AdzunaPosting[] = [];
+    let searched = 0;
+    let rateLimited = false;
+    // Deliberately low concurrency compared to this file's usual 6-8 for plain fetches -- Adzuna's
+    // free tier has a real per-day/per-second rate limit, unlike verifyWebsite or a board read.
+    await runPooled(
+      batch,
+      2,
+      async (stream) => {
+        if (rateLimited) return null;
+        try {
+          return await searchAdzunaPage(env, stream.term, stream.location, stream.next_page, 50);
+        } catch (err) {
+          const message = (err as Error).message;
+          if (message === "adzuna_rate_limited") {
+            // Not this stream's fault and not "nothing left" -- leave its cursor untouched so the
+            // very next click retries the same page rather than skipping it.
+            rateLimited = true;
+            return null;
+          }
+          queryErrors.push(`${stream.term} / ${stream.location || "anywhere"}: ${message}`);
+          // A genuine per-query failure still advances last_searched_at (so a broken stream
+          // doesn't permanently monopolize the front of the least-recently-searched queue) but
+          // never marks it exhausted -- "failed once" isn't "confirmed nothing left".
+          await env.DB.prepare("UPDATE company_discovery_streams SET last_searched_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(stream.id)
+            .run();
+          return null;
+        }
+      },
+      async (stream, result) => {
+        searched += 1;
+        if (result) {
+          allPostings.push(...result.postings);
+          const nextPage = stream.next_page + 1;
+          const exhausted = result.postings.length === 0 || (stream.next_page - 1) * 50 + result.postings.length >= result.count;
+          await env.DB.prepare(
+            `UPDATE company_discovery_streams SET next_page = ?, exhausted = ?, total_available = ?,
+             postings_seen = postings_seen + ?, last_searched_at = CURRENT_TIMESTAMP WHERE id = ?`,
+          )
+            .bind(nextPage, exhausted ? 1 : 0, result.count, result.postings.length, stream.id)
+            .run();
+        }
+        await emit({ type: "progress", stage: "search", done: searched, total: batch.length, what: stream.term, where: stream.location });
+      },
+    );
 
-    const known = new Set(existingNames.map(companyNameKey));
-    const deduped = proposals.filter((p) => {
-      const key = companyNameKey(p.name);
+    const aggregated = aggregateCompanies(allPostings);
+    const discovered = aggregated.filter((c) => {
+      const key = companyNameKey(c.name);
       if (!key || known.has(key)) return false;
       known.add(key);
       return true;
     });
+    const duplicates = aggregated.length - discovered.length;
 
-    // The prompt states the location requirement, but a model treats it as guidance often enough
-    // that it has to be enforced here too rather than trusted.
-    const fresh = deduped.filter((p) => locationMatches(p.location, locationTerms));
-    const offTarget = deduped.length - fresh.length;
+    // Adzuna's `where` filter is soft-matched on its end, so the same location check is enforced
+    // locally too, rather than trusted blindly -- a filter stated to an external system is still
+    // worth re-checking.
+    const fresh = discovered.filter((c) => locationMatches(c.location, locationTerms));
+    const offTarget = discovered.length - fresh.length;
 
     await emit({
       type: "progress",
-      stage: "verify",
+      stage: "resolve",
       done: 0,
       total: fresh.length,
-      proposed: proposals.length,
-      duplicates: proposals.length - deduped.length,
+      discovered: discovered.length,
+      duplicates,
       off_target: offTarget,
     });
 
     let added = 0;
-    let unreachable = 0;
+    let domainResolved = 0;
+    let domainUnresolved = 0;
     let checked = 0;
-    // Verifying a website is one fetch with no LLM cost -- almost all wall-clock time is spent
-    // waiting on the network, not CPU. Running several at once instead of one after another is
-    // what turns "up to 20 sequential 8s timeouts" into a few seconds, and emitting after each one
-    // settles is what gives the candidate something to actually watch happen instead of one static
-    // "please wait" for the whole batch.
     await runPooled(
       fresh,
       6,
-      async (proposal) => verifyWebsite(proposal.website),
-      async (proposal, reachable) => {
+      async (company) => resolveCompanyDomain(company.name),
+      async (company, domain) => {
         checked += 1;
-        // A proposal whose site genuinely doesn't resolve is never added at all, not added and
-        // flagged -- an out-of-business or misremembered company (verifyWebsite already treats a
-        // bot-blocking 401/403 as reachable, so this is a real dead end, not a picky WAF) clutters
-        // the list with an entry the candidate can do nothing useful with. Skipping it here means
-        // there's nothing to clean up later, either.
-        if (!reachable) {
-          unreachable += 1;
-          await emit({ type: "progress", stage: "verify", done: checked, total: fresh.length, company: proposal.name, reachable });
-          return;
-        }
+        if (domain) domainResolved += 1;
+        else domainUnresolved += 1;
         const inserted = await addCompanyRow(env, profileId, {
-          ...proposal,
-          status: "reachable",
-          source: "ai",
-          scan_note: reachable
-            ? "Website verified; checking its careers page and supported job boards."
-            : "The proposed company website could not be reached, so its careers page and job board could not be checked.",
+          name: company.name,
+          website: domain ?? "",
+          careers_url: "",
+          bio: "",
+          location: company.location,
+          status: domain ? "discovered" : "unverified",
+          verify_reason: domain ? "" : "no_website",
+          source: "adzuna",
+          scan_note: domain
+            ? "Website found from the company's name; checking its careers page and supported job boards."
+            : "Discovered from real job postings. No matching website was confirmed automatically yet -- this is retried the next time you scan, including a search-grounded fallback, or add the website by hand.",
+          signal: company.signal,
         });
         if (inserted) added += 1;
         await emit({
           type: "progress",
-          stage: "verify",
+          stage: "resolve",
           done: checked,
           total: fresh.length,
-          company: proposal.name,
-          reachable,
+          company: company.name,
+          resolved: Boolean(domain),
         });
       },
     );
 
     return {
       added,
-      proposed: proposals.length,
-      duplicates: proposals.length - deduped.length,
+      discovered: discovered.length,
+      duplicates,
       off_target: offTarget,
-      unreachable,
+      domain_resolved: domainResolved,
+      domain_unresolved: domainUnresolved,
       locations: desiredLocations,
+      query_errors: queryErrors,
+      rate_limited: rateLimited,
+      streams_processed: searched,
+      streams_remaining: Math.max(0, eligible.length - searched),
     };
   });
 }
@@ -2547,24 +2844,35 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
   const limit = Math.min(Math.max(Number(body.limit) || 6, 1), 500);
   const targets = body.company_id
     ? await env.DB.prepare(
-        "SELECT id, name, website, careers_url, ats_provider, ats_token FROM companies WHERE id = ? AND profile_id = ?",
+        "SELECT id, name, website, careers_url, ats_provider, ats_token, last_scanned_at, location, signal FROM companies WHERE id = ? AND profile_id = ?",
       )
         .bind(body.company_id, profileId)
         .all<CompanyScanRow>()
     : await env.DB.prepare(
-        // Unreachable companies are excluded the same as dismissed ones -- their site didn't
-        // resolve at discovery time, so spending scan budget retrying them automatically would just
-        // fail again. The single-company scan query above (by id, no status filter) still reaches
-        // them, for a deliberate manual retry.
+        // Only 'dismissed' (user-removed) is excluded, with one narrower exception below.
+        // 'unverified' companies are deliberately included, not skipped: verification is retried on
+        // every run (a company with no website last time might have one now; a board this app
+        // couldn't read might have changed ATS), and a company with a website but no board
+        // resolution yet needs this same pass to attempt one. 'discovered' and 'verified' both need
+        // it too -- a fresh company for its first check, an already-verified one for its routine
+        // board re-read.
         //
-        // No "already scanned today" exclusion: every eligible company is always a candidate, so a
-        // Find Jobs click re-reads everything regardless of when it was last read. Ordering by
-        // least-recently-scanned first still matters when the fetch budget can't reach everyone in
-        // one request -- each round's just-scanned companies get a fresh last_scanned_at and sort
-        // to the back, so a multi-round run still ends up covering every company exactly once.
-        `SELECT id, name, website, careers_url, ats_provider, ats_token
+        // The exception: 'unsupported_ats' is the one unverified reason that's a real capability
+        // limitation of this app, not something a re-check can fix on its own -- retrying it every
+        // single click just burns budget confirming the same "yes, still ADP" outcome. Skipped
+        // unless it's been at least 14 days since the last check, in case the company migrated ATS
+        // platforms since.
+        //
+        // No "already scanned today" exclusion otherwise: every other eligible company is always a
+        // candidate, so a Find companies click re-reads everything regardless of when it was last
+        // checked. Ordering by least-recently-scanned first still matters when the fetch budget
+        // can't reach everyone in one request -- each round's just-checked companies get a fresh
+        // last_scanned_at and sort to the back, so a multi-round run still ends up covering every
+        // company exactly once.
+        `SELECT id, name, website, careers_url, ats_provider, ats_token, last_scanned_at, location, signal
          FROM companies
-         WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable')
+         WHERE profile_id = ? AND status != 'dismissed'
+           AND NOT (verify_reason = 'unsupported_ats' AND last_verified_at > datetime('now', '-14 days'))
          ORDER BY last_scanned_at IS NOT NULL, last_scanned_at ASC
          LIMIT ?`,
       )
@@ -2607,14 +2915,17 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
           total: companies.length,
           company: company.name,
           new_jobs: outcome.newJobs,
+          verified: outcome.status === "verified",
         });
       },
     );
 
-    // Total eligible companies, not time-gated -- the client uses this against however many it's
-    // scanned so far across this click's rounds to know when a Find Jobs run has covered everyone.
+    // Total eligible companies, not time-gated (beyond the same unsupported_ats cooldown the
+    // target query above applies) -- the client uses this against however many it's scanned so
+    // far across this click's rounds to know when a Find Jobs run has covered everyone.
     const eligible = await env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status NOT IN ('dismissed', 'unreachable')`,
+      `SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status != 'dismissed'
+       AND NOT (verify_reason = 'unsupported_ats' AND last_verified_at > datetime('now', '-14 days'))`,
     )
       .bind(profileId)
       .first<{ n: number }>();
@@ -2630,7 +2941,14 @@ type CompanyScanRow = {
   careers_url: string;
   ats_provider: string;
   ats_token: string;
+  last_scanned_at: string | null;
+  location: string;
+  signal: string;
 };
+
+/** Minimum confidence resolveWebsiteViaSearch must report before its answer is even attempted --
+ *  below this, it's treated the same as "ambiguous", not silently trusted. */
+const WEBSITE_SEARCH_CONFIDENCE_FLOOR = 60;
 
 async function scanOneCompany(
   env: Env,
@@ -2639,23 +2957,76 @@ async function scanOneCompany(
   locationTerms: string[],
   budget: { remaining: number },
   titleTerms: string[] = [],
-): Promise<{ jobs: number; newJobs: number; note: string }> {
+): Promise<{ jobs: number; newJobs: number; note: string; status: "verified" | "unverified" }> {
+  // No website at all -- nothing for resolveBoard to even try. Can happen for a manually-added
+  // company with just a name, a discovered row that reached this query before its domain
+  // resolution ever ran, or a company the deterministic slug-guess in discoverCompanies couldn't
+  // place. Only ever tried once per company (gated on last_scanned_at being unset) -- the search
+  // fallback costs real money, so it isn't worth re-attempting on every single Find companies click
+  // the way the free deterministic paths are; a manual "Save website" fix remains available
+  // regardless of how this attempt goes.
+  if (!company.website) {
+    if (!company.last_scanned_at) {
+      const found = await resolveWebsiteViaSearch(env, { name: company.name, location: company.location, signal: company.signal });
+      if (found && found.official_website && found.confidence >= WEBSITE_SEARCH_CONFIDENCE_FLOOR) {
+        const reachable = await verifyWebsite(found.official_website);
+        if (reachable) {
+          await env.DB.prepare(
+            `UPDATE companies SET website = ?, careers_url = ?, website_source = 'search', website_confidence = ?,
+             updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+          )
+            .bind(found.official_website, found.careers_url || company.careers_url, found.confidence, company.id)
+            .run();
+          // Fall through into the normal resolved-website path below with the freshly found site --
+          // no reason to make the candidate wait for a second click just to attempt board resolution.
+          company = { ...company, website: found.official_website, careers_url: found.careers_url || company.careers_url };
+        }
+      } else if (found && found.official_website) {
+        // A URL was proposed, but the model itself wasn't confident this is the right company for
+        // a name this ambiguous -- reporting it as found-but-wrong-company would be worse than not
+        // finding it at all, so this is its own reason, not folded into no_website.
+        await env.DB.prepare(
+          `UPDATE companies SET status = 'unverified', verify_reason = 'ambiguous', scan_note = ?,
+           last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`,
+        )
+          .bind(`Multiple companies could match this name. ${found.reason}`.trim(), company.id)
+          .run();
+        return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
+      }
+    }
+  }
+  if (!company.website) {
+    await env.DB.prepare(
+      `UPDATE companies SET status = 'unverified', verify_reason = 'no_website', scan_note = ?,
+       last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+    )
+      .bind("No website on file for this company yet. Add one to include it in scanning.", company.id)
+      .run();
+    return { jobs: 0, newJobs: 0, note: "no website on file", status: "unverified" };
+  }
+
   let provider = company.ats_provider as AtsProvider | "" | "none";
   let token = company.ats_token;
 
   if (!provider || provider === "none") {
     const resolved = await resolveBoard(company.website, company.careers_url, company.name, budget);
     if (!resolved) {
+      const { status, verify_reason } = classifyVerification(true, null, false, false);
       await env.DB.prepare(
-        `UPDATE companies SET ats_provider = 'none', scan_note = ?, last_scanned_at = CURRENT_TIMESTAMP,
-         updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        `UPDATE companies SET status = ?, verify_reason = ?, ats_provider = 'none', scan_note = ?,
+         last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
       )
         .bind(
+          status,
+          verify_reason,
           "Checked the company careers page and common careers-page paths, then tested likely Greenhouse, Lever, Ashby, and SmartRecruiters board addresses. No accessible supported job board was found.",
           company.id,
         )
         .run();
-      return { jobs: 0, newJobs: 0, note: "no supported board found" };
+      return { jobs: 0, newJobs: 0, note: "no supported board found", status: "unverified" };
     }
     provider = resolved.provider;
     token = resolved.token;
@@ -2672,27 +3043,39 @@ async function scanOneCompany(
   if (!isReadableAtsProvider(provider as AtsProvider)) {
     const boardUrl = `https://${token}`;
     const label = atsDisplayName(provider as AtsProvider);
+    const { status, verify_reason } = classifyVerification(true, { provider: provider as AtsProvider, token }, false, false);
     await env.DB.prepare(
-      `UPDATE companies SET ats_provider = ?, ats_token = ?, careers_url = ?, scan_note = ?,
-       last_scanned_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      `UPDATE companies SET status = ?, verify_reason = ?, ats_provider = ?, ats_token = ?, careers_url = ?, scan_note = ?,
+       last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     )
-      .bind(provider, token, boardUrl, `Uses ${label} for hiring. View current openings directly.`, company.id)
+      .bind(status, verify_reason, provider, token, boardUrl, `Uses ${label} for hiring. View current openings directly.`, company.id)
       .run();
-    return { jobs: 0, newJobs: 0, note: `uses ${label}, view directly` };
+    return { jobs: 0, newJobs: 0, note: `uses ${label}, view directly`, status: "unverified" };
   }
+
+  // A company already read successfully at least once is never demoted back to unverified by a
+  // later transient failure -- see classifyVerification's own header comment for why. Only a
+  // never-yet-successful company's first failed attempt counts as a real verification outcome.
+  const hadPriorSuccess = Boolean(company.last_scanned_at);
 
   let scanned;
   try {
     budget.remaining -= 1;
     scanned = await fetchBoardJobs(provider as AtsProvider, token);
   } catch (err) {
+    const { status, verify_reason } = classifyVerification(
+      true,
+      { provider: provider as AtsProvider, token },
+      true,
+      hadPriorSuccess,
+    );
     await env.DB.prepare(
-      `UPDATE companies SET scan_note = ?, last_scanned_at = CURRENT_TIMESTAMP,
-       updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      `UPDATE companies SET status = ?, verify_reason = ?, scan_note = ?, last_scanned_at = CURRENT_TIMESTAMP,
+       last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     )
-      .bind(`Board read failed: ${(err as Error).message}`, company.id)
+      .bind(status, verify_reason, `Board read failed: ${(err as Error).message}`, company.id)
       .run();
-    return { jobs: 0, newJobs: 0, note: "board read failed" };
+    return { jobs: 0, newJobs: 0, note: "board read failed", status };
   }
 
   // A company can qualify on location while most of its postings don't, so each posting is
@@ -2762,24 +3145,89 @@ async function scanOneCompany(
       : `${relevant.length} of ${scanned.length} open roles match your target roles and locations.`;
 
   await env.DB.prepare(
-    `UPDATE companies SET ats_provider = ?, ats_token = ?, open_jobs = ?, scan_note = ?,
-     last_scanned_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    `UPDATE companies SET status = 'verified', verify_reason = '', ats_provider = ?, ats_token = ?, open_jobs = ?, scan_note = ?,
+     last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
   )
     .bind(provider, token, total?.n ?? 0, note, company.id)
     .run();
 
-  return { jobs: relevant.length, newJobs, note };
+  return { jobs: relevant.length, newJobs, note, status: "verified" };
 }
 
 async function updateCompany(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { status?: string };
-  const status = body.status === "dismissed" ? "dismissed" : "reachable";
+  const body = (await request.json().catch(() => ({}))) as {
+    status?: string;
+    website?: string;
+    careers_url?: string;
+  };
+
+  // A website supplied for an 'unverified'/no_website row is the manual-fix path: re-verify it the
+  // same way discovery would have, and only clear the ATS provider (so the next scan re-resolves
+  // the board from scratch against the corrected domain) if it actually resolves, rather than
+  // trusting whatever was typed in. Set back to 'discovered' on success so the routine verify/scan
+  // pass picks it up naturally -- no separate "retry" endpoint needed.
+  const website = (body.website ?? "").trim();
+  if (website) {
+    const reachable = await verifyWebsite(website.match(/^https?:\/\//i) ? website : `https://${website}`);
+    const status = reachable ? "discovered" : "unverified";
+    const verifyReason: VerifyReason = reachable ? "" : "no_website";
+    const result = await env.DB.prepare(
+      `UPDATE companies SET website = ?, careers_url = ?, status = ?, verify_reason = ?,
+       website_source = 'manual', website_confidence = NULL,
+       ats_provider = CASE WHEN ? THEN '' ELSE ats_provider END, scan_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    )
+      .bind(
+        website,
+        (body.careers_url ?? "").trim(),
+        status,
+        verifyReason,
+        reachable ? 1 : 0,
+        reachable
+          ? "Website verified; checking its careers page and supported job boards."
+          : "That website could not be reached -- double-check the address.",
+        id,
+      )
+      .run();
+    return json({ updated: result.meta.changes > 0, status, reachable });
+  }
+
+  if (body.status === "dismissed") {
+    const result = await env.DB.prepare(
+      "UPDATE companies SET status = 'dismissed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+    return json({ updated: result.meta.changes > 0, status: "dismissed" });
+  }
+
+  // Re-add: restore whatever verify state the row's already-known ats_provider/website implies,
+  // rather than blindly resetting to 'discovered' -- a previously-verified company (working board,
+  // real postings) should read as Verified again immediately, not sit mislabeled as freshly
+  // discovered until its next scan happens to run. No network call needed; this is the same
+  // classification the 0027 migration's backfill already used for exactly this reason.
+  const row = await env.DB.prepare("SELECT website, ats_provider FROM companies WHERE id = ?")
+    .bind(id)
+    .first<{ website: string; ats_provider: string }>();
+  let status = "discovered";
+  let verifyReason: VerifyReason = "";
+  if (!row?.website) {
+    status = "unverified";
+    verifyReason = "no_website";
+  } else if (row.ats_provider === "none") {
+    status = "unverified";
+    verifyReason = "no_job_board";
+  } else if (row.ats_provider && !isReadableAtsProvider(row.ats_provider as AtsProvider)) {
+    status = "unverified";
+    verifyReason = "unsupported_ats";
+  } else if (row.ats_provider) {
+    status = "verified";
+  }
   const result = await env.DB.prepare(
-    "UPDATE companies SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    "UPDATE companies SET status = ?, verify_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
   )
-    .bind(status, id)
+    .bind(status, verifyReason, id)
     .run();
   return json({ updated: result.meta.changes > 0, status });
 }
@@ -5874,6 +6322,46 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     font-family: ui-monospace, 'SF Mono', Menlo, monospace;
   }
   .pf-stat-row b { color: var(--text); font-weight: 700; }
+  /* Companies pipeline (Search tab). #companies-pipeline holds the real Sankey (#cpf-svg, same
+     engine and dimensions as #jobs-pipeline -- see createPipelineFlow) for Discovery -> Verify,
+     both stages counting companies. #companies-pipeline-row visually joins a third "Pre-screen"
+     card to its right so the diagram reads as one continuous pipeline, but that card is
+     deliberately not a third ribbon-conserved Sankey stage: it counts jobs, not companies, and a
+     flow-conserving ribbon across that boundary would visually claim a company-to-job unit that
+     doesn't exist. */
+  #companies-pipeline-row { display: flex; align-items: center; gap: 0.5rem; }
+  /* Fixed at 58% (not 100%) of the row on purpose: the viewBox below (vbW 770) is tightly cropped
+     to this diagram's real 2-stage content using Jobs' own per-stage constants (COL_MARGIN,
+     COL_STEP, node/font CSS -- all shared, unchanged), rather than Jobs' full 3-stage vbW (1320).
+     Stretching that narrower viewBox to 100% of a full-width row would scale every node/font/stroke
+     up by ~1320/770, i.e. visibly larger than Jobs' -- exactly the "too large" complaint. Capping
+     the container to the matching 770/1320 fraction keeps 1 viewBox unit equal to the same real
+     pixel size in both diagrams, so node size/typography/density genuinely match, not just the
+     stage-graph logic. */
+  #companies-pipeline { flex: 0 0 58%; max-width: 58%; margin: 0.6rem 0 0.5rem; }
+  #companies-pipeline svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .cpf-arrow { flex: 0 0 auto; font-size: 15px; color: var(--text-muted); }
+  .cpf-stage-handoff {
+    flex: 0 0 auto; padding: 0.7rem 0.85rem; border: 1px dashed var(--border);
+    border-radius: 10px; background: var(--surface-2);
+  }
+  .cpf-stage-handoff h3 { margin: 0 0 0.35rem; font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; color: var(--text-muted); text-transform: uppercase; }
+  .cpf-stat-primary { font-size: 20px; font-weight: 700; color: var(--text); font-family: ui-monospace, 'SF Mono', Menlo, monospace; white-space: nowrap; }
+  .cpf-stat-sub { margin-top: 0.15rem; font-size: 11.5px; color: var(--text-muted); font-family: ui-monospace, 'SF Mono', Menlo, monospace; white-space: nowrap; }
+  .chip-list { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.3rem 0 0.5rem; }
+  .chip-list:empty::after { content: 'No search terms yet.'; font-size: 12.5px; color: var(--text-muted); }
+  .chip {
+    display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.3rem 0.4rem 0.3rem 0.7rem;
+    border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2);
+    font-size: 13px; color: var(--text);
+  }
+  .chip.chip-manual { border-color: var(--accent); }
+  .chip button {
+    all: unset; cursor: pointer; width: 16px; height: 16px; border-radius: 50%; flex: 0 0 auto;
+    display: flex; align-items: center; justify-content: center; font-size: 12px; line-height: 1;
+    color: var(--text-muted);
+  }
+  .chip button:hover { background: var(--surface); color: var(--text); }
   .template-choices { display: grid; gap: 0.5rem; margin-bottom: 0.9rem; }
   @media (min-width: 560px) { .template-choices { grid-template-columns: repeat(3, 1fr); } }
   .template-card {
@@ -6311,36 +6799,54 @@ Let me check the placeholder embraces like a variable name, gets its value when 
   <div id="panel-companies" class="panel">
     <div class="segmented-control" id="companies-view-tabs" role="group" aria-label="Company sections">
       <button class="active" data-companies-view="find" type="button" aria-pressed="true">Search</button>
-      <button data-companies-view="added" type="button" aria-pressed="false">Added <span id="companies-added-count"></span></button>
-      <button data-companies-view="unscannable" type="button" aria-pressed="false">Unscannable <span id="companies-unscannable-count"></span></button>
+      <button data-companies-view="verified" type="button" aria-pressed="false">Verified <span id="companies-verified-count"></span></button>
+      <button data-companies-view="unverified" type="button" aria-pressed="false">Unverified <span id="companies-unverified-count"></span></button>
       <button data-companies-view="removed" type="button" aria-pressed="false">Removed <span id="companies-removed-count"></span></button>
     </div>
 
     <section id="companies-find-panel">
       <h2>Find companies</h2>
+      <p class="hint">Find companies hiring for your target roles. No AI judges whether a company "sounds relevant" — only whether it's a real, monitorable employer; fit is judged per-job in Jobs.</p>
+
+      <h3 id="companies-search-terms-heading">Search terms</h3>
+      <p class="hint">What ApplyGo actually searches for. Generated from your Role Analysis — edit freely.</p>
+      <div id="companies-search-terms-list" class="chip-list" role="group" aria-labelledby="companies-search-terms-heading"></div>
+      <div class="controls">
+        <label for="companies-search-term-input" class="sr-only">Add a search term</label>
+        <input id="companies-search-term-input" placeholder="Add a term…" maxlength="80">
+        <button id="companies-search-term-add" type="button">+ Add term</button>
+        <button id="companies-search-terms-reset" type="button" class="secondary">Reset to suggested</button>
+      </div>
+      <p id="companies-search-terms-status" class="status" role="status" aria-live="polite"></p>
+
       <label for="company-focus">Search focus (optional)</label>
       <input id="company-focus" placeholder="e.g. automotive, robotics, Bay Area startups">
-      <div class="controls">
-        <div>
-          <label for="company-count">How many</label>
-          <select id="company-count">
-            <option value="10">10</option>
-            <option value="20">20</option>
-            <option value="25">25</option>
-            <option value="50">50</option>
-            <option value="75">75</option>
-            <option value="100">100</option>
-          </select>
+
+      <p id="companies-pipeline-summary" class="sr-only" aria-live="polite"></p>
+      <div id="companies-pipeline-row">
+        <div id="companies-pipeline" aria-hidden="true">
+          <svg id="cpf-svg" preserveAspectRatio="xMidYMid meet"></svg>
         </div>
-        <div>
-          <label for="company-provider">Search using</label>
-          <select id="company-provider">
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI</option>
-          </select>
+        <div class="cpf-arrow" aria-hidden="true">→</div>
+        <!-- Visually joined to the diagram (same row, same connector styling as the ribbons feeding
+             it) but deliberately not one more Sankey stage: the diagram to its left counts
+             companies throughout; this counts jobs. One verified company can produce many postings,
+             or none, so drawing this as a conserved-flow ribbon would visually claim a
+             company-to-job relationship that doesn't exist. See src/companies.ts's header comment
+             for why company-level and job-level judgments are kept this separate everywhere. -->
+        <div class="cpf-stage-handoff">
+          <h3>Pre-screen</h3>
+          <div class="cpf-stat-primary"><span id="cpfStatPrescreen">0</span> jobs</div>
+          <div class="cpf-stat-sub">in Jobs → Pre-screen</div>
         </div>
       </div>
-      <button id="companies-discover-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Find companies</button>
+      <div class="pf-legend">
+        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--accent)"></span>Discovered</span>
+        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--error)"></span>Unverified</span>
+        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--success)"></span>Verified</span>
+      </div>
+
+      <button id="companies-discover-button" type="button">Find companies</button>
       <p id="companies-discover-status" class="status" role="status" aria-live="polite"></p>
 
       <details class="disclosure">
@@ -6364,6 +6870,14 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     <section id="companies-list-section" style="display:none">
           <label for="companies-filter">Filter</label>
           <input id="companies-filter" placeholder="Search by name, location, or description">
+          <div class="segmented-control" id="companies-unverified-filters" role="group" aria-label="Unverified reason" style="display:none">
+            <button class="active" data-unverified-reason="" type="button" aria-pressed="true">All <span id="companies-reason-all-count"></span></button>
+            <button data-unverified-reason="no_website" type="button" aria-pressed="false">No website <span id="companies-reason-no_website-count"></span></button>
+            <button data-unverified-reason="no_job_board" type="button" aria-pressed="false">No job board <span id="companies-reason-no_job_board-count"></span></button>
+            <button data-unverified-reason="unsupported_ats" type="button" aria-pressed="false">Unsupported board <span id="companies-reason-unsupported_ats-count"></span></button>
+            <button data-unverified-reason="board_unreachable" type="button" aria-pressed="false">Board unreachable <span id="companies-reason-board_unreachable-count"></span></button>
+            <button data-unverified-reason="ambiguous" type="button" aria-pressed="false">Ambiguous <span id="companies-reason-ambiguous-count"></span></button>
+          </div>
           <div id="companies-list"><p class="empty">Loading…</p></div>
     </section>
   </div>
@@ -8384,24 +8898,20 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       return haystack.toLowerCase().indexOf(needle.toLowerCase()) !== -1;
     }
 
-    // Mirrors companies.ts's READABLE_ATS_PROVIDERS -- the handful of platforms this app can
-    // actually read structured job listings from. Everything else companies.ts recognizes (ADP,
-    // iCIMS, and the rest) is a real find with a working link, just not one this app can auto-scan.
-    var READABLE_ATS = { greenhouse: 1, lever: 1, ashby: 1, smartrecruiters: 1, workday: 1 };
-
-    // A site that didn't resolve at discovery time, or one whose board we scanned and found
-    // nothing supported on, isn't going to start yielding postings on its own -- surfacing it
-    // in the main list every time is just noise. A detected-but-unreadable ATS (ADP, iCIMS, ...)
-    // gets the same treatment: no postings will ever appear automatically, even though the
-    // company itself was a real find. Kept in the database either way; this only controls what
-    // renders by default.
-    function isUnscannable(company) {
-      return company.status === 'unreachable' || company.ats_provider === 'none' ||
-        String(company.scan_note || '').indexOf('Board read failed:') === 0 ||
-        (company.ats_provider && !READABLE_ATS[company.ats_provider]);
-    }
+    // The reason a failed company shows in the Unverified tab, in plain language -- see
+    // classifyVerification in src/companies.ts and the search-fallback confidence floor in
+    // src/websearch.ts for where these five codes come from.
+    var VERIFY_REASON_LABELS = {
+      no_website: 'No website could be confirmed for this company.',
+      no_job_board: 'A website was confirmed, but no job board could be found on it.',
+      unsupported_ats: 'This company’s job board uses a system this app can’t automatically read yet.',
+      board_unreachable: 'A supported job board was found, but reading it failed. This is often temporary.',
+      ambiguous: 'A possible website was found, but not with enough confidence to trust automatically — this is a common-name collision, not a missing website.',
+    };
 
     var companiesView = 'find';
+    var companiesUnverifiedReason = '';
+    var companiesPipeline = {};
 
     function renderCompanyRows(list, companies) {
       companies.forEach(function (company) {
@@ -8417,12 +8927,10 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         if (company.open_jobs > 0) {
           titleChildren.push(el('span', { className: 'badge jobs', textContent: company.open_jobs + ' open' }));
         }
-        if (company.status === 'unreachable') {
-          titleChildren.push(el('span', { className: 'badge warn', textContent: 'site unreachable' }));
-        } else if (company.ats_provider === 'none') {
-          titleChildren.push(el('span', { className: 'badge warn', textContent: 'no job board found' }));
-        } else if (company.ats_provider && !READABLE_ATS[company.ats_provider]) {
-          titleChildren.push(el('span', { className: 'badge warn', textContent: 'view directly, see below' }));
+        if (company.status === 'verified') {
+          titleChildren.push(el('span', { className: 'badge strong', textContent: 'verified' }));
+        } else if (company.status === 'unverified') {
+          titleChildren.push(el('span', { className: 'badge warn', textContent: company.verify_reason ? company.verify_reason.replace(/_/g, ' ') : 'unverified' }));
         }
         if (company.status === 'dismissed') {
           titleChildren.push(el('span', { className: 'badge', textContent: 'removed' }));
@@ -8438,17 +8946,48 @@ Let me check the placeholder embraces like a variable name, gets its value when 
           el('div', { className: 'row-title-line' }, titleChildren),
           el('div', { className: 'row-meta', textContent: meta }),
         ];
+        if (company.signal) body.push(el('p', { className: 'company-bio', textContent: company.signal }));
         if (company.bio) body.push(el('p', { className: 'company-bio', textContent: company.bio }));
-        if (company.why_fit) body.push(el('p', { className: 'company-why', textContent: company.why_fit }));
+        // Prominent, plain-language failure reason -- debugging why a company didn't make it in
+        // matters for an open-source app the candidate might need to fix themselves.
+        if (company.status === 'unverified') {
+          body.push(el('p', {
+            className: 'company-why',
+            textContent: 'Why verification failed: ' + (VERIFY_REASON_LABELS[company.verify_reason] || 'Unknown reason.'),
+          }));
+        }
         if (company.scan_note) body.push(el('div', { className: 'row-meta', textContent: company.scan_note }));
-        // Resolved once this company was scanned -- the actual careers/board link the site
-        // publishes, not just its homepage. Most useful for a detected-but-unreadable ATS (ADP,
+        // Resolved once this company was checked -- the actual careers/board link the site
+        // publishes, not just its homepage. Most useful for a detected-but-unsupported ATS (ADP,
         // iCIMS, ...), where this is the only way to actually see the postings, but shown whenever
         // it's known since "click through and look yourself" is always a fair fallback.
         if (company.careers_url) {
           body.push(el('div', { className: 'row-meta' }, [
             el('a', { href: company.careers_url, target: '_blank', rel: 'noopener', textContent: 'View job board ↗' }),
           ]));
+        }
+
+        // The manual-fix path for any unverified company: typing a real website here re-verifies it
+        // the same way discovery would have, and clears any stale board resolution so the next scan
+        // starts fresh against the corrected domain.
+        if (company.status === 'unverified') {
+          var websiteInput = el('input', { type: 'url', placeholder: 'https://example.com' });
+          var websiteButton = el('button', { type: 'button', textContent: 'Save website' });
+          var websiteStatus = el('span', { className: 'row-meta' });
+          websiteButton.addEventListener('click', async function () {
+            var value = websiteInput.value.trim();
+            if (!value) return;
+            websiteStatus.textContent = 'Checking…';
+            var res = await api('/companies/' + encodeURIComponent(company.id), {
+              method: 'PATCH',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ website: value }),
+            });
+            var data = await res.json();
+            websiteStatus.textContent = data.reachable ? 'Verified — refreshing…' : "Couldn't be reached; double-check the address.";
+            if (data.reachable) await loadCompanies();
+          });
+          body.push(el('div', { className: 'row' }, [websiteInput, websiteButton, websiteStatus]));
         }
 
         var changeStatus = el('button', {
@@ -8465,7 +9004,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
           loadCompanies();
         });
 
-        var muted = company.status === 'dismissed' || isUnscannable(company);
+        var muted = company.status === 'dismissed' || company.status === 'unverified';
         list.appendChild(el('div', { className: 'row-item' + (muted ? ' is-muted' : '') }, [
           el('div', { className: 'row' }, [
             el('div', {}, body),
@@ -8479,6 +9018,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       var finding = companiesView === 'find';
       document.getElementById('companies-find-panel').style.display = finding ? 'block' : 'none';
       document.getElementById('companies-list-section').style.display = finding ? 'none' : 'block';
+      document.getElementById('companies-unverified-filters').style.display = companiesView === 'unverified' ? 'flex' : 'none';
       if (finding) return;
 
       var needle = document.getElementById('companies-filter').value.trim();
@@ -8486,12 +9026,16 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       list.innerHTML = '';
 
       var matching = allCompanies.filter(function (c) {
-        return matchesFilter([c.name, c.location, c.bio, c.why_fit].join(' '), needle);
+        return matchesFilter([c.name, c.location, c.bio, c.signal].join(' '), needle);
       });
       var visible = matching.filter(function (c) {
         if (companiesView === 'removed') return c.status === 'dismissed';
-        if (companiesView === 'unscannable') return c.status !== 'dismissed' && isUnscannable(c);
-        return c.status !== 'dismissed' && !isUnscannable(c);
+        if (companiesView === 'verified') return c.status === 'verified';
+        if (companiesView === 'unverified') {
+          if (c.status !== 'unverified') return false;
+          return !companiesUnverifiedReason || c.verify_reason === companiesUnverifiedReason;
+        }
+        return false;
       });
 
       if (!visible.length) {
@@ -8505,17 +9049,148 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       renderCompanyRows(list, visible);
     }
 
+    // ---- Companies -> Search: search terms (chips) -----------------------------------------------
+    // The frontend owns the working list client-side and PUTs the whole thing back on every change
+    // (see setCompanySearchTerms's own comment for why) -- so add/remove/reset all just mutate
+    // companySearchTerms then call saveCompanySearchTerms, never a separate per-chip endpoint.
+    var companySearchTerms = [];
+
+    function renderCompanySearchTerms() {
+      var list = document.getElementById('companies-search-terms-list');
+      list.innerHTML = '';
+      companySearchTerms.forEach(function (entry, index) {
+        var removeBtn = el('button', { type: 'button', title: 'Remove "' + entry.term + '"', 'aria-label': 'Remove ' + entry.term, textContent: String.fromCharCode(215) });
+        removeBtn.addEventListener('click', function () {
+          companySearchTerms.splice(index, 1);
+          saveCompanySearchTerms();
+        });
+        list.appendChild(el('span', { className: 'chip' + (entry.source === 'manual' ? ' chip-manual' : '') }, [
+          el('span', { textContent: entry.term }),
+          removeBtn,
+        ]));
+      });
+    }
+
+    async function saveCompanySearchTerms() {
+      renderCompanySearchTerms();
+      var statusEl = document.getElementById('companies-search-terms-status');
+      try {
+        var res = await api('/companies/search-terms', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ terms: companySearchTerms }),
+        });
+        if (!res.ok) throw new Error(errorMessage(await res.json(), 'save_failed'));
+        statusEl.textContent = '';
+        statusEl.className = 'status';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    }
+
+    async function loadCompanySearchTerms() {
+      var res = await api('/companies/search-terms');
+      var data = await res.json();
+      companySearchTerms = data.terms || [];
+      renderCompanySearchTerms();
+    }
+
+    function addCompanySearchTermFromInput() {
+      var input = document.getElementById('companies-search-term-input');
+      var value = input.value.trim();
+      if (!value) return;
+      var already = companySearchTerms.some(function (t) { return t.term.toLowerCase() === value.toLowerCase(); });
+      if (!already) companySearchTerms.push({ term: value, source: 'manual' });
+      input.value = '';
+      saveCompanySearchTerms();
+    }
+    document.getElementById('companies-search-term-add').addEventListener('click', addCompanySearchTermFromInput);
+    document.getElementById('companies-search-term-input').addEventListener('keydown', function (event) {
+      if (event.key === 'Enter') { event.preventDefault(); addCompanySearchTermFromInput(); }
+    });
+
+    document.getElementById('companies-search-terms-reset').addEventListener('click', async function () {
+      var statusEl = document.getElementById('companies-search-terms-status');
+      statusEl.textContent = 'Regenerating from your Role Analysis…';
+      statusEl.className = 'status';
+      try {
+        var res = await api('/companies/search-terms/regenerate', { method: 'POST' });
+        var data = await res.json();
+        if (!res.ok) throw new Error(errorMessage(data, 'regenerate_failed'));
+        companySearchTerms = data.terms || [];
+        renderCompanySearchTerms();
+        statusEl.textContent = 'Suggested terms refreshed. Your own additions were kept.';
+        statusEl.className = 'status success';
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      }
+    });
+
+    // ---- Companies -> Search: Discovery -> Verify -----------------------------------------------
+    // Same generic engine Jobs uses (createPipelineFlow, defined further down -- function
+    // declarations are hoisted, so calling it here before its own textual definition is fine).
+    // Only two stages, and deliberately no accumulator edge overrides: unlike Jobs' review_queue,
+    // neither 'verified' nor 'unverified' feeds a further stage in this diagram, so the default
+    // rule (an edge's committed volume is simply its target node's own count) is exactly right for
+    // both edges here. The Companies -> Jobs handoff (a jobs COUNT, not a companies one) sits in
+    // the same row, visually joined, but is deliberately not folded into this ribbon graph -- see
+    // the HTML/CSS comment on #companies-pipeline-row.
+    var CPF_NODES = [
+      { id: 'discovery_gate', label: 'Discovered', stage: 0, kind: 'gate' },
+      { id: 'unverified', label: 'Unverified', stage: 1, kind: 'reject' },
+      { id: 'verified', label: 'Verified', stage: 1, kind: 'success' },
+    ];
+    var CPF_BRANCHES = { discovery_gate: ['unverified', 'verified'] };
+    var CPF_STAGE_TITLES = ['Discovery', 'Verify'];
+    // vbH/sourceHeight/colStep are Jobs' own #jobs-pipeline constants, unchanged. vbW=770 is those
+    // same constants' natural width for 2 stages instead of 3 (COL_MARGIN 66 + 1*colStep 550 +
+    // node width 10 + the same ~144-unit label margin Jobs reserves) -- see the CSS comment on
+    // #companies-pipeline for how this stays visually the same size as Jobs despite the smaller
+    // viewBox.
+    var companiesFlow = createPipelineFlow({ svgId: 'cpf-svg', nodes: CPF_NODES, branches: CPF_BRANCHES, stageTitles: CPF_STAGE_TITLES, vbW: 770, vbH: 340, sourceHeight: 200, colStep: 550 });
+
+    var cpfDiscovered = 0, cpfVerified = 0, cpfUnverified = 0;
+
+    function cpfRefresh() {
+      var nodeCounts = { discovery_gate: Math.max(0, cpfDiscovered), unverified: cpfUnverified, verified: cpfVerified };
+      companiesFlow.setCounts(nodeCounts, { total: nodeCounts.discovery_gate + nodeCounts.unverified + nodeCounts.verified });
+    }
+
+    // Full reconciliation from the authoritative backend counts -- every /companies load resets
+    // Discovery/Verify from here, the same role setPfCounts plays for Jobs. Never bursts on its
+    // own; live per-company bursts come only from the discover/scan progress handlers below, which
+    // is where a real, individually-resolved company outcome actually becomes known.
+    // Every number here is explicitly unit-labeled and never combined with a number of a different
+    // unit as if they were comparable -- Discovery counts job postings (with unique companies as a
+    // secondary figure), Verify counts companies, Pre-screen counts jobs. E.g. never "found 269,
+    // verified 214, imported 57"; always "269 companies discovered, 214 verified, 57 jobs imported".
+    function renderCompanyPipelineStats() {
+      var p = companiesPipeline;
+      cpfDiscovered = p.discovered || 0;
+      cpfVerified = p.verified || 0;
+      cpfUnverified = p.unverified || 0;
+      cpfRefresh();
+      document.getElementById('cpfStatPrescreen').textContent = p.prescreen_jobs || 0;
+      document.getElementById('companies-pipeline-summary').textContent =
+        (p.discovery_postings || 0) + ' job postings searched across ' + (p.discovery_companies || 0) + ' compan' + ((p.discovery_companies || 0) === 1 ? 'y' : 'ies') +
+        ' · ' + cpfVerified + ' verified · ' + cpfUnverified + ' unverified · ' + (p.prescreen_jobs || 0) + ' jobs imported into Jobs → Pre-screen.';
+    }
+
     async function loadCompanies() {
       var res = await api('/companies');
       var data = await res.json();
       allCompanies = data.companies || [];
-      var unscannableCount = allCompanies.filter(isUnscannable).length;
-      var removedCount = allCompanies.filter(function (c) { return c.status === 'dismissed'; }).length;
-      var addedCount = allCompanies.filter(function (c) { return c.status !== 'dismissed' && !isUnscannable(c); }).length;
-      unscannableCount = allCompanies.filter(function (c) { return c.status !== 'dismissed' && isUnscannable(c); }).length;
-      document.getElementById('companies-added-count').textContent = '(' + addedCount + ')';
-      document.getElementById('companies-unscannable-count').textContent = '(' + unscannableCount + ')';
-      document.getElementById('companies-removed-count').textContent = '(' + removedCount + ')';
+      companiesPipeline = data.company_pipeline || {};
+      document.getElementById('companies-verified-count').textContent = '(' + (companiesPipeline.verified || 0) + ')';
+      document.getElementById('companies-unverified-count').textContent = '(' + (companiesPipeline.unverified || 0) + ')';
+      document.getElementById('companies-removed-count').textContent = '(' + (companiesPipeline.dismissed || 0) + ')';
+      ['no_website', 'no_job_board', 'unsupported_ats', 'board_unreachable', 'ambiguous'].forEach(function (reason) {
+        document.getElementById('companies-reason-' + reason + '-count').textContent = '(' + (companiesPipeline['unverified_' + reason] || 0) + ')';
+      });
+      document.getElementById('companies-reason-all-count').textContent = '(' + (companiesPipeline.unverified || 0) + ')';
+      renderCompanyPipelineStats();
       renderCompanies();
     }
 
@@ -8524,6 +9199,18 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       button.addEventListener('click', function () {
         companiesView = button.dataset.companiesView;
         document.querySelectorAll('[data-companies-view]').forEach(function (item) {
+          item.classList.remove('active');
+          item.setAttribute('aria-pressed', 'false');
+        });
+        button.classList.add('active');
+        button.setAttribute('aria-pressed', 'true');
+        renderCompanies();
+      });
+    });
+    document.querySelectorAll('[data-unverified-reason]').forEach(function (button) {
+      button.addEventListener('click', function () {
+        companiesUnverifiedReason = button.dataset.unverifiedReason;
+        document.querySelectorAll('[data-unverified-reason]').forEach(function (item) {
           item.classList.remove('active');
           item.setAttribute('aria-pressed', 'false');
         });
@@ -8543,53 +9230,100 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       return readNdjson(res, function (event) {
         statusEl.textContent = 'Checking job boards… ' + event.done + ' of ' + event.total +
           ' (' + event.company + (event.new_jobs ? ', ' + event.new_jobs + ' openings added' : '') + ')';
+        // scanCompanies is where a company's Verify outcome actually becomes known -- domain
+        // resolution alone (the discover-button handler below) only gets it as far as the
+        // Discovery gate. One real per-company burst per event, same idea as Jobs' pipeline events.
+        if (typeof event.verified === 'boolean') {
+          cpfDiscovered = Math.max(0, cpfDiscovered - 1);
+          if (event.verified) cpfVerified += 1; else cpfUnverified += 1;
+          cpfRefresh();
+          companiesFlow.burst(event.verified ? 'discovery_gate->verified' : 'discovery_gate->unverified', 1);
+        }
       });
     }
 
+    // Find companies: search real job postings for real hiring activity, then verify each new
+    // company has a real, readable job board -- one action, the whole Discovery → Verify pipeline,
+    // then hands straight into the existing board scan (which is where jobs actually get imported
+    // into Jobs' own Pre-screen). No LLM call anywhere in this flow. Each stage's endpoint only
+    // does a bounded unit of work per call, so this re-fires each stage until its backlog clears or
+    // a round cap protects against a stuck state, exactly like Find Jobs already does.
+    // "Find companies" means continue, not start over: /companies/discover advances each
+    // (search term, location) stream from wherever its own cursor left off (never page 1 of an
+    // already-searched stream), and stops itself on a provider rate limit or once this click's
+    // bounded batch of streams is processed -- streams_remaining/rate_limited below say what, if
+    // anything, is left for another click. The round loop here just re-fires that bounded call a
+    // few times so a realistic backlog usually clears in one click instead of requiring several.
     document.getElementById('companies-discover-button').addEventListener('click', async function () {
       var statusEl = document.getElementById('companies-discover-status');
       var button = this;
       button.disabled = true;
-      statusEl.textContent = 'Starting…';
+      statusEl.textContent = 'Searching real job postings…';
       statusEl.className = 'status';
       try {
-        var res = await api('/companies/discover', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            provider: document.getElementById('company-provider').value,
-            count: Number(document.getElementById('company-count').value),
-            focus: document.getElementById('company-focus').value,
-          }),
-        });
-        if (!res.ok) throw new Error(errorMessage(await res.json(), 'discovery_failed'));
-        var data = await readNdjson(res, function (event) {
-          if (event.stage === 'propose') {
-            statusEl.textContent = event.message;
-            return;
-          }
-          // The first 'verify' event (done=0) carries the propose/dedupe/location breakdown before
-          // any site check has even started -- showing it immediately is what answers "why so few"
-          // without waiting for the slowest part (the website checks) to finish first.
-          var prefix = 'Proposed ' + event.proposed + '.' +
-            (event.duplicates ? ' ' + event.duplicates + ' already on your list.' : '') +
-            (event.off_target ? ' ' + event.off_target + ' outside your locations.' : '');
-          if (!event.total) {
-            statusEl.textContent = prefix + (event.proposed ? ' Nothing new left to check.' : '');
-            return;
-          }
-          statusEl.textContent = prefix + ' Checking ' + event.done + ' of ' + event.total +
-            (event.company ? ' (' + event.company + (event.done ? (event.reachable ? ', reachable' : ", couldn't be reached") : '') + ')' : '') + '…';
-        });
-        var scanData = data.added ? await scanNewCompanies(statusEl) : null;
-        var parts = ['Found ' + data.added + ' new.'];
-        if (scanData) parts.push('Checked ' + scanData.scanned + ' job board' + (scanData.scanned === 1 ? '' : 's') +
-          ' and imported ' + scanData.new_listings + ' new opening' + (scanData.new_listings === 1 ? '' : 's') + '.');
-        if (data.duplicates) parts.push(data.duplicates + ' already on your list.');
-        if (data.off_target) {
-          parts.push(data.off_target + ' rejected as outside ' + (data.locations || 'your locations') + '.');
+        var round = 0, totalAdded = 0, totalDuplicates = 0, totalOffTarget = 0;
+        var totalResolved = 0, totalUnresolved = 0, discoverData;
+        do {
+          round += 1;
+          var res = await api('/companies/discover', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ focus: document.getElementById('company-focus').value }),
+          });
+          if (!res.ok) throw new Error(errorMessage(await res.json(), 'discovery_failed'));
+          discoverData = await readNdjson(res, function (event) {
+            if (event.stage === 'search') {
+              statusEl.textContent = (round > 1 ? 'Round ' + round + ': ' : '') + 'Searching job postings… ' + (event.done || 0) + ' of ' + event.total + ' quer' + (event.total === 1 ? 'y' : 'ies');
+              return;
+            }
+            statusEl.textContent = (round > 1 ? 'Round ' + round + ': ' : '') + 'Verifying companies… ' + event.done + ' of ' + event.total +
+              (event.company ? ' (' + event.company + (event.done ? (event.resolved ? ', website found' : ', website not found') : '') + ')' : '') + '…';
+            // A resolve-stage event is one company's real, just-determined outcome: either it has
+            // a confirmed website and enters Discovery awaiting a board check, or (no website) it's
+            // already fully classified Unverified -- no board check could ever help it.
+            if (event.stage === 'resolve' && event.company) {
+              if (event.resolved) {
+                cpfDiscovered += 1;
+                cpfRefresh();
+                companiesFlow.burstIntoGate('discovery_gate', 1);
+              } else {
+                cpfUnverified += 1;
+                cpfRefresh();
+                companiesFlow.burst('discovery_gate->unverified', 1);
+              }
+            }
+          });
+          totalAdded += discoverData.added || 0;
+          totalDuplicates += discoverData.duplicates || 0;
+          totalOffTarget += discoverData.off_target || 0;
+          totalResolved += discoverData.domain_resolved || 0;
+          totalUnresolved += discoverData.domain_unresolved || 0;
+        } while (round < 10 && !discoverData.rate_limited && discoverData.streams_remaining > 0);
+
+        // Always re-check job boards, not only when this click found something new -- scanCompanies
+        // covers every eligible company each call (including prior Unverified rows worth retrying,
+        // e.g. a "no website" company a search-grounded lookup might now resolve), which is what
+        // makes Unverified companies actually get retried on a later Find companies click instead
+        // of only ever being checked once.
+        var scanData = await scanNewCompanies(statusEl);
+
+        var parts = [totalAdded ? (totalAdded + ' new compan' + (totalAdded === 1 ? 'y' : 'ies') + ' discovered.') : 'No new companies discovered this run.'];
+        if (totalResolved || totalUnresolved) parts.push(totalResolved + ' website' + (totalResolved === 1 ? '' : 's') + ' confirmed, ' + totalUnresolved + " couldn't be found automatically.");
+        if (scanData) {
+          parts.push((scanData.new_listings ? scanData.new_listings + ' new job' + (scanData.new_listings === 1 ? '' : 's') + ' imported' : 'No new jobs found') +
+            ' from ' + scanData.scanned + ' compan' + (scanData.scanned === 1 ? 'y' : 'ies') + ' checked.');
+          parts.push('Those jobs are now in Jobs → Pre-screen.');
         }
-        if (data.unreachable) parts.push(data.unreachable + " couldn't be reached and " + (data.unreachable === 1 ? 'was' : 'were') + " skipped.");
+        if (totalDuplicates) parts.push(totalDuplicates + ' already on your list.');
+        if (totalOffTarget) parts.push(totalOffTarget + ' rejected as outside ' + (discoverData.locations || 'your locations') + '.');
+        if (discoverData.rate_limited) {
+          parts.push('Search paused at the job board’s rate limit — click Find companies again to continue.');
+        } else if (discoverData.streams_remaining > 0) {
+          parts.push(discoverData.streams_remaining + ' search quer' + (discoverData.streams_remaining === 1 ? 'y' : 'ies') + ' left to check — click Find companies again to continue.');
+        }
+        if (discoverData.query_errors && discoverData.query_errors.length) {
+          parts.push(discoverData.query_errors.length + ' quer' + (discoverData.query_errors.length === 1 ? 'y' : 'ies') + ' failed and will retry next run.');
+        }
         statusEl.textContent = parts.join(' ');
         statusEl.className = 'status success';
         await loadCompanies();
@@ -9269,18 +10003,400 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       }
     });
 
-    // ---- Pipeline flow diagram (Search tab) --------------------------------------------------
+    // ---- Pipeline flow diagram engine (shared by Jobs -> Search and Companies -> Search) -------
     // A live liquid pipeline. Waiting work is always upstream of the gate that will process it;
-    // only completed decisions flow downstream. Backend pipeline events remove real postings from
-    // queue reservoirs at dispatch and release them from gates when their real batch resolves.
+    // only completed decisions flow downstream. Extracted into a factory so both tabs' diagrams
+    // share one animation/layout/rendering engine rather than maintaining two copies of the same
+    // ~500 lines of Sankey-ribbon math and particle physics -- each tab keeps its own small glue
+    // layer (translating its own backend's counts/events into the generic shape below), but the
+    // engine itself (layoutColumns, edge slicing, node/reservoir/particle rendering, the smooth
+    // height-interpolation loop) knows nothing about postings or companies.
+    //
+    // cfg: { svgId, nodes: [{id,label,stage,kind}], branches: {sourceId:[targetId,...]},
+    //        stageTitles: [string,...], kindColor?, vbW?, vbH?, sourceHeight?, colStep? }
+    // Returns: { setCounts(nodeCounts, opts), burst(key, delta, reverse?, addCount?, releaseGate?),
+    //            burstIntoGate(nodeId, count), waitForIdle(), wake() }
+    function createPipelineFlow(cfg) {
+      var NODES = cfg.nodes;
+      var BRANCHES = cfg.branches;
+      var STAGE_TITLES = cfg.stageTitles;
+      var KIND_COLOR = cfg.kindColor || { queue: 'var(--warning)', gate: 'var(--accent)', reject: 'var(--error)', success: 'var(--success)' };
+
+      var VB_W = cfg.vbW || 1320, VB_H = cfg.vbH || 340;
+      var MARGIN_TOP = 26, MARGIN_BOTTOM = 8;
+      var USABLE_H = VB_H - MARGIN_TOP - MARGIN_BOTTOM;
+      var NODE_W = 10;
+      var MIN_H = 12;
+      var ROW_GAP = 26; // generous on purpose: each node's 2-line label needs real clearance from its neighbors, not just its own (possibly tiny) bar height
+      var SOURCE_HEIGHT = cfg.sourceHeight || 200;
+      var COL_MARGIN = 66;
+      var COL_STEP = cfg.colStep || 550;
+      var SMOOTH_RATE = 6;
+
+      var nodeMap = {};
+      NODES.forEach(function (n) {
+        nodeMap[n.id] = n;
+        n.x = COL_MARGIN + n.stage * COL_STEP;
+        n.width = NODE_W;
+        n.dispHeight = MIN_H;
+        n.y = MARGIN_TOP; n.cy = MARGIN_TOP;
+      });
+      var stageGroups = STAGE_TITLES.map(function () { return []; });
+      NODES.forEach(function (n) {
+        if (!stageGroups[n.stage]) stageGroups[n.stage] = [];
+        stageGroups[n.stage].push(n.id);
+      });
+
+      var edges = {};
+      var childEdges = {}; var parentEdges = {};
+      NODES.forEach(function (n) { childEdges[n.id] = []; parentEdges[n.id] = []; });
+      Object.keys(BRANCHES).forEach(function (source) {
+        BRANCHES[source].forEach(function (target) {
+          var edge = { source: source, target: target, committed: 0, sy0: 0, sy1: 0, ty0: 0, ty1: 0 };
+          edges[source + '->' + target] = edge;
+          childEdges[source].push(edge);
+          parentEdges[target].push(edge);
+        });
+      });
+
+      var sourceTotal = 0;
+      var nodeCounts = {};
+      var isFirstCall = true;
+      var animating = false;
+      var lastFrame = 0;
+      var reservoirCounts = {};
+      var reservoirDisplay = {};
+
+      function derivedTotal(nodeId) {
+        return nodeCounts[nodeId] || 0;
+      }
+      function targetHeight(n) {
+        return Math.max(MIN_H, (derivedTotal(n.id) / Math.max(1, sourceTotal)) * SOURCE_HEIGHT);
+      }
+
+      function layoutColumns() {
+        stageGroups.forEach(function (ids) {
+          var totalH = 0;
+          ids.forEach(function (id) { totalH += nodeMap[id].dispHeight; });
+          totalH += ROW_GAP * (ids.length - 1);
+          var y = MARGIN_TOP + (USABLE_H - totalH) / 2;
+          ids.forEach(function (id) {
+            var n = nodeMap[id];
+            n.y = y; n.cy = y + n.dispHeight / 2;
+            y += n.dispHeight + ROW_GAP;
+          });
+        });
+      }
+      function edgeWeight(edge) {
+        // Every declared transition is a permanent channel. A value of one is only the visual
+        // floor; labels and statistics continue to show the truthful zero count.
+        return Math.max(1, edge.committed);
+      }
+      function recomputeEdgeSlices() {
+        NODES.forEach(function (n) {
+          var outs = childEdges[n.id].slice().sort(function (a, b) { return nodeMap[a.target].cy - nodeMap[b.target].cy; });
+          var outDenom = 0; outs.forEach(function (e) { outDenom += edgeWeight(e); }); outDenom = Math.max(1, outDenom);
+          var cum = 0;
+          outs.forEach(function (e) {
+            var h = (edgeWeight(e) / outDenom) * n.dispHeight;
+            e.sy0 = n.y + cum; e.sy1 = e.sy0 + h; cum += h;
+          });
+          var ins = parentEdges[n.id].slice().sort(function (a, b) { return nodeMap[a.source].cy - nodeMap[b.source].cy; });
+          var inDenom = 0; ins.forEach(function (e) { inDenom += edgeWeight(e); }); inDenom = Math.max(1, inDenom);
+          cum = 0;
+          ins.forEach(function (e) {
+            var h = (edgeWeight(e) / inDenom) * n.dispHeight;
+            e.ty0 = n.y + cum; e.ty1 = e.ty0 + h; cum += h;
+          });
+        });
+      }
+
+      var SVG_NS = 'http://www.w3.org/2000/svg';
+      function svgEl(tag, attrs) {
+        var e = document.createElementNS(SVG_NS, tag);
+        for (var k in attrs) e.setAttribute(k, attrs[k]);
+        return e;
+      }
+
+      var svg = document.getElementById(cfg.svgId);
+      svg.setAttribute('viewBox', '0 0 ' + VB_W + ' ' + VB_H);
+      STAGE_TITLES.forEach(function (title, i) {
+        var t = svgEl('text', { x: COL_MARGIN + i * COL_STEP + NODE_W / 2, y: MARGIN_TOP - 12, 'text-anchor': 'middle', class: 'pf-stage-title' });
+        t.textContent = title;
+        svg.appendChild(t);
+      });
+
+      var flowLayer = svgEl('g', {});
+      svg.appendChild(flowLayer);
+      var pathByKey = {};
+      Object.keys(edges).forEach(function (key) {
+        var path = svgEl('path', { class: 'pf-link', d: '' });
+        flowLayer.appendChild(path);
+        pathByKey[key] = path;
+      });
+
+      // Pools sit above ribbons but below labels/nodes. Their right edge is fixed to the receiving
+      // wall; added volume expands leftward, making each impact visibly accumulate instead of
+      // simply vanishing at the destination.
+      var reservoirLayer = svgEl('g', {});
+      svg.appendChild(reservoirLayer);
+      var reservoirByNode = {};
+      NODES.forEach(function (node) {
+        var pool = svgEl('rect', {
+          class: 'pf-reservoir' + (node.kind === 'queue' || node.kind === 'gate' ? ' pf-reservoir-queue' : ''), x: node.x, y: node.y, width: 0, height: node.dispHeight,
+          rx: 2, fill: KIND_COLOR[node.kind], 'fill-opacity': 0.72,
+        });
+        reservoirLayer.appendChild(pool);
+        reservoirByNode[node.id] = pool;
+      });
+
+      var BURST_MAX = cfg.burstMax || 60;
+      var BURST_STAGGER = 30; // milliseconds between releases, so droplets visibly peel away
+      var GRAVITY_X = 620; // SVG units / second²: zero-speed release, then acceleration right
+      var POOL_MAX_W = 46;
+      var particles = [];
+      var splashes = [];
+      var particleAnimating = false;
+      var idleWaiters = [];
+
+      function deposit(nodeId, amount, addCount) {
+        if (addCount) nodeCounts[nodeId] = (nodeCounts[nodeId] || 0) + amount;
+        reservoirCounts[nodeId] = Math.min(derivedTotal(nodeId), (reservoirCounts[nodeId] || 0) + amount);
+        wake();
+      }
+
+      function waitForIdle() {
+        if (!particleAnimating) return Promise.resolve();
+        return new Promise(function (resolve) { idleWaiters.push(resolve); });
+      }
+
+      function burstIntoGate(nodeId, count) {
+        var gate = nodeMap[nodeId];
+        var n = Math.max(1, Math.min(BURST_MAX, Math.round(count)));
+        var now = performance.now();
+        var x1 = gate.x, x0 = gate.x - POOL_MAX_W - 8;
+        for (var i = 0; i < n; i++) {
+          var y = gate.y + Math.random() * gate.dispHeight;
+          var dot = svgEl('circle', { r: 2.8, class: 'pf-dot', fill: KIND_COLOR.gate, cx: x0, cy: y });
+          flowLayer.appendChild(dot);
+          particles.push({
+            el: dot, target: nodeId, color: KIND_COLOR.gate, volume: count / n,
+            addCount: false, releaseGate: null, noDeposit: true,
+            x0: x0, x1: x1, dx: x1 - x0, y0: y, y1: y,
+            distance: Math.max(1, x1 - x0), drift: (Math.random() - 0.5) * 5,
+            start: now + i * BURST_STAGGER,
+          });
+        }
+        if (!particleAnimating) { particleAnimating = true; requestAnimationFrame(particleFrame); }
+      }
+
+      function splashAt(x, y, color, now) {
+        for (var j = 0; j < 3; j++) {
+          var circle = svgEl('circle', { r: 1.5, class: 'pf-splash', fill: color });
+          flowLayer.appendChild(circle);
+          splashes.push({
+            el: circle, x: x, y: y, vx: -18 - Math.random() * 34,
+            vy: (j - 1) * 28 + (Math.random() - 0.5) * 10, born: now, life: 310,
+          });
+        }
+      }
+
+      function particleFrame(now) {
+        for (var i = particles.length - 1; i >= 0; i--) {
+          var p = particles[i];
+          if (now < p.start) continue;
+          var elapsed = (now - p.start) / 1000;
+          var progress = Math.min(1, (0.5 * GRAVITY_X * elapsed * elapsed) / p.distance);
+          var easedY = progress * progress * (3 - 2 * progress);
+          p.el.setAttribute('cx', p.x0 + p.dx * progress);
+          p.el.setAttribute('cy', p.y0 + (p.y1 - p.y0) * easedY + Math.sin(progress * Math.PI) * p.drift);
+          if (progress >= 1) {
+            p.el.remove();
+            particles.splice(i, 1);
+            if (p.releaseGate) nodeCounts[p.releaseGate] = Math.max(0, (nodeCounts[p.releaseGate] || 0) - p.volume);
+            if (!p.noDeposit) deposit(p.target, p.volume, p.addCount);
+            splashAt(p.x1, p.y1, p.color, now);
+          }
+        }
+        for (var s = splashes.length - 1; s >= 0; s--) {
+          var sp = splashes[s];
+          var age = now - sp.born;
+          if (age >= sp.life) {
+            sp.el.remove(); splashes.splice(s, 1); continue;
+          }
+          var seconds = age / 1000;
+          sp.el.setAttribute('cx', sp.x + sp.vx * seconds);
+          sp.el.setAttribute('cy', sp.y + sp.vy * seconds);
+          sp.el.setAttribute('fill-opacity', String(1 - age / sp.life));
+        }
+        if (particles.length || splashes.length) requestAnimationFrame(particleFrame);
+        else {
+          particleAnimating = false;
+          while (idleWaiters.length) idleWaiters.shift()();
+        }
+      }
+
+      // Fires once per real increase, driven explicitly by the caller (never on a timer or a
+      // loop): a handful of dots -- proportional to, capped at a readable count of, exactly how
+      // much this specific edge just grew by -- ride their OWN random path across the current
+      // ribbon band (computed fresh from the edge's live sy0/sy1/ty0/ty1, so a burst mid-transition
+      // still starts and ends on the ribbon as it actually is right now). Each begins at rest and
+      // accelerates horizontally, then deposits its share of the real delta into the destination
+      // pool and makes a tiny splash.
+      function burst(key, delta, reverse, addCount, releaseGate) {
+        var e = edges[key];
+        if (!e) return;
+        var source = nodeMap[e.source], target = nodeMap[e.target];
+        if (reverse) { var swap = source; source = target; target = swap; }
+        var x0 = reverse ? source.x : source.x + source.width;
+        var x1 = reverse ? target.x + target.width : target.x;
+        var n = Math.max(1, Math.min(BURST_MAX, Math.round(delta)));
+        var color = KIND_COLOR[target.kind] || 'var(--text-muted)';
+        var now = performance.now();
+        for (var i = 0; i < n; i++) {
+          // One random vertical fraction per dot, reused at both ends, so each dot cuts its own
+          // straight-ish diagonal through the band instead of every dot sharing one centerline.
+          var frac = Math.random();
+          var y0 = (reverse ? e.ty0 : e.sy0) + frac * ((reverse ? e.ty1 : e.sy1) - (reverse ? e.ty0 : e.sy0));
+          var y1 = (reverse ? e.sy0 : e.ty0) + frac * ((reverse ? e.sy1 : e.ty1) - (reverse ? e.sy0 : e.ty0));
+          var dot = svgEl('circle', { r: 2.8, class: 'pf-dot', fill: color, cx: x0, cy: y0 });
+          flowLayer.appendChild(dot);
+          particles.push({
+            el: dot, target: target.id, color: color, volume: delta / n,
+            addCount: Boolean(addCount), releaseGate: releaseGate || null,
+            x0: x0, x1: x1, dx: x1 - x0, y0: y0, y1: y1, distance: Math.max(1, Math.abs(x1 - x0)),
+            drift: (Math.random() - 0.5) * 9,
+            start: now + i * BURST_STAGGER + Math.random() * BURST_STAGGER * 0.35,
+          });
+        }
+        if (!particleAnimating) { particleAnimating = true; requestAnimationFrame(particleFrame); }
+      }
+
+      var nodeLayer = svgEl('g', {});
+      svg.appendChild(nodeLayer);
+      var nodeVisuals = {};
+      NODES.forEach(function (n) {
+        var rect = svgEl('rect', { class: 'pf-node-rect' + (n.kind === 'gate' ? ' pf-node-gate' : ''), x: n.x, y: n.y, width: n.width, height: n.dispHeight, rx: 2, fill: n.kind === 'gate' ? 'var(--accent-soft)' : 'var(--surface-2)', stroke: KIND_COLOR[n.kind] });
+        var tx = n.x + n.width + 8;
+        // A label can end up sitting inside a wide ribbon, dead center of the diagram, with
+        // stacked ribbons passing directly behind it -- a halo behind the text keeps it legible
+        // regardless of what color is behind it, rather than hoping every ribbon stays out of the way.
+        var halo = svgEl('rect', { class: 'pf-label-halo', x: tx - 4, y: n.cy - 14, width: 90, height: 30, rx: 3, fill: 'var(--surface)', 'fill-opacity': 0.85 });
+        var label = svgEl('text', { x: tx, y: n.cy - 2, class: 'pf-node-label' });
+        label.textContent = n.label;
+        var meta = svgEl('text', { x: tx, y: n.cy + 12, class: 'pf-node-count', fill: KIND_COLOR[n.kind] });
+        meta.textContent = '0';
+        nodeLayer.appendChild(halo); nodeLayer.appendChild(rect); nodeLayer.appendChild(label); nodeLayer.appendChild(meta);
+        nodeVisuals[n.id] = { rect: rect, halo: halo, label: label, meta: meta };
+      });
+
+      function render() {
+        NODES.forEach(function (n) {
+          var v = nodeVisuals[n.id];
+          v.rect.setAttribute('y', n.y);
+          v.rect.setAttribute('height', n.dispHeight);
+          v.halo.setAttribute('y', n.cy - 14);
+          v.label.setAttribute('y', n.cy - 2);
+          v.meta.setAttribute('y', n.cy + 12);
+          var total = Math.round(derivedTotal(n.id));
+          var pct = sourceTotal ? (100 * total / sourceTotal).toFixed(1) + '%' : '0%';
+          v.meta.textContent = total + ' · ' + pct;
+          var pool = reservoirByNode[n.id];
+          if (pool) {
+            var poolCount = Math.min(total, reservoirDisplay[n.id] || 0);
+            var poolWidth = POOL_MAX_W * (poolCount / Math.max(1, sourceTotal));
+            pool.setAttribute('x', n.x - poolWidth);
+            pool.setAttribute('y', n.y);
+            pool.setAttribute('width', poolWidth);
+            pool.setAttribute('height', n.dispHeight);
+          }
+        });
+        Object.keys(edges).forEach(function (key) {
+          var e = edges[key];
+          var s = nodeMap[e.source], t = nodeMap[e.target];
+          var x0 = s.x + s.width, x1 = t.x, midX = (x0 + x1) / 2;
+          var d = 'M' + x0 + ',' + e.sy0 + ' C' + midX + ',' + e.sy0 + ' ' + midX + ',' + e.ty0 + ' ' + x1 + ',' + e.ty0 +
+            ' L' + x1 + ',' + e.ty1 + ' C' + midX + ',' + e.ty1 + ' ' + midX + ',' + e.sy1 + ' ' + x0 + ',' + e.sy1 + ' Z';
+          pathByKey[key].setAttribute('d', d);
+          var edgeColor = KIND_COLOR[t.kind] || 'var(--text-muted)';
+          var empty = e.committed <= 0;
+          pathByKey[key].setAttribute('fill', edgeColor);
+          pathByKey[key].setAttribute('fill-opacity', empty ? 0.16 : 0.4);
+          pathByKey[key].setAttribute('stroke', edgeColor);
+          pathByKey[key].setAttribute('stroke-opacity', empty ? 0.5 : 0);
+          pathByKey[key].setAttribute('stroke-width', empty ? 1.25 : 0);
+        });
+      }
+
+      function frame(now) {
+        var dt = Math.min(0.1, (now - lastFrame) / 1000);
+        lastFrame = now;
+        var settled = true;
+        NODES.forEach(function (n) {
+          var target = targetHeight(n);
+          if (Math.abs(target - n.dispHeight) > 0.3) settled = false;
+          var alpha = 1 - Math.exp(-dt * SMOOTH_RATE);
+          n.dispHeight += (target - n.dispHeight) * alpha;
+        });
+        Object.keys(reservoirByNode).forEach(function (nodeId) {
+          var target = reservoirCounts[nodeId] || 0;
+          var shown = reservoirDisplay[nodeId] || 0;
+          if (Math.abs(target - shown) > 0.03) settled = false;
+          reservoirDisplay[nodeId] = shown + (target - shown) * (1 - Math.exp(-dt * 9));
+        });
+        layoutColumns();
+        recomputeEdgeSlices();
+        render();
+        if (settled) { animating = false; return; }
+        requestAnimationFrame(frame);
+      }
+      function wake() {
+        if (animating) return;
+        animating = true;
+        lastFrame = performance.now();
+        requestAnimationFrame(frame);
+      }
+
+      // The one full-reconciliation entry point: caller hands over the current absolute count for
+      // every node ('counts'), optionally a 'total' (the denominator percentages/bar heights are
+      // computed against -- not always just the sum of stage-0 nodes, e.g. Jobs' total includes
+      // postings that have already moved past the gate) and 'edgeOverrides' for any edge whose
+      // real committed volume isn't simply "the target node's own count" (an accumulator node like
+      // Jobs' review_queue, which also feeds further stages, needs the sum of everything that
+      // passed through it, not just what's currently sitting there). Never bursts on its own --
+      // reconciliation resizes bars/pools smoothly; a caller wanting a droplet burst calls burst()/
+      // burstIntoGate() explicitly with the real delta it just learned about, same as before this
+      // was a shared engine.
+      function setCounts(counts, opts) {
+        opts = opts || {};
+        nodeCounts = counts;
+        sourceTotal = opts.total !== undefined ? opts.total : stageGroups[0].reduce(function (sum, id) { return sum + (counts[id] || 0); }, 0);
+
+        NODES.forEach(function (node) {
+          var actual = derivedTotal(node.id);
+          if (isFirstCall || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+            reservoirCounts[node.id] = actual;
+            reservoirDisplay[node.id] = actual;
+          } else if ((reservoirCounts[node.id] || 0) > actual) {
+            reservoirCounts[node.id] = actual;
+          }
+        });
+
+        Object.keys(edges).forEach(function (key) {
+          var e = edges[key];
+          e.committed = (opts.edgeOverrides && opts.edgeOverrides[key] !== undefined) ? opts.edgeOverrides[key] : (counts[e.target] || 0);
+        });
+
+        isFirstCall = false;
+        wake();
+      }
+
+      return { setCounts: setCounts, burst: burst, burstIntoGate: burstIntoGate, waitForIdle: waitForIdle, wake: wake };
+    }
+
+    // ---- Jobs -> Search: Pre-Screen -> Screen -> Fit -------------------------------------------
     // Human actions aren't shown -- this diagram ends with the AI pipeline's Fit outcomes. Manual
     // state never changes which path a posting took through the screening and fit stages.
-    //
-    // setPfCounts() is the single entry point, same idea as a real-events-call-decideNext design:
-    // it's called with the authoritative shape jobPipelineCounts() returns (every full /jobs load
-    // reconciles from it), and nudged with real per-batch deltas while a scan or a Find-my-matches
-    // run is actively in flight, via pfBumpScanned() and pfApplyPipelineEvent() below. No
-    // probability or random weighting is used: dispatch and outcome events come from real work.
     var PF_NODES = [
       { id: 'screen_gate', label: 'Pre-Screen', stage: 0, kind: 'gate' },
       { id: 'screen_rejected', label: 'Fail', stage: 1, kind: 'reject' },
@@ -9296,44 +10412,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       review_queue: ['fit_failed', 'fit_recommended', 'fit_rejected'],
     };
     var PF_STAGE_TITLES = ['Pre-Screen', 'Screen', 'Fit'];
-    var PF_KIND_COLOR = { queue: 'var(--warning)', gate: 'var(--accent)', reject: 'var(--error)', success: 'var(--success)' };
-
-    var PF_VB_W = 1320, PF_VB_H = 340;
-    var PF_MARGIN_TOP = 26, PF_MARGIN_BOTTOM = 8;
-    var PF_USABLE_H = PF_VB_H - PF_MARGIN_TOP - PF_MARGIN_BOTTOM;
-    var PF_NODE_W = 10;
-    var PF_MIN_H = 12;
-    var PF_ROW_GAP = 26; // generous on purpose: each node's 2-line label needs real clearance from its neighbors, not just its own (possibly tiny) bar height
-    var PF_SOURCE_HEIGHT = 200;
-    var PF_COL_MARGIN = 66;
-    var PF_COL_STEP = 550;
-    var PF_SMOOTH_RATE = 6;
-
-    var pfNodeMap = {};
-    PF_NODES.forEach(function (n) {
-      pfNodeMap[n.id] = n;
-      n.x = PF_COL_MARGIN + n.stage * PF_COL_STEP;
-      n.width = PF_NODE_W;
-      n.dispHeight = PF_MIN_H;
-      n.y = PF_MARGIN_TOP; n.cy = PF_MARGIN_TOP;
-    });
-    var pfStageGroups = PF_STAGE_TITLES.map(function () { return []; });
-    PF_NODES.forEach(function (n) {
-      if (!pfStageGroups[n.stage]) pfStageGroups[n.stage] = [];
-      pfStageGroups[n.stage].push(n.id);
-    });
-
-    var pfEdges = {};
-    var pfChildEdges = {}; var pfParentEdges = {};
-    PF_NODES.forEach(function (n) { pfChildEdges[n.id] = []; pfParentEdges[n.id] = []; });
-    Object.keys(PF_BRANCHES).forEach(function (source) {
-      PF_BRANCHES[source].forEach(function (target) {
-        var edge = { source: source, target: target, committed: 0, sy0: 0, sy1: 0, ty0: 0, ty1: 0 };
-        pfEdges[source + '->' + target] = edge;
-        pfChildEdges[source].push(edge);
-        pfParentEdges[target].push(edge);
-      });
-    });
+    var jobsFlow = createPipelineFlow({ svgId: 'pf-svg', nodes: PF_NODES, branches: PF_BRANCHES, stageTitles: PF_STAGE_TITLES, vbW: 1320, vbH: 340, sourceHeight: 200, colStep: 550 });
 
     var pfSourceTotal = 0;
     var pfNodeCounts = {};
@@ -9341,17 +10420,25 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     var pfScreenProcessing = 0;
     var pfFitProcessing = 0;
     var pfLastCountsPayload = null;
-    var pfAnimating = false;
-    var pfLastFrame = 0;
-    var pfReservoirCounts = {};
-    var pfReservoirDisplay = {};
 
-    function pfDerivedTotal(nodeId) {
-      return pfNodeCounts[nodeId] || 0;
+    // Recomputes the generic engine's node-count snapshot from Jobs' own bookkeeping above and
+    // pushes it through setCounts(). review_queue needs an edge override: it's an accumulator
+    // (also feeds Fit), so the volume that "passed screening" is everything still downstream of
+    // it, not just its own currently-waiting count.
+    function pfRefresh() {
+      var nodeCounts = {
+        screen_gate: pfScreenWaiting + pfScreenProcessing,
+        screen_rejected: pfNodeCounts.screen_rejected || 0,
+        review_queue: pfNodeCounts.review_queue || 0,
+        fit_failed: pfNodeCounts.fit_failed || 0,
+        fit_rejected: pfNodeCounts.fit_rejected || 0,
+        fit_recommended: pfNodeCounts.fit_recommended || 0,
+      };
+      var accepted = nodeCounts.review_queue + nodeCounts.fit_failed + nodeCounts.fit_rejected + nodeCounts.fit_recommended;
+      jobsFlow.setCounts(nodeCounts, { total: pfSourceTotal, edgeOverrides: { 'screen_gate->review_queue': accepted } });
     }
-    function pfTargetHeight(n) {
-      return Math.max(PF_MIN_H, (pfDerivedTotal(n.id) / Math.max(1, pfSourceTotal)) * PF_SOURCE_HEIGHT);
-    }
+    function pfWake() { jobsFlow.wake(); }
+    function pfWaitForIdle() { return jobsFlow.waitForIdle(); }
 
     // Sankey-only interpretation of the existing rows. This deliberately does not call
     // jobCategory(): manual Interested/Removed choices and the Jobs tabs must not rewrite the AI
@@ -9391,15 +10478,12 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       return buckets;
     }
 
-    // The one entry point that actually moves the diagram, and the one place bursts get decided:
-    // whatever edge's committed count just went UP compared to last time gets a burst proportional
-    // to that increase, so motion only ever appears at the instant new real numbers land, not as
-    // constant ambient looping. The very first call (page load) is deliberately silent -- that's
-    // the starting state, not an update, and bursting the entire existing backlog on load would be
-    // both meaningless and overwhelming.
+    // Full reconciliation from the authoritative /jobs payload -- every full Jobs load resets from
+    // here. Deliberately silent (no burst): this resizes bars/pools to match reality, it doesn't
+    // claim new real work just happened. Live motion comes only from pfApplyPipelineEvent/
+    // pfBumpScanned below, each firing an explicit burst for the specific real delta it just
+    // learned about from an actual backend event -- never inferred from a before/after diff here.
     function setPfCounts(counts) {
-      var isFirstLoad = pfLastCountsPayload === null;
-
       pfLastCountsPayload = counts;
       var buckets = pfBucketsFromJobs(counts);
       var screenAccepted = buckets.screenPassed + buckets.fitFailed + buckets.recommended + buckets.notRecommended;
@@ -9408,31 +10492,12 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       pfScreenWaiting = buckets.unassessed;
       pfScreenProcessing = 0;
       pfFitProcessing = 0;
-      pfNodeCounts.screen_gate = buckets.unassessed;
       pfNodeCounts.screen_rejected = buckets.screenFailed;
       pfNodeCounts.review_queue = buckets.screenPassed;
       pfNodeCounts.fit_failed = buckets.fitFailed;
       pfNodeCounts.fit_rejected = buckets.notRecommended;
       pfNodeCounts.fit_recommended = buckets.recommended;
-      pfEdges['screen_gate->screen_rejected'].committed = buckets.screenFailed;
-      pfEdges['screen_gate->review_queue'].committed = screenAccepted;
-      pfEdges['review_queue->fit_failed'].committed = buckets.fitFailed;
-      pfEdges['review_queue->fit_rejected'].committed = buckets.notRecommended;
-      pfEdges['review_queue->fit_recommended'].committed = buckets.recommended;
-
-      // Reservoirs mirror the currently retained volume at each destination. On first load there
-      // is no historical trip to replay, so begin full. Later decreases reconcile immediately;
-      // increases are deposited only when their visible droplets actually arrive below.
-      PF_NODES.forEach(function (node) {
-        if (node.kind === 'gate' && node.id !== 'screen_gate') return;
-        var actual = node.id === 'screen_gate' ? pfScreenWaiting : pfDerivedTotal(node.id);
-        if (isFirstLoad || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-          pfReservoirCounts[node.id] = actual;
-          pfReservoirDisplay[node.id] = actual;
-        } else if ((pfReservoirCounts[node.id] || 0) > actual) {
-          pfReservoirCounts[node.id] = actual;
-        }
-      });
+      pfRefresh();
 
       document.getElementById('jobs-pipeline-summary').textContent =
         buckets.screenFailed + ' failed pre-screen' +
@@ -9447,25 +10512,9 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       var processed = pfSourceTotal ? Math.round(100 * (buckets.screenFailed + buckets.fitFailed + buckets.recommended + buckets.notRecommended) / pfSourceTotal) : 0;
       document.getElementById('pfStatProcessed').textContent = processed + '%';
       document.getElementById('pfProgressFill').style.width = processed + '%';
-
-      pfWake();
     }
 
     function pfBeginRun() { /* Pipeline events carry the real transient state. */ }
-
-    function pfSyncLiveEdges() {
-      pfEdges['screen_gate->screen_rejected'].committed = pfNodeCounts.screen_rejected || 0;
-      pfEdges['screen_gate->review_queue'].committed = (pfNodeCounts.review_queue || 0) +
-        (pfNodeCounts.fit_failed || 0) +
-        (pfNodeCounts.fit_rejected || 0) + (pfNodeCounts.fit_recommended || 0);
-      pfEdges['review_queue->fit_failed'].committed = pfNodeCounts.fit_failed || 0;
-      pfEdges['review_queue->fit_rejected'].committed = pfNodeCounts.fit_rejected || 0;
-      pfEdges['review_queue->fit_recommended'].committed = pfNodeCounts.fit_recommended || 0;
-      pfLayoutColumns();
-      pfRecomputeEdgeSlices();
-      pfRender();
-      pfWake();
-    }
 
     function pfApplyPipelineEvent(event) {
       var count = (event.ids || event.outcomes || []).length;
@@ -9474,56 +10523,50 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         if (event.stage === 'screen') {
           pfScreenWaiting = Math.max(0, pfScreenWaiting - count);
           pfScreenProcessing += count;
-          pfNodeCounts.screen_gate = pfScreenWaiting + pfScreenProcessing;
-          pfReservoirCounts.screen_gate = pfScreenWaiting;
-          pfSyncLiveEdges();
-          pfBurstIntoGate('screen_gate', count);
+          pfRefresh();
+          jobsFlow.burstIntoGate('screen_gate', count);
           return;
         }
         // There is intentionally no separate AI Review node. A dispatched deep-assessment batch
         // remains represented by Screen > Pass until its real Fit outcome resolves.
         pfFitProcessing += count;
-        pfSyncLiveEdges();
+        pfRefresh();
         return;
       }
       if (event.phase === 'failed') {
         if (event.stage === 'screen') {
           pfScreenProcessing = Math.max(0, pfScreenProcessing - count);
           pfScreenWaiting += count;
-          pfNodeCounts.screen_gate = pfScreenWaiting + pfScreenProcessing;
-          pfReservoirCounts.screen_gate = pfScreenWaiting;
-          pfSyncLiveEdges();
+          pfRefresh();
           return;
         }
         pfFitProcessing = Math.max(0, pfFitProcessing - count);
-        pfSyncLiveEdges();
+        pfRefresh();
         return;
       }
       if (event.phase === 'resolved') {
         if (event.stage === 'screen') {
           pfScreenProcessing = Math.max(0, pfScreenProcessing - count);
-          pfNodeCounts.screen_gate = pfScreenWaiting + pfScreenProcessing;
         } else {
           pfFitProcessing = Math.max(0, pfFitProcessing - count);
           pfNodeCounts.review_queue = Math.max(0, (pfNodeCounts.review_queue || 0) - count);
-          pfReservoirCounts.review_queue = pfNodeCounts.review_queue;
         }
         var grouped = {};
         event.outcomes.forEach(function (item) { grouped[item.outcome] = (grouped[item.outcome] || 0) + 1; });
         if (event.stage === 'screen') {
           pfNodeCounts.screen_rejected += grouped.rejected || 0;
           pfNodeCounts.review_queue += grouped.passed || 0;
-          pfSyncLiveEdges();
-          if (grouped.rejected) pfBurst('screen_gate->screen_rejected', grouped.rejected, false, false);
-          if (grouped.passed) pfBurst('screen_gate->review_queue', grouped.passed, false, false);
+          pfRefresh();
+          if (grouped.rejected) jobsFlow.burst('screen_gate->screen_rejected', grouped.rejected, false, false);
+          if (grouped.passed) jobsFlow.burst('screen_gate->review_queue', grouped.passed, false, false);
         } else {
           pfNodeCounts.fit_failed += grouped.failed || 0;
           pfNodeCounts.fit_rejected += grouped.rejected || 0;
           pfNodeCounts.fit_recommended += grouped.recommended || 0;
-          pfSyncLiveEdges();
-          if (grouped.failed) pfBurst('review_queue->fit_failed', grouped.failed, false, false);
-          if (grouped.rejected) pfBurst('review_queue->fit_rejected', grouped.rejected, false, false);
-          if (grouped.recommended) pfBurst('review_queue->fit_recommended', grouped.recommended, false, false);
+          pfRefresh();
+          if (grouped.failed) jobsFlow.burst('review_queue->fit_failed', grouped.failed, false, false);
+          if (grouped.rejected) jobsFlow.burst('review_queue->fit_rejected', grouped.rejected, false, false);
+          if (grouped.recommended) jobsFlow.burst('review_queue->fit_recommended', grouped.recommended, false, false);
         }
       }
     }
@@ -9534,294 +10577,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       if (!newJobs) return;
       pfSourceTotal += newJobs;
       pfScreenWaiting += newJobs;
-      pfNodeCounts.screen_gate = pfScreenWaiting + pfScreenProcessing;
-      pfReservoirCounts.screen_gate = pfScreenWaiting;
-      pfSyncLiveEdges();
-    }
-
-    function pfLayoutColumns() {
-      pfStageGroups.forEach(function (ids) {
-        var totalH = 0;
-        ids.forEach(function (id) { totalH += pfNodeMap[id].dispHeight; });
-        totalH += PF_ROW_GAP * (ids.length - 1);
-        var y = PF_MARGIN_TOP + (PF_USABLE_H - totalH) / 2;
-        ids.forEach(function (id) {
-          var n = pfNodeMap[id];
-          n.y = y; n.cy = y + n.dispHeight / 2;
-          y += n.dispHeight + PF_ROW_GAP;
-        });
-      });
-    }
-    function pfEdgeWeight(edge) {
-      // Every declared transition is a permanent channel. A value of one is only the visual
-      // floor; labels and statistics continue to show the truthful zero count.
-      return Math.max(1, edge.committed);
-    }
-    function pfRecomputeEdgeSlices() {
-      PF_NODES.forEach(function (n) {
-        var outs = pfChildEdges[n.id].slice().sort(function (a, b) { return pfNodeMap[a.target].cy - pfNodeMap[b.target].cy; });
-        var outDenom = 0; outs.forEach(function (e) { outDenom += pfEdgeWeight(e); }); outDenom = Math.max(1, outDenom);
-        var cum = 0;
-        outs.forEach(function (e) {
-          var h = (pfEdgeWeight(e) / outDenom) * n.dispHeight;
-          e.sy0 = n.y + cum; e.sy1 = e.sy0 + h; cum += h;
-        });
-        var ins = pfParentEdges[n.id].slice().sort(function (a, b) { return pfNodeMap[a.source].cy - pfNodeMap[b.source].cy; });
-        var inDenom = 0; ins.forEach(function (e) { inDenom += pfEdgeWeight(e); }); inDenom = Math.max(1, inDenom);
-        cum = 0;
-        ins.forEach(function (e) {
-          var h = (pfEdgeWeight(e) / inDenom) * n.dispHeight;
-          e.ty0 = n.y + cum; e.ty1 = e.ty0 + h; cum += h;
-        });
-      });
-    }
-
-    var PF_SVG_NS = 'http://www.w3.org/2000/svg';
-    function pfEl(tag, attrs) {
-      var e = document.createElementNS(PF_SVG_NS, tag);
-      for (var k in attrs) e.setAttribute(k, attrs[k]);
-      return e;
-    }
-
-    var pfSvg = document.getElementById('pf-svg');
-    pfSvg.setAttribute('viewBox', '0 0 ' + PF_VB_W + ' ' + PF_VB_H);
-    PF_STAGE_TITLES.forEach(function (title, i) {
-      var t = pfEl('text', { x: PF_COL_MARGIN + i * PF_COL_STEP + PF_NODE_W / 2, y: PF_MARGIN_TOP - 12, 'text-anchor': 'middle', class: 'pf-stage-title' });
-      t.textContent = title;
-      pfSvg.appendChild(t);
-    });
-
-    var pfFlowLayer = pfEl('g', {});
-    pfSvg.appendChild(pfFlowLayer);
-    var pfPathByKey = {};
-    Object.keys(pfEdges).forEach(function (key) {
-      var path = pfEl('path', { class: 'pf-link', d: '' });
-      pfFlowLayer.appendChild(path);
-      pfPathByKey[key] = path;
-    });
-
-    // Pools sit above ribbons but below labels/nodes. Their right edge is fixed to the receiving
-    // wall; added volume expands leftward, making each impact visibly accumulate instead of simply
-    // vanishing at the destination.
-    var pfReservoirLayer = pfEl('g', {});
-    pfSvg.appendChild(pfReservoirLayer);
-    var pfReservoirByNode = {};
-    PF_NODES.forEach(function (node) {
-      if (node.kind === 'gate' && node.id !== 'screen_gate') return;
-      var pool = pfEl('rect', {
-        class: 'pf-reservoir' + (node.kind === 'queue' || node.id === 'screen_gate' ? ' pf-reservoir-queue' : ''), x: node.x, y: node.y, width: 0, height: node.dispHeight,
-        rx: 2, fill: PF_KIND_COLOR[node.kind], 'fill-opacity': 0.72,
-      });
-      pfReservoirLayer.appendChild(pool);
-      pfReservoirByNode[node.id] = pool;
-    });
-
-    var PF_BURST_MAX = 60; // SCREEN_BATCH_SIZE: one visible droplet per posting in a real batch
-    var PF_BURST_STAGGER = 30; // milliseconds between releases, so droplets visibly peel away
-    var PF_GRAVITY_X = 620; // SVG units / second²: zero-speed release, then acceleration right
-    var PF_POOL_MAX_W = 46;
-    var pfParticles = [];
-    var pfSplashes = [];
-    var pfParticleAnimating = false;
-    var pfIdleWaiters = [];
-
-    function pfDeposit(nodeId, amount, addCount) {
-      if (addCount) pfNodeCounts[nodeId] = (pfNodeCounts[nodeId] || 0) + amount;
-      pfReservoirCounts[nodeId] = Math.min(pfDerivedTotal(nodeId), (pfReservoirCounts[nodeId] || 0) + amount);
-      pfSyncLiveEdges();
-      pfWake();
-    }
-
-    function pfWaitForIdle() {
-      if (!pfParticleAnimating) return Promise.resolve();
-      return new Promise(function (resolve) { pfIdleWaiters.push(resolve); });
-    }
-
-    function pfBurstIntoGate(nodeId, count) {
-      var gate = pfNodeMap[nodeId];
-      var n = Math.max(1, Math.min(PF_BURST_MAX, Math.round(count)));
-      var now = performance.now();
-      var x1 = gate.x, x0 = gate.x - PF_POOL_MAX_W - 8;
-      for (var i = 0; i < n; i++) {
-        var y = gate.y + Math.random() * gate.dispHeight;
-        var dot = pfEl('circle', { r: 2.8, class: 'pf-dot', fill: PF_KIND_COLOR.gate, cx: x0, cy: y });
-        pfFlowLayer.appendChild(dot);
-        pfParticles.push({
-          el: dot, target: nodeId, color: PF_KIND_COLOR.gate, volume: count / n,
-          addCount: false, releaseGate: null, noDeposit: true,
-          x0: x0, x1: x1, dx: x1 - x0, y0: y, y1: y,
-          distance: Math.max(1, x1 - x0), drift: (Math.random() - 0.5) * 5,
-          start: now + i * PF_BURST_STAGGER,
-        });
-      }
-      if (!pfParticleAnimating) { pfParticleAnimating = true; requestAnimationFrame(pfParticleFrame); }
-    }
-
-    function pfSplash(x, y, color, now) {
-      for (var j = 0; j < 3; j++) {
-        var circle = pfEl('circle', { r: 1.5, class: 'pf-splash', fill: color });
-        pfFlowLayer.appendChild(circle);
-        pfSplashes.push({
-          el: circle, x: x, y: y, vx: -18 - Math.random() * 34,
-          vy: (j - 1) * 28 + (Math.random() - 0.5) * 10, born: now, life: 310,
-        });
-      }
-    }
-
-    function pfParticleFrame(now) {
-      for (var i = pfParticles.length - 1; i >= 0; i--) {
-        var p = pfParticles[i];
-        if (now < p.start) continue;
-        var elapsed = (now - p.start) / 1000;
-        var progress = Math.min(1, (0.5 * PF_GRAVITY_X * elapsed * elapsed) / p.distance);
-        var easedY = progress * progress * (3 - 2 * progress);
-        p.el.setAttribute('cx', p.x0 + p.dx * progress);
-        p.el.setAttribute('cy', p.y0 + (p.y1 - p.y0) * easedY + Math.sin(progress * Math.PI) * p.drift);
-        if (progress >= 1) {
-          p.el.remove();
-          pfParticles.splice(i, 1);
-          if (p.releaseGate) pfNodeCounts[p.releaseGate] = Math.max(0, (pfNodeCounts[p.releaseGate] || 0) - p.volume);
-          if (!p.noDeposit) pfDeposit(p.target, p.volume, p.addCount);
-          pfSplash(p.x1, p.y1, p.color, now);
-        }
-      }
-      for (var s = pfSplashes.length - 1; s >= 0; s--) {
-        var splash = pfSplashes[s];
-        var age = now - splash.born;
-        if (age >= splash.life) {
-          splash.el.remove(); pfSplashes.splice(s, 1); continue;
-        }
-        var seconds = age / 1000;
-        splash.el.setAttribute('cx', splash.x + splash.vx * seconds);
-        splash.el.setAttribute('cy', splash.y + splash.vy * seconds);
-        splash.el.setAttribute('fill-opacity', String(1 - age / splash.life));
-      }
-      if (pfParticles.length || pfSplashes.length) requestAnimationFrame(pfParticleFrame);
-      else {
-        pfParticleAnimating = false;
-        while (pfIdleWaiters.length) pfIdleWaiters.shift()();
-      }
-    }
-
-    // Fires once per real increase (see setPfCounts), never on a timer or a loop: a handful of
-    // dots -- proportional to, capped at a readable count of, exactly how much this specific edge
-    // just grew by -- ride their OWN random path across the current ribbon band (computed fresh
-    // from the edge's live sy0/sy1/ty0/ty1, so a burst mid-transition still starts and ends on the
-    // ribbon as it actually is right now). Each begins at rest and accelerates horizontally, then
-    // deposits its share of the real delta into the destination pool and makes a tiny splash.
-    function pfBurst(key, delta, reverse, addCount, releaseGate) {
-      var e = pfEdges[key];
-      if (!e) return;
-      var source = pfNodeMap[e.source], target = pfNodeMap[e.target];
-      if (reverse) { var swap = source; source = target; target = swap; }
-      var x0 = reverse ? source.x : source.x + source.width;
-      var x1 = reverse ? target.x + target.width : target.x;
-      var n = Math.max(1, Math.min(PF_BURST_MAX, Math.round(delta)));
-      var color = PF_KIND_COLOR[target.kind] || 'var(--text-muted)';
-      var now = performance.now();
-      for (var i = 0; i < n; i++) {
-        // One random vertical fraction per dot, reused at both ends, so each dot cuts its own
-        // straight-ish diagonal through the band instead of every dot sharing one centerline.
-        var frac = Math.random();
-        var y0 = (reverse ? e.ty0 : e.sy0) + frac * ((reverse ? e.ty1 : e.sy1) - (reverse ? e.ty0 : e.sy0));
-        var y1 = (reverse ? e.sy0 : e.ty0) + frac * ((reverse ? e.sy1 : e.ty1) - (reverse ? e.sy0 : e.ty0));
-        var dot = pfEl('circle', { r: 2.8, class: 'pf-dot', fill: color, cx: x0, cy: y0 });
-        pfFlowLayer.appendChild(dot);
-        pfParticles.push({
-          el: dot, target: target.id, color: color, volume: delta / n,
-          addCount: Boolean(addCount), releaseGate: releaseGate || null,
-          x0: x0, x1: x1, dx: x1 - x0, y0: y0, y1: y1, distance: Math.max(1, Math.abs(x1 - x0)),
-          drift: (Math.random() - 0.5) * 9,
-          start: now + i * PF_BURST_STAGGER + Math.random() * PF_BURST_STAGGER * 0.35,
-        });
-      }
-      if (!pfParticleAnimating) { pfParticleAnimating = true; requestAnimationFrame(pfParticleFrame); }
-    }
-
-    var pfNodeLayer = pfEl('g', {});
-    pfSvg.appendChild(pfNodeLayer);
-    var pfNodeVisuals = {};
-    PF_NODES.forEach(function (n) {
-      var rect = pfEl('rect', { class: 'pf-node-rect' + (n.kind === 'gate' ? ' pf-node-gate' : ''), x: n.x, y: n.y, width: n.width, height: n.dispHeight, rx: 2, fill: n.kind === 'gate' ? 'var(--accent-soft)' : 'var(--surface-2)', stroke: PF_KIND_COLOR[n.kind] });
-      var tx = n.x + n.width + 8;
-      // A label can end up sitting inside a wide ribbon (e.g. "Scanned postings", dead center of
-      // the diagram, with three stacked col1 ribbons passing directly behind it) -- a halo behind
-      // the text keeps it legible regardless of what color is behind it, rather than hoping every
-      // ribbon stays out of the way.
-      var halo = pfEl('rect', { class: 'pf-label-halo', x: tx - 4, y: n.cy - 14, width: 90, height: 30, rx: 3, fill: 'var(--surface)', 'fill-opacity': 0.85 });
-      var label = pfEl('text', { x: tx, y: n.cy - 2, class: 'pf-node-label' });
-      label.textContent = n.label;
-      var meta = pfEl('text', { x: tx, y: n.cy + 12, class: 'pf-node-count', fill: PF_KIND_COLOR[n.kind] });
-      meta.textContent = '0';
-      pfNodeLayer.appendChild(halo); pfNodeLayer.appendChild(rect); pfNodeLayer.appendChild(label); pfNodeLayer.appendChild(meta);
-      pfNodeVisuals[n.id] = { rect: rect, halo: halo, label: label, meta: meta };
-    });
-
-    function pfRender() {
-      PF_NODES.forEach(function (n) {
-        var v = pfNodeVisuals[n.id];
-        v.rect.setAttribute('y', n.y);
-        v.rect.setAttribute('height', n.dispHeight);
-        v.halo.setAttribute('y', n.cy - 14);
-        v.label.setAttribute('y', n.cy - 2);
-        v.meta.setAttribute('y', n.cy + 12);
-        var total = Math.round(pfDerivedTotal(n.id));
-        var pct = pfSourceTotal ? (100 * total / pfSourceTotal).toFixed(1) + '%' : '0%';
-        v.meta.textContent = total + ' · ' + pct;
-        var pool = pfReservoirByNode[n.id];
-        if (pool) {
-          var poolCount = Math.min(total, pfReservoirDisplay[n.id] || 0);
-          var poolWidth = PF_POOL_MAX_W * (poolCount / Math.max(1, pfSourceTotal));
-          pool.setAttribute('x', n.x - poolWidth);
-          pool.setAttribute('y', n.y);
-          pool.setAttribute('width', poolWidth);
-          pool.setAttribute('height', n.dispHeight);
-        }
-      });
-      Object.keys(pfEdges).forEach(function (key) {
-        var e = pfEdges[key];
-        var s = pfNodeMap[e.source], t = pfNodeMap[e.target];
-        var x0 = s.x + s.width, x1 = t.x, midX = (x0 + x1) / 2;
-        var d = 'M' + x0 + ',' + e.sy0 + ' C' + midX + ',' + e.sy0 + ' ' + midX + ',' + e.ty0 + ' ' + x1 + ',' + e.ty0 +
-          ' L' + x1 + ',' + e.ty1 + ' C' + midX + ',' + e.ty1 + ' ' + midX + ',' + e.sy1 + ' ' + x0 + ',' + e.sy1 + ' Z';
-        pfPathByKey[key].setAttribute('d', d);
-        var edgeColor = PF_KIND_COLOR[t.kind] || 'var(--text-muted)';
-        var empty = e.committed <= 0;
-        pfPathByKey[key].setAttribute('fill', edgeColor);
-        pfPathByKey[key].setAttribute('fill-opacity', empty ? 0.16 : 0.4);
-        pfPathByKey[key].setAttribute('stroke', edgeColor);
-        pfPathByKey[key].setAttribute('stroke-opacity', empty ? 0.5 : 0);
-        pfPathByKey[key].setAttribute('stroke-width', empty ? 1.25 : 0);
-      });
-    }
-
-    function pfFrame(now) {
-      var dt = Math.min(0.1, (now - pfLastFrame) / 1000);
-      pfLastFrame = now;
-      var settled = true;
-      PF_NODES.forEach(function (n) {
-        var target = pfTargetHeight(n);
-        if (Math.abs(target - n.dispHeight) > 0.3) settled = false;
-        var alpha = 1 - Math.exp(-dt * PF_SMOOTH_RATE);
-        n.dispHeight += (target - n.dispHeight) * alpha;
-      });
-      Object.keys(pfReservoirByNode).forEach(function (nodeId) {
-        var target = pfReservoirCounts[nodeId] || 0;
-        var shown = pfReservoirDisplay[nodeId] || 0;
-        if (Math.abs(target - shown) > 0.03) settled = false;
-        pfReservoirDisplay[nodeId] = shown + (target - shown) * (1 - Math.exp(-dt * 9));
-      });
-      pfLayoutColumns();
-      pfRecomputeEdgeSlices();
-      pfRender();
-      if (settled) { pfAnimating = false; return; }
-      requestAnimationFrame(pfFrame);
-    }
-    function pfWake() {
-      if (pfAnimating) return;
-      pfAnimating = true;
-      pfLastFrame = performance.now();
-      requestAnimationFrame(pfFrame);
+      pfRefresh();
     }
 
     function renderJobPipeline(counts) {
@@ -9859,6 +10615,9 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     // easing that stalled while it was hidden.
     document.querySelector('[data-tab="jobs"]').addEventListener('click', function () {
       if (jobsView === 'search') pfWake();
+    });
+    document.querySelector('[data-tab="companies"]').addEventListener('click', function () {
+      if (companiesView === 'find') companiesFlow.wake();
     });
 
     async function loadJobs(syncPipeline) {
@@ -10910,6 +11669,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     loadNotes();
     loadResumes();
     loadCompanies();
+    loadCompanySearchTerms();
     loadJobs();
     loadDevices();
     loadGmailStatus();
@@ -10998,8 +11758,6 @@ function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "structured", schema: FIT_BATCH_SCHEMA, toolName: "submit_fit_assessment", maxTokens: 7000 };
     case "fit.criteria":
       return { kind: "structured", schema: CARE_ABOUT_TOPICS_SCHEMA, toolName: "submit_topics", maxTokens: 1200 };
-    case "companies.discover":
-      return { kind: "structured", schema: COMPANY_LIST_SCHEMA, toolName: "submit_companies", maxTokens: 4000 };
     case "profile.structure":
       // Retained only so an eval case saved before the profile/create rename can still be replayed
       // against the schema it was actually generated with -- new cases are saved under "profile.create".
@@ -11219,6 +11977,9 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "GET" && url.pathname === "/companies") return listCompanies(request, env);
     if (request.method === "POST" && url.pathname === "/companies") return createCompany(request, env);
     if (request.method === "POST" && url.pathname === "/companies/bulk") return bulkAddCompanies(request, env);
+    if (request.method === "GET" && url.pathname === "/companies/search-terms") return getCompanySearchTerms(request, env);
+    if (request.method === "PUT" && url.pathname === "/companies/search-terms") return setCompanySearchTerms(request, env);
+    if (request.method === "POST" && url.pathname === "/companies/search-terms/regenerate") return regenerateCompanySearchTerms(request, env);
     if (request.method === "POST" && url.pathname === "/companies/discover") return discoverCompanies(request, env, ctx);
     if (request.method === "POST" && url.pathname === "/companies/scan") return scanCompanies(request, env, ctx);
     const companyMatch = url.pathname.match(/^\/companies\/([^/]+)$/);
