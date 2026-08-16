@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
@@ -128,6 +128,58 @@ def update_preferences(
 def regenerate_summary(profile_id: str, session: Session = Depends(get_session)) -> RedirectResponse:
     generate_profile_summary(session, require_profile(session, profile_id))
     return RedirectResponse(f"/profiles/{profile_id}#profile", status_code=303)
+
+
+@app.get("/profiles/{profile_id}/export")
+def export_profile(profile_id: str, session: Session = Depends(get_session)) -> JSONResponse:
+    profile = require_profile(session, profile_id)
+    data = {
+        "profile": {
+            "id": profile.id,
+            "label": profile.label,
+            "summary": profile.summary,
+            "preferences": profile.preferences,
+            "created_at": profile.created_at.isoformat(),
+        },
+        "user": {
+            "id": profile.user.id,
+            "display_name": profile.user.display_name,
+        },
+        "evidence": [
+            {
+                "id": item.id,
+                "category": item.category,
+                "claim": item.claim,
+                "verification_status": item.verification_status,
+                "usable_in_applications": item.usable_in_applications,
+                "created_at": item.created_at.isoformat(),
+            }
+            for item in profile.evidence
+        ],
+        "documents": [
+            {
+                "id": doc.id,
+                "original_name": doc.original_name,
+                "media_type": doc.media_type,
+                "created_at": doc.created_at.isoformat(),
+            }
+            for doc in profile.documents
+        ],
+        "resumes": [
+            {
+                "id": resume.id,
+                "title": resume.title,
+                "purpose": resume.purpose,
+                "content_markdown": resume.content_markdown,
+                "provider": resume.provider,
+                "model": resume.model,
+                "created_at": resume.created_at.isoformat(),
+            }
+            for resume in profile.resumes
+        ],
+    }
+    filename = f"applygo-profile-{profile.id}.json"
+    return JSONResponse(content=data, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.post("/profiles/{profile_id}/documents")
