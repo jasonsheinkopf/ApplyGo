@@ -18,6 +18,9 @@ export type LlmTaskId =
   | "fit.assess"
   | "fit.criteria"
   | "profile.structure"
+  | "profile.create"
+  | "profile.improve_audit"
+  | "profile.improve_apply"
   | "roles.analyze"
   | "roles.research"
   | "review.question"
@@ -88,11 +91,41 @@ export const LLM_TASKS: LlmTaskInfo[] = [
   },
   {
     id: "profile.structure",
-    name: "Structure the profile",
+    name: "Structure the profile (legacy)",
     stage: "Profile",
     tier: "reason",
-    what: "Turns uploaded documents and notes into the canonical CareerProfile every later stage reads from.",
+    what: "Pre-schema-v3 name for building the canonical CareerProfile. Superseded by profile.create; kept only so old traces/eval cases remain labeled and replayable.",
     source: "src/index.ts -> generateProfile",
+    batched: false,
+    replayable: true,
+  },
+  {
+    id: "profile.create",
+    name: "Create the Career Evidence Record",
+    stage: "Profile",
+    tier: "reason",
+    what: "Turns uploaded documents, notes, and applied Improve answers into the canonical CareerProfile (schema v3, with stable entity ids) every later stage reads from.",
+    source: "src/index.ts -> generateProfile",
+    batched: false,
+    replayable: true,
+  },
+  {
+    id: "profile.improve_audit",
+    name: "Find profile improvements",
+    stage: "Profile",
+    tier: "reason",
+    what: "Audits the structured profile plus prior question/answer state and proposes prioritized, entity-targeted questions about missing high-value evidence.",
+    source: "src/index.ts -> runImproveAudit",
+    batched: false,
+    replayable: true,
+  },
+  {
+    id: "profile.improve_apply",
+    name: "Apply improve answers",
+    stage: "Profile",
+    tier: "reason",
+    what: "Integrates saved Improve answers into the canonical profile -- distributing multi-fact answers across fields, correcting explicit contradictions, never inventing facts.",
+    source: "src/index.ts -> applyImproveAnswers",
     batched: false,
     replayable: true,
   },

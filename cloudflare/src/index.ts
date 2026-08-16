@@ -36,13 +36,22 @@ import { taskInfo } from "./tasks";
 import {
   CAREER_PROFILE_SCHEMA,
   CAREER_PROFILE_SCHEMA_VERSION,
+  IMPROVE_AUDIT_SCHEMA,
   type CareerProfile,
+  type ImproveQuestion,
   careerProfileHasContent,
+  listProfileEntities,
   normalizeCareerProfile,
+  normalizeImproveQuestions,
   readCareerProfile,
   renderCareerProfile,
 } from "./profile";
-import { PROFILE_STRUCTURE_PROMPT, ROLES_ANALYZE_PROMPT } from "./prompts";
+import {
+  PROFILE_CREATE_PROMPT,
+  PROFILE_IMPROVE_APPLY_PROMPT,
+  PROFILE_IMPROVE_AUDIT_PROMPT,
+  ROLES_ANALYZE_PROMPT,
+} from "./prompts";
 import { MARKET_RESEARCH_TTL_DAYS, marketCacheKey, researchRoleMarket } from "./market";
 import {
   type EvidencePlan,
@@ -389,6 +398,35 @@ const ADDITIVE_TABLES = [
    )`,
   "CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_streams_key ON company_discovery_streams(profile_id, term, location)",
   "CREATE INDEX IF NOT EXISTS idx_discovery_streams_pending ON company_discovery_streams(profile_id, exhausted, last_searched_at)",
+  // 0029_profile_improve.sql
+  `CREATE TABLE IF NOT EXISTS profile_improvement_questions (
+     id TEXT PRIMARY KEY,
+     profile_id TEXT NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
+     profile_version TEXT NOT NULL DEFAULT '',
+     entity_type TEXT NOT NULL DEFAULT '',
+     entity_id TEXT NOT NULL DEFAULT '',
+     entity_label TEXT NOT NULL DEFAULT '',
+     target_field TEXT NOT NULL DEFAULT '',
+     category TEXT NOT NULL DEFAULT 'other',
+     priority INTEGER NOT NULL DEFAULT 0,
+     question TEXT NOT NULL,
+     why_it_matters TEXT NOT NULL DEFAULT '',
+     answer_type TEXT NOT NULL DEFAULT 'long_text',
+     answer TEXT NOT NULL DEFAULT '',
+     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'answered', 'applied', 'dismissed', 'obsolete')),
+     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     answered_at TEXT,
+     applied_at TEXT
+   )`,
+  "CREATE INDEX IF NOT EXISTS idx_improve_questions_profile ON profile_improvement_questions(profile_id, status)",
+  `CREATE TABLE IF NOT EXISTS profile_improvement_audits (
+     id TEXT PRIMARY KEY,
+     profile_id TEXT NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
+     profile_version TEXT NOT NULL DEFAULT '',
+     questions_generated INTEGER NOT NULL DEFAULT 0,
+     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+   )`,
+  "CREATE INDEX IF NOT EXISTS idx_improve_audits_profile ON profile_improvement_audits(profile_id, created_at DESC)",
 ];
 
 /**
@@ -3890,9 +3928,25 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   )
     .bind(profileId)
     .all<{ original_name: string; extracted_text: string }>();
+  // Answers the candidate has already given through Improve and that have been integrated into the
+  // profile once are first-person evidence too -- surfaced here as supplementary source material so
+  // a regeneration that reconsiders the whole record from scratch (see the prompt's "do NOT simply
+  // copy the current profile forward" instruction) doesn't need the integration in current_profile
+  // alone to survive; the candidate never has to copy anything into Notes by hand.
+  const appliedAnswers = await env.DB.prepare(
+    `SELECT entity_label, question, answer FROM profile_improvement_questions
+     WHERE profile_id = ? AND status = 'applied' ORDER BY applied_at ASC`,
+  )
+    .bind(profileId)
+    .all<{ entity_label: string; question: string; answer: string }>();
 
   const sourceParts: string[] = [];
   for (const note of notes.results) sourceParts.push(`Note: ${note.claim}`);
+  for (const qa of appliedAnswers.results) {
+    sourceParts.push(
+      `Improve interview answer${qa.entity_label ? ` (${qa.entity_label})` : ""} — Q: ${qa.question}\nA: ${qa.answer}`,
+    );
+  }
   for (const doc of docs.results) {
     const text = doc.extracted_text.slice(0, PROFILE_SOURCE_DOC_CHARS);
     const truncated = doc.extracted_text.length > PROFILE_SOURCE_DOC_CHARS;
@@ -3905,28 +3959,30 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   if (sourceParts.length === 0) return json({ error: "no_source_material" }, 400);
 
   const existingStructured = readStructuredProfile(profile?.structured_json ?? "{}");
+  const previousEntityIds = existingStructured
+    ? listProfileEntities(existingStructured)
+        .filter((e) => e.entity_id)
+        .map((e) => `${e.entity_id} — ${e.entity_label}`)
+        .join("\n")
+    : "";
   const prompt = await getManagedPrompt(
     env,
-    "profile/structure",
+    "profile/create",
     {
-      // Kept supplied though the current prompt no longer uses it: an older Langfuse template still
-      // references {{baseline_rule}}, and compilePrompt throws on a variable the template wants and
-      // the code stopped sending. Supplying a superset is what lets the schema change deploy without
-      // being sequenced against a prompt promotion.
-      baseline_rule: "",
       current_profile: existingStructured
         ? `Current profile (previous interpretation, not authoritative):\n${JSON.stringify(existingStructured)}`
         : "",
       source_material: sourceParts.join("\n\n"),
+      previous_entity_ids: previousEntityIds,
     },
-    PROFILE_STRUCTURE_PROMPT,
+    PROFILE_CREATE_PROMPT,
   );
 
   try {
     const raw = await callStructured<unknown>(
       env,
       provider,
-      "profile.structure",
+      "profile.create",
       prompt,
       CAREER_PROFILE_SCHEMA,
       "submit_structured_profile",
@@ -3941,6 +3997,326 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   } catch (err) {
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Improve workflow: audit, save/dismiss answers, apply
+// ---------------------------------------------------------------------------
+
+type ImproveQuestionRow = {
+  id: string;
+  profile_version: string;
+  entity_type: string;
+  entity_id: string;
+  entity_label: string;
+  target_field: string;
+  category: string;
+  priority: number;
+  question: string;
+  why_it_matters: string;
+  answer_type: string;
+  answer: string;
+  status: string;
+  created_at: string;
+  answered_at: string | null;
+  applied_at: string | null;
+};
+
+/**
+ * A short, content-derived version tag for the structured profile, stored on every question row so
+ * a later pass can tell whether the profile has changed underneath a still-open question. Hash
+ * rather than `updated_at`: a save that reorders or re-normalizes without changing meaning would
+ * otherwise look like drift it isn't.
+ */
+async function profileVersionTag(structuredJson: string): Promise<string> {
+  const bytes = new TextEncoder().encode(structuredJson);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest).slice(0, 8), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function questionDedupeKey(entityType: string, entityId: string, targetField: string): string {
+  return `${entityType}|${entityId}|${targetField.trim().toLowerCase()}`;
+}
+
+async function loadOpenImproveQuestions(env: Env, profileId: string): Promise<ImproveQuestionRow[]> {
+  const rows = await env.DB.prepare(
+    `SELECT * FROM profile_improvement_questions
+     WHERE profile_id = ? AND status IN ('pending', 'answered') ORDER BY priority DESC, created_at ASC`,
+  )
+    .bind(profileId)
+    .all<ImproveQuestionRow>();
+  return rows.results;
+}
+
+async function listImproveQuestions(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const questions = await loadOpenImproveQuestions(env, profileId);
+  const answered = questions.filter((q) => q.status === "answered").length;
+  return json({ questions, answered_count: answered, pending_count: questions.length - answered });
+}
+
+/**
+ * State B/C's "Find Improvements": audits the current structured profile against everything
+ * already asked (so resolved ground is not re-covered), inserts the genuinely new questions, and
+ * returns the full open set. A deterministic dedupe key backstops the prompt's own
+ * "don't re-ask resolved questions" instruction -- if the model regenerates a near-duplicate of an
+ * already-open question for the same entity and field, it is dropped here rather than shown twice.
+ */
+/** Result shape shared by the route wrapper and applyImproveAnswers' inline re-audit. */
+type ImproveAuditResult =
+  | { ok: true; questions: ImproveQuestionRow[]; inserted: number; answered_count: number; pending_count: number }
+  | { ok: false; status: number; error: string; detail?: string };
+
+/**
+ * The audit itself, factored out from the route handler so `applyImproveAnswers` can re-run it
+ * in-process after a successful apply without constructing a second authenticated request -- this
+ * runs strictly after its caller has already checked the session and the profile exists.
+ */
+async function runImproveAudit(env: Env, profileId: string, provider: Provider): Promise<ImproveAuditResult> {
+  const row = await env.DB.prepare("SELECT structured_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ structured_json: string }>();
+  const structured = readCareerProfile(row?.structured_json ?? "{}");
+  if (!structured) return { ok: false, status: 400, error: "no_profile_yet" };
+
+  const priorRows = await env.DB.prepare(
+    `SELECT entity_type, entity_id, entity_label, target_field, category, question, answer, status
+     FROM profile_improvement_questions WHERE profile_id = ? ORDER BY created_at ASC`,
+  )
+    .bind(profileId)
+    .all<{
+      entity_type: string; entity_id: string; entity_label: string; target_field: string;
+      category: string; question: string; answer: string; status: string;
+    }>();
+
+  const priorState = priorRows.results.length
+    ? priorRows.results
+        .map((q) =>
+          `[${q.status}] ${q.entity_label || q.entity_type} / ${q.target_field || q.category}: "${q.question}"` +
+          (q.answer ? ` -> answered: "${q.answer}"` : ""),
+        )
+        .join("\n")
+    : "(no prior questions -- this is the first audit of this profile)";
+
+  const prompt = await getManagedPrompt(
+    env,
+    "profile/improve-audit",
+    { career_profile: renderCareerProfile(structured), prior_question_state: priorState },
+    PROFILE_IMPROVE_AUDIT_PROMPT,
+  );
+
+  let generated: ImproveQuestion[];
+  try {
+    const raw = await callStructured<unknown>(
+      env,
+      provider,
+      "profile.improve_audit",
+      prompt,
+      IMPROVE_AUDIT_SCHEMA,
+      "submit_improve_questions",
+      8000,
+    );
+    generated = normalizeImproveQuestions((raw as { questions?: unknown })?.questions, structured);
+  } catch (err) {
+    // Existing profile and question state are untouched on failure -- there is nothing to roll back.
+    return { ok: false, status: 502, error: "audit_failed", detail: friendlyMessage(err) };
+  }
+
+  const versionTag = await profileVersionTag(row?.structured_json ?? "{}");
+  const existingOpen = await loadOpenImproveQuestions(env, profileId);
+  const existingKeys = new Set(existingOpen.map((q) => questionDedupeKey(q.entity_type, q.entity_id, q.target_field)));
+
+  let inserted = 0;
+  for (const q of generated) {
+    const key = questionDedupeKey(q.entity_type, q.entity_id, q.target_field);
+    if (existingKeys.has(key)) continue;
+    existingKeys.add(key);
+    await env.DB.prepare(
+      `INSERT INTO profile_improvement_questions
+       (id, profile_id, profile_version, entity_type, entity_id, entity_label, target_field, category, priority, question, why_it_matters, answer_type, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+    )
+      .bind(q.id, profileId, versionTag, q.entity_type, q.entity_id, q.entity_label, q.target_field, q.category, q.priority, q.question, q.why_it_matters, q.answer_type)
+      .run();
+    inserted += 1;
+  }
+
+  await env.DB.prepare(
+    "INSERT INTO profile_improvement_audits (id, profile_id, profile_version, questions_generated) VALUES (?, ?, ?, ?)",
+  )
+    .bind(crypto.randomUUID(), profileId, versionTag, inserted)
+    .run();
+
+  const questions = await loadOpenImproveQuestions(env, profileId);
+  const answered = questions.filter((q) => q.status === "answered").length;
+  return { ok: true, questions, inserted, answered_count: answered, pending_count: questions.length - answered };
+}
+
+/** State B/C's "Find Improvements" route: authenticates, validates the provider, then delegates to
+ * runImproveAudit above. */
+async function findProfileImprovements(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string };
+  const provider = normalizeProvider(body.provider);
+  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
+  if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
+
+  const profileId = await getOrCreateProfileId(env);
+  const result = await runImproveAudit(env, profileId, provider);
+  if (!result.ok) return json({ error: result.error, detail: result.detail }, result.status);
+  return json({ questions: result.questions, inserted: result.inserted, answered_count: result.answered_count, pending_count: result.pending_count });
+}
+
+async function saveImproveAnswer(request: Request, env: Env, questionId: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { answer?: string };
+  const answer = (body.answer ?? "").trim();
+  if (!answer) return json({ error: "answer_required" }, 400);
+
+  const profileId = await getOrCreateProfileId(env);
+  const existing = await env.DB.prepare(
+    "SELECT status FROM profile_improvement_questions WHERE id = ? AND profile_id = ?",
+  )
+    .bind(questionId, profileId)
+    .first<{ status: string }>();
+  if (!existing) return json({ error: "question_not_found" }, 404);
+  if (existing.status === "applied") return json({ error: "question_already_applied" }, 409);
+
+  await env.DB.prepare(
+    "UPDATE profile_improvement_questions SET answer = ?, status = 'answered', answered_at = CURRENT_TIMESTAMP WHERE id = ?",
+  )
+    .bind(answer, questionId)
+    .run();
+  const updated = await env.DB.prepare("SELECT * FROM profile_improvement_questions WHERE id = ?")
+    .bind(questionId)
+    .first<ImproveQuestionRow>();
+  return json({ question: updated });
+}
+
+/** Explicit dismiss -- "I don't remember" / "not applicable" / "don't want to add this" -- distinct
+ * from simply leaving a question unanswered. Dismissed questions are excluded from the open set a
+ * later audit is shown as still-pending, so they do not immediately resurface. */
+async function dismissImproveQuestion(request: Request, env: Env, questionId: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const existing = await env.DB.prepare(
+    "SELECT status FROM profile_improvement_questions WHERE id = ? AND profile_id = ?",
+  )
+    .bind(questionId, profileId)
+    .first<{ status: string }>();
+  if (!existing) return json({ error: "question_not_found" }, 404);
+  if (existing.status === "applied") return json({ error: "question_already_applied" }, 409);
+
+  await env.DB.prepare("UPDATE profile_improvement_questions SET status = 'dismissed' WHERE id = ?")
+    .bind(questionId)
+    .run();
+  return json({ ok: true });
+}
+
+/**
+ * State D's "Apply Answers & Continue": integrates every saved-but-unapplied answer into the
+ * canonical profile via an LLM pass, then immediately re-audits so the next round of questions is
+ * ready without a second click. Atomic in the sense the spec asks for: a question is marked
+ * `applied` only after both the LLM integration call AND the structured_json write have succeeded,
+ * and a failure at either step leaves every saved answer exactly as it was, retryable.
+ */
+async function applyImproveAnswers(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string };
+  const provider = normalizeProvider(body.provider);
+  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
+  if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
+
+  const profileId = await getOrCreateProfileId(env);
+  const row = await env.DB.prepare("SELECT structured_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ structured_json: string }>();
+  const structured = readCareerProfile(row?.structured_json ?? "{}");
+  if (!structured) return json({ error: "no_profile_yet" }, 400);
+
+  const answered = await env.DB.prepare(
+    "SELECT * FROM profile_improvement_questions WHERE profile_id = ? AND status = 'answered' ORDER BY created_at ASC",
+  )
+    .bind(profileId)
+    .all<ImproveQuestionRow>();
+  if (!answered.results.length) return json({ error: "no_answers_to_apply" }, 400);
+
+  const answeredText = answered.results
+    .map((q) =>
+      `- entity_type: ${q.entity_type}\n  entity_id: ${q.entity_id}\n  entity_label: ${q.entity_label}\n  ` +
+      `target_field: ${q.target_field}\n  question: ${q.question}\n  why_it_matters: ${q.why_it_matters}\n  answer: ${q.answer}`,
+    )
+    .join("\n\n");
+
+  const prompt = await getManagedPrompt(
+    env,
+    "profile/improve-apply",
+    { career_profile: JSON.stringify(structured), answered_questions: answeredText },
+    PROFILE_IMPROVE_APPLY_PROMPT,
+  );
+
+  let updated: CareerProfile;
+  try {
+    const raw = await callStructured<unknown>(
+      env,
+      provider,
+      "profile.improve_apply",
+      prompt,
+      CAREER_PROFILE_SCHEMA,
+      "submit_updated_profile",
+      16000,
+    );
+    const normalized = normalizeCareerProfile(raw);
+    // Same regression guard a Create regeneration gets: an apply pass that comes back with
+    // materially fewer organizations/institutions than it started from is a failed integration
+    // (truncated response, model lost its place), not a legitimate edit, and must not be written.
+    const { profile: accepted, rejected } = acceptRegeneratedProfile(structured, normalized);
+    if (rejected) return json({ error: "apply_rejected_incomplete" }, 502);
+    updated = accepted;
+  } catch (err) {
+    // No question is marked applied and structured_json is untouched -- every saved answer is
+    // exactly as retryable as it was before this call.
+    return json({ error: "apply_failed", detail: friendlyMessage(err) }, 502);
+  }
+
+  // The write and the status flip happen together, after the LLM call has already succeeded, so a
+  // failure anywhere above this point never leaves a question marked applied against unsaved data.
+  await env.DB.prepare(
+    `UPDATE candidate_profiles SET structured_json = ?, summary = ?, match_profile = ?,
+     updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+  )
+    .bind(JSON.stringify(updated), updated.career_summary.narrative_summary.slice(0, 4000), buildMatchProfile(updated), profileId)
+    .run();
+
+  const appliedIds = answered.results.map((q) => q.id);
+  for (const id of appliedIds) {
+    await env.DB.prepare(
+      "UPDATE profile_improvement_questions SET status = 'applied', applied_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+  }
+
+  // Re-audit immediately against the newly-applied profile, so the loop (Create -> Analyze -> Ask ->
+  // Answer -> Save -> Apply -> Reanalyze -> Ask Again) advances in one action from the user's side.
+  // A failure here does not undo the apply that already succeeded above -- the candidate can always
+  // press "Check Again" -- so it degrades to an empty next-question set rather than an error.
+  const reaudit = await runImproveAudit(env, profileId, provider);
+
+  return json({
+    structured: updated,
+    applied_count: appliedIds.length,
+    questions: reaudit.ok ? reaudit.questions : [],
+    answered_count: reaudit.ok ? reaudit.answered_count : 0,
+    pending_count: reaudit.ok ? reaudit.pending_count : 0,
+    reaudit_error: reaudit.ok ? null : reaudit.error,
+  });
 }
 
 async function listResumes(request: Request, env: Env): Promise<Response> {
@@ -6291,7 +6667,8 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     <div class="segmented-control" role="group" aria-label="Profile sections">
       <button class="subtab active" data-profile-subtab="docs" type="button">Docs</button>
       <button class="subtab" data-profile-subtab="notes" type="button">Notes</button>
-      <button class="subtab" data-profile-subtab="summary" type="button">Summary</button>
+      <button class="subtab" data-profile-subtab="summary" type="button">Create</button>
+      <button class="subtab" data-profile-subtab="improve" type="button">Improve</button>
     </div>
 
     <div id="profile-subpanel-docs" class="subpanel active">
@@ -6324,8 +6701,8 @@ Let me check the placeholder embraces like a variable name, gets its value when 
 
     <div id="profile-subpanel-summary" class="subpanel">
       <section id="career-profile-section">
-        <h2>Summary</h2>
-        <p class="hint">Your career evidence record, built from every document and note above. This is the factual source of truth the whole app reads from -- career analysis, job matching, and every resume. It is deliberately far more complete than any single resume would be; a resume selects from this, it never replaces it.</p>
+        <h2>Create</h2>
+        <p class="hint">Your career evidence record, built from every document and note above. This is the factual source of truth the whole app reads from -- career analysis, job matching, and every resume. It is deliberately far more complete than any single resume would be; a resume selects from this, it never replaces it. Optimized for completeness and structure, never for length or polish.</p>
         <label for="profile-provider">Generate using</label>
         <select id="profile-provider">
           <option value="anthropic">Anthropic (Claude)</option>
@@ -6338,6 +6715,28 @@ Let me check the placeholder embraces like a variable name, gets its value when 
           <summary>Raw structured data</summary>
           <pre id="career-profile-raw" class="raw-json"></pre>
         </details>
+      </section>
+    </div>
+
+    <div id="profile-subpanel-improve" class="subpanel">
+      <section id="improve-section">
+        <h2>Improve</h2>
+        <p class="hint">A guided interview that asks about specific, high-value gaps in your Career Evidence Record -- never generic "tell me more" prompts, and never resume-writing advice. Answer any question, several, or all, in any order, then apply them to fold the answers into your profile.</p>
+        <div id="improve-no-profile" class="empty" style="display:none">
+          Create your profile before improving it.
+          <button id="improve-go-to-create" class="secondary" type="button" style="margin-left:0.5rem">Go to Create</button>
+        </div>
+        <div id="improve-controls">
+          <div id="improve-progress" class="summary-line" style="display:none"></div>
+          <label for="improve-provider">Analyze using</label>
+          <select id="improve-provider">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI</option>
+          </select>
+          <button id="improve-action-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Find Improvements</button>
+          <p id="improve-status" class="status" role="status" aria-live="polite"></p>
+        </div>
+        <div id="improve-questions"></div>
       </section>
     </div>
   </div>
@@ -7416,6 +7815,8 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         var hasProfile = Boolean(data.profile.structured);
         document.getElementById('resume-no-profile').style.display = hasProfile ? 'none' : '';
         document.getElementById('resume-build-controls').style.display = hasProfile ? '' : 'none';
+        setImproveProfileAvailability(hasProfile);
+        if (hasProfile) loadImproveQuestions();
         maybeReanalyzeRoles();
       }
     }
@@ -7978,6 +8379,219 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         statusEl.className = 'status error';
       } finally {
         button.disabled = false;
+      }
+    });
+
+    // --- Profile → Improve: guided evidence interview ---
+    //
+    // One state-driven primary action button, per the spec: "Find Improvements" (no audit run yet,
+    // or the open questions have all been resolved), "Apply Answers & Continue" (at least one saved
+    // answer waiting to be integrated), "Improving Profile…" (a call is in flight), or
+    // "Check Again" (the last audit found nothing valuable). Never a chat UI, never separate
+    // technical buttons for "run audit" vs "integrate JSON".
+
+    var improveQuestions = [];
+    var improveHasAudited = false;
+    var improveBusy = false;
+
+    function improveCategoryLabel(category) {
+      return (category || 'other').replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+    }
+
+    function updateImproveButton() {
+      var button = document.getElementById('improve-action-button');
+      if (!button) return;
+      var answeredCount = improveQuestions.filter(function (q) { return q.status === 'answered'; }).length;
+      var pendingCount = improveQuestions.filter(function (q) { return q.status === 'pending'; }).length;
+      if (improveBusy) {
+        button.textContent = 'Improving Profile…';
+      } else if (answeredCount > 0) {
+        button.textContent = 'Apply Answers & Continue';
+      } else if (improveHasAudited && pendingCount === 0) {
+        button.textContent = 'Check Again';
+      } else {
+        button.textContent = 'Find Improvements';
+      }
+      button.disabled = improveBusy;
+
+      var progress = document.getElementById('improve-progress');
+      if (pendingCount === 0 && answeredCount === 0) {
+        progress.style.display = 'none';
+      } else {
+        progress.style.display = '';
+        progress.textContent = answeredCount + ' answered · ' + pendingCount + ' remaining';
+      }
+    }
+
+    function renderImproveQuestionCard(question) {
+      var card = el('div', { className: 'profile-card' });
+      var titleRow = el('div', { className: 'row-title-line', style: 'display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap' });
+      titleRow.appendChild(el('span', { className: 'badge', textContent: improveCategoryLabel(question.category) }));
+      if (question.status === 'answered') titleRow.appendChild(el('span', { className: 'badge', textContent: 'Answered', style: 'background:var(--success,#2e7d32);color:#fff' }));
+      card.appendChild(titleRow);
+      card.appendChild(el('p', { className: 'row-title', textContent: question.question, style: 'margin-top:0.4rem' }));
+      if (question.why_it_matters) {
+        card.appendChild(el('p', { className: 'row-meta', textContent: 'Why it matters: ' + question.why_it_matters }));
+      }
+      var textarea = el('textarea', {
+        placeholder: 'Your answer…',
+        value: question.answer || '',
+        style: 'min-height:4.5rem',
+      });
+      card.appendChild(textarea);
+      var actions = el('div', { className: 'row-actions', style: 'margin-top:0.5rem' });
+      var statusMsg = el('span', { className: 'status' });
+      var saveBtn = el('button', { type: 'button', textContent: question.status === 'answered' ? 'Update Answer' : 'Save' });
+      saveBtn.addEventListener('click', async function () {
+        var value = textarea.value.trim();
+        if (!value) { statusMsg.textContent = 'Enter an answer first.'; statusMsg.className = 'status error'; return; }
+        saveBtn.disabled = true;
+        try {
+          var res = await api('/profile/improve/questions/' + encodeURIComponent(question.id), {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ answer: value }),
+          });
+          var data = await requireJsonResponse(res, 'save_failed');
+          question.status = data.question.status;
+          question.answer = data.question.answer;
+          statusMsg.textContent = 'Saved.';
+          statusMsg.className = 'status success';
+          updateImproveButton();
+          renderImproveQuestions(improveQuestions);
+        } catch (err) {
+          statusMsg.textContent = 'Error: ' + err.message;
+          statusMsg.className = 'status error';
+          saveBtn.disabled = false;
+        }
+      });
+      var dismissBtn = el('button', { type: 'button', className: 'secondary', textContent: 'Skip / Dismiss' });
+      dismissBtn.addEventListener('click', async function () {
+        dismissBtn.disabled = true;
+        try {
+          await api('/profile/improve/questions/' + encodeURIComponent(question.id) + '/dismiss', { method: 'POST' });
+          improveQuestions = improveQuestions.filter(function (q) { return q.id !== question.id; });
+          updateImproveButton();
+          renderImproveQuestions(improveQuestions);
+        } catch (err) {
+          statusMsg.textContent = 'Error: ' + err.message;
+          statusMsg.className = 'status error';
+          dismissBtn.disabled = false;
+        }
+      });
+      actions.appendChild(saveBtn);
+      actions.appendChild(dismissBtn);
+      card.appendChild(actions);
+      card.appendChild(statusMsg);
+      return card;
+    }
+
+    /** Grouped by entity, highest-priority question in each group first, groups ordered by their
+     * own best question -- so the candidate sees the most valuable open thread first but can still
+     * jump straight to any other role or project's questions. */
+    function renderImproveQuestions(questions) {
+      var container = document.getElementById('improve-questions');
+      container.innerHTML = '';
+      if (!questions.length) {
+        if (improveHasAudited) {
+          container.appendChild(el('p', {
+            className: 'empty',
+            textContent: 'No high-value questions found right now. Your Career Evidence Record already contains strong detail across the areas this review checks.',
+          }));
+        }
+        return;
+      }
+      var groups = {};
+      var order = [];
+      questions.forEach(function (q) {
+        var key = q.entity_label || 'General';
+        if (!groups[key]) { groups[key] = []; order.push(key); }
+        groups[key].push(q);
+      });
+      order.sort(function (a, b) {
+        var maxA = Math.max.apply(null, groups[a].map(function (q) { return q.priority; }));
+        var maxB = Math.max.apply(null, groups[b].map(function (q) { return q.priority; }));
+        return maxB - maxA;
+      });
+      order.forEach(function (key) {
+        var items = groups[key].slice().sort(function (a, b) { return b.priority - a.priority; });
+        var group = profileGroup(key, items.length, true);
+        items.forEach(function (q) { group.appendChild(renderImproveQuestionCard(q)); });
+        container.appendChild(group);
+      });
+    }
+
+    /** Called from loadProfile so Improve reflects "no profile yet" (state A) without an extra
+     * round trip, and so a profile that already has open questions shows them immediately. */
+    function setImproveProfileAvailability(hasProfile) {
+      document.getElementById('improve-no-profile').style.display = hasProfile ? 'none' : '';
+      document.getElementById('improve-controls').style.display = hasProfile ? '' : 'none';
+      document.getElementById('improve-questions').style.display = hasProfile ? '' : 'none';
+    }
+
+    async function loadImproveQuestions() {
+      try {
+        var res = await api('/profile/improve/questions');
+        var data = await res.json();
+        improveQuestions = data.questions || [];
+        if (improveQuestions.length) improveHasAudited = true;
+        renderImproveQuestions(improveQuestions);
+        updateImproveButton();
+      } catch (err) {
+        // Best-effort on initial load; the action button still lets the candidate try explicitly.
+      }
+    }
+
+    document.getElementById('improve-go-to-create').addEventListener('click', function () {
+      document.querySelector('[data-profile-subtab="summary"]').click();
+    });
+
+    document.getElementById('improve-action-button').addEventListener('click', async function () {
+      var statusEl = document.getElementById('improve-status');
+      var provider = document.getElementById('improve-provider').value;
+      var answeredCount = improveQuestions.filter(function (q) { return q.status === 'answered'; }).length;
+      improveBusy = true;
+      updateImproveButton();
+      statusEl.textContent = answeredCount > 0
+        ? 'Integrating your answers into the profile…'
+        : 'Reviewing your Career Evidence Record for high-value gaps…';
+      statusEl.className = 'status';
+      try {
+        if (answeredCount > 0) {
+          var applyRes = await api('/profile/improve/apply', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ provider: provider }),
+          });
+          var applyData = await requireJsonResponse(applyRes, 'apply_failed');
+          renderStructuredProfileView('career-profile-view', applyData.structured);
+          setProfileButtonMode(true);
+          improveQuestions = applyData.questions || [];
+          improveHasAudited = true;
+          statusEl.textContent = applyData.applied_count + ' answer' + (applyData.applied_count === 1 ? '' : 's') +
+            ' applied to your profile.' + (applyData.reaudit_error ? ' (Could not check for new questions -- try Check Again.)' : '');
+          statusEl.className = 'status success';
+        } else {
+          var auditRes = await api('/profile/improve/audit', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ provider: provider }),
+          });
+          var auditData = await requireJsonResponse(auditRes, 'audit_failed');
+          improveQuestions = auditData.questions || [];
+          improveHasAudited = true;
+          statusEl.textContent = auditData.inserted > 0
+            ? 'Found ' + auditData.inserted + ' new question' + (auditData.inserted === 1 ? '' : 's') + '.'
+            : 'No new questions this time.';
+          statusEl.className = 'status success';
+        }
+        renderImproveQuestions(improveQuestions);
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        statusEl.className = 'status error';
+      } finally {
+        improveBusy = false;
+        updateImproveButton();
       }
     });
 
@@ -11145,7 +11759,15 @@ function replaySpecFor(task: string): ReplaySpec | null {
     case "fit.criteria":
       return { kind: "structured", schema: CARE_ABOUT_TOPICS_SCHEMA, toolName: "submit_topics", maxTokens: 1200 };
     case "profile.structure":
+      // Retained only so an eval case saved before the profile/create rename can still be replayed
+      // against the schema it was actually generated with -- new cases are saved under "profile.create".
       return { kind: "structured", schema: STRUCTURED_PROFILE_JSON_SCHEMA, toolName: "submit_structured_profile", maxTokens: 2000 };
+    case "profile.create":
+      return { kind: "structured", schema: CAREER_PROFILE_SCHEMA, toolName: "submit_structured_profile", maxTokens: 16000 };
+    case "profile.improve_audit":
+      return { kind: "structured", schema: IMPROVE_AUDIT_SCHEMA, toolName: "submit_improve_questions", maxTokens: 8000 };
+    case "profile.improve_apply":
+      return { kind: "structured", schema: CAREER_PROFILE_SCHEMA, toolName: "submit_updated_profile", maxTokens: 16000 };
     case "roles.analyze":
       return { kind: "structured", schema: ROLE_ANALYSIS_SCHEMA, toolName: "submit_role_analysis", maxTokens: 3000 };
     case "review.question":
@@ -11400,6 +12022,13 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     const answerMatch = url.pathname.match(/^\/application-answers\/([^/]+)$/);
     if (request.method === "DELETE" && answerMatch) return deleteApplicationAnswer(request, env, answerMatch[1]);
     if (request.method === "POST" && url.pathname === "/profile/generate") return generateProfile(request, env);
+    if (request.method === "GET" && url.pathname === "/profile/improve/questions") return listImproveQuestions(request, env);
+    if (request.method === "POST" && url.pathname === "/profile/improve/audit") return findProfileImprovements(request, env);
+    if (request.method === "POST" && url.pathname === "/profile/improve/apply") return applyImproveAnswers(request, env);
+    const improveQuestionMatch = url.pathname.match(/^\/profile\/improve\/questions\/([^/]+)$/);
+    if (request.method === "PUT" && improveQuestionMatch) return saveImproveAnswer(request, env, improveQuestionMatch[1]);
+    const improveDismissMatch = url.pathname.match(/^\/profile\/improve\/questions\/([^/]+)\/dismiss$/);
+    if (request.method === "POST" && improveDismissMatch) return dismissImproveQuestion(request, env, improveDismissMatch[1]);
     if (request.method === "GET" && url.pathname === "/role-signals") return listRoleSignals(request, env);
     if (request.method === "POST" && url.pathname === "/role-signals") return createRoleSignal(request, env);
     const roleSignalMatch = url.pathname.match(/^\/role-signals\/([^/]+)$/);

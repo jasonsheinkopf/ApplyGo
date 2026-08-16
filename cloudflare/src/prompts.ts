@@ -30,9 +30,17 @@ export type PromptDefault = {
   text: string;
 };
 
-export const PROFILE_STRUCTURE_PROMPT: PromptDefault = {
-  requires: ["current_profile", "source_material"],
-  schemaVersion: 2,
+/**
+ * Renamed from `profile/structure` to `profile/create` when schema v3 (stable entity ids, the
+ * additional evidence dimensions, the `other[]` escape hatches) shipped -- the old name is no
+ * longer registered in PROMPT_DEFAULTS, so a production Langfuse prompt still labeled
+ * `profile/structure` will not be found and this bundled default will be used instead until a
+ * `profile/create` prompt is promoted. See the top-of-file comment for why that fails safe rather
+ * than silently running the old prompt against the new schema.
+ */
+export const PROFILE_CREATE_PROMPT: PromptDefault = {
+  requires: ["current_profile", "source_material", "previous_entity_ids"],
+  schemaVersion: 3,
   text: `You are building a comprehensive CAREER EVIDENCE RECORD for one person.
 
 This is NOT a resume. Do not write it like one. A resume selects a small amount of evidence and
@@ -40,14 +48,20 @@ polishes it for one audience; this record collects everything the source materia
 context where it happened, so that a later system can select from it. Length, ATS keywords,
 presentation polish, and fitness for any particular job are explicitly NOT your concern here.
 
-SOURCE MATERIAL (primary evidence -- resumes, CVs, documents, and notes the candidate wrote):
+SOURCE MATERIAL (primary evidence -- resumes, CVs, documents, notes the candidate wrote, and answers
+the candidate has given to previous Improve questions -- all first-person evidence):
 {{source_material}}
 
 CURRENT STRUCTURED PROFILE (a previous interpretation, which may be incomplete, weakly organized,
 or produced against an older and much smaller schema):
 {{current_profile}}
 
-HOW TO USE THE TWO INPUTS
+PREVIOUS ENTITY IDS (the "id" field of every work_experience/project/achievement/education/
+independent_project/research entry in the current structured profile, one per line as
+"id — label", so you can tell which real-world thing each previous id refers to):
+{{previous_entity_ids}}
+
+HOW TO USE THE INPUTS
 The source material is primary evidence. The current profile is a previous interpretation of that
 same evidence -- useful for continuity and as secondary evidence for facts whose original document
 is no longer present, but it is not authoritative and it is not a baseline to append to.
@@ -65,6 +79,24 @@ Specifically:
   entry, merged, not three. Combine complementary detail from every document that describes it.
 - Merge, don't truncate. If one resume describes a role in one line and another describes it in ten,
   the merged entry keeps the detail from both.
+- Evidence that came from an Improve answer is first-person and just as authoritative as a document
+  the candidate uploaded -- integrate it the same way, attributed to the role/project it is about.
+
+STABLE ENTITY IDS
+Every work_experience entry, project (inside a role, independently, or under education), achievement,
+education entry, independent_project, and research_and_publications entry needs an "id" field.
+- If PREVIOUS ENTITY IDS above contains an id for what is clearly the same real-world role, project,
+  achievement, degree, or publication, reuse that EXACT id string. Do not rename it, even if you are
+  now describing it more completely or correctly than before.
+- Only mint a new id when there is no reasonable match in the previous list -- a genuinely new role,
+  project, etc. A new id is lowercase, ascii, underscore-separated, and readable: organization +
+  title + year for a role ("work_bosch_ai_engineer_2024"), project name for a project
+  ("project_vehicle_personalization"), institution + degree + year for education
+  ("education_georgia_tech_ms_cs_2019"). If you cannot form a good one, leave "id" empty and the
+  system will assign one.
+- Never invent a match. If it's genuinely ambiguous whether an entry is the same real-world thing as
+  a previous one, prefer minting a new id over guessing wrong -- a wrongly reused id points a future
+  question at the wrong role.
 
 RULES
 - Never invent a fact. If the sources do not support it, it does not go in.
@@ -76,6 +108,17 @@ RULES
   project. Do not lift things into flat global lists that lose their origin.
 - Distinguish responsibilities (ongoing duties -- what they were accountable for) from achievements
   (discrete accomplishments -- what they actually delivered). These are different fields.
+- Actively look for quantitative evidence when it exists (revenue, time/cost saved, throughput,
+  accuracy, adoption, users served, team/stakeholder counts, geographic scope, duration, portfolio
+  size, hires, frequency, percentage change, deadlines met, risk avoided, incidents prevented,
+  systems shipped, decisions enabled, demonstrations, publications, awards, promotions, customer
+  acceptance, deployment) -- but a strong qualitative outcome with no number attached is still
+  valuable evidence and belongs in the record exactly as stated.
+- Use collaborators_and_stakeholders, scope_and_scale, constraints_and_challenges, decisions_enabled
+  and recognition wherever the source material actually supports them -- they exist because this
+  kind of detail is exactly what earlier, resume-shaped schemas lost.
+- Use each entity's "other" array for factual detail that is real but doesn't fit a named field.
+  Never use "other" to dodge a more specific field that actually fits.
 - For rollup sections (technical_skills, tools_and_technologies, professional_skills,
   domain_knowledge, career_signals), cite evidence. A skill that appears nowhere in the record's
   actual history does not belong in the rollup.
@@ -83,10 +126,16 @@ RULES
   technical and non-technical audiences". They are observations, not career advice. Do not
   recommend roles, industries, or next steps anywhere in this output.
 - evidence_gaps names what is missing or ambiguous and would change the picture if known. Name the
-  gap and suggest a question. Never fill the gap in with a guess.
+  gap and suggest a question. Never fill the gap in with a guess. (This is a lightweight, best-effort
+  list; the Improve workflow's dedicated audit is the thorough version of this same idea and runs
+  separately.)
 
 Return only the structured output.`,
 };
+
+/** @deprecated Kept only as an alias so any code or test still importing the pre-v3 name keeps
+ * working. New code should use PROFILE_CREATE_PROMPT and the "profile/create" registry key. */
+export const PROFILE_STRUCTURE_PROMPT = PROFILE_CREATE_PROMPT;
 
 export const ROLES_ANALYZE_PROMPT: PromptDefault = {
   requires: ["good_examples", "bad_examples", "candidate_background"],
@@ -193,9 +242,182 @@ than reporting nothing -- the candidate would have no way to tell the difference
 Return only the structured output.`,
 };
 
+/**
+ * The Improve workflow's first half: look at the career evidence record (plus what has already
+ * been asked, answered, and dismissed) and propose the highest-value next questions. This is
+ * explicitly an audit, not a chat -- it never writes to the profile itself.
+ */
+export const PROFILE_IMPROVE_AUDIT_PROMPT: PromptDefault = {
+  requires: ["career_profile", "prior_question_state"],
+  schemaVersion: 3,
+  text: `You are auditing one person's CAREER EVIDENCE RECORD to find the highest-value missing
+evidence, then writing targeted questions to ask them for it.
+
+You are not writing a resume and not giving career advice. Your only job is: find real, specific
+gaps in what this record can currently prove, and ask about them.
+
+CAREER EVIDENCE RECORD:
+{{career_profile}}
+
+PRIOR QUESTION STATE (questions already asked in earlier audits, with their current status --
+pending, answered, applied, dismissed, or obsolete):
+{{prior_question_state}}
+
+DO NOT RE-ASK RESOLVED QUESTIONS
+Never regenerate a question that prior question state shows as answered, applied, or dismissed for
+the same entity and target_field -- that ground has already been covered or the candidate has
+already said they don't have or don't want to give that information. A genuinely still-ambiguous
+answered question may justify ONE sharper, more specific follow-up, not a repeat of the same
+question. A "pending" question from a prior audit that is still valuable can be repeated verbatim
+rather than duplicated with slightly different wording.
+
+WHAT TO LOOK FOR
+For every meaningful role, project, research item, or leadership/mentoring activity actually present
+in the record, look for gaps across these dimensions -- but infer from the record which of them
+actually apply to this person's career; do not force every dimension onto every entity, and do not
+treat this as an engineering-only checklist:
+
+(A) Accountability / ownership -- was this person driving it, contributing to it, or something in
+    between? The record often leaves this ambiguous.
+(B) Concrete work performed -- ask about a SPECIFIC activity already named in the record (built,
+    designed, implemented, launched, migrated, automated, researched, analyzed, taught, negotiated,
+    coordinated, hired, mentored, presented, deployed, debugged, validated, and equivalents outside
+    engineering), never "tell me more about your job".
+(C) Why the work existed -- problem, business need, user need, technical constraint, research
+    question, customer request, organizational objective.
+(D) What happened because of the work -- shipped, decision enabled, roadmap changed, approved or
+    stopped, cost/time saved, quality/performance improved, revenue, adoption, customer/student/
+    research result, publication, award, deployment, demonstration, stakeholder acceptance, repeat
+    use, process improvement, risk reduction. Never assume the result; ask.
+(E) Scope and scale -- team size, collaborators, teams, regions, customers, users, students,
+    employees, hires, projects, models, datasets, locations, partners, budget, revenue, duration,
+    frequency, volume, systems, events, courses. Only ask when plausible from context; never imply
+    the answer must be large.
+(F) Collaboration -- who else was involved: engineering, product, design, sales, legal, ops,
+    executives, clients, vendors, researchers, teachers, architects, external partners, subject
+    matter experts, international teams.
+(G) Tools/technologies IN CONTEXT, not as a flat keyword list -- ask what specific tool, system,
+    language, or framework was used for a described piece of work. Skip entirely when technology is
+    irrelevant to the work (this must work for non-engineering careers too).
+(H) Leadership -- without inflating it to "management" unless the record supports that: ownership,
+    coordinating peers, mentoring, hiring, onboarding, reviewing others' work, setting direction,
+    standards or process, persuading stakeholders.
+(I) Communication/stakeholder evidence -- presentations, demos, reports, docs, customer meetings,
+    executive communication, workshops, curriculum, training, proposals, requirements gathering.
+(J) Constraints that make an accomplishment more meaningful -- no or poor data, small dataset,
+    limited budget, short deadline, safety/regulatory requirements, legacy systems, ambiguous
+    requirements, distributed or cross-language teams, hardware limits, customer-specific
+    requirements.
+(K) Distinctive evidence already present that could use more detail -- awards, publications,
+    patents, open source, speaking, cross-domain experience, promotions, selection for special work,
+    high-trust responsibilities, mentoring, zero-to-one ownership, cross-discipline projects. Ask
+    about plausible missing DETAIL around distinction that already exists; never ask the candidate
+    to manufacture distinction that isn't there.
+
+CROSS-CAREER CALIBRATION EXAMPLES (anchors, not an exhaustive list -- infer the right dimensions for
+whatever careers actually appear in this record):
+- Logistics/operations: order or shipment volume, on-time delivery rate, inventory accuracy,
+  vendors/carriers managed, cost, delays, compliance, number of locations.
+- Sales: quota, pipeline, revenue, conversion rate, deal size, number of accounts, renewal rate,
+  territory, CRM used.
+- Education/teaching: number of students, courses taught, curriculum designed, assessment/outcome
+  improvement, programs created, teachers coordinated, stakeholders involved, learning outcomes.
+
+QUESTION QUALITY RULES
+- Specific, not generic: "How was the improvement to the vehicle-personalization prototype
+  measured -- a before/after score, a percentage change, a count of something, or something else?"
+  is good. "Tell me more about your job at Bosch" is not a question, it's a prompt for a monologue.
+- Grounded: every question must arise from something that already exists in the record above. Never
+  ask about a project, role, or claim the record does not actually contain.
+- Non-redundant: the record is given to you in full specifically so you can check whether the
+  information is already present somewhere else before asking for it again.
+- Non-leading about facts: it is fine to offer example answer shapes ("...a decision, deployment,
+  cost reduction, time savings, or another concrete outcome? If so, what happened?"). It is NOT fine
+  to assume a specific event occurred ("How much money did this save?" assumes savings occurred --
+  don't ask that; ask whether it did, and if so what, and how it was measured).
+- Never ask a bare "what percentage did this improve?" with no context. Give the candidate a
+  plausible menu of ways they might know the answer, in their own domain's terms.
+
+TARGETING
+Every question must reference the entity it is about using entity_type and entity_id copied EXACTLY
+from the ids shown in the career evidence record (e.g. an id like "work_bosch_ai_engineer_2024" or
+"project_vehicle_personalization"). Use entity_type "profile" with an empty entity_id only for a
+question that is genuinely about the person as a whole (identity, career-wide pattern) and cannot be
+attached to one entity. Never invent an entity_id that does not appear in the record.
+
+PRIORITY (0-100)
+High priority: missing outcome for a major or recent project, missing scope for a leadership claim,
+unclear ownership, missing quantitative evidence where a metric plausibly exists, ambiguity that
+affects credibility, missing context around a distinctive accomplishment, unclear result of an
+important initiative.
+Lower priority: minor historical detail, redundant evidence, low-relevance hobby detail, information
+unlikely to matter later.
+
+VOLUME
+Generate as many genuinely useful questions as the record warrants, but do not pad to hit a number.
+Cap at roughly 30 unresolved questions per pass, sorted highest-value first -- if more real gaps
+exist than that, surface the best ones now; a later pass will find the rest.
+
+If the record already has strong detail across everything you checked and no genuinely valuable gap
+remains, return an empty questions array. Do not manufacture filler questions to avoid an empty
+result.
+
+Return only the structured output.`,
+};
+
+/**
+ * The Improve workflow's second half: take the candidate's saved answers and integrate them into
+ * the canonical structured profile. This never runs on its own trigger -- only after the candidate
+ * has saved at least one answer and pressed "Apply Answers & Continue".
+ */
+export const PROFILE_IMPROVE_APPLY_PROMPT: PromptDefault = {
+  requires: ["career_profile", "answered_questions"],
+  schemaVersion: 3,
+  text: `You are integrating newly answered interview questions into one person's CAREER EVIDENCE
+RECORD, without inventing anything the answers do not support.
+
+CURRENT CAREER EVIDENCE RECORD (the complete canonical record; return an updated version of this
+exact same shape):
+{{career_profile}}
+
+NEWLY ANSWERED QUESTIONS (each with the entity it targets, the field it was aimed at, the question
+asked, why it mattered, and the candidate's own answer in their own words):
+{{answered_questions}}
+
+YOUR JOB
+1. Read each answer and understand what it actually says -- including cases where a chatty or
+   informal answer contains several distinct facts. Example: "Yeah, there were probably 4 teams,
+   Japan, Germany, China and US, and I basically had to get everybody aligned before we could run
+   the test" supports THREE separate additions: a list of collaborators/regions in
+   collaborators_and_stakeholders, a team/region count in scope_and_scale, and the coordination
+   outcome in outcomes (or decisions_enabled if the alignment led to a decision) -- distribute the
+   answer across whichever fields it actually supports. Never invent a fact or number the answer
+   does not state, even one that would be a natural continuation of what they said.
+2. Locate the entity the question's entity_type/entity_id points at in the current record and add
+   the supported information to the right field(s) on that entity. If entity_type is "profile" with
+   no entity_id, the update is career-wide (identity, career_summary, career_signals).
+3. When an answer explicitly corrects something the record currently says (a wrong date, a
+   misattributed outcome, a role the candidate says was actually different), correct it. Only do
+   this when the correction is explicit and clear from the answer -- do not reinterpret an answer as
+   a correction unless the candidate is plainly saying the previous version was wrong.
+4. Deduplicate: if the answer restates something already in the record, do not add a near-duplicate
+   entry.
+5. Preserve everything unrelated to these answers exactly as it already is. This is an update, not a
+   regeneration -- entities, ids, and evidence the answers did not touch must come back unchanged.
+6. Never invent a fact, metric, outcome, technology, collaborator, or scope figure the answer does
+   not state. An answer that says "I don't remember" or is otherwise non-committal supports adding
+   nothing; leave the field as it was.
+7. Return the complete, valid, updated career evidence record in the same schema as the input --
+   every entity keeps its existing "id"; do not renumber or regenerate ids.
+
+Return only the structured output.`,
+};
+
 /** Registry consulted by getManagedPrompt. Prompts absent here behave exactly as before. */
 export const PROMPT_DEFAULTS: Record<string, PromptDefault> = {
-  "profile/structure": PROFILE_STRUCTURE_PROMPT,
+  "profile/create": PROFILE_CREATE_PROMPT,
+  "profile/improve-audit": PROFILE_IMPROVE_AUDIT_PROMPT,
+  "profile/improve-apply": PROFILE_IMPROVE_APPLY_PROMPT,
   "roles/analyze": ROLES_ANALYZE_PROMPT,
   "roles/research": ROLES_RESEARCH_PROMPT,
 };
