@@ -17,7 +17,6 @@ export type LlmTaskId =
   | "fit.screen"
   | "fit.assess"
   | "fit.criteria"
-  | "companies.discover"
   | "profile.structure"
   | "roles.analyze"
   | "roles.research"
@@ -85,16 +84,6 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     what: "Turns the free-text field into canonical {label, looking_for} topics. Runs once per save, not per posting.",
     source: "src/fit.ts -> deriveCareAboutTopics",
     batched: false,
-    replayable: true,
-  },
-  {
-    id: "companies.discover",
-    name: "Suggest companies",
-    stage: "Find matches",
-    tier: "reason",
-    what: "Proposes companies worth watching, given the desired-roles description.",
-    source: "src/companies.ts -> discoverCompanies",
-    batched: true,
     replayable: true,
   },
   {

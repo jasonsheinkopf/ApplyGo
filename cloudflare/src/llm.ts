@@ -396,6 +396,64 @@ export async function callStructured<T>(
   });
 }
 
+/**
+ * Structured output grounded in Claude's own server-side web search, for the one class of question
+ * plain model memory can't honestly answer: something that depends on current, real information
+ * (e.g. "what is this specific company's real website"). Anthropic-only -- there is no equivalent
+ * concept for OpenAI's chat completions endpoint wired into this app, and the caller is responsible
+ * for checking `providerKeyMissing(env, "anthropic")` first and treating this capability as simply
+ * unavailable rather than an error when it's unset.
+ *
+ * Deliberately does not force tool_choice the way callStructured does: the model has to be free to
+ * call `web_search` first (Anthropic runs the search server-side and continues the same turn with
+ * real results in context), then call the caller's own structured tool once it has an answer.
+ * `tool_choice` stays "auto" so both remain available; the prompt itself is what tells the model to
+ * finish by calling the structured tool. If it never does -- it answered in plain text instead, or
+ * gave up -- this throws `anthropic_no_search_result` rather than inventing a fallback value, so a
+ * caller can treat "the model didn't commit to an answer" as exactly as unresolved as "it found
+ * nothing," never as a result to trust.
+ *
+ * Cost note: Anthropic bills a small additional per-search fee on top of normal token cost, which
+ * estimateCostUsd (token-only) doesn't account for -- the Cost tab will slightly undercount calls
+ * that used web_search. Not worth modeling precisely for how rarely this path runs.
+ */
+export async function callWithWebSearch<T>(
+  env: LlmEnv,
+  task: string,
+  prompt: PromptInput,
+  schema: unknown,
+  toolName: string,
+  maxTokens = 1500,
+  maxSearches = 3,
+): Promise<T> {
+  const model = modelFor(env, "anthropic", "reason");
+  const meta = promptMeta(prompt);
+  return traced(env, { task, provider: "anthropic", model, tier: "reason", ...meta }, async () => {
+    const res = await fetch(ANTHROPIC_URL, {
+      method: "POST",
+      headers: anthropicHeaders(env),
+      body: JSON.stringify({
+        model,
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content: meta.prompt }],
+        tools: [
+          { type: "web_search_20250305", name: "web_search", max_uses: maxSearches },
+          { name: toolName, input_schema: schema },
+        ],
+      }),
+    });
+    if (!res.ok) throw await failure("anthropic", res);
+    const data = (await res.json()) as { content: { type: string; name?: string; input?: T }[] };
+    // The model may call web_search (and Anthropic may inject its own result blocks) any number of
+    // times before finally calling the structured tool -- only the LAST tool_use block named
+    // `toolName` is the real answer; anything named "web_search" is the model's own search query,
+    // not a result to parse as T.
+    const toolUse = [...data.content].reverse().find((b) => b.type === "tool_use" && b.name === toolName);
+    if (!toolUse?.input) throw new Error("anthropic_no_search_result");
+    return { value: toolUse.input, response: JSON.stringify(toolUse.input), ...anthropicUsage(data) };
+  });
+}
+
 /** Same contract as callStructured, with a JPEG image prepended to the user turn. */
 export async function callStructuredWithImage<T>(
   env: LlmEnv,

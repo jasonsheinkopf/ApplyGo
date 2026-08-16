@@ -1,27 +1,21 @@
-// Company discovery and job-board scanning.
+// Company discovery, ATS resolution, and job-board scanning. Entirely deterministic, on purpose.
 //
-// Two deliberate choices here.
+// No aggregators *for job data*. Every posting a candidate actually sees comes from a company's
+// *own* job board, never a third party. Nearly every company runs that board on one of a handful of
+// applicant tracking systems, and those systems publish plain public JSON APIs for the board's
+// contents. So "check their website directly" is done by resolving which ATS a company uses and
+// reading its board API -- structured, stable, and far more reliable than scraping a
+// JavaScript-rendered careers page. Company *discovery* is a separate concern from this, and does
+// draw on a real job-market aggregator (Adzuna, see src/adzuna.ts) -- see that file's header for why
+// that doesn't weaken this principle.
 //
-// First, no aggregators. Jobs come from each company's *own* job board. Nearly every company
-// runs that board on one of a handful of applicant tracking systems, and those systems publish
-// plain public JSON APIs for the board's contents. So "check their website directly" is done by
-// resolving which ATS a company uses and reading its board API -- structured, stable, and far
-// more reliable than scraping a JavaScript-rendered careers page.
-//
-// Second, the same model/code split as the resume pipeline: the LLM *proposes* companies from
-// the candidate's profile, and code *verifies* them. A proposed company whose site does not
-// resolve is marked unreachable rather than silently trusted, because a model listing plausible
-// employers will occasionally invent or misremember one.
-
-import { type LlmEnv, type Provider, callStructured } from "./llm.ts";
-import { getManagedPrompt } from "./langfuse.ts";
-
-export const MAX_COMPANY_DISCOVERY_COUNT = 100;
-
-/** Keeps the browser and API on the same 1-100 discovery range. */
-export function normalizeCompanyDiscoveryCount(value: unknown): number {
-  return Math.min(Math.max(Number(value) || 10, 1), MAX_COMPANY_DISCOVERY_COUNT);
-}
+// There is no LLM anywhere in this file, and deliberately so. A company is monitored because a real
+// job search found it and its board can actually be read -- never because a model judged its
+// industry "relevant" to the candidate. A non-tech company that occasionally hires the candidate's
+// target role is exactly as worth monitoring as a company whose whole business matches it; that
+// judgment belongs at the job level (fit.ts), never at the company level. Wherever this file has to
+// guess something (an ATS org slug in resolveBoard, a domain in resolveCompanyDomain), the guess is
+// always confirmed by a real request before it's trusted -- never taken on a model's word.
 
 // Every ATS this app recognizes on a careers page, whether or not it can actually read job
 // listings from it. Recognizing a platform is worth doing even without a read path: it's the
@@ -86,15 +80,6 @@ const ATS_DISPLAY_NAMES: Record<AtsProvider, string> = {
 export function atsDisplayName(provider: AtsProvider): string {
   return ATS_DISPLAY_NAMES[provider] ?? provider;
 }
-
-export type CompanyProposal = {
-  name: string;
-  website: string;
-  careers_url: string;
-  bio: string;
-  location: string;
-  why_fit: string;
-};
 
 export type ScannedJob = {
   external_id: string;
@@ -218,105 +203,9 @@ export function slugFromWebsite(website: string): string {
   }
 }
 
-function normalizeUrl(value: string): string {
-  const raw = String(value ?? "").trim();
-  if (!raw) return "";
-  const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
-  try {
-    return new URL(withScheme).toString();
-  } catch {
-    return "";
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
-
-export const COMPANY_LIST_SCHEMA = {
-  type: "object",
-  properties: {
-    companies: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "The company's common name, without a legal suffix." },
-          website: { type: "string", description: "Primary marketing site, e.g. https://example.com" },
-          careers_url: { type: "string", description: "Careers or jobs page URL if you know it, else empty string." },
-          bio: {
-            type: "string",
-            description: "2-3 sentences: what the company actually does, its scale, and its engineering character.",
-          },
-          location: { type: "string", description: "Headquarters as 'City, State/Country'." },
-          why_fit: {
-            type: "string",
-            description: "One sentence tying this company to the candidate's specific evidence and target roles.",
-          },
-        },
-        required: ["name", "website", "careers_url", "bio", "location", "why_fit"],
-      },
-    },
-  },
-  required: ["companies"],
-} as const;
-
-export async function proposeCompanies(
-  env: LlmEnv,
-  provider: Provider,
-  profileJson: string,
-  desiredRoles: string,
-  existingNames: string[],
-  count: number,
-  focus: string,
-  locations: string,
-): Promise<CompanyProposal[]> {
-  const locationRequirement = locations
-      ? [
-          "LOCATION REQUIREMENT -- this is a hard constraint, not a preference:",
-          `The candidate will only consider work in: ${locations}.`,
-          "Every company you propose must be headquartered there, or have a substantial office there.",
-          "Set `location` to that qualifying office, not to a headquarters somewhere else.",
-          "A company that does not qualify must be left out entirely, even if it is otherwise a",
-          "perfect fit. Returning fewer companies is correct; returning out-of-area ones is not.",
-          "",
-        ].join("\n") : "";
-  const prompt = await getManagedPrompt(env, "companies/discover", {
-    count: String(count),
-    location_requirement: locationRequirement,
-    focus_rule: focus ? `- The candidate specifically asked to focus on: ${focus}` : "",
-    existing_companies: existingNames.length
-      ? `ALREADY ON THE LIST -- do not propose any of these again:\n${existingNames.join(", ")}`
-      : "The list is currently empty.",
-    target_roles: desiredRoles
-      ? `TARGET ROLES (if these state a location or work arrangement, treat it as binding):\n${desiredRoles}`
-      : "TARGET ROLES: not specified; infer from the profile.",
-    candidate_profile: profileJson,
-  });
-
-  const result = await callStructured<{ companies: CompanyProposal[] }>(
-    env,
-    provider,
-    "companies.discover",
-    prompt,
-    COMPANY_LIST_SCHEMA,
-    "submit_companies",
-    // Twenty proposals fit comfortably in the historical 4k cap. Larger user-requested batches
-    // need proportionally more response room or Anthropic can truncate otherwise-valid JSON.
-    Math.max(4000, Math.min(24000, count * 200)),
-  );
-
-  return (result.companies ?? [])
-    .map((c) => ({
-      name: String(c.name ?? "").trim(),
-      website: normalizeUrl(c.website ?? ""),
-      careers_url: normalizeUrl(c.careers_url ?? ""),
-      bio: String(c.bio ?? "").trim(),
-      location: String(c.location ?? "").trim(),
-      why_fit: String(c.why_fit ?? "").trim(),
-    }))
-    .filter((c) => c.name && c.website);
-}
 
 export async function fetchWithTimeout(url: string, ms: number, init: RequestInit = {}): Promise<Response | null> {
   const controller = new AbortController();
@@ -447,7 +336,7 @@ export type BoardResolution = { provider: AtsProvider; token: string } | null;
  * Greenhouse slug is "andurilindustries", which `slugFromWebsite("anduril.com")` ("anduril") never
  * produces. Deduplicated by the caller against the domain-derived guess.
  */
-function slugsFromName(name: string): string[] {
+export function slugsFromName(name: string): string[] {
   const words = String(name ?? "")
     .toLowerCase()
     .replace(/&/g, " and ")
@@ -588,6 +477,34 @@ export async function resolveBoard(
         const body = await res.text().catch(() => "");
         if (body && boardHasListings(provider, body)) return { provider, token: slug };
       }
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Domain resolution
+// ---------------------------------------------------------------------------
+
+// Tried in this order because a company more often registers the plainer, shorter-TLD domain --
+// trying .com first keeps the common case to a single request.
+const DOMAIN_GUESS_TLDS = ["com", "io", "ai"];
+
+/**
+ * Guesses a company's real website from its bare name, confirming every guess with verifyWebsite()
+ * before returning it -- the same "propose a candidate, code confirms it" split this file already
+ * uses for ATS resolution (resolveBoard's own slug-guessing step, one level down, guesses org
+ * tokens the same way). Deliberately never falls back to an LLM: an unconfirmed guess here is worse
+ * than none, since a wrong domain would go on to resolveBoard and could resolve to some *other*
+ * company's real ATS board entirely. Returns null rather than inventing anything when nothing
+ * verifies -- see discoverCompanies in index.ts, which records that company as 'unresolved' instead
+ * of dropping it, so a human can supply the real website later.
+ */
+export async function resolveCompanyDomain(name: string): Promise<string | null> {
+  for (const slug of slugsFromName(name)) {
+    for (const tld of DOMAIN_GUESS_TLDS) {
+      const candidate = `https://${slug}.${tld}`;
+      if (await verifyWebsite(candidate)) return candidate;
     }
   }
   return null;
@@ -941,6 +858,46 @@ export function filterJobsByRoles(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Verification outcome
+// ---------------------------------------------------------------------------
+//
+// There is deliberately no company-level "fit" judgment anywhere in this file. Whether a company's
+// business is a good match for the candidate is a job-level question (see fit.ts's
+// assessJobFitBatch, which judges a specific posting) -- a company is worth monitoring purely on
+// operational grounds: does a real, readable job board exist for it. A non-tech company that
+// occasionally hires an AI engineer is exactly as "verified" as a company whose whole business is
+// AI, once both have a confirmed website and a board this app can read.
+
+export type VerifyReason = "" | "no_website" | "no_job_board" | "unsupported_ats" | "board_unreachable" | "ambiguous";
+
+export type VerifyOutcome = { status: "verified" | "unverified"; verify_reason: VerifyReason };
+
+/**
+ * Turns a board-resolution attempt into the status/reason pair companies.status/verify_reason
+ * store, matching the exact reason taxonomy the Unverified tab filters on. Pure and synchronous so
+ * it's fully unit-testable independent of any actual network call -- the caller (index.ts) is
+ * responsible for the fetches themselves and passes in only what was learned.
+ *
+ * `hadPriorSuccess` covers one deliberate asymmetry: a company that has already been read
+ * successfully at least once (a real, working board is known) is never demoted back to unverified
+ * by a later transient read failure -- that would flip a perfectly good company in and out of
+ * Verified on nothing but network flakiness. A read failure only counts as a verification outcome
+ * (board_unreachable) the first time a company's board is ever attempted.
+ */
+export function classifyVerification(
+  hasWebsite: boolean,
+  resolution: BoardResolution,
+  readFailed: boolean,
+  hadPriorSuccess: boolean,
+): VerifyOutcome {
+  if (!hasWebsite) return { status: "unverified", verify_reason: "no_website" };
+  if (!resolution) return { status: "unverified", verify_reason: "no_job_board" };
+  if (!isReadableAtsProvider(resolution.provider)) return { status: "unverified", verify_reason: "unsupported_ats" };
+  if (readFailed && !hadPriorSuccess) return { status: "unverified", verify_reason: "board_unreachable" };
+  return { status: "verified", verify_reason: "" };
+}
+
 const STOPWORDS = new Set([
   "the", "and", "for", "with", "that", "this", "from", "have", "has", "are", "was", "were", "you",
   "your", "their", "they", "would", "could", "should", "like", "want", "looking", "role", "roles",
@@ -948,3 +905,31 @@ const STOPWORDS = new Set([
   "experience", "candidate", "position", "positions", "opportunity", "opportunities", "where",
   "which", "into", "about", "more", "most", "also", "such", "than", "then", "some", "any", "can",
 ]);
+
+// ---------------------------------------------------------------------------
+// Company search terms -- shaping only. index.ts owns the actual persisted list (reads/writes
+// preferences_json) and the role-analysis extraction (readRoleAnalysis/roleTitleTerms); the two
+// pure transformations below live here instead so they're unit-testable the same way every other
+// deterministic rule in this file is, without pulling index.ts's DB/route plumbing into a test.
+// ---------------------------------------------------------------------------
+
+export type CompanySearchTerm = { term: string; source: "generated" | "manual" };
+
+const MAX_GENERATED_SEARCH_TERMS = 15;
+
+export function titleCaseTerm(value: string): string {
+  return value.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/** Shapes raw extracted title strings (from index.ts's roleTitleTerms) into the generated half of
+ *  the editable Search Terms list: capped, title-cased, tagged source:'generated'. */
+export function companySearchTermsFromTitles(titles: string[]): CompanySearchTerm[] {
+  return titles.slice(0, MAX_GENERATED_SEARCH_TERMS).map((t) => ({ term: titleCaseTerm(t), source: "generated" as const }));
+}
+
+/** "Reset to suggested": the candidate's own manual terms are always kept, with freshly generated
+ *  suggestions filling in after, deduped case-insensitively against the manual ones so a suggestion
+ *  matching something the candidate already typed doesn't show up twice. */
+export function mergeCompanySearchTerms(manual: CompanySearchTerm[], generated: CompanySearchTerm[]): CompanySearchTerm[] {
+  return [...manual, ...generated.filter((g) => !manual.some((m) => m.term.toLowerCase() === g.term.toLowerCase()))];
+}
