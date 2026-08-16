@@ -42,15 +42,17 @@ export type AtsProvider =
   | "jobvite";
 
 /**
- * Providers this app can read structured job listings from. The other six are still worth
- * *detecting* -- see the type comment above -- but none of them publish a stable, unauthenticated
- * public API the way Greenhouse/Lever/Ashby/SmartRecruiters/Workday do; some (ADP, iCIMS, most of
- * the enterprise HR suites) are fully server-rendered with no documented API at all, and guessing
- * a JSON shape with no way to verify it against a live response is how you ship code that silently
- * returns nothing while looking like it works. A detected-but-unreadable company gets a working
- * link to its board instead, via ATS_DISPLAY_NAMES and the isReadableAtsProvider check below.
+ * Providers this app can read structured job listings from. Workable, Recruitee, and BambooHR
+ * joined the original five after each was checked against real, live companies (not assumed from
+ * a vendor's docs) and confirmed to publish an unauthenticated JSON endpoint with real job data.
+ * The other ten are still worth *detecting* -- see the type comment above -- but each was checked
+ * the same way and found to have no equivalent path; see the comment on ATS_PATTERNS for the
+ * specific reason per provider. A detected-but-unreadable company gets a working link to its board
+ * instead, via ATS_DISPLAY_NAMES and the isReadableAtsProvider check below.
  */
-const READABLE_ATS_PROVIDERS = new Set<AtsProvider>(["greenhouse", "lever", "ashby", "smartrecruiters", "workday"]);
+const READABLE_ATS_PROVIDERS = new Set<AtsProvider>([
+  "greenhouse", "lever", "ashby", "smartrecruiters", "workday", "workable", "recruitee", "bamboohr",
+]);
 
 export function isReadableAtsProvider(provider: AtsProvider): boolean {
   return READABLE_ATS_PROVIDERS.has(provider);
@@ -247,7 +249,7 @@ export async function verifyWebsite(website: string): Promise<boolean> {
 // Each company's careers page almost always links out to whichever ATS hosts the real board.
 // Finding that link gives us the board token without guessing.
 //
-// Split into two groups. The first five are READABLE_ATS_PROVIDERS -- their capture group is the
+// Split into two groups. The first eight are READABLE_ATS_PROVIDERS -- their capture group is the
 // org slug boardApiUrl needs to build a listing request. The rest are detect-only: their capture
 // group is the whole host+path fragment the link pointed at (no scheme), stored as the token
 // as-is and turned straight into a clickable `https://` URL by the caller, since there's no API
@@ -265,14 +267,40 @@ const ATS_PATTERNS: { provider: AtsProvider; pattern: RegExp }[] = [
   { provider: "smartrecruiters", pattern: /careers\.smartrecruiters\.com\/([a-z0-9_-]+)/i },
   { provider: "workday", pattern: /([a-z0-9-]+\.wd\d+\.myworkdayjobs\.com\/(?:[a-z]{2}-[A-Z]{2}\/)?[a-zA-Z0-9_.-]+)/i },
 
+  // These three were investigated and confirmed to have a real, live, unauthenticated JSON API --
+  // verified against 9 real companies (3 each) during that investigation, not assumed from a
+  // vendor's own marketing claim. Their capture groups pull out just the account slug the API
+  // needs, matching the five above rather than the detect-only group below.
+  { provider: "workable", pattern: /apply\.workable\.com\/([a-z0-9_-]+)/i },
+  { provider: "recruitee", pattern: /([a-z0-9-]+)\.recruitee\.com/i },
+  { provider: "bamboohr", pattern: /([a-z0-9-]+)\.bamboohr\.com\/(?:jobs|careers)/i },
+
   // Detect-only: recognized so a company using one of these reads as "found, here's the link"
-  // instead of "no supported job board" -- not read automatically, since none of them publish a
-  // documented public API the way the five above do. See the AtsProvider type comment.
+  // instead of "no supported job board" -- not read automatically. Each of these ten was checked
+  // for a real public API during the same investigation that added the three above, live against
+  // real companies wherever a plausible endpoint existed, rather than assumed:
+  //   adp, icims          -- career-site HTML is client-rendered from an internal call this
+  //                          investigation could not locate; the official API is customer-gated.
+  //   jazzhr, jobvite      -- native API is real but strictly per-customer-key or opt-in-per-
+  //                          customer-and-usually-off; no public multi-tenant path exists.
+  //   breezy               -- official API requires a bearer token; no working public path found.
+  //   paylocity            -- has a "documented-looking" public feed API, and it responds 200 with
+  //                          well-formed JSON -- but it returned an empty jobs array for every one
+  //                          of 5 real, currently-recruiting companies tested. That is the exact
+  //                          failure mode this file's header warns about (looks like it works,
+  //                          silently returns nothing), so it stays unread rather than shipped on
+  //                          a guess a live test could not actually confirm.
+  //   personio             -- has a real, confirmed-live, unauthenticated feed (verified against
+  //                          a real company's postings) -- but it's XML, and every reader in this
+  //                          file is a JSON.parse. Adding an XML posting format is a real, scoped
+  //                          piece of follow-up work, not a dead end like the others below.
+  //   ukg, successfactors, taleo -- each has some public-but-undocumented surface (an XML sitemap,
+  //                          an OData call, a searchjobs endpoint), but every one needs a company-
+  //                          specific ID discovered by a step beyond regex extraction from a
+  //                          careers page (a data-center-specific host, a portal ID, a company
+  //                          code) -- a real gap, not a "didn't get to it yet".
   { provider: "adp", pattern: /((?:workforcenow|recruiting|jobs)\.adp\.com\/[^\s"'<>]+)/i },
   { provider: "icims", pattern: /([a-z0-9-]+\.icims\.com\/(?:jobs|careers)[^\s"'<>]*)/i },
-  { provider: "bamboohr", pattern: /([a-z0-9-]+\.bamboohr\.com\/(?:jobs|careers)[^\s"'<>]*)/i },
-  { provider: "workable", pattern: /([a-z0-9-]+\.workable\.com\/[^\s"'<>]*)/i },
-  { provider: "recruitee", pattern: /([a-z0-9-]+\.recruitee\.com[^\s"'<>]*)/i },
   { provider: "jazzhr", pattern: /([a-z0-9-]+\.applytojob\.com[^\s"'<>]*)/i },
   { provider: "breezy", pattern: /([a-z0-9-]+\.breezy\.hr[^\s"'<>]*)/i },
   { provider: "personio", pattern: /([a-z0-9-]+\.(?:jobs\.)?personio\.(?:de|com)[^\s"'<>]*)/i },
@@ -298,6 +326,19 @@ function boardApiUrl(provider: AtsProvider, token: string): string {
       return `https://api.ashbyhq.com/posting-api/job-board/${encodeURIComponent(token)}`;
     case "smartrecruiters":
       return `https://api.smartrecruiters.com/v1/companies/${encodeURIComponent(token)}/postings?limit=100`;
+    case "workable":
+      // Workable's own embeddable-widget endpoint -- public and unauthenticated by design, since
+      // Workable's own product uses it to power customer career pages. details=true includes each
+      // job's full HTML description inline, so no per-posting follow-up fetch is needed.
+      return `https://apply.workable.com/api/v1/widget/accounts/${encodeURIComponent(token)}?details=true`;
+    case "recruitee":
+      // Documented at docs.recruitee.com/reference/offers-get. Includes full description inline.
+      return `https://${encodeURIComponent(token)}.recruitee.com/api/offers/`;
+    case "bamboohr":
+      // Unlike the other two added alongside it, this list endpoint is thin -- no description, no
+      // posting URL, no date -- so bamboohr also needs the per-posting detail fetch in
+      // fetchMissingDescriptions below, the same shape smartrecruiters already uses.
+      return `https://${encodeURIComponent(token)}.bamboohr.com/careers/list`;
     default:
       // Workday builds its own request (POST, paginated -- see fetchWorkdayJobs) and every
       // detect-only provider is never read at all, so neither ever reaches this function. Reaching
@@ -485,9 +526,17 @@ export async function resolveBoard(
     if (result?.found) return result.found;
   }
 
+  // Workable's empty-account response (`{"jobs":[]}`) already matches boardHasListings' generic
+  // fallback check, so it's safe to guess here too. Recruitee and BambooHR are deliberately left
+  // out: their empty markers are `"offers":[]` and `"result":[]` respectively, which that same
+  // generic check does not recognize, so a wrong guess against either would misread as a real hit
+  // instead of correctly failing closed. Steps 1-3 above (a real link the company's own site
+  // publishes) already read both providers correctly; only this last-resort blind guess is
+  // narrowed until boardHasListings gets a per-provider case for them rather than one guessed at
+  // under time pressure.
   const slugs = Array.from(new Set([slugFromWebsite(website), ...slugsFromName(name)].filter(Boolean)));
   for (const slug of slugs) {
-    for (const provider of ["greenhouse", "lever", "ashby", "smartrecruiters"] as AtsProvider[]) {
+    for (const provider of ["greenhouse", "lever", "ashby", "smartrecruiters", "workable"] as AtsProvider[]) {
       if (budget.remaining <= 0) return null;
       budget.remaining -= 1;
       const res = await fetchWithTimeout(boardApiUrl(provider, slug), 8000);
@@ -736,6 +785,59 @@ export async function fetchBoardJobs(provider: AtsProvider, token: string): Prom
     });
   }
 
+  if (provider === "workable") {
+    const jobs = asArray((data as { jobs?: unknown }).jobs);
+    return jobs.map((j) => {
+      const locations = asArray(j.locations);
+      const first = (locations[0] ?? {}) as { city?: string; region?: string; country?: string };
+      const location = [str(j.city) || first.city, str(j.state) || first.region, str(j.country) || first.country]
+        .filter(Boolean)
+        .join(", ");
+      return {
+        external_id: str(j.shortcode),
+        title: str(j.title),
+        url: str(j.url) || str(j.shortlink),
+        location,
+        posted_at: str(j.published_on) || str(j.created_at),
+        description: joinSections([str(j.description)]),
+      };
+    });
+  }
+
+  if (provider === "recruitee") {
+    const offers = asArray((data as { offers?: unknown }).offers);
+    return offers.map((j) => ({
+      // Recruitee's `id` is a number, not a string (confirmed against a real response) -- str()
+      // only accepts strings by design, so a numeric id has to be coerced explicitly rather than
+      // silently falling through to guid every time, which is what plain str(j.id) did here before.
+      external_id: j.id !== undefined && j.id !== null ? String(j.id) : str(j.guid),
+      title: str(j.title),
+      url: str(j.careers_apply_url) || str(j.careers_url),
+      // Recruitee already publishes a ready-made display string here, unlike most providers.
+      location: str(j.location),
+      posted_at: str(j.published_at) || str(j.created_at),
+      description: joinSections([str(j.description)]),
+    }));
+  }
+
+  if (provider === "bamboohr") {
+    // Thin list: id, title, department, and a location object only -- no description, URL, or
+    // date. fetchMissingDescriptions below fills in the rest from the per-posting detail endpoint,
+    // same shape SmartRecruiters already needs.
+    const jobs = asArray((data as { result?: unknown }).result);
+    return jobs.map((j) => {
+      const loc = (j.location ?? {}) as { city?: string; state?: string; addressCountry?: string };
+      return {
+        external_id: str(j.id),
+        title: str(j.jobOpeningName),
+        url: "",
+        location: [loc.city, loc.state, loc.addressCountry].filter(Boolean).join(", "),
+        posted_at: "",
+        description: "",
+      };
+    });
+  }
+
   // SmartRecruiters' postings list carries no description at all -- it has to be read per posting
   // from the detail endpoint, which `fetchMissingDescriptions` below does for the postings that
   // survive filtering rather than for every posting on the board.
@@ -760,11 +862,13 @@ const DETAIL_CONCURRENCY = 5;
 /**
  * Fills in descriptions for providers whose board listing doesn't include one.
  *
- * SmartRecruiters' `/postings` list returns titles and locations but no body at all, and
- * Workday's listing endpoint is the same -- both need one extra fetch per posting to get the real
- * text. Without this, every posting from either provider reached tier-2 scoring with an empty
- * description -- judged on its title alone, and structurally unable to report a salary or
- * years-of-experience figure no matter how clearly the real posting states one.
+ * SmartRecruiters' `/postings` list returns titles and locations but no body at all, Workday's
+ * listing endpoint is the same, and BambooHR's `/careers/list` is thinner still -- no description,
+ * URL, or date, only id/title/department/location. All three need one extra fetch per posting to
+ * get the real text (and, for BambooHR, the posting URL too). Without this, every posting from any
+ * of them reached tier-2 scoring with an empty description -- judged on its title alone, and
+ * structurally unable to report a salary or years-of-experience figure no matter how clearly the
+ * real posting states one.
  *
  * Deliberately called on the *filtered* set (after role and location matching), not on the whole
  * board: a detail fetch costs a request each, and there's no reason to spend one on a posting that
@@ -778,7 +882,7 @@ export async function fetchMissingDescriptions(
   jobs: ScannedJob[],
   budget: { remaining: number },
 ): Promise<void> {
-  if (provider !== "smartrecruiters" && provider !== "workday") return;
+  if (provider !== "smartrecruiters" && provider !== "workday" && provider !== "bamboohr") return;
   const pending = jobs.filter((job) => !job.description && job.external_id).slice(0, MAX_DETAIL_FETCHES);
 
   const [tenant, pod, site] = provider === "workday" ? token.split("|") : [];
@@ -803,6 +907,19 @@ export async function fetchMissingDescriptions(
             } | null;
             const description = detail?.jobPostingInfo?.jobDescription;
             if (description) job.description = joinSections([description]);
+            return;
+          }
+
+          if (provider === "bamboohr") {
+            const res = await fetchWithTimeout(`https://${token}.bamboohr.com/careers/${encodeURIComponent(job.external_id)}/detail`, 8000);
+            if (!res || !res.ok) return;
+            const detail = (await res.json().catch(() => null)) as {
+              result?: { jobOpening?: { description?: string; jobOpeningShareUrl?: string } };
+            } | null;
+            const opening = detail?.result?.jobOpening;
+            if (!opening) return;
+            if (opening.description) job.description = joinSections([opening.description]);
+            if (opening.jobOpeningShareUrl) job.url = opening.jobOpeningShareUrl;
             return;
           }
 
