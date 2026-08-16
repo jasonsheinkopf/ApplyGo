@@ -23,8 +23,12 @@ flowchart TD
     PROFILE_LLM[LLM_PROFILE_EXTRACT<br/>profile.structure]:::llm
     MATCH_PROFILE[buildMatchProfile]:::code
     ROLES_LLM[LLM_ROLE_ANALYSIS<br/>roles.analyze]:::llm
-    COMPANY_LLM[LLM_COMPANY_DISCOVERY<br/>companies.discover]:::llm
-    COMPANY_CHECK[Validate website, location, and duplicate name]:::code
+    ADZUNA[(Adzuna job-search API)]:::external
+    COMPANY_DISCOVER[Search real postings; aggregate employers]:::code
+    COMPANY_IDENT[Canonicalize name; dedupe on match key]:::code
+    COMPANY_RESOLVE[Website waterfall: evidence, then guess,<br/>each confirmed against page evidence]:::code
+    WEBSITE_LLM[LLM_WEBSITE_RESOLVE<br/>companies.resolve_website<br/>search-grounded; only if deterministic fails]:::llm
+    COMPANY_CHECK[Classify identity + job source; enforce invariants]:::code
     SCAN{Human starts company-board scan}:::human
     subgraph BOARD_STORAGE_ROW[ ]
       direction LR
@@ -84,8 +88,13 @@ flowchart TD
     FUTURE[Planned status monitoring, interviews, and offers]:::planned
     ACCEPTED([Planned accepted job]):::plannedTerminal
 
-    START --> SOURCES --> PROFILE_LLM --> MATCH_PROFILE --> ROLES_LLM
-    COMPANY_LLM --> COMPANY_CHECK --> SCAN --> BOARD
+    START --> SOURCES --> PROFILE_LLM --> MATCH_PROFILE --> ROLES_LLM --> COMPANY_DISCOVER
+    COMPANY_DISCOVER <-->|postings| ADZUNA
+    COMPANY_DISCOVER --> COMPANY_IDENT --> COMPANY_RESOLVE
+    COMPANY_RESOLVE -->|deterministic tiers failed| WEBSITE_LLM
+    WEBSITE_LLM -->|proposed URL, re-verified before trust| COMPANY_CHECK
+    COMPANY_RESOLVE -->|confirmed| COMPANY_CHECK
+    COMPANY_CHECK --> SCAN --> BOARD
     C_UPDATE ~~~ ATS_SPACER
     BOARD <-->|board jobs| ATS
     BOARD --> PREFILTER --> DEDUPE
@@ -128,8 +137,8 @@ flowchart TD
     MATCH_PROFILE -->|write structured profile + match profile| P_WRITE
     P_WRITE -->|profile + preferences| ROLES_LLM
     ROLES_LLM -->|write role analysis + desired roles| P_WRITE
-    P_WRITE -->|profile + target roles| COMPANY_LLM
-    COMPANY_CHECK -->|write verified company| C_WRITE
+    P_WRITE -->|search terms from role analysis| COMPANY_DISCOVER
+    COMPANY_CHECK -->|write company: identity + job-source state| C_WRITE
     C_WRITE -->|companies due to scan| SCAN
     F_SCREEN -->|confirmed rejection reasons| SCREEN_LLM
     SCREEN_RESULT -->|write screened_in or screened_out| J_FIT_PIPE
@@ -217,7 +226,10 @@ lifecycle visible without pretending that a corresponding database column exists
 | StructuredProfile | `candidate_profiles.structured_json` | Saved by `saveStructuredProfile`; drafted by `profile.structure` |
 | Preferences | `preferences_json.desired_locations`, `dealbreakers`, `care_about`, `care_about_topics`, `role_analysis`, `desired_roles` | `saveDesiredRoles` saves the first four; `deriveCareAboutTopics` derives `care_about_topics`; `analyzeDesiredRoles` derives `role_analysis` and `desired_roles` together -- the latter is never saved directly by the user |
 | Match profile | `candidate_profiles.match_profile` | Deterministically rebuilt by `buildMatchProfile` on every structured-profile save |
-| CompanyProposal | `name`, `website`, `careers_url`, `bio`, `location`, `why_fit` | `proposeCompanies` |
+| Company identity | `companies.source_name` (raw), `name` (cleaned display), `name_key` (dedupe) | `companyIdentity` in `cloudflare/src/identity.ts` |
+| Company identity state | `companies.identity_status` — `pending`/`verified`/`ambiguous`/`unresolved`/`not_a_company`/`dismissed` | `resolveWebsiteDeterministic`, reconciled by `reconcileCompanyState` |
+| Company job-source state | `companies.job_source_status` — `pending`/`supported`/`unsupported_ats`/`careers_only`/`no_board`/`board_unreachable` | `resolveBoard` + `detectAtsFromUrl`, reconciled by `reconcileCompanyState` |
+| Website evidence | `companies.website_source`, `website_confidence`, `website_evidence` | `scoreSiteMatch` in `cloudflare/src/resolver.ts` |
 | Company scan identity | `companies.ats_provider` + `ats_token` | `resolveBoard`; cached after resolution |
 | Raw/discovered job | `job_postings` listing fields plus `raw_description` | `fetchBoardJobs`, `fetchMissingDescriptions`, and `scanOneCompany` |
 | Job identity | Partial unique index on `(company_id, external_id)` | `INSERT OR IGNORE` in `scanOneCompany` |
@@ -238,7 +250,7 @@ All calls route through `cloudflare/src/llm.ts`; task/provider/model selection i
 | LLM_PROFILE_EXTRACT | `profile.structure`; `generateProfile` in `cloudflare/src/index.ts` | Extracted source documents, notes, existing profile | `StructuredProfile` draft. It is persisted only after the human saves it. |
 | LLM_ROLE_ANALYSIS | `roles.analyze`; `analyzeDesiredRoles` in `index.ts` | User-created `role_signal` evidence, the compact `match_profile`, desired locations, dealbreakers, and criteria (`care_about`) | Structured `{summary, roles: [{title, description}]}`. Saved directly (no draft/approve step) to `preferences_json.role_analysis`; `desired_roles`, the flat string every scoring/resume prompt reads, is deterministically re-derived from `roles` on every save. |
 | LLM_CARE_TOPICS | `fit.care_about_topics`; `deriveCareAboutTopics` in `cloudflare/src/fit.ts` | Free-text `care_about` | Structured topic keys/labels/questions, stored inside `preferences_json`. |
-| LLM_COMPANY_DISCOVERY | `companies.discover`; `proposeCompanies` in `cloudflare/src/companies.ts` | Structured profile, desired roles/locations, existing names, requested count and focus | `CompanyProposal[]`; code validates and then persists rows in `companies`. There is no separate company-query-generation call or web-search agent. |
+| LLM_WEBSITE_RESOLVE | `companies.resolve_website`; `resolveWebsiteViaSearch` in `cloudflare/src/websearch.ts` | Canonical company name, location, and the job titles discovery actually saw for it | `{official_website, careers_url, confidence, reason}` via Claude's server-side web search. **The only model call in company discovery**, and only for a company the deterministic waterfall could not place. Its answer is never trusted as returned: `scanOneCompany` re-fetches the proposed URL and scores it with `scoreSiteMatch` before accepting, and anything under the confidence floor is stored as `ambiguous` rather than guessed. |
 | LLM_JOB_SCREEN | `fit.screen`; `screenJobsBatch` in `fit.ts` | Compact `match_profile`, roles, confirmed rejection reasons, and batches containing job title/location (not description) | `{id, keep, note}`; stored as `screened_in` or `screened_out`. |
 | LLM_JOB_FIT | `fit.assess`; `assessJobFitBatch` in `fit.ts` | Full structured profile, roles, dealbreakers, care-about topics, confirmed disqualifiers, and job descriptions | Score, reason, missing evidence, and facts; stored in `job_postings`. |
 | LLM_REVIEW_QUESTION | `review.question`; `reviewJobQuestion` in `index.ts` | Job, structured profile, and prior job-review answers | One question. The question itself is not stored until the human submits an answer; then question and answer are stored together as evidence. |
@@ -395,6 +407,94 @@ There are still no separate `discovered`, `seen`, `deduplicated`, `documents_gen
 deduplication are represented by row existence and the unique index; document readiness is
 represented by related-row existence. The remaining lifecycle states are architectural gaps.
 
+## Company pipeline: discovery to job handoff
+
+A company carries **two independent states**, and conflating them was a real defect rather than a
+naming quibble: a company whose website is confirmed is a *verified company* even when ApplyGo
+cannot read the ATS it hires through, because an unsupported ATS is a limitation of this app, not a
+property of the employer.
+
+| Axis | Column | Values |
+|---|---|---|
+| Who is this employer? | `identity_status` | `pending`, `verified`, `ambiguous`, `unresolved`, `not_a_company`, `dismissed` |
+| Can we read their jobs? | `job_source_status` | `pending`, `supported`, `unsupported_ats`, `careers_only`, `no_board`, `board_unreachable` |
+
+Job source is only meaningful downstream of a verified identity, so `pending` on an unresolved
+company means "never attempted", not "checked and found nothing".
+
+```mermaid
+flowchart LR
+    RAW[/Adzuna employer string/]:::human
+    CANON[Canonicalize<br/>strip legal suffixes, ATS artifacts,<br/>entity codes]:::code
+    JUNK{Names an employer<br/>at all?}:::code
+    DEDUPE{Already known?<br/>match key}:::code
+    T1[Tier 1: URLs discovery supplied]:::code
+    T2[Tier 2: domain candidates<br/>from the cleaned name]:::code
+    T3[Tier 3: fetch and score the page<br/>title, og:site_name, schema.org]:::code
+    T4[LLM_WEBSITE_RESOLVE<br/>search-grounded, first scan only]:::llm
+    VERDICT{Confidence >= floor?}:::code
+    VERIFIED("identity_status = verified"):::row
+    AMBIG("identity_status = ambiguous<br/>evidence retained"):::row
+    UNRES("identity_status = unresolved<br/>retried automatically"):::row
+    BOARD[Resolve job board<br/>stored URL patterns, then careers page,<br/>then slug guesses]:::code
+    SUPPORTED("job_source = supported"):::row
+    UNSUPPORTED("job_source = unsupported_ats<br/>board link shown"):::row
+    CAREERS("job_source = careers_only"):::row
+    NOBOARD("job_source = no_board"):::row
+    IMPORT[Import postings]:::code
+    PRESCREEN("Pre-screen — jobs<br/>shared with the Jobs page"):::row
+
+    RAW --> CANON --> JUNK
+    JUNK -->|no| NOTCO("identity_status = not_a_company"):::row
+    JUNK -->|yes| DEDUPE
+    DEDUPE -->|yes| MERGE[Merge into the existing company]:::code
+    DEDUPE -->|no| T1 --> T2 --> T3 --> VERDICT
+    T3 -->|nothing confirmed| T4 --> VERDICT
+    VERDICT -->|yes| VERIFIED
+    VERDICT -->|URL found, not confirmed| AMBIG
+    VERDICT -->|nothing found| UNRES
+    VERIFIED --> BOARD
+    BOARD --> SUPPORTED
+    BOARD --> UNSUPPORTED
+    BOARD --> CAREERS
+    BOARD --> NOBOARD
+    SUPPORTED --> IMPORT -->|unit changes: companies to jobs| PRESCREEN
+
+    classDef human fill:#fff4cc,stroke:#9a6b00,color:#2b2100,stroke-width:2px;
+    classDef llm fill:#efe7ff,stroke:#7048a8,color:#2d174d,stroke-width:2px;
+    classDef code fill:#f4f4f4,stroke:#666,color:#222;
+    classDef row fill:#dff5df,stroke:#267326,color:#123d12,stroke-width:2px,text-align:left;
+```
+
+**Where AI enters, and where it deliberately does not.** Everything above is deterministic except
+`LLM_WEBSITE_RESOLVE`. Company discovery uses no model to decide *which* companies are worth
+watching — that judgment happens per job, in `fit.screen`/`fit.assess`, because almost any large
+employer can hold a relevant role. The single model call exists for one question a model is
+genuinely better at than code (which of several same-named organizations is this?), it is given
+real web search rather than being asked to recall a domain, and its answer is re-verified
+deterministically before it is trusted.
+
+**Invariants.** `reconcileCompanyState` (`cloudflare/src/companystate.ts`) runs on every write, so
+contradictory rows cannot be stored — a board URL cannot coexist with "no job board found", a
+verified identity cannot lack a website, and a job source cannot be set on an unverified company.
+
+**Counts.** `cloudflare/src/pipeline.ts` owns the funnel arithmetic and asserts that each stage's
+outcomes sum to what entered it. `PRESCREEN_PREDICATE` is defined once there and imported by both
+the Companies and Jobs endpoints, so the last node on Companies and the first node on Jobs are the
+same rows by construction.
+
+## Read-only MCP server
+
+`mcp/` is a Model Context Protocol server that exposes ApplyGo's data to an MCP client such as
+Claude Desktop: `search_companies`, `get_company`, `search_jobs`, `get_job`, `list_applications`,
+`get_application_status`, `get_pipeline_summary`.
+
+It cannot write. The guarantee is one check in `requireSession`: a credential with
+`scope='read_only'` may only issue `GET`/`HEAD` requests. Because that sits at the single
+authentication choke point, every mutating route is covered by construction, including routes added
+later, and the restriction holds even against a modified client. The token cannot mint another
+token. See `mcp/README.md` for setup.
+
 ## Human-in-the-loop checkpoints
 
 - The human owns profile facts, preferences, role signals, locations, dealbreakers, and whether an
@@ -416,8 +516,11 @@ represented by related-row existence. The remaining lifecycle states are archite
 |---|---|---|
 | Profile/evidence/preferences | **Current** | D1/R2 schema and profile endpoints in `index.ts`. |
 | Structured search target | **Current** | Preferences plus deterministic `match_profile`; there is no single LLM-produced `target_profile` object. |
-| Company query generation / external web search | **Not implemented as a separate stage** | The model directly proposes companies. Code only verifies their websites; it does not run a search-engine query. |
-| Company discovery and database | **Current, human-triggered** | LLM proposals or manual input, deterministic validation, D1 persistence. |
+| Company discovery | **Current, human-triggered** | Real Adzuna postings, aggregated by employer. No model chooses which companies are worth watching. Search terms come from the saved role analysis and are editable. |
+| Company identity resolution | **Current** | Deterministic canonicalization and a bounded domain waterfall, every candidate confirmed against page evidence before acceptance (`identity.ts`, `resolver.ts`). Measured on the real unresolved backlog, this resolves 34 of a 40-company sample the previous slug-only guess resolved none of. |
+| Search-grounded website fallback | **Current, first scan only** | `companies.resolve_website` via Claude's server-side web search, for companies the deterministic tiers cannot place. Never accepted on the model's word: the proposed URL is re-fetched and scored before it is trusted. |
+| Resumable discovery | **Current** | Per-`(term, location)` cursors persist across runs; one press continues until the queries are exhausted and waits out provider rate limits. A dropped progress stream loses no work. |
+| Read-only MCP server | **Current** | `mcp/`, seven read tools, enforced read-only at ApplyGo's authentication choke point. |
 | Recurring company scans | **Partially implemented** | A once-per-calendar-day eligibility guard exists, and repeat clicks resume work, but there is no scheduler/cron trigger in the current Worker. |
 | Official career-board discovery | **Current** | Deterministic resolution and public APIs for four supported ATS providers. Unsupported boards are recorded as `ats_provider='none'`; there is no generic browser scraper fallback. |
 | Job dedupe and cheap prefilter | **Current** | Unique company/external ID, deterministic location/role filtering, then cheap-model screening. |
