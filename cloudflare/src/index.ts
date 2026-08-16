@@ -6617,15 +6617,11 @@ Let me check the placeholder embraces like a variable name, gets its value when 
      flow-conserving ribbon across that boundary would visually claim a company-to-job unit that
      doesn't exist. */
   #companies-pipeline-row { display: flex; align-items: center; gap: 0.5rem; }
-  /* Fixed at 58% (not 100%) of the row on purpose: the viewBox below (vbW 770) is tightly cropped
-     to this diagram's real 2-stage content using Jobs' own per-stage constants (COL_MARGIN,
-     COL_STEP, node/font CSS -- all shared, unchanged), rather than Jobs' full 3-stage vbW (1320).
-     Stretching that narrower viewBox to 100% of a full-width row would scale every node/font/stroke
-     up by ~1320/770, i.e. visibly larger than Jobs' -- exactly the "too large" complaint. Capping
-     the container to the matching 770/1320 fraction keeps 1 viewBox unit equal to the same real
-     pixel size in both diagrams, so node size/typography/density genuinely match, not just the
-     stage-graph logic. */
-  #companies-pipeline { flex: 0 0 58%; max-width: 58%; margin: 0.6rem 0 0.5rem; }
+  /* Same viewBox and constants as #jobs-pipeline (vbW 1320, three stages), so one viewBox unit is
+     the same real pixel size in both diagrams and the two read at identical node size, typography,
+     and density -- they are two windows onto one pipeline, not two charts that happen to sit on
+     different pages. */
+  #companies-pipeline { flex: 1 1 auto; min-width: 0; margin: 0.6rem 0 0.5rem; }
   #companies-pipeline svg { display: block; width: 100%; height: auto; overflow: visible; }
   .cpf-arrow { flex: 0 0 auto; font-size: 15px; color: var(--text-muted); }
   .cpf-stage-handoff {
@@ -7062,7 +7058,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     <div class="segmented-control" id="companies-view-tabs" role="group" aria-label="Company sections">
       <button class="active" data-companies-view="find" type="button" aria-pressed="true">Search</button>
       <button data-companies-view="verified" type="button" aria-pressed="false">Verified <span id="companies-verified-count"></span></button>
-      <button data-companies-view="unverified" type="button" aria-pressed="false">Unverified <span id="companies-unverified-count"></span></button>
+      <button data-companies-view="unresolved" type="button" aria-pressed="false">Unresolved <span id="companies-unresolved-count"></span></button>
       <button data-companies-view="removed" type="button" aria-pressed="false">Removed <span id="companies-removed-count"></span></button>
     </div>
 
@@ -7103,9 +7099,9 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         </div>
       </div>
       <div class="pf-legend">
-        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--accent)"></span>Discovered</span>
-        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--error)"></span>Unverified</span>
-        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--success)"></span>Verified</span>
+        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--accent)"></span>Awaiting checks</span>
+        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--error)"></span>Unresolved / unreadable</span>
+        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--success)"></span>Verified &amp; scannable</span>
       </div>
 
       <button id="companies-discover-button" type="button">Find companies</button>
@@ -7132,13 +7128,23 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     <section id="companies-list-section" style="display:none">
           <label for="companies-filter">Filter</label>
           <input id="companies-filter" placeholder="Search by name, location, or description">
-          <div class="segmented-control" id="companies-unverified-filters" role="group" aria-label="Unverified reason" style="display:none">
-            <button class="active" data-unverified-reason="" type="button" aria-pressed="true">All <span id="companies-reason-all-count"></span></button>
-            <button data-unverified-reason="no_website" type="button" aria-pressed="false">No website <span id="companies-reason-no_website-count"></span></button>
-            <button data-unverified-reason="no_job_board" type="button" aria-pressed="false">No job board <span id="companies-reason-no_job_board-count"></span></button>
-            <button data-unverified-reason="unsupported_ats" type="button" aria-pressed="false">Unsupported board <span id="companies-reason-unsupported_ats-count"></span></button>
-            <button data-unverified-reason="board_unreachable" type="button" aria-pressed="false">Board unreachable <span id="companies-reason-board_unreachable-count"></span></button>
-            <button data-unverified-reason="ambiguous" type="button" aria-pressed="false">Ambiguous <span id="companies-reason-ambiguous-count"></span></button>
+          <!-- Inside Verified: these companies are all confirmed employers. This filters by whether
+               ApplyGo can read their jobs, which is a separate question from who they are. -->
+          <div class="segmented-control" id="companies-source-filters" role="group" aria-label="Job source" style="display:none">
+            <button class="active" data-source-filter="" type="button" aria-pressed="true">All <span id="companies-source-all-count"></span></button>
+            <button data-source-filter="supported" type="button" aria-pressed="false">Scannable <span id="companies-source-supported-count"></span></button>
+            <button data-source-filter="unsupported_ats" type="button" aria-pressed="false">Unsupported board <span id="companies-source-unsupported_ats-count"></span></button>
+            <button data-source-filter="careers_only" type="button" aria-pressed="false">Careers page only <span id="companies-source-careers_only-count"></span></button>
+            <button data-source-filter="no_board" type="button" aria-pressed="false">No job board <span id="companies-source-no_board-count"></span></button>
+            <button data-source-filter="board_unreachable" type="button" aria-pressed="false">Board unavailable <span id="companies-source-board_unreachable-count"></span></button>
+            <button data-source-filter="pending" type="button" aria-pressed="false">Not checked yet <span id="companies-source-pending-count"></span></button>
+          </div>
+          <!-- Inside Unresolved: why identity could not be established. -->
+          <div class="segmented-control" id="companies-identity-filters" role="group" aria-label="Reason unresolved" style="display:none">
+            <button class="active" data-identity-filter="" type="button" aria-pressed="true">All <span id="companies-identity-all-count"></span></button>
+            <button data-identity-filter="unresolved" type="button" aria-pressed="false">No website found <span id="companies-identity-unresolved-count"></span></button>
+            <button data-identity-filter="ambiguous" type="button" aria-pressed="false">Ambiguous <span id="companies-identity-ambiguous-count"></span></button>
+            <button data-identity-filter="not_a_company" type="button" aria-pressed="false">Not a company <span id="companies-identity-not_a_company-count"></span></button>
           </div>
           <div id="companies-list"><p class="empty">Loading…</p></div>
     </section>
@@ -7739,26 +7745,49 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     // soon as it's in -- used for long-running operations (scanning boards, filtering hundreds
     // of postings) so progress shows up while the work is happening, not just at the end.
     // Returns the final {type: "done", ...} event's payload, or throws on a {type: "error"} event.
+    //
+    // A stream that ends without its 'done' event is NOT reported as a failure, which is what
+    // 'stream_ended_unexpectedly' used to do. Every long operation behind these endpoints writes
+    // its progress to the database as it goes -- discovery advances a per-query cursor, scanning
+    // marks each company as it finishes -- so a dropped stream means the reporting channel broke,
+    // not that the work was lost or has to be redone. (Streams drop for ordinary reasons: the
+    // isolate is recycled mid-request, a laptop sleeps, a proxy times out an idle connection.)
+    // Reporting that as an error told the candidate their run had failed when in fact it had
+    // partly succeeded and was safe to continue, so it is surfaced as partial progress instead and
+    // the caller's own round loop picks up where the cursor left off.
     async function readNdjson(res, onEvent) {
       var reader = res.body.getReader();
       var decoder = new TextDecoder();
       var buffer = '';
       var result = null;
-      while (true) {
-        var chunk = await reader.read();
-        if (chunk.done) break;
-        buffer += decoder.decode(chunk.value, { stream: true });
-        var lines = buffer.split('\\n');
-        buffer = lines.pop();
-        for (var i = 0; i < lines.length; i++) {
-          if (!lines[i]) continue;
-          var event = JSON.parse(lines[i]);
-          if (event.type === 'error') throw new Error(event.message || 'stream_failed');
-          if (event.type === 'done') { result = event; continue; }
-          onEvent(event);
+      var sawProgress = false;
+      try {
+        while (true) {
+          var chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder.decode(chunk.value, { stream: true });
+          var lines = buffer.split('\\n');
+          buffer = lines.pop();
+          for (var i = 0; i < lines.length; i++) {
+            if (!lines[i]) continue;
+            var event;
+            try { event = JSON.parse(lines[i]); } catch (parseError) { continue; }
+            if (event.type === 'error') throw new Error(event.message || 'stream_failed');
+            if (event.type === 'done') { result = event; continue; }
+            sawProgress = true;
+            onEvent(event);
+          }
         }
+      } catch (readError) {
+        // An explicit {type:'error'} event is a real failure and must propagate. A transport-level
+        // read failure is the same interrupted-stream case handled below.
+        if (readError && readError.message && readError.message !== 'stream_failed' &&
+            String(readError.name) !== 'TypeError' && !/network|aborted|reset/i.test(readError.message)) {
+          throw readError;
+        }
+        if (!result && !sawProgress) throw readError;
       }
-      if (!result) throw new Error('stream_ended_unexpectedly');
+      if (!result) return { interrupted: true, partial: sawProgress };
       return result;
     }
 
@@ -9138,16 +9167,47 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     // The reason a failed company shows in the Unverified tab, in plain language -- see
     // classifyVerification in src/companies.ts and the search-fallback confidence floor in
     // src/websearch.ts for where these five codes come from.
-    var VERIFY_REASON_LABELS = {
-      no_website: 'No website could be confirmed for this company.',
-      no_job_board: 'A website was confirmed, but no job board could be found on it.',
-      unsupported_ats: 'This company’s job board uses a system this app can’t automatically read yet.',
-      board_unreachable: 'A supported job board was found, but reading it failed. This is often temporary.',
-      ambiguous: 'A possible website was found, but not with enough confidence to trust automatically — this is a common-name collision, not a missing website.',
+    // Mirrors IDENTITY_LABELS / JOB_SOURCE_LABELS / explainState in src/companystate.ts. The two
+    // axes are labelled separately here for the same reason they are stored separately: "we could
+    // not work out who this employer is" and "we know exactly who they are but cannot read their
+    // job board" are different problems with different fixes.
+    var IDENTITY_LABELS = {
+      pending: 'Not checked yet',
+      verified: 'Verified',
+      ambiguous: 'Ambiguous',
+      unresolved: 'Unresolved',
+      not_a_company: 'Not a company',
+      dismissed: 'Removed',
     };
-
+    var JOB_SOURCE_LABELS = {
+      pending: 'Board not checked yet',
+      supported: 'Scannable',
+      unsupported_ats: 'Unsupported board',
+      careers_only: 'Careers page only',
+      no_board: 'No job board',
+      board_unreachable: 'Board unavailable',
+    };
+    var STATE_EXPLANATIONS = {
+      'identity:pending': 'Discovered from a real job posting. Identity has not been checked yet.',
+      'identity:unresolved': 'No website could be confirmed for this company. It stays on the list and is retried automatically.',
+      'identity:ambiguous': 'A possible website was found, but not with enough evidence to be sure it is this company rather than a similarly named one.',
+      'identity:not_a_company': 'This employer field held a job-board page title rather than a company name.',
+      'source:pending': 'Website confirmed. Its job board has not been checked yet.',
+      'source:supported': 'Website and job board confirmed. Jobs are imported from it automatically.',
+      'source:unsupported_ats': 'Website confirmed. They hire through a system ApplyGo cannot read automatically yet — use the board link to browse it directly.',
+      'source:careers_only': 'Website and careers page confirmed, but the careers page does not run on a job-board system ApplyGo can read.',
+      'source:no_board': 'Website confirmed, but no job board or careers page could be found on it.',
+      'source:board_unreachable': 'Website and job board confirmed, but reading the board failed. This is usually temporary and is retried.',
+    };
+    function explainCompanyState(company) {
+      if (company.identity_status !== 'verified') {
+        return STATE_EXPLANATIONS['identity:' + company.identity_status] || '';
+      }
+      return STATE_EXPLANATIONS['source:' + company.job_source_status] || '';
+    }
     var companiesView = 'find';
-    var companiesUnverifiedReason = '';
+    var companiesSourceFilter = '';
+    var companiesIdentityFilter = '';
     var companiesPipeline = {};
 
     function renderCompanyRows(list, companies) {
@@ -9164,13 +9224,22 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         if (company.open_jobs > 0) {
           titleChildren.push(el('span', { className: 'badge jobs', textContent: company.open_jobs + ' open' }));
         }
-        if (company.status === 'verified') {
+        if (company.identity_status === 'verified') {
           titleChildren.push(el('span', { className: 'badge strong', textContent: 'verified' }));
-        } else if (company.status === 'unverified') {
-          titleChildren.push(el('span', { className: 'badge warn', textContent: company.verify_reason ? company.verify_reason.replace(/_/g, ' ') : 'unverified' }));
-        }
-        if (company.status === 'dismissed') {
+          // Only shown once it means something: before the board is checked, "pending" is noise.
+          if (company.job_source_status && company.job_source_status !== 'pending') {
+            titleChildren.push(el('span', {
+              className: 'badge ' + (company.job_source_status === 'supported' ? 'jobs' : 'warn'),
+              textContent: (JOB_SOURCE_LABELS[company.job_source_status] || company.job_source_status).toLowerCase(),
+            }));
+          }
+        } else if (company.identity_status === 'dismissed') {
           titleChildren.push(el('span', { className: 'badge', textContent: 'removed' }));
+        } else if (company.identity_status) {
+          titleChildren.push(el('span', {
+            className: 'badge warn',
+            textContent: (IDENTITY_LABELS[company.identity_status] || company.identity_status).toLowerCase(),
+          }));
         }
         if (company.off_target) {
           titleChildren.push(el('span', { className: 'badge warn', textContent: 'outside your locations' }));
@@ -9187,27 +9256,34 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         if (company.bio) body.push(el('p', { className: 'company-bio', textContent: company.bio }));
         // Prominent, plain-language failure reason -- debugging why a company didn't make it in
         // matters for an open-source app the candidate might need to fix themselves.
-        if (company.status === 'unverified') {
-          body.push(el('p', {
-            className: 'company-why',
-            textContent: 'Why verification failed: ' + (VERIFY_REASON_LABELS[company.verify_reason] || 'Unknown reason.'),
-          }));
+        // Shown for anything not fully scannable -- including verified companies, where the
+        // explanation is about ApplyGo's reach rather than the company.
+        if (!(company.identity_status === 'verified' && company.job_source_status === 'supported') &&
+            company.identity_status !== 'dismissed') {
+          var explanation = explainCompanyState(company);
+          if (explanation) body.push(el('p', { className: 'company-why', textContent: explanation }));
+          // The evidence behind the decision, for an ambiguous or unresolved row where the
+          // candidate may want to judge it themselves.
+          if (company.website_evidence && company.identity_status !== 'verified') {
+            body.push(el('div', { className: 'row-meta', textContent: 'Evidence: ' + company.website_evidence }));
+          }
         }
         if (company.scan_note) body.push(el('div', { className: 'row-meta', textContent: company.scan_note }));
         // Resolved once this company was checked -- the actual careers/board link the site
         // publishes, not just its homepage. Most useful for a detected-but-unsupported ATS (ADP,
         // iCIMS, ...), where this is the only way to actually see the postings, but shown whenever
         // it's known since "click through and look yourself" is always a fair fallback.
-        if (company.careers_url) {
+        var boardLink = company.board_url || company.careers_url;
+        if (boardLink) {
           body.push(el('div', { className: 'row-meta' }, [
-            el('a', { href: company.careers_url, target: '_blank', rel: 'noopener', textContent: 'View job board ↗' }),
+            el('a', { href: boardLink, target: '_blank', rel: 'noopener', textContent: 'View job board ↗' }),
           ]));
         }
 
         // The manual-fix path for any unverified company: typing a real website here re-verifies it
         // the same way discovery would have, and clears any stale board resolution so the next scan
         // starts fresh against the corrected domain.
-        if (company.status === 'unverified') {
+        if (company.identity_status !== 'verified' && company.identity_status !== 'dismissed') {
           var websiteInput = el('input', { type: 'url', placeholder: 'https://example.com' });
           var websiteButton = el('button', { type: 'button', textContent: 'Save website' });
           var websiteStatus = el('span', { className: 'row-meta' });
@@ -9229,19 +9305,19 @@ Let me check the placeholder embraces like a variable name, gets its value when 
 
         var changeStatus = el('button', {
           type: 'button',
-          textContent: company.status === 'dismissed' ? 'Re-add' : 'Remove',
-          className: company.status === 'dismissed' ? '' : 'danger',
+          textContent: company.identity_status === 'dismissed' ? 'Re-add' : 'Remove',
+          className: company.identity_status === 'dismissed' ? '' : 'danger',
         });
         changeStatus.addEventListener('click', async function () {
           await api('/companies/' + encodeURIComponent(company.id), {
             method: 'PATCH',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ status: company.status === 'dismissed' ? 'reachable' : 'dismissed' }),
+            body: JSON.stringify({ status: company.identity_status === 'dismissed' ? 'reachable' : 'dismissed' }),
           });
           loadCompanies();
         });
 
-        var muted = company.status === 'dismissed' || company.status === 'unverified';
+        var muted = company.identity_status === 'dismissed' || company.identity_status === 'unresolved';
         list.appendChild(el('div', { className: 'row-item' + (muted ? ' is-muted' : '') }, [
           el('div', { className: 'row' }, [
             el('div', {}, body),
@@ -9255,7 +9331,8 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       var finding = companiesView === 'find';
       document.getElementById('companies-find-panel').style.display = finding ? 'block' : 'none';
       document.getElementById('companies-list-section').style.display = finding ? 'none' : 'block';
-      document.getElementById('companies-unverified-filters').style.display = companiesView === 'unverified' ? 'flex' : 'none';
+      document.getElementById('companies-source-filters').style.display = companiesView === 'verified' ? 'flex' : 'none';
+      document.getElementById('companies-identity-filters').style.display = companiesView === 'unresolved' ? 'flex' : 'none';
       if (finding) return;
 
       var needle = document.getElementById('companies-filter').value.trim();
@@ -9265,12 +9342,19 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       var matching = allCompanies.filter(function (c) {
         return matchesFilter([c.name, c.location, c.bio, c.signal].join(' '), needle);
       });
+      // Tabs filter on identity; the sub-filter inside Verified filters on job source. Keeping
+      // those on separate axes is the whole point -- a verified company with an unreadable board
+      // belongs under Verified, not hidden away under a failure tab.
       var visible = matching.filter(function (c) {
-        if (companiesView === 'removed') return c.status === 'dismissed';
-        if (companiesView === 'verified') return c.status === 'verified';
-        if (companiesView === 'unverified') {
-          if (c.status !== 'unverified') return false;
-          return !companiesUnverifiedReason || c.verify_reason === companiesUnverifiedReason;
+        if (companiesView === 'removed') return c.identity_status === 'dismissed';
+        if (companiesView === 'verified') {
+          if (c.identity_status !== 'verified') return false;
+          return !companiesSourceFilter || c.job_source_status === companiesSourceFilter;
+        }
+        if (companiesView === 'unresolved') {
+          var unresolvedStates = { unresolved: true, ambiguous: true, not_a_company: true };
+          if (!unresolvedStates[c.identity_status]) return false;
+          return !companiesIdentityFilter || c.identity_status === companiesIdentityFilter;
         }
         return false;
       });
@@ -9365,54 +9449,80 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       }
     });
 
-    // ---- Companies -> Search: Discovery -> Verify -----------------------------------------------
+    // ---- Companies -> Search: Identity -> Job source --------------------------------------------
     // Same generic engine Jobs uses (createPipelineFlow, defined further down -- function
     // declarations are hoisted, so calling it here before its own textual definition is fine).
-    // Only two stages, and deliberately no accumulator edge overrides: unlike Jobs' review_queue,
-    // neither 'verified' nor 'unverified' feeds a further stage in this diagram, so the default
-    // rule (an edge's committed volume is simply its target node's own count) is exactly right for
-    // both edges here. The Companies -> Jobs handoff (a jobs COUNT, not a companies one) sits in
-    // the same row, visually joined, but is deliberately not folded into this ribbon graph -- see
-    // the HTML/CSS comment on #companies-pipeline-row.
+    //
+    // Three columns now, matching the two real state axes plus the handoff. Both ribbon stages
+    // count COMPANIES, which is what makes a conserved flow honest between them: every discovered
+    // company lands in exactly one identity outcome, and every verified company lands in exactly
+    // one job-source outcome. The Pre-screen figure counts JOBS and is deliberately not a ribbon
+    // stage -- it sits in the same row, visually joined, but nothing about 24 companies producing
+    // 722 jobs conserves a quantity. See the CSS comment on #companies-pipeline-row.
     var CPF_NODES = [
-      { id: 'discovery_gate', label: 'Discovered', stage: 0, kind: 'gate' },
-      { id: 'unverified', label: 'Unverified', stage: 1, kind: 'reject' },
+      { id: 'discovered', label: 'Discovered', stage: 0, kind: 'gate' },
+      { id: 'unresolved', label: 'Unresolved', stage: 1, kind: 'reject' },
       { id: 'verified', label: 'Verified', stage: 1, kind: 'success' },
+      { id: 'no_source', label: 'No readable board', stage: 2, kind: 'reject' },
+      { id: 'scannable', label: 'Scannable', stage: 2, kind: 'success' },
     ];
-    var CPF_BRANCHES = { discovery_gate: ['unverified', 'verified'] };
-    var CPF_STAGE_TITLES = ['Discovery', 'Verify'];
-    // vbH/sourceHeight/colStep are Jobs' own #jobs-pipeline constants, unchanged. vbW=770 is those
-    // same constants' natural width for 2 stages instead of 3 (COL_MARGIN 66 + 1*colStep 550 +
-    // node width 10 + the same ~144-unit label margin Jobs reserves) -- see the CSS comment on
-    // #companies-pipeline for how this stays visually the same size as Jobs despite the smaller
-    // viewBox.
-    var companiesFlow = createPipelineFlow({ svgId: 'cpf-svg', nodes: CPF_NODES, branches: CPF_BRANCHES, stageTitles: CPF_STAGE_TITLES, vbW: 770, vbH: 340, sourceHeight: 200, colStep: 550 });
+    var CPF_BRANCHES = {
+      discovered: ['unresolved', 'verified'],
+      verified: ['no_source', 'scannable'],
+    };
+    var CPF_STAGE_TITLES = ['Discovery', 'Identity', 'Job source'];
+    // Jobs' own #jobs-pipeline constants, unchanged, so the two diagrams read at the same density.
+    var companiesFlow = createPipelineFlow({ svgId: 'cpf-svg', nodes: CPF_NODES, branches: CPF_BRANCHES, stageTitles: CPF_STAGE_TITLES, vbW: 1320, vbH: 340, sourceHeight: 200, colStep: 550 });
 
-    var cpfDiscovered = 0, cpfVerified = 0, cpfUnverified = 0;
+    var cpfCounts = { discovered: 0, unresolved: 0, verified: 0, no_source: 0, scannable: 0 };
 
     function cpfRefresh() {
-      var nodeCounts = { discovery_gate: Math.max(0, cpfDiscovered), unverified: cpfUnverified, verified: cpfVerified };
-      companiesFlow.setCounts(nodeCounts, { total: nodeCounts.discovery_gate + nodeCounts.unverified + nodeCounts.verified });
+      // 'verified' is an accumulator: it is both an outcome of Identity and the input to Job
+      // source, so its own node count is what still sits there un-forwarded, while the edge into it
+      // carries the full verified volume. Same shape as Jobs' review_queue.
+      var verifiedTotal = cpfCounts.verified;
+      var forwarded = cpfCounts.no_source + cpfCounts.scannable;
+      var nodeCounts = {
+        discovered: Math.max(0, cpfCounts.discovered),
+        unresolved: cpfCounts.unresolved,
+        verified: Math.max(0, verifiedTotal - forwarded),
+        no_source: cpfCounts.no_source,
+        scannable: cpfCounts.scannable,
+      };
+      companiesFlow.setCounts(nodeCounts, {
+        total: nodeCounts.discovered + cpfCounts.unresolved + verifiedTotal,
+        edgeOverrides: { 'discovered->verified': verifiedTotal },
+      });
     }
 
-    // Full reconciliation from the authoritative backend counts -- every /companies load resets
-    // Discovery/Verify from here, the same role setPfCounts plays for Jobs. Never bursts on its
-    // own; live per-company bursts come only from the discover/scan progress handlers below, which
-    // is where a real, individually-resolved company outcome actually becomes known.
-    // Every number here is explicitly unit-labeled and never combined with a number of a different
-    // unit as if they were comparable -- Discovery counts job postings (with unique companies as a
-    // secondary figure), Verify counts companies, Pre-screen counts jobs. E.g. never "found 269,
-    // verified 214, imported 57"; always "269 companies discovered, 214 verified, 57 jobs imported".
+    // Full reconciliation from the authoritative backend counts. Every figure comes from
+    // company_pipeline, which is computed once server-side (see companiesPipelineCounts and
+    // src/pipeline.ts) -- the diagram and the sentence below it read the same numbers, so they
+    // cannot disagree the way two independent client-side calculations could.
     function renderCompanyPipelineStats() {
       var p = companiesPipeline;
-      cpfDiscovered = p.discovered || 0;
-      cpfVerified = p.verified || 0;
-      cpfUnverified = p.unverified || 0;
+      var discovered = (p.identity_pending || 0) + (p.identity_verified || 0) + (p.identity_ambiguous || 0) +
+        (p.identity_unresolved || 0) + (p.identity_not_a_company || 0);
+
+      cpfCounts.discovered = p.identity_pending || 0;
+      // Ambiguous and not-a-company are identity failures alongside unresolved: none of them
+      // produced a company we can go read jobs from.
+      cpfCounts.unresolved = (p.identity_unresolved || 0) + (p.identity_ambiguous || 0) + (p.identity_not_a_company || 0);
+      cpfCounts.verified = p.identity_verified || 0;
+      cpfCounts.scannable = p.source_supported || 0;
+      cpfCounts.no_source = (p.source_unsupported_ats || 0) + (p.source_careers_only || 0) +
+        (p.source_no_board || 0) + (p.source_board_unreachable || 0);
       cpfRefresh();
+
       document.getElementById('cpfStatPrescreen').textContent = p.prescreen_jobs || 0;
+
+      // Every number carries its unit, and company figures are never added to job figures.
+      var plural = function (n, one, many) { return n + ' ' + (n === 1 ? one : many); };
       document.getElementById('companies-pipeline-summary').textContent =
-        (p.discovery_postings || 0) + ' job postings searched across ' + (p.discovery_companies || 0) + ' compan' + ((p.discovery_companies || 0) === 1 ? 'y' : 'ies') +
-        ' · ' + cpfVerified + ' verified · ' + cpfUnverified + ' unverified · ' + (p.prescreen_jobs || 0) + ' jobs imported into Jobs → Pre-screen.';
+        plural(discovered, 'company', 'companies') + ' discovered · ' +
+        (p.identity_verified || 0) + ' verified · ' +
+        plural(cpfCounts.scannable, 'company', 'companies') + ' with a readable job board · ' +
+        plural(p.prescreen_jobs || 0, 'job', 'jobs') + ' waiting in Jobs → Pre-screen.';
     }
 
     async function loadCompanies() {
@@ -9420,13 +9530,27 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       var data = await res.json();
       allCompanies = data.companies || [];
       companiesPipeline = data.company_pipeline || {};
-      document.getElementById('companies-verified-count').textContent = '(' + (companiesPipeline.verified || 0) + ')';
-      document.getElementById('companies-unverified-count').textContent = '(' + (companiesPipeline.unverified || 0) + ')';
-      document.getElementById('companies-removed-count').textContent = '(' + (companiesPipeline.dismissed || 0) + ')';
-      ['no_website', 'no_job_board', 'unsupported_ats', 'board_unreachable', 'ambiguous'].forEach(function (reason) {
-        document.getElementById('companies-reason-' + reason + '-count').textContent = '(' + (companiesPipeline['unverified_' + reason] || 0) + ')';
+      var p = companiesPipeline;
+      var unresolvedTotal = (p.identity_unresolved || 0) + (p.identity_ambiguous || 0) + (p.identity_not_a_company || 0);
+      var setCount = function (id, n) {
+        var node = document.getElementById(id);
+        if (node) node.textContent = '(' + (n || 0) + ')';
+      };
+      setCount('companies-verified-count', p.identity_verified);
+      setCount('companies-unresolved-count', unresolvedTotal);
+      setCount('companies-removed-count', p.identity_dismissed);
+
+      // Job-source sub-filter counts, scoped to verified companies -- same scoping the backend
+      // uses, so the tab total and the sum of its filters agree.
+      setCount('companies-source-all-count', p.identity_verified);
+      ['supported', 'unsupported_ats', 'careers_only', 'no_board', 'board_unreachable', 'pending'].forEach(function (k) {
+        setCount('companies-source-' + k + '-count', p['source_' + k]);
       });
-      document.getElementById('companies-reason-all-count').textContent = '(' + (companiesPipeline.unverified || 0) + ')';
+
+      setCount('companies-identity-all-count', unresolvedTotal);
+      ['unresolved', 'ambiguous', 'not_a_company'].forEach(function (k) {
+        setCount('companies-identity-' + k + '-count', p['identity_' + k]);
+      });
       renderCompanyPipelineStats();
       renderCompanies();
     }
@@ -9444,18 +9568,22 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         renderCompanies();
       });
     });
-    document.querySelectorAll('[data-unverified-reason]').forEach(function (button) {
-      button.addEventListener('click', function () {
-        companiesUnverifiedReason = button.dataset.unverifiedReason;
-        document.querySelectorAll('[data-unverified-reason]').forEach(function (item) {
-          item.classList.remove('active');
-          item.setAttribute('aria-pressed', 'false');
+    function wireSegmented(selector, datasetKey, onPick) {
+      document.querySelectorAll(selector).forEach(function (button) {
+        button.addEventListener('click', function () {
+          onPick(button.dataset[datasetKey]);
+          document.querySelectorAll(selector).forEach(function (item) {
+            item.classList.remove('active');
+            item.setAttribute('aria-pressed', 'false');
+          });
+          button.classList.add('active');
+          button.setAttribute('aria-pressed', 'true');
+          renderCompanies();
         });
-        button.classList.add('active');
-        button.setAttribute('aria-pressed', 'true');
-        renderCompanies();
       });
-    });
+    }
+    wireSegmented('[data-source-filter]', 'sourceFilter', function (v) { companiesSourceFilter = v; });
+    wireSegmented('[data-identity-filter]', 'identityFilter', function (v) { companiesIdentityFilter = v; });
 
     async function scanNewCompanies(statusEl) {
       var res = await api('/companies/scan', {
@@ -9471,10 +9599,11 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         // resolution alone (the discover-button handler below) only gets it as far as the
         // Discovery gate. One real per-company burst per event, same idea as Jobs' pipeline events.
         if (typeof event.verified === 'boolean') {
-          cpfDiscovered = Math.max(0, cpfDiscovered - 1);
-          if (event.verified) cpfVerified += 1; else cpfUnverified += 1;
+          // A scan result is a job-source outcome for an already-verified company, so it moves the
+          // company out of the Verified reservoir into one of the third-stage buckets.
+          if (event.verified) cpfCounts.scannable += 1; else cpfCounts.no_source += 1;
           cpfRefresh();
-          companiesFlow.burst(event.verified ? 'discovery_gate->verified' : 'discovery_gate->unverified', 1);
+          companiesFlow.burst(event.verified ? 'verified->scannable' : 'verified->no_source', 1);
         }
       });
     }
@@ -9498,6 +9627,13 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       statusEl.textContent = 'Searching real job postings…';
       statusEl.className = 'status';
       try {
+        // One press runs the configured search to completion. The old loop stopped after a bounded
+        // batch and told the candidate to click again ("19 search queries remaining"), which made
+        // them the scheduler for their own backlog. Every round resumes from a persisted per-query
+        // cursor, so this is continuation, not repetition, and stopping early only loses the round
+        // in flight.
+        var MAX_DISCOVERY_ROUNDS = 200;
+        var RATE_LIMIT_BACKOFF_SECONDS = 20;
         var round = 0, totalAdded = 0, totalDuplicates = 0, totalOffTarget = 0;
         var totalResolved = 0, totalUnresolved = 0, discoverData;
         do {
@@ -9520,13 +9656,15 @@ Let me check the placeholder embraces like a variable name, gets its value when 
             // already fully classified Unverified -- no board check could ever help it.
             if (event.stage === 'resolve' && event.company) {
               if (event.resolved) {
-                cpfDiscovered += 1;
+                // A confirmed website is an Identity outcome: the company moves from the
+                // Discovery gate into Verified, where the job-source stage picks it up.
+                cpfCounts.verified += 1;
                 cpfRefresh();
-                companiesFlow.burstIntoGate('discovery_gate', 1);
+                companiesFlow.burst('discovered->verified', 1);
               } else {
-                cpfUnverified += 1;
+                cpfCounts.unresolved += 1;
                 cpfRefresh();
-                companiesFlow.burst('discovery_gate->unverified', 1);
+                companiesFlow.burst('discovered->unresolved', 1);
               }
             }
           });
@@ -9535,7 +9673,15 @@ Let me check the placeholder embraces like a variable name, gets its value when 
           totalOffTarget += discoverData.off_target || 0;
           totalResolved += discoverData.domain_resolved || 0;
           totalUnresolved += discoverData.domain_unresolved || 0;
-        } while (round < 10 && !discoverData.rate_limited && discoverData.streams_remaining > 0);
+          // Rate limited: wait and continue rather than stopping and asking for another click.
+          // The cursor is untouched by a 429, so resuming re-fetches the same page safely.
+          if (discoverData.rate_limited && round < MAX_DISCOVERY_ROUNDS) {
+            for (var wait = RATE_LIMIT_BACKOFF_SECONDS; wait > 0; wait -= 1) {
+              statusEl.textContent = 'Paused at the job board rate limit — resuming in ' + wait + 's…';
+              await new Promise(function (r) { setTimeout(r, 1000); });
+            }
+          }
+        } while (round < MAX_DISCOVERY_ROUNDS && (discoverData.streams_remaining > 0 || discoverData.rate_limited));
 
         // Always re-check job boards, not only when this click found something new -- scanCompanies
         // covers every eligible company each call (including prior Unverified rows worth retrying,
@@ -9553,10 +9699,12 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         }
         if (totalDuplicates) parts.push(totalDuplicates + ' already on your list.');
         if (totalOffTarget) parts.push(totalOffTarget + ' rejected as outside ' + (discoverData.locations || 'your locations') + '.');
-        if (discoverData.rate_limited) {
-          parts.push('Search paused at the job board’s rate limit — click Find companies again to continue.');
-        } else if (discoverData.streams_remaining > 0) {
-          parts.push(discoverData.streams_remaining + ' search quer' + (discoverData.streams_remaining === 1 ? 'y' : 'ies') + ' left to check — click Find companies again to continue.');
+        if (discoverData.streams_remaining > 0) {
+          parts.push(discoverData.streams_remaining + ' search quer' + (discoverData.streams_remaining === 1 ? 'y' : 'ies') +
+            ' still queued; they resume automatically on the next run.');
+        }
+        if (discoverData.interrupted) {
+          parts.push('The progress stream dropped before the end — everything completed so far is saved.');
         }
         if (discoverData.query_errors && discoverData.query_errors.length) {
           parts.push(discoverData.query_errors.length + ' quer' + (discoverData.query_errors.length === 1 ? 'y' : 'ies') + ' failed and will retry next run.');
