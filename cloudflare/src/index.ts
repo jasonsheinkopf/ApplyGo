@@ -6233,6 +6233,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     .mobile-subnav {
       display: flex; flex-direction: column; align-items: center; gap: 0.3rem; margin-bottom: 1rem;
     }
+    .mobile-subnav-row { display: flex; align-items: center; justify-content: center; gap: 0.75rem; width: 100%; }
     .mobile-subnav-dots { display: flex; align-items: center; gap: 0.4rem; }
     .mobile-subnav-dot {
       width: 6px; height: 6px; border-radius: 50%; background: var(--border-strong); padding: 0;
@@ -6240,6 +6241,16 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     }
     .mobile-subnav-dot.active { background: var(--accent); transform: scale(1.25); }
     .mobile-subnav-label { font-size: 0.95rem; font-weight: 650; color: var(--text); }
+    /* Backup for the not-working swipe gesture: same-sized tap targets flanking the dots so
+       there's always a reliable way to move between subtabs on mobile. */
+    .mobile-subnav-arrow {
+      display: flex; align-items: center; justify-content: center; flex: 0 0 auto;
+      width: 2.4rem; height: 2.4rem; border-radius: 50%; border: 1px solid var(--border);
+      background: var(--surface); color: var(--text); padding: 0;
+    }
+    .mobile-subnav-arrow svg { display: block; width: 18px; height: 18px; }
+    .mobile-subnav-arrow:disabled { opacity: 0.35; }
+    .mobile-subnav-arrow:not(:disabled):active { background: var(--surface-2); }
   }
   /* Settings tab's gear icon replaces its text label but keeps the same button box, so it needs
      to center the icon the way a short text label centers itself. */
@@ -6537,7 +6548,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
   <nav id="workflow-nav">
     <button class="tab active" data-tab="profile" type="button">Profile</button>
     <button class="tab" data-tab="careers" type="button">Careers</button>
-    <button class="tab" data-tab="resume" type="button">Resume</button>
+    <button class="tab" data-tab="resume" type="button">CV</button>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
     <button class="tab" data-tab="jindr" type="button">Jindr</button>
@@ -7297,6 +7308,9 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       return label || button.textContent.trim();
     }
 
+    var ARROW_LEFT_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"></path></svg>';
+    var ARROW_RIGHT_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"></path></svg>';
+
     function initMobileSubnav(container) {
       if (!container) return null;
       var buttons = Array.prototype.slice.call(container.children).filter(function (node) {
@@ -7306,13 +7320,21 @@ Let me check the placeholder embraces like a variable name, gets its value when 
 
       container.classList.add('has-mobile-subnav');
       var nav = el('div', { className: 'mobile-subnav' });
+      var row = el('div', { className: 'mobile-subnav-row' });
+      var prevBtn = el('button', { className: 'mobile-subnav-arrow', type: 'button', innerHTML: ARROW_LEFT_SVG });
+      prevBtn.setAttribute('aria-label', 'Previous tab');
       var dots = el('div', { className: 'mobile-subnav-dots' });
       dots.setAttribute('role', 'tablist');
       dots.setAttribute('aria-hidden', 'true');
+      var nextBtn = el('button', { className: 'mobile-subnav-arrow', type: 'button', innerHTML: ARROW_RIGHT_SVG });
+      nextBtn.setAttribute('aria-label', 'Next tab');
       var label = el('div', { className: 'mobile-subnav-label' });
       label.setAttribute('aria-live', 'polite');
       buttons.forEach(function () { dots.appendChild(el('span', { className: 'mobile-subnav-dot' })); });
-      nav.appendChild(dots);
+      row.appendChild(prevBtn);
+      row.appendChild(dots);
+      row.appendChild(nextBtn);
+      nav.appendChild(row);
       nav.appendChild(label);
       container.parentNode.insertBefore(nav, container);
 
@@ -7324,6 +7346,8 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         var idx = activeIndex();
         Array.prototype.forEach.call(dots.children, function (dot, i) { dot.classList.toggle('active', i === idx); });
         label.textContent = subtabLabelText(buttons[idx]);
+        prevBtn.disabled = idx <= 0;
+        nextBtn.disabled = idx >= buttons.length - 1;
       }
       // Deferred rather than run inline: this listener is wired up before the section's own
       // click handler that actually moves the .active class (e.g. the Companies/Jobs view
@@ -7334,10 +7358,13 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       buttons.forEach(function (button) { button.addEventListener('click', function () { setTimeout(sync, 0); }); });
       sync();
 
-      return {
+      var controller = {
         next: function () { var idx = activeIndex(); if (idx < buttons.length - 1) buttons[idx + 1].click(); },
         prev: function () { var idx = activeIndex(); if (idx > 0) buttons[idx - 1].click(); },
       };
+      prevBtn.addEventListener('click', controller.prev);
+      nextBtn.addEventListener('click', controller.next);
+      return controller;
     }
 
     [
