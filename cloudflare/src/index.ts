@@ -181,6 +181,8 @@ type Session = {
   device_name: string;
   expires_at: string;
   revoked_at: string | null;
+  /** 'full' for a normal device; 'read_only' for an MCP/reporting credential. */
+  scope: string;
 };
 
 const encoder = new TextEncoder();
@@ -534,7 +536,7 @@ async function requireSession(request: Request, env: Env): Promise<Session | Res
   if (!token) return json({ error: "authentication_required" }, 401);
   const tokenHash = await sha256(token);
   const session = await env.DB.prepare(
-    `SELECT id, device_name, expires_at, revoked_at
+    `SELECT id, device_name, expires_at, revoked_at, scope
      FROM device_sessions
      WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > datetime('now')`,
   )
@@ -547,6 +549,14 @@ async function requireSession(request: Request, env: Env): Promise<Session | Res
       ? json({ error: "invalid_or_expired_session" }, 401)
       : json({ error: "invalid_or_expired_session" }, 401, { "set-cookie": clearSessionCookie() });
   }
+  // The whole read-only guarantee, in one place. A read_only credential may look at anything it is
+  // allowed to fetch, and may change nothing -- enforced here rather than route by route, so a
+  // route added tomorrow is covered without anyone remembering to mark it. Every mutation in this
+  // app is a POST/PUT/PATCH/DELETE, so restricting the method is restricting the capability.
+  if (session.scope === "read_only" && request.method !== "GET" && request.method !== "HEAD") {
+    return json({ error: "read_only_credential", detail: "This token can read ApplyGo data but cannot change anything." }, 403);
+  }
+
   await env.DB.prepare("UPDATE device_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?")
     .bind(session.id)
     .run();
@@ -598,6 +608,32 @@ async function exchangeEnrollment(request: Request, env: Env): Promise<Response>
   const payload: Record<string, unknown> = { authenticated: true, device_id: sessionId, expires_in_days: days };
   if (body.return_token === true) payload.token = token;
   return json(payload, 201, { "set-cookie": sessionCookie(token, days * 86400) });
+}
+
+/**
+ * POST /devices/read-only -- mints a credential that can read ApplyGo but change nothing.
+ *
+ * Requires an existing full session, so this is "the signed-in user issuing themselves a reporting
+ * key", not a new way in. The raw token is returned exactly once and only its hash is stored; there
+ * is no endpoint that can read it back, so a lost token is revoked and replaced, never recovered.
+ */
+async function createReadOnlyToken(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { label?: string; days?: number };
+  const token = randomToken();
+  const tokenHash = await sha256(token);
+  const days = Math.min(Math.max(Number(body.days) || 365, 1), 365);
+  const label = (body.label || "MCP read-only").slice(0, 120);
+  await env.DB.prepare(
+    `INSERT INTO device_sessions (id, token_hash, device_name, expires_at, scope)
+     VALUES (?, ?, ?, datetime('now', ?), 'read_only')`,
+  )
+    .bind(crypto.randomUUID(), tokenHash, label, `+${days} days`)
+    .run();
+  // Deliberately not set as a cookie: this is a machine credential for an MCP client, and putting
+  // it in the browser's cookie jar would downgrade the current session to read-only.
+  return json({ token, scope: "read_only", label, expires_in_days: days }, 201);
 }
 
 async function listDevices(request: Request, env: Env): Promise<Response> {
@@ -2337,15 +2373,17 @@ async function listCompanies(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
   const profileId = await getOrCreateProfileId(env);
   const rows = await env.DB.prepare(
-    `SELECT id, name, website, careers_url, bio, ats_provider, status, verify_reason, source,
-            scan_note, last_scanned_at, last_verified_at, open_jobs, created_at, signal, location,
-            website_source, website_confidence
+    `SELECT id, name, source_name, website, careers_url, board_url, bio, ats_provider, source,
+            identity_status, job_source_status, status, verify_reason,
+            scan_note, last_scanned_at, last_verified_at, job_source_checked_at, open_jobs,
+            created_at, signal, location, website_source, website_confidence, website_evidence
      FROM companies WHERE profile_id = ? ORDER BY name COLLATE NOCASE ASC`,
   )
     .bind(profileId)
     .all();
   const pending = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status = 'verified' AND last_scanned_at IS NULL",
+    `SELECT COUNT(*) AS n FROM companies WHERE profile_id = ?
+       AND identity_status = 'verified' AND job_source_status = 'pending'`,
   )
     .bind(profileId)
     .first<{ n: number }>();
@@ -12013,6 +12051,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "GET" && url.pathname === "/companies") return listCompanies(request, env);
     if (request.method === "POST" && url.pathname === "/companies") return createCompany(request, env);
     if (request.method === "POST" && url.pathname === "/companies/bulk") return bulkAddCompanies(request, env);
+    if (request.method === "POST" && url.pathname === "/devices/read-only") return createReadOnlyToken(request, env);
     if (request.method === "GET" && url.pathname === "/companies/search-terms") return getCompanySearchTerms(request, env);
     if (request.method === "PUT" && url.pathname === "/companies/search-terms") return setCompanySearchTerms(request, env);
     if (request.method === "POST" && url.pathname === "/companies/search-terms/regenerate") return regenerateCompanySearchTerms(request, env);
