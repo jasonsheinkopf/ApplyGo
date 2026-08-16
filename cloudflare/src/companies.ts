@@ -328,6 +328,24 @@ function detectAtsInHtml(html: string): { provider: AtsProvider; token: string }
   return null;
 }
 
+/**
+ * Detects an ATS directly from a URL, rather than from a page's HTML.
+ *
+ * The same ATS_PATTERNS apply -- a board URL contains the provider's own hostname by definition --
+ * but nothing used to run them against a URL we had *already resolved and stored*. That gap is
+ * visible in the live database: "General Matter" sits at ats_provider='none', job source "no board
+ * found", with `https://job-boards.greenhouse.io/generalmatter` stored on the very same row. Its
+ * jobs are readable right now and were never imported, and the row displays a board link beside
+ * the words "no job board" -- the contradiction reported from the UI.
+ *
+ * Cheap and offline: pure pattern matching on a string, no request. Worth running on any careers
+ * or board URL, however it was obtained (redirect target, manual entry, prior scan).
+ */
+export function detectAtsFromUrl(url: string): { provider: AtsProvider; token: string } | null {
+  if (!url) return null;
+  return detectAtsInHtml(url);
+}
+
 export type BoardResolution = { provider: AtsProvider; token: string } | null;
 
 /**

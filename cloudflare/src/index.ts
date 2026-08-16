@@ -2211,19 +2211,6 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
     return json({ id, applied: false });
   }
 
-  if (body.action === "restore_snapshot") {
-    // Undo for Jindr. Swipes only ever change manual_status/interested_at -- never fit_score/
-    // fit_status -- so undo just needs to revert those, safe since Jindr only ever swipes cards
-    // that started out at manual_status='normal'.
-    await env.DB.prepare(
-      `UPDATE job_postings SET manual_status = 'normal', interested_at = NULL, removed_at = NULL,
-       removed_from_status = NULL, removal_reason = '' WHERE id = ?`,
-    )
-      .bind(id)
-      .run();
-    return json({ id, manual_status: "normal" });
-  }
-
   return json({ error: "unknown_action" }, 400);
 }
 
@@ -6175,8 +6162,8 @@ Let me check the placeholder embraces like a variable name, gets its value when 
      back in seconds, so they stay quiet and only redden on hover. These two -- resetting a whole
      pipeline stage, deleting an entire collection -- can throw away hours of scanning, and a
      confirm() dialog that only appears after the click is too late to be the first warning. Same
-     red-outline vocabulary Jindr's "Not for me" already established, so it reads as a known shape
-     rather than a new one. */
+     red-outline vocabulary the Jobs cards' own "Not for me" already established, so it reads as a
+     known shape rather than a new one. */
   .row-actions button.destructive {
     border-color: var(--error); color: var(--error);
   }
@@ -6386,25 +6373,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     font-size: 0.9rem; border-left: 3px solid var(--accent); padding: 0.5rem 0.75rem;
     background: var(--surface-2, rgba(127,127,127,0.08)); border-radius: 0 0.4rem 0.4rem 0;
   }
-  /* One-at-a-time review card. touch-action:pan-y leaves vertical scroll to the browser and hands
-     horizontal movement to the drag handler; select:none stops a fast swipe from also highlighting
-     the card's text on desktop. */
-  /* Jindr is the one screen built around a single decision, so it gets to look like one instead of
-     like a Jobs row that happens to be alone on the page. Capping the section and centring it
-     stops the card stranding itself in the top-left corner of a wide window; the extra padding and
-     larger type inside are what make it read as "look at this one thing" rather than "here is a
-     list of length one". */
-  #jindr-section { max-width: 34rem; margin-inline: auto; }
-  .jindr-card {
-    border: 1px solid var(--border); border-radius: var(--radius); padding: 1.6rem 1.5rem;
-    background: var(--surface-2); touch-action: pan-y; user-select: none; cursor: grab;
-  }
-  .jindr-card .row-title { font-size: 1.25rem; line-height: 1.3; }
-  .jindr-card .row-title-line { gap: 0.55rem; margin-bottom: 0.15rem; }
-  .jindr-card .job-reason { font-size: 0.95rem; margin-top: 0.7rem; }
-  .jindr-card.dragging { cursor: grabbing; transition: none; }
-  .jindr-facts, .row-facts { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.6rem 0; }
-  .row-facts { margin: 0.3rem 0 0; }
+  .row-facts { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.3rem 0 0; }
   /* Label above value, not squeezed onto one line -- a long value (e.g. a full remote/onsite
      policy sentence) used to force a single-line badge past the edge of the card/screen instead
      of wrapping. min-width:0 lets the value actually wrap inside a flex-wrap parent. */
@@ -6418,12 +6387,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     color: var(--text-muted);
   }
   .fact-chip .fact-value { color: var(--text); word-break: break-word; }
-  .jindr-actions { display: flex; gap: 0.75rem; margin-top: 1.1rem; }
-  .jindr-actions button { flex: 1; font-size: 0.95rem; padding: 0.75rem; margin-top: 0; }
-  .jindr-actions button.danger {
-    background: var(--surface); border: 1px solid var(--error); color: var(--error);
-  }
-  .jindr-actions button.danger:hover:not(:disabled) { background: var(--error-soft); opacity: 1; }
   /* Compact green action -- Recommended/Not Recommended's "Interested" and Removed's "Re-add" -- same quiet,
      colors-on-hover convention as .danger, just green instead of red. */
   .row-actions button.success:hover:not(:disabled) { color: var(--success); border-color: var(--success); }
@@ -6540,7 +6503,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     <button class="tab" data-tab="resume" type="button">Resume</button>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
-    <button class="tab" data-tab="jindr" type="button">Jindr</button>
     <button class="tab tab-icon" data-tab="settings" type="button" aria-label="Settings" title="Settings">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="12" r="3"></circle>
@@ -7066,31 +7028,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     </section>
   </div>
 
-  <div id="panel-jindr" class="panel">
-    <section id="jindr-section">
-      <h2>Jindr</h2>
-      <p class="hint">One posting at a time, best match first. Judge it and move on -- the same Interested/Not-for-me decision the Jobs tab makes, just without the scrolling.</p>
-      <p id="jindr-progress" class="summary-line"></p>
-      <div id="jindr-empty" class="empty" style="display:none">All caught up -- nothing left to review. New matches will show up here after your next "Find my matches" pass.</div>
-      <div id="jindr-card" class="jindr-card" style="display:none">
-        <div class="row-title-line">
-          <a id="jindr-title" class="row-title" target="_blank" rel="noopener"></a>
-          <span id="jindr-score" class="badge strong"></span>
-        </div>
-        <div id="jindr-meta" class="row-meta"></div>
-        <div id="jindr-facts" class="jindr-facts"></div>
-        <p id="jindr-reason" class="job-reason"></p>
-        <div id="jindr-missing"></div>
-        <div class="jindr-actions">
-          <button id="jindr-reject" class="danger" type="button">✕ Not for me</button>
-          <button id="jindr-interested" type="button">♥ Interested</button>
-        </div>
-      </div>
-      <button id="jindr-undo" class="secondary" type="button" style="display:none">Undo</button>
-      <p id="jindr-status" class="status" role="status" aria-live="polite"></p>
-    </section>
-  </div>
-
   <div id="panel-settings" class="panel">
     <div class="segmented-control" role="group" aria-label="Settings sections">
       <button class="active" data-settings-subtab="devices" type="button" aria-pressed="true">Devices</button>
@@ -7429,7 +7366,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     }
     function text(value) { return document.createTextNode(value); }
 
-    // Shared by the Jindr card and the Jobs tab rows -- label above value so a long value (a full
+    // Shared by every Jobs tab row -- label above value so a long value (a full
     // sentence, not just a short word) wraps inside the chip instead of forcing a single-line
     // badge past the edge of the card or screen.
     function factChip(fact) {
@@ -7531,7 +7468,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     });
 
     // Shows what the saved free text was actually understood to mean, using the same chip the
-    // Jindr and Jobs cards use -- so the columns you'll see there are visible before any scan runs.
+    // Jobs cards use -- so the columns you'll see there are visible before any scan runs.
     function renderCareAboutTopics(topics) {
       var host = document.getElementById('care-about-topics');
       host.innerHTML = '';
@@ -9410,11 +9347,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       interested: { text: 'Interested', cls: 'strong' },
       applied: { text: 'Applied', cls: 'strong' },
     };
-    // Jindr still queues directly off the AI pipeline's own fit_status buckets -- it only ever
-    // shows already-rated, not-yet-decided postings, independent of the Jobs page's six subtabs.
-    var QUEUED_STATUSES = { unassessed: true, screened_in: true };
-    var RULED_OUT_STATUSES = { reject: true, screened_out: true };
-
     var matchThreshold = 70;
     var jobsView = 'search';
 
@@ -9454,164 +9386,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       if (reload !== false) await loadJobs();
       return data;
     }
-
-    // Jindr: the same judged-matches bucket the Jobs tab shows, one at a time instead of scrolled,
-    // always ordered best-match-first regardless of whatever sort the Jobs tab currently has
-    // selected. The queue is a plain snapshot taken when the tab is opened -- not rebuilt on every
-    // loadJobs() -- so a background scan or reassess finishing mid-review doesn't reshuffle the
-    // stack out from under you.
-    var jindrQueue = [];
-    var jindrIndex = 0;
-    var jindrLastSwipe = null;
-
-    function jindrBuildQueue() {
-      jindrQueue = allJobs.filter(function (j) {
-        return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status] && j.manual_status === 'normal';
-      }).sort(jobSortComparator('score'));
-      jindrIndex = 0;
-      jindrLastSwipe = null;
-      renderJindrCard();
-    }
-
-    function renderJindrCard() {
-      document.getElementById('jindr-undo').style.display = jindrLastSwipe ? 'inline-block' : 'none';
-      document.getElementById('jindr-status').textContent = '';
-
-      if (jindrIndex >= jindrQueue.length) {
-        document.getElementById('jindr-progress').textContent = jindrQueue.length
-          ? 'Reviewed all ' + jindrQueue.length + '.' : '';
-        document.getElementById('jindr-card').style.display = 'none';
-        document.getElementById('jindr-empty').style.display = 'block';
-        return;
-      }
-
-      document.getElementById('jindr-empty').style.display = 'none';
-      document.getElementById('jindr-card').style.display = 'block';
-      var card = document.getElementById('jindr-card');
-      card.style.transform = '';
-      card.classList.remove('dragging');
-
-      var job = jindrQueue[jindrIndex];
-      document.getElementById('jindr-progress').textContent = (jindrIndex + 1) + ' of ' + jindrQueue.length + ' to review';
-
-      var titleEl = document.getElementById('jindr-title');
-      titleEl.textContent = job.title;
-      if (job.source_url) { titleEl.href = job.source_url; } else { titleEl.removeAttribute('href'); }
-
-      var hasScore = job.fit_score !== null && job.fit_score !== undefined;
-      var scoreEl = document.getElementById('jindr-score');
-      scoreEl.textContent = hasScore ? job.fit_score + '% match' : 'Not yet scored';
-      // The class was hardcoded to "strong" in the markup, so a 55% here looked exactly as settled
-      // as a 92% -- the same flattening the Jobs rows had. Derive it from the posting's own status
-      // via the shared label table instead.
-      var scoreInfo = FIT_LABELS[job.fit_status] || FIT_LABELS.unassessed;
-      scoreEl.className = ('badge ' + scoreInfo.cls).trim();
-
-      document.getElementById('jindr-meta').textContent = [job.company, job.location].filter(Boolean).join(' · ');
-
-      var detail = {};
-      try { detail = JSON.parse(job.fit_detail_json || '{}'); } catch (e) { detail = {}; }
-      var factsHost = document.getElementById('jindr-facts');
-      factsHost.innerHTML = '';
-      (detail.facts || []).map(factChip).filter(Boolean).forEach(function (chip) { factsHost.appendChild(chip); });
-
-      document.getElementById('jindr-reason').textContent = job.fit_reason || '';
-
-      var missing = [];
-      try { missing = JSON.parse(job.fit_missing_json || '[]'); } catch (e) { missing = []; }
-      var missingHost = document.getElementById('jindr-missing');
-      missingHost.innerHTML = '';
-      if (missing.length) {
-        missingHost.appendChild(el('p', { className: 'job-missing', textContent: 'Gaps: ' + missing.join('; ') }));
-      }
-    }
-
-    function jindrSwipe(action) {
-      if (jindrIndex >= jindrQueue.length) return;
-      var job = jindrQueue[jindrIndex];
-      // Swipes only ever change manual_status/interested_at, never fit_score/fit_status, so undo
-      // just needs the job id to revert -- there's no AI-field snapshot to hold onto anymore.
-      jindrLastSwipe = job.id;
-      jindrIndex += 1;
-      renderJindrCard();
-      // Fired after the UI has already moved on -- reviewing one posting shouldn't stall on a
-      // round trip the same way a swipe app never waits for the server before showing the next card.
-      submitJobFit(job.id, action).catch(function (err) {
-        document.getElementById('jindr-status').textContent = 'Error saving that decision: ' + err.message;
-        document.getElementById('jindr-status').className = 'status error';
-      });
-    }
-
-    document.getElementById('jindr-interested').addEventListener('click', function () { jindrSwipe('interested'); });
-    document.getElementById('jindr-reject').addEventListener('click', function () { jindrSwipe('removed'); });
-
-    document.getElementById('jindr-undo').addEventListener('click', async function () {
-      if (!jindrLastSwipe) return;
-      var jobId = jindrLastSwipe;
-      var button = this;
-      button.disabled = true;
-      try {
-        await api('/jobs/' + encodeURIComponent(jobId) + '/fit', {
-          method: 'PATCH',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ action: 'restore_snapshot' }),
-        });
-        jindrIndex -= 1;
-        jindrLastSwipe = null;
-        renderJindrCard();
-        await loadJobs();
-      } catch (err) {
-        document.getElementById('jindr-status').textContent = 'Error: ' + err.message;
-        document.getElementById('jindr-status').className = 'status error';
-      } finally {
-        button.disabled = false;
-      }
-    });
-
-    // Drag-to-swipe: a bonus on top of the buttons above, not a replacement -- pointer events so
-    // it works with both touch and mouse, translateX follows the pointer, releasing past a distance
-    // threshold commits to the same action the corresponding button would.
-    (function () {
-      var card = document.getElementById('jindr-card');
-      var dragging = false;
-      var startX = 0;
-      var dx = 0;
-      var THRESHOLD = 100;
-
-      card.addEventListener('pointerdown', function (event) {
-        if (jindrIndex >= jindrQueue.length) return;
-        // The buttons are children of the card -- without this, pressing one starts a drag first
-        // (capturing the pointer to the card) and the button never sees its own click at all.
-        if (event.target.closest('.jindr-actions')) return;
-        dragging = true;
-        startX = event.clientX;
-        dx = 0;
-        card.classList.add('dragging');
-        card.setPointerCapture(event.pointerId);
-      });
-      card.addEventListener('pointermove', function (event) {
-        if (!dragging) return;
-        dx = event.clientX - startX;
-        card.style.transform = 'translateX(' + dx + 'px) rotate(' + (dx / 20) + 'deg)';
-      });
-      function endDrag() {
-        if (!dragging) return;
-        dragging = false;
-        card.classList.remove('dragging');
-        if (dx > THRESHOLD) {
-          jindrSwipe('interested');
-        } else if (dx < -THRESHOLD) {
-          jindrSwipe('removed');
-        } else {
-          card.style.transform = '';
-        }
-        dx = 0;
-      }
-      card.addEventListener('pointerup', endDrag);
-      card.addEventListener('pointercancel', endDrag);
-    })();
-
-    document.querySelector('[data-tab="jindr"]').addEventListener('click', jindrBuildQueue);
 
     // Shared title/badge/meta/facts/reason/missing block for Recommended, Not Recommended, Unrated,
     // AI Ruled Out, and manually removed cards.
