@@ -68,8 +68,8 @@ import {
   type CompanySearchTerm,
   type VerifyReason,
   atsDisplayName,
-  classifyVerification,
   companyNameKey,
+  detectAtsFromUrl,
   companySearchTermsFromTitles,
   fetchBoardJobs,
   fetchMissingDescriptions,
@@ -81,11 +81,20 @@ import {
   mergeCompanySearchTerms,
   parseLocationFilter,
   resolveBoard,
-  resolveCompanyDomain,
   verifyWebsite,
 } from "./companies";
 import { type AdzunaPosting, adzunaConfigured, aggregateCompanies, searchAdzunaPage } from "./adzuna";
 import { resolveWebsiteViaSearch } from "./websearch";
+import { companyIdentity, isNonCompanyName } from "./identity";
+import { PRESCREEN_PREDICATE, companyFunnel, companyToJobHandoff, funnelViolations } from "./pipeline";
+import {
+  type IdentityStatus,
+  type JobSourceStatus,
+  isScannable,
+  reconcileCompanyState,
+} from "./companystate";
+import { CONFIDENCE_FLOOR, type DiscoveryEvidence, resolveWebsiteDeterministic, verifyCandidate } from "./resolver";
+
 import {
   CARE_ABOUT_TOPICS_SCHEMA,
   type CareAboutTopic,
@@ -1914,6 +1923,16 @@ async function jobPipelineCounts(env: Env, threshold?: number): Promise<Record<s
     else counts.bad_fit += row.n;
   }
   counts.total = total;
+
+  // THE shared Pre-screen figure -- the identical predicate Companies uses, imported from
+  // pipeline.ts rather than restated here. Companies' last node and Jobs' first node are the same
+  // rows by construction, which is what makes moving between the two pages continue one diagram
+  // instead of showing two numbers that nearly agree.
+  const prescreen = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM job_postings WHERE ${PRESCREEN_PREDICATE}`,
+  ).first<{ n: number }>();
+  counts.prescreen_jobs = prescreen?.n ?? 0;
+
   return counts;
 }
 
@@ -1937,40 +1956,35 @@ async function jobPipelineCounts(env: Env, threshold?: number): Promise<Record<s
  *   they're reading the same rows, not two independently computed totals that could drift apart.
  */
 async function companiesPipelineCounts(env: Env, profileId: string): Promise<Record<string, number>> {
+  // Grouped on the two real axes. The legacy status/verify_reason pair is no longer read here --
+  // it is a projection now, not the source of truth, and counting from a projection is how the
+  // page ended up disagreeing with itself.
   const rows = await env.DB.prepare(
-    `SELECT status, verify_reason, COUNT(*) AS n FROM companies
-     WHERE profile_id = ? GROUP BY status, verify_reason`,
+    `SELECT identity_status, job_source_status, COUNT(*) AS n FROM companies
+     WHERE profile_id = ? GROUP BY identity_status, job_source_status`,
   )
     .bind(profileId)
-    .all<{ status: string; verify_reason: string; n: number }>();
+    .all<{ identity_status: string; job_source_status: string; n: number }>();
 
   const counts: Record<string, number> = {
-    discovered: 0,
-    verified: 0,
-    unverified: 0,
-    unverified_no_website: 0,
-    unverified_no_job_board: 0,
-    unverified_unsupported_ats: 0,
-    unverified_board_unreachable: 0,
-    unverified_ambiguous: 0,
-    dismissed: 0,
+    identity_pending: 0, identity_verified: 0, identity_ambiguous: 0,
+    identity_unresolved: 0, identity_not_a_company: 0, identity_dismissed: 0,
+    source_pending: 0, source_supported: 0, source_unsupported_ats: 0,
+    source_careers_only: 0, source_no_board: 0, source_board_unreachable: 0,
   };
   let total = 0;
   for (const row of rows.results ?? []) {
     total += row.n;
-    if (row.status === "dismissed") counts.dismissed += row.n;
-    else if (row.status === "discovered") counts.discovered += row.n;
-    else if (row.status === "verified") counts.verified += row.n;
-    else if (row.status === "unverified") {
-      counts.unverified += row.n;
-      const key = `unverified_${row.verify_reason}`;
-      if (key in counts) counts[key] += row.n;
+    const identityKey = `identity_${row.identity_status}`;
+    if (identityKey in counts) counts[identityKey] += row.n;
+    // Job-source counts are scoped to verified companies, matching the funnel: a pending job source
+    // on an unresolved company means "never reached", not "checked and found nothing".
+    if (row.identity_status === "verified") {
+      const sourceKey = `source_${row.job_source_status}`;
+      if (sourceKey in counts) counts[sourceKey] += row.n;
     }
   }
   counts.total = total;
-  // "Unique companies discovered" for the Discovery stage's secondary stat -- everything that isn't
-  // dismissed (dismissed is a removal decision, not a discovery-stage concept).
-  counts.discovery_companies = total - counts.dismissed;
 
   const streams = await env.DB.prepare(
     "SELECT COALESCE(SUM(postings_seen), 0) AS n FROM company_discovery_streams WHERE profile_id = ?",
@@ -1979,10 +1993,20 @@ async function companiesPipelineCounts(env: Env, profileId: string): Promise<Rec
     .first<{ n: number }>();
   counts.discovery_postings = streams?.n ?? 0;
 
+  // THE shared Pre-screen number. Same predicate Jobs uses, imported rather than restated, so the
+  // two pages cannot drift.
   const prescreen = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM job_postings WHERE company_id IS NOT NULL AND fit_status = 'unassessed'",
+    `SELECT COUNT(*) AS n FROM job_postings WHERE ${PRESCREEN_PREDICATE}`,
   ).first<{ n: number }>();
   counts.prescreen_jobs = prescreen?.n ?? 0;
+
+  // Legacy aliases, still read by parts of the UI not yet migrated. Derived from the new axes so
+  // they cannot disagree with them.
+  counts.verified = counts.identity_verified;
+  counts.discovered = counts.identity_pending;
+  counts.dismissed = counts.identity_dismissed;
+  counts.unverified = counts.identity_unresolved + counts.identity_ambiguous;
+  counts.discovery_companies = total - counts.identity_dismissed;
 
   return counts;
 }
@@ -2347,6 +2371,13 @@ async function listCompanies(request: Request, env: Env): Promise<Response> {
   });
 }
 
+/**
+ * The single insert path for a company, and the only place a new row's state is decided.
+ *
+ * Everything written here goes through companyIdentity (so the raw aggregator string is preserved
+ * as source_name while the display name is cleaned) and reconcileCompanyState (so an impossible
+ * identity/job-source combination is corrected here rather than surfacing in the UI later).
+ */
 async function addCompanyRow(
   env: Env,
   profileId: string,
@@ -2356,35 +2387,82 @@ async function addCompanyRow(
     careers_url: string;
     bio: string;
     location: string;
-    status: string;
     source: string;
-    verify_reason?: string;
+    identity?: IdentityStatus;
+    jobSource?: JobSourceStatus;
+    websiteConfidence?: number | null;
+    websiteEvidence?: string;
+    websiteSource?: string;
+    boardUrl?: string;
     scan_note?: string;
     signal?: string;
   },
 ): Promise<boolean> {
+  const identity = companyIdentity(company.name);
+  const { state } = reconcileCompanyState({
+    identity: company.identity ?? "pending",
+    jobSource: company.jobSource ?? "pending",
+    website: company.website,
+    websiteConfidence: company.websiteConfidence ?? null,
+    websiteEvidence: company.websiteEvidence ?? "",
+    boardUrl: company.boardUrl ?? "",
+    atsProvider: "",
+    atsToken: "",
+  });
+
   const result = await env.DB.prepare(
     `INSERT OR IGNORE INTO companies
-       (id, profile_id, name, name_key, website, careers_url, bio, location, status, verify_reason, source, scan_note, signal)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, profile_id, name, name_key, source_name, website, careers_url, bio, location,
+        status, verify_reason, identity_status, job_source_status, website_source,
+        website_confidence, website_evidence, board_url, source, scan_note, signal)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       crypto.randomUUID(),
       profileId,
-      company.name,
-      companyNameKey(company.name),
-      company.website,
+      identity.displayName,
+      identity.matchKey,
+      identity.sourceName,
+      state.website,
       company.careers_url,
       company.bio,
       company.location,
-      company.status,
-      company.verify_reason ?? "",
+      // Legacy status/verify_reason are still written for one release so a rollback stays possible.
+      legacyStatusFor(state),
+      legacyVerifyReasonFor(state),
+      state.identity,
+      state.jobSource,
+      company.websiteSource ?? "",
+      state.websiteConfidence,
+      state.websiteEvidence,
+      state.boardUrl,
       company.source,
       company.scan_note ?? "",
       company.signal ?? "",
     )
     .run();
   return result.meta.changes > 0;
+}
+
+/** Legacy `status` projection, kept in sync so an older reader still sees something coherent. */
+function legacyStatusFor(state: { identity: IdentityStatus; jobSource: JobSourceStatus }): string {
+  if (state.identity === "dismissed") return "dismissed";
+  if (state.identity !== "verified") return state.identity === "pending" ? "discovered" : "unverified";
+  return state.jobSource === "supported" ? "verified" : state.jobSource === "pending" ? "discovered" : "unverified";
+}
+
+/** Legacy `verify_reason` projection. */
+function legacyVerifyReasonFor(state: { identity: IdentityStatus; jobSource: JobSourceStatus }): string {
+  if (state.identity === "unresolved") return "no_website";
+  if (state.identity === "ambiguous") return "ambiguous";
+  if (state.identity !== "verified") return "";
+  switch (state.jobSource) {
+    case "unsupported_ats": return "unsupported_ats";
+    case "board_unreachable": return "board_unreachable";
+    case "no_board":
+    case "careers_only": return "no_job_board";
+    default: return "";
+  }
 }
 
 async function createCompany(request: Request, env: Env): Promise<Response> {
@@ -2406,7 +2484,10 @@ async function createCompany(request: Request, env: Env): Promise<Response> {
     careers_url: (body.careers_url ?? "").trim(),
     bio: (body.bio ?? "").trim(),
     location: (body.location ?? "").trim(),
-    status: "discovered",
+    // A website the candidate typed themselves is identity evidence -- they know who they meant, so
+    // it needs no resolver confirmation. Without one, identity stays pending for the resolver.
+    identity: (body.website ?? "").trim() ? "verified" : "pending",
+    websiteSource: (body.website ?? "").trim() ? "manual" : "",
     source: "manual",
   });
   return json({ added }, added ? 201 : 200);
@@ -2469,7 +2550,8 @@ async function bulkAddCompanies(request: Request, env: Env): Promise<Response> {
       careers_url: "",
       bio: "",
       location: "",
-      status: "discovered",
+      identity: company.website ? "verified" : "pending",
+      websiteSource: company.website ? "manual" : "",
       source: "manual",
     });
     if (wasAdded) added += 1;
@@ -2670,7 +2752,7 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
   const existing = await env.DB.prepare("SELECT name FROM companies WHERE profile_id = ?")
     .bind(profileId)
     .all<{ name: string }>();
-  const known = new Set((existing.results ?? []).map((r) => companyNameKey(r.name)));
+  const known = new Set((existing.results ?? []).map((r) => companyIdentity(r.name).matchKey));
 
   return ndjsonResponse(ctx, async (emit) => {
     await emit({
@@ -2728,13 +2810,22 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
     );
 
     const aggregated = aggregateCompanies(allPostings);
-    const discovered = aggregated.filter((c) => {
-      const key = companyNameKey(c.name);
+
+    // Employer fields that held an ATS page title rather than a company ("Careers Listing", "Job
+    // Board"). Dropped before dedupe so they never become company rows to resolve, display, or
+    // explain -- there is no website to find for a string that names no employer.
+    const namedCompanies = aggregated.filter((c) => !isNonCompanyName(c.name));
+    const notCompanies = aggregated.length - namedCompanies.length;
+
+    const discovered = namedCompanies.filter((c) => {
+      // companyIdentity's match key, not the old companyNameKey: it merges "Sargent & Lundy LLC."
+      // with "Sargent Lundy" while keeping genuinely distinct employers apart.
+      const key = companyIdentity(c.name).matchKey;
       if (!key || known.has(key)) return false;
       known.add(key);
       return true;
     });
-    const duplicates = aggregated.length - discovered.length;
+    const duplicates = namedCompanies.length - discovered.length;
 
     // Adzuna's `where` filter is soft-matched on its end, so the same location check is enforced
     // locally too, rather than trusted blindly -- a filter stated to an external system is still
@@ -2759,23 +2850,41 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
     await runPooled(
       fresh,
       6,
-      async (company) => resolveCompanyDomain(company.name),
-      async (company, domain) => {
+      // The full waterfall, not the old bare slug guess: cleaned-name domain candidates, each one
+      // confirmed against what the page says about itself before it is accepted. Discovery evidence
+      // (the posting URL the aggregator gave us) is tried first and outranks any guess.
+      async (company): Promise<Awaited<ReturnType<typeof resolveWebsiteDeterministic>>> => {
+        const evidence: DiscoveryEvidence = {
+          name: company.name,
+          location: company.location,
+          signal: company.signal,
+          urls: company.urls ?? [],
+        };
+        return resolveWebsiteDeterministic(evidence);
+      },
+      async (company, outcome) => {
         checked += 1;
-        if (domain) domainResolved += 1;
+        if (outcome.status === "resolved") domainResolved += 1;
         else domainUnresolved += 1;
+
+        const resolved = outcome.status === "resolved";
+        const ambiguous = outcome.status === "ambiguous";
         const inserted = await addCompanyRow(env, profileId, {
           name: company.name,
-          website: domain ?? "",
+          website: outcome.status === "unresolved" ? "" : outcome.website,
           careers_url: "",
           bio: "",
           location: company.location,
-          status: domain ? "discovered" : "unverified",
-          verify_reason: domain ? "" : "no_website",
+          identity: resolved ? "verified" : ambiguous ? "ambiguous" : "unresolved",
+          websiteSource: resolved || ambiguous ? outcome.source : "",
+          websiteConfidence: resolved || ambiguous ? outcome.confidence : null,
+          websiteEvidence: outcome.evidence,
           source: "adzuna",
-          scan_note: domain
-            ? "Website found from the company's name; checking its careers page and supported job boards."
-            : "Discovered from real job postings. No matching website was confirmed automatically yet -- this is retried the next time you scan, including a search-grounded fallback, or add the website by hand.",
+          scan_note: resolved
+            ? "Website confirmed; checking its careers page and job board next."
+            : ambiguous
+              ? "A possible website was found but could not be confirmed to be this company. Left unverified rather than guessed -- confirm or correct it by hand."
+              : "Discovered from real job postings. No website confirmed yet; retried automatically on the next run, and you can add one by hand.",
           signal: company.signal,
         });
         if (inserted) added += 1;
@@ -2785,7 +2894,8 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
           done: checked,
           total: fresh.length,
           company: company.name,
-          resolved: Boolean(domain),
+          resolved: outcome.status === "resolved",
+          outcome: outcome.status,
         });
       },
     );
@@ -2798,6 +2908,7 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
       domain_resolved: domainResolved,
       domain_unresolved: domainUnresolved,
       locations: desiredLocations,
+      not_companies: notCompanies,
       query_errors: queryErrors,
       rate_limited: rateLimited,
       streams_processed: searched,
@@ -2831,7 +2942,7 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
   const limit = Math.min(Math.max(Number(body.limit) || 6, 1), 500);
   const targets = body.company_id
     ? await env.DB.prepare(
-        "SELECT id, name, website, careers_url, ats_provider, ats_token, last_scanned_at, location, signal FROM companies WHERE id = ? AND profile_id = ?",
+        "SELECT id, name, website, careers_url, ats_provider, ats_token, last_scanned_at, location, signal, board_url FROM companies WHERE id = ? AND profile_id = ?",
       )
         .bind(body.company_id, profileId)
         .all<CompanyScanRow>()
@@ -2856,10 +2967,11 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
         // can't reach everyone in one request -- each round's just-checked companies get a fresh
         // last_scanned_at and sort to the back, so a multi-round run still ends up covering every
         // company exactly once.
-        `SELECT id, name, website, careers_url, ats_provider, ats_token, last_scanned_at, location, signal
+        `SELECT id, name, website, careers_url, ats_provider, ats_token, last_scanned_at, location, signal, board_url
          FROM companies
-         WHERE profile_id = ? AND status != 'dismissed'
-           AND NOT (verify_reason = 'unsupported_ats' AND last_verified_at > datetime('now', '-14 days'))
+         WHERE profile_id = ? AND identity_status NOT IN ('dismissed', 'not_a_company')
+           AND NOT (job_source_status = 'unsupported_ats' AND job_source_checked_at > datetime('now', '-14 days'))
+           AND NOT (job_source_status IN ('no_board', 'careers_only') AND job_source_checked_at > datetime('now', '-3 days'))
          ORDER BY last_scanned_at IS NOT NULL, last_scanned_at ASC
          LIMIT ?`,
       )
@@ -2911,8 +3023,9 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
     // target query above applies) -- the client uses this against however many it's scanned so
     // far across this click's rounds to know when a Find Jobs run has covered everyone.
     const eligible = await env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status != 'dismissed'
-       AND NOT (verify_reason = 'unsupported_ats' AND last_verified_at > datetime('now', '-14 days'))`,
+      `SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND identity_status NOT IN ('dismissed', 'not_a_company')
+       AND NOT (job_source_status = 'unsupported_ats' AND job_source_checked_at > datetime('now', '-14 days'))
+       AND NOT (job_source_status IN ('no_board', 'careers_only') AND job_source_checked_at > datetime('now', '-3 days'))`,
     )
       .bind(profileId)
       .first<{ n: number }>();
@@ -2931,11 +3044,105 @@ type CompanyScanRow = {
   last_scanned_at: string | null;
   location: string;
   signal: string;
+  board_url: string;
 };
 
 /** Minimum confidence resolveWebsiteViaSearch must report before its answer is even attempted --
  *  below this, it's treated the same as "ambiguous", not silently trusted. */
 const WEBSITE_SEARCH_CONFIDENCE_FLOOR = 60;
+
+/**
+ * The single update path for a company's pipeline state, and the only place scan outcomes are
+ * persisted. Everything runs through reconcileCompanyState first, so a caller that computes an
+ * impossible combination gets it corrected here instead of writing a contradictory row.
+ *
+ * Legacy status/verify_reason are projected alongside the new axes for one release, so an older
+ * reader (or a rollback) still sees a coherent value.
+ */
+async function writeCompanyState(
+  env: Env,
+  companyId: string,
+  desired: {
+    identity: IdentityStatus;
+    jobSource: JobSourceStatus;
+    website?: string;
+    websiteConfidence?: number | null;
+    websiteEvidence?: string;
+    websiteSource?: string;
+    boardUrl?: string;
+    atsProvider?: string;
+    atsToken?: string;
+    careersUrl?: string;
+    scanNote?: string;
+    touchScanned?: boolean;
+  },
+): Promise<{ identity: IdentityStatus; jobSource: JobSourceStatus; repaired: string[] }> {
+  const { state, repaired } = reconcileCompanyState({
+    identity: desired.identity,
+    jobSource: desired.jobSource,
+    website: desired.website ?? "",
+    websiteConfidence: desired.websiteConfidence ?? null,
+    websiteEvidence: desired.websiteEvidence ?? "",
+    boardUrl: desired.boardUrl ?? "",
+    atsProvider: desired.atsProvider ?? "",
+    atsToken: desired.atsToken ?? "",
+  });
+
+  await env.DB.prepare(
+    `UPDATE companies SET
+       identity_status = ?, job_source_status = ?, status = ?, verify_reason = ?,
+       website = COALESCE(NULLIF(?, ''), website),
+       website_confidence = COALESCE(?, website_confidence),
+       website_evidence = COALESCE(NULLIF(?, ''), website_evidence),
+       website_source = COALESCE(NULLIF(?, ''), website_source),
+       board_url = COALESCE(NULLIF(?, ''), board_url),
+       ats_provider = COALESCE(NULLIF(?, ''), ats_provider),
+       ats_token = COALESCE(NULLIF(?, ''), ats_token),
+       careers_url = COALESCE(NULLIF(?, ''), careers_url),
+       scan_note = COALESCE(NULLIF(?, ''), scan_note),
+       last_verified_at = CURRENT_TIMESTAMP,
+       job_source_checked_at = CURRENT_TIMESTAMP,
+       last_scanned_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_scanned_at END,
+       updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  )
+    .bind(
+      state.identity,
+      state.jobSource,
+      legacyStatusFor(state),
+      legacyVerifyReasonFor(state),
+      state.website,
+      state.websiteConfidence,
+      state.websiteEvidence,
+      desired.websiteSource ?? "",
+      state.boardUrl,
+      state.atsProvider,
+      state.atsToken,
+      desired.careersUrl ?? "",
+      desired.scanNote ?? "",
+      desired.touchScanned === false ? 0 : 1,
+      companyId,
+    )
+    .run();
+
+  return { identity: state.identity, jobSource: state.jobSource, repaired };
+}
+
+/** The public board URL for a resolved provider/token pair. One definition, so a board link and a
+ *  board read can never disagree about where the board is. */
+function boardUrlFor(provider: AtsProvider, token: string): string {
+  switch (provider) {
+    case "greenhouse": return `https://job-boards.greenhouse.io/${token}`;
+    case "lever": return `https://jobs.lever.co/${token}`;
+    case "ashby": return `https://jobs.ashbyhq.com/${token}`;
+    case "smartrecruiters": return `https://careers.smartrecruiters.com/${token}`;
+    case "workday": {
+      const [tenant, pod, site] = token.split("|");
+      return tenant && pod && site ? `https://${tenant}.${pod}.myworkdayjobs.com/${site}` : "";
+    }
+    default: return token.includes(".") ? `https://${token}` : "";
+  }
+}
 
 async function scanOneCompany(
   env: Env,
@@ -2953,67 +3160,118 @@ async function scanOneCompany(
   // the way the free deterministic paths are; a manual "Save website" fix remains available
   // regardless of how this attempt goes.
   if (!company.website) {
-    if (!company.last_scanned_at) {
+    // Free deterministic waterfall first (cleaned-name candidates, each confirmed against what the
+    // page says about itself). It runs on every scan, because it costs nothing beyond a couple of
+    // HTTP requests and a company unresolvable last week may be resolvable today.
+    const deterministic = await resolveWebsiteDeterministic({
+      name: company.name,
+      location: company.location,
+      signal: company.signal,
+    });
+    if (deterministic.status === "resolved") {
+      await writeCompanyState(env, company.id, {
+        identity: "verified",
+        jobSource: "pending",
+        website: deterministic.website,
+        websiteConfidence: deterministic.confidence,
+        websiteEvidence: deterministic.evidence,
+        websiteSource: deterministic.source,
+        scanNote: "Website confirmed; checking its job board next.",
+        touchScanned: false,
+      });
+      company = { ...company, website: deterministic.website };
+    } else if (!company.last_scanned_at) {
+      // Paid, search-grounded fallback. Only on a company's first scan: it costs real money, so it
+      // is not worth re-spending on every click the way the free paths above are. Manual entry
+      // stays available regardless of how this goes.
       const found = await resolveWebsiteViaSearch(env, { name: company.name, location: company.location, signal: company.signal });
       if (found && found.official_website && found.confidence >= WEBSITE_SEARCH_CONFIDENCE_FLOOR) {
-        const reachable = await verifyWebsite(found.official_website);
-        if (reachable) {
-          await env.DB.prepare(
-            `UPDATE companies SET website = ?, careers_url = ?, website_source = 'search', website_confidence = ?,
-             updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-          )
-            .bind(found.official_website, found.careers_url || company.careers_url, found.confidence, company.id)
-            .run();
-          // Fall through into the normal resolved-website path below with the freshly found site --
-          // no reason to make the candidate wait for a second click just to attempt board resolution.
-          company = { ...company, website: found.official_website, careers_url: found.careers_url || company.careers_url };
+        // Never trusted on the model's word: the proposed URL is re-verified against real page
+        // evidence, exactly like a guessed one.
+        const confirmed = await verifyCandidate(company.name, found.official_website);
+        if (confirmed && confirmed.score >= CONFIDENCE_FLOOR) {
+          await writeCompanyState(env, company.id, {
+            identity: "verified",
+            jobSource: "pending",
+            website: confirmed.url,
+            websiteConfidence: confirmed.score,
+            websiteEvidence: `search: ${found.reason} | confirmed: ${confirmed.evidence}`,
+            websiteSource: "search",
+            careersUrl: found.careers_url || "",
+            scanNote: "Website found by search and confirmed; checking its job board next.",
+            touchScanned: false,
+          });
+          company = { ...company, website: confirmed.url, careers_url: found.careers_url || company.careers_url };
+        } else {
+          await writeCompanyState(env, company.id, {
+            identity: "ambiguous",
+            jobSource: "pending",
+            website: found.official_website,
+            websiteConfidence: confirmed?.score ?? found.confidence,
+            websiteEvidence: `search proposed ${found.official_website} but the page did not confirm it: ${confirmed?.evidence ?? "unreachable"}`,
+            websiteSource: "search",
+            scanNote: "A website was proposed but could not be confirmed as this company. Confirm or correct it by hand.",
+          });
+          return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
         }
       } else if (found && found.official_website) {
-        // A URL was proposed, but the model itself wasn't confident this is the right company for
-        // a name this ambiguous -- reporting it as found-but-wrong-company would be worse than not
-        // finding it at all, so this is its own reason, not folded into no_website.
-        await env.DB.prepare(
-          `UPDATE companies SET status = 'unverified', verify_reason = 'ambiguous', scan_note = ?,
-           last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-           WHERE id = ?`,
-        )
-          .bind(`Multiple companies could match this name. ${found.reason}`.trim(), company.id)
-          .run();
+        await writeCompanyState(env, company.id, {
+          identity: "ambiguous",
+          jobSource: "pending",
+          website: found.official_website,
+          websiteConfidence: found.confidence,
+          websiteEvidence: found.reason,
+          websiteSource: "search",
+          scanNote: `Multiple companies could match this name. ${found.reason}`.trim(),
+        });
         return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
       }
+    } else if (deterministic.status === "ambiguous") {
+      await writeCompanyState(env, company.id, {
+        identity: "ambiguous",
+        jobSource: "pending",
+        website: deterministic.website,
+        websiteConfidence: deterministic.confidence,
+        websiteEvidence: deterministic.evidence,
+        websiteSource: deterministic.source,
+        scanNote: "A possible website was found but not confirmed as this company. Confirm or correct it by hand.",
+      });
+      return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
     }
   }
   if (!company.website) {
-    await env.DB.prepare(
-      `UPDATE companies SET status = 'unverified', verify_reason = 'no_website', scan_note = ?,
-       last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
-    )
-      .bind("No website on file for this company yet. Add one to include it in scanning.", company.id)
-      .run();
-    return { jobs: 0, newJobs: 0, note: "no website on file", status: "unverified" };
+    await writeCompanyState(env, company.id, {
+      identity: "unresolved",
+      jobSource: "pending",
+      scanNote: "No website could be confirmed for this company yet. Retried automatically, or add one by hand.",
+    });
+    return { jobs: 0, newJobs: 0, note: "no website confirmed", status: "unverified" };
   }
 
   let provider = company.ats_provider as AtsProvider | "" | "none";
   let token = company.ats_token;
 
   if (!provider || provider === "none") {
-    const resolved = await resolveBoard(company.website, company.careers_url, company.name, budget);
+    // Any URL already on the row may itself name an ATS. This is free and used to be skipped
+    // entirely: the patterns only ever ran against careers-page HTML, never against a URL already
+    // resolved and stored, which is how a readable Greenhouse board sat on a row labelled "no job
+    // board" with its jobs never imported.
+    const fromStoredUrl = detectAtsFromUrl(company.careers_url) ?? detectAtsFromUrl(company.board_url ?? "");
+    const resolved = fromStoredUrl ?? (await resolveBoard(company.website, company.careers_url, company.name, budget));
     if (!resolved) {
-      const { status, verify_reason } = classifyVerification(true, null, false, false);
-      await env.DB.prepare(
-        `UPDATE companies SET status = ?, verify_reason = ?, ats_provider = 'none', scan_note = ?,
-         last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?`,
-      )
-        .bind(
-          status,
-          verify_reason,
-          "Checked the company careers page and common careers-page paths, then tested likely Greenhouse, Lever, Ashby, and SmartRecruiters board addresses. No accessible supported job board was found.",
-          company.id,
-        )
-        .run();
-      return { jobs: 0, newJobs: 0, note: "no supported board found", status: "unverified" };
+      // A careers page we found but could not classify is NOT "no job board" -- the link is the
+      // useful thing to show. Only a company with no hiring surface at all gets no_board.
+      const careersUrl = company.careers_url || "";
+      await writeCompanyState(env, company.id, {
+        identity: "verified",
+        jobSource: careersUrl ? "careers_only" : "no_board",
+        website: company.website,
+        boardUrl: careersUrl,
+        scanNote: careersUrl
+          ? "Careers page found, but it does not run on a job-board system this app can read. Use the link to browse it directly."
+          : "Checked the careers page, common careers paths, and likely Greenhouse, Lever, Ashby, and SmartRecruiters addresses. No job board was found.",
+      });
+      return { jobs: 0, newJobs: 0, note: careersUrl ? "careers page only" : "no job board found", status: "unverified" };
     }
     provider = resolved.provider;
     token = resolved.token;
@@ -3028,15 +3286,20 @@ async function scanOneCompany(
   // above entirely and would otherwise fall through into fetchBoardJobs with a provider it has no
   // case for.
   if (!isReadableAtsProvider(provider as AtsProvider)) {
-    const boardUrl = `https://${token}`;
+    const boardUrl = token.includes(".") ? `https://${token}` : company.careers_url || company.website;
     const label = atsDisplayName(provider as AtsProvider);
-    const { status, verify_reason } = classifyVerification(true, { provider: provider as AtsProvider, token }, false, false);
-    await env.DB.prepare(
-      `UPDATE companies SET status = ?, verify_reason = ?, ats_provider = ?, ats_token = ?, careers_url = ?, scan_note = ?,
-       last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    )
-      .bind(status, verify_reason, provider, token, boardUrl, `Uses ${label} for hiring. View current openings directly.`, company.id)
-      .run();
+    // Verified company, unsupported board. The limitation is ApplyGo's, not the employer's, and the
+    // state model now says so instead of filing this under "unverified".
+    await writeCompanyState(env, company.id, {
+      identity: "verified",
+      jobSource: "unsupported_ats",
+      website: company.website,
+      atsProvider: provider,
+      atsToken: token,
+      boardUrl,
+      careersUrl: boardUrl,
+      scanNote: `Hires through ${label}, which this app cannot read automatically yet. View current openings directly.`,
+    });
     return { jobs: 0, newJobs: 0, note: `uses ${label}, view directly`, status: "unverified" };
   }
 
@@ -3050,19 +3313,17 @@ async function scanOneCompany(
     budget.remaining -= 1;
     scanned = await fetchBoardJobs(provider as AtsProvider, token);
   } catch (err) {
-    const { status, verify_reason } = classifyVerification(
-      true,
-      { provider: provider as AtsProvider, token },
-      true,
-      hadPriorSuccess,
-    );
-    await env.DB.prepare(
-      `UPDATE companies SET status = ?, verify_reason = ?, scan_note = ?, last_scanned_at = CURRENT_TIMESTAMP,
-       last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    )
-      .bind(status, verify_reason, `Board read failed: ${(err as Error).message}`, company.id)
-      .run();
-    return { jobs: 0, newJobs: 0, note: "board read failed", status };
+    // A company that has read successfully before is never demoted by one transient failure.
+    await writeCompanyState(env, company.id, {
+      identity: "verified",
+      jobSource: hadPriorSuccess ? "supported" : "board_unreachable",
+      website: company.website,
+      atsProvider: provider,
+      atsToken: token,
+      boardUrl: boardUrlFor(provider as AtsProvider, token),
+      scanNote: `Board read failed: ${(err as Error).message}`,
+    });
+    return { jobs: 0, newJobs: 0, note: "board read failed", status: hadPriorSuccess ? "verified" : "unverified" };
   }
 
   // A company can qualify on location while most of its postings don't, so each posting is
@@ -3131,12 +3392,16 @@ async function scanOneCompany(
       ? `${scanned.length} open role${scanned.length === 1 ? "" : "s"} on their board.`
       : `${relevant.length} of ${scanned.length} open roles match your target roles and locations.`;
 
-  await env.DB.prepare(
-    `UPDATE companies SET status = 'verified', verify_reason = '', ats_provider = ?, ats_token = ?, open_jobs = ?, scan_note = ?,
-     last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-  )
-    .bind(provider, token, total?.n ?? 0, note, company.id)
-    .run();
+  await writeCompanyState(env, company.id, {
+    identity: "verified",
+    jobSource: "supported",
+    website: company.website,
+    atsProvider: provider,
+    atsToken: token,
+    boardUrl: boardUrlFor(provider as AtsProvider, token),
+    scanNote: note,
+  });
+  await env.DB.prepare("UPDATE companies SET open_jobs = ? WHERE id = ?").bind(total?.n ?? 0, company.id).run();
 
   return { jobs: relevant.length, newJobs, note, status: "verified" };
 }
@@ -3150,73 +3415,70 @@ async function updateCompany(request: Request, env: Env, id: string): Promise<Re
     careers_url?: string;
   };
 
-  // A website supplied for an 'unverified'/no_website row is the manual-fix path: re-verify it the
-  // same way discovery would have, and only clear the ATS provider (so the next scan re-resolves
-  // the board from scratch against the corrected domain) if it actually resolves, rather than
-  // trusting whatever was typed in. Set back to 'discovered' on success so the routine verify/scan
-  // pass picks it up naturally -- no separate "retry" endpoint needed.
+  // A website the candidate typed is the manual-fix path. It is still verified before being
+  // trusted -- but held to a lower bar than a machine guess: they know which company they meant,
+  // so reachability is enough and page-evidence scoring is not required.
   const website = (body.website ?? "").trim();
   if (website) {
-    const reachable = await verifyWebsite(website.match(/^https?:\/\//i) ? website : `https://${website}`);
-    const status = reachable ? "discovered" : "unverified";
-    const verifyReason: VerifyReason = reachable ? "" : "no_website";
-    const result = await env.DB.prepare(
-      `UPDATE companies SET website = ?, careers_url = ?, status = ?, verify_reason = ?,
-       website_source = 'manual', website_confidence = NULL,
-       ats_provider = CASE WHEN ? THEN '' ELSE ats_provider END, scan_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    )
-      .bind(
-        website,
-        (body.careers_url ?? "").trim(),
-        status,
-        verifyReason,
-        reachable ? 1 : 0,
-        reachable
-          ? "Website verified; checking its careers page and supported job boards."
-          : "That website could not be reached -- double-check the address.",
-        id,
-      )
-      .run();
-    return json({ updated: result.meta.changes > 0, status, reachable });
+    const normalized = website.match(/^https?:\/\//i) ? website : `https://${website}`;
+    const reachable = await verifyWebsite(normalized);
+    const { identity } = await writeCompanyState(env, id, {
+      identity: reachable ? "verified" : "unresolved",
+      // Force a fresh board resolution against the corrected domain: whatever was resolved before
+      // belonged to the old (wrong) website.
+      jobSource: "pending",
+      website: reachable ? normalized : "",
+      websiteConfidence: reachable ? 100 : null,
+      websiteEvidence: reachable ? "entered by hand" : "entered by hand but unreachable",
+      websiteSource: "manual",
+      careersUrl: (body.careers_url ?? "").trim(),
+      scanNote: reachable
+        ? "Website set by hand; checking its careers page and job board next."
+        : "That website could not be reached -- double-check the address.",
+      touchScanned: false,
+    });
+    if (reachable) {
+      await env.DB.prepare("UPDATE companies SET ats_provider = '', ats_token = '', board_url = '' WHERE id = ?").bind(id).run();
+    }
+    return json({ updated: true, status: identity, reachable });
   }
 
   if (body.status === "dismissed") {
     const result = await env.DB.prepare(
-      "UPDATE companies SET status = 'dismissed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      "UPDATE companies SET identity_status = 'dismissed', status = 'dismissed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
       .bind(id)
       .run();
     return json({ updated: result.meta.changes > 0, status: "dismissed" });
   }
 
-  // Re-add: restore whatever verify state the row's already-known ats_provider/website implies,
-  // rather than blindly resetting to 'discovered' -- a previously-verified company (working board,
-  // real postings) should read as Verified again immediately, not sit mislabeled as freshly
-  // discovered until its next scan happens to run. No network call needed; this is the same
-  // classification the 0027 migration's backfill already used for exactly this reason.
-  const row = await env.DB.prepare("SELECT website, ats_provider FROM companies WHERE id = ?")
+  // Re-add: restore the state the row's own stored evidence implies rather than resetting to
+  // "discovered" -- a company with a confirmed website and a working board should read as Verified
+  // again immediately, not sit mislabeled until its next scan. reconcileCompanyState does the
+  // deriving, so this agrees with every other write path by construction.
+  const row = await env.DB.prepare("SELECT website, ats_provider, ats_token, board_url, website_confidence FROM companies WHERE id = ?")
     .bind(id)
-    .first<{ website: string; ats_provider: string }>();
-  let status = "discovered";
-  let verifyReason: VerifyReason = "";
-  if (!row?.website) {
-    status = "unverified";
-    verifyReason = "no_website";
-  } else if (row.ats_provider === "none") {
-    status = "unverified";
-    verifyReason = "no_job_board";
-  } else if (row.ats_provider && !isReadableAtsProvider(row.ats_provider as AtsProvider)) {
-    status = "unverified";
-    verifyReason = "unsupported_ats";
-  } else if (row.ats_provider) {
-    status = "verified";
-  }
-  const result = await env.DB.prepare(
-    "UPDATE companies SET status = ?, verify_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-  )
-    .bind(status, verifyReason, id)
-    .run();
-  return json({ updated: result.meta.changes > 0, status });
+    .first<{ website: string; ats_provider: string; ats_token: string; board_url: string; website_confidence: number | null }>();
+  const readable = row?.ats_provider ? isReadableAtsProvider(row.ats_provider as AtsProvider) : false;
+  const { identity } = await writeCompanyState(env, id, {
+    identity: row?.website ? "verified" : "pending",
+    jobSource: !row?.website
+      ? "pending"
+      : readable
+        ? "supported"
+        : row.ats_provider
+          ? "unsupported_ats"
+          : row.board_url
+            ? "careers_only"
+            : "pending",
+    website: row?.website ?? "",
+    websiteConfidence: row?.website_confidence ?? null,
+    atsProvider: row?.ats_provider ?? "",
+    atsToken: row?.ats_token ?? "",
+    boardUrl: row?.board_url ?? "",
+    touchScanned: false,
+  });
+  return json({ updated: true, status: identity });
 }
 
 async function deleteCompany(request: Request, env: Env, id: string): Promise<Response> {
