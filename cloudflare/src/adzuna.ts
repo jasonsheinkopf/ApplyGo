@@ -98,9 +98,22 @@ export async function searchAdzunaPage(
   return { postings, count: typeof record.count === "number" ? record.count : postings.length };
 }
 
-export type DiscoveredCompany = { name: string; location: string; signal: string; postings_seen: number };
+export type DiscoveredCompany = {
+  name: string;
+  location: string;
+  signal: string;
+  postings_seen: number;
+  /**
+   * Posting URLs seen for this employer. These are the highest-value input the website resolver
+   * gets -- a URL the aggregator itself published for this company outranks any hostname guess --
+   * and they used to be discarded the moment the company name was extracted. Capped, since only a
+   * couple are ever needed to disambiguate.
+   */
+  urls: string[];
+};
 
 const MAX_SIGNAL_TITLES = 3;
+const MAX_EVIDENCE_URLS = 3;
 
 /**
  * Groups raw postings by companyNameKey(posting.company) -- the same normalization every other
@@ -117,7 +130,7 @@ const MAX_SIGNAL_TITLES = 3;
  */
 export function aggregateCompanies(postings: AdzunaPosting[]): DiscoveredCompany[] {
   const seenIds = new Set<string>();
-  const groups = new Map<string, { name: string; location: string; titles: string[]; count: number }>();
+  const groups = new Map<string, { name: string; location: string; titles: string[]; count: number; urls: string[] }>();
   for (const posting of postings) {
     if (posting.id) {
       if (seenIds.has(posting.id)) continue;
@@ -129,10 +142,12 @@ export function aggregateCompanies(postings: AdzunaPosting[]): DiscoveredCompany
     if (!key) continue;
     let group = groups.get(key);
     if (!group) {
-      group = { name, location: posting.location.trim(), titles: [], count: 0 };
+      group = { name, location: posting.location.trim(), titles: [], count: 0, urls: [] };
       groups.set(key, group);
     }
     group.count += 1;
+    const url = posting.url?.trim();
+    if (url && !group.urls.includes(url) && group.urls.length < MAX_EVIDENCE_URLS) group.urls.push(url);
     const title = posting.title.trim();
     if (title && !group.titles.includes(title) && group.titles.length < MAX_SIGNAL_TITLES) {
       group.titles.push(title);
@@ -143,5 +158,6 @@ export function aggregateCompanies(postings: AdzunaPosting[]): DiscoveredCompany
     location: group.location,
     signal: `Hiring for: ${group.titles.join(", ")}${group.count > group.titles.length ? ` (${group.count} postings seen)` : ""}`,
     postings_seen: group.count,
+    urls: group.urls,
   }));
 }

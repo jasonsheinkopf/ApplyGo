@@ -68,8 +68,8 @@ import {
   type CompanySearchTerm,
   type VerifyReason,
   atsDisplayName,
-  classifyVerification,
   companyNameKey,
+  detectAtsFromUrl,
   companySearchTermsFromTitles,
   fetchBoardJobs,
   fetchMissingDescriptions,
@@ -81,11 +81,20 @@ import {
   mergeCompanySearchTerms,
   parseLocationFilter,
   resolveBoard,
-  resolveCompanyDomain,
   verifyWebsite,
 } from "./companies";
 import { type AdzunaPosting, adzunaConfigured, aggregateCompanies, searchAdzunaPage } from "./adzuna";
 import { resolveWebsiteViaSearch } from "./websearch";
+import { companyIdentity, isNonCompanyName } from "./identity";
+import { PRESCREEN_PREDICATE, companyFunnel, companyToJobHandoff, funnelViolations } from "./pipeline";
+import {
+  type IdentityStatus,
+  type JobSourceStatus,
+  isScannable,
+  reconcileCompanyState,
+} from "./companystate";
+import { CONFIDENCE_FLOOR, type DiscoveryEvidence, resolveWebsiteDeterministic, verifyCandidate } from "./resolver";
+
 import {
   CARE_ABOUT_TOPICS_SCHEMA,
   type CareAboutTopic,
@@ -172,6 +181,8 @@ type Session = {
   device_name: string;
   expires_at: string;
   revoked_at: string | null;
+  /** 'full' for a normal device; 'read_only' for an MCP/reporting credential. */
+  scope: string;
 };
 
 const encoder = new TextEncoder();
@@ -525,7 +536,7 @@ async function requireSession(request: Request, env: Env): Promise<Session | Res
   if (!token) return json({ error: "authentication_required" }, 401);
   const tokenHash = await sha256(token);
   const session = await env.DB.prepare(
-    `SELECT id, device_name, expires_at, revoked_at
+    `SELECT id, device_name, expires_at, revoked_at, scope
      FROM device_sessions
      WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > datetime('now')`,
   )
@@ -538,6 +549,14 @@ async function requireSession(request: Request, env: Env): Promise<Session | Res
       ? json({ error: "invalid_or_expired_session" }, 401)
       : json({ error: "invalid_or_expired_session" }, 401, { "set-cookie": clearSessionCookie() });
   }
+  // The whole read-only guarantee, in one place. A read_only credential may look at anything it is
+  // allowed to fetch, and may change nothing -- enforced here rather than route by route, so a
+  // route added tomorrow is covered without anyone remembering to mark it. Every mutation in this
+  // app is a POST/PUT/PATCH/DELETE, so restricting the method is restricting the capability.
+  if (session.scope === "read_only" && request.method !== "GET" && request.method !== "HEAD") {
+    return json({ error: "read_only_credential", detail: "This token can read ApplyGo data but cannot change anything." }, 403);
+  }
+
   await env.DB.prepare("UPDATE device_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?")
     .bind(session.id)
     .run();
@@ -589,6 +608,32 @@ async function exchangeEnrollment(request: Request, env: Env): Promise<Response>
   const payload: Record<string, unknown> = { authenticated: true, device_id: sessionId, expires_in_days: days };
   if (body.return_token === true) payload.token = token;
   return json(payload, 201, { "set-cookie": sessionCookie(token, days * 86400) });
+}
+
+/**
+ * POST /devices/read-only -- mints a credential that can read ApplyGo but change nothing.
+ *
+ * Requires an existing full session, so this is "the signed-in user issuing themselves a reporting
+ * key", not a new way in. The raw token is returned exactly once and only its hash is stored; there
+ * is no endpoint that can read it back, so a lost token is revoked and replaced, never recovered.
+ */
+async function createReadOnlyToken(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { label?: string; days?: number };
+  const token = randomToken();
+  const tokenHash = await sha256(token);
+  const days = Math.min(Math.max(Number(body.days) || 365, 1), 365);
+  const label = (body.label || "MCP read-only").slice(0, 120);
+  await env.DB.prepare(
+    `INSERT INTO device_sessions (id, token_hash, device_name, expires_at, scope)
+     VALUES (?, ?, ?, datetime('now', ?), 'read_only')`,
+  )
+    .bind(crypto.randomUUID(), tokenHash, label, `+${days} days`)
+    .run();
+  // Deliberately not set as a cookie: this is a machine credential for an MCP client, and putting
+  // it in the browser's cookie jar would downgrade the current session to read-only.
+  return json({ token, scope: "read_only", label, expires_in_days: days }, 201);
 }
 
 async function listDevices(request: Request, env: Env): Promise<Response> {
@@ -1914,6 +1959,16 @@ async function jobPipelineCounts(env: Env, threshold?: number): Promise<Record<s
     else counts.bad_fit += row.n;
   }
   counts.total = total;
+
+  // THE shared Pre-screen figure -- the identical predicate Companies uses, imported from
+  // pipeline.ts rather than restated here. Companies' last node and Jobs' first node are the same
+  // rows by construction, which is what makes moving between the two pages continue one diagram
+  // instead of showing two numbers that nearly agree.
+  const prescreen = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM job_postings WHERE ${PRESCREEN_PREDICATE}`,
+  ).first<{ n: number }>();
+  counts.prescreen_jobs = prescreen?.n ?? 0;
+
   return counts;
 }
 
@@ -1937,40 +1992,35 @@ async function jobPipelineCounts(env: Env, threshold?: number): Promise<Record<s
  *   they're reading the same rows, not two independently computed totals that could drift apart.
  */
 async function companiesPipelineCounts(env: Env, profileId: string): Promise<Record<string, number>> {
+  // Grouped on the two real axes. The legacy status/verify_reason pair is no longer read here --
+  // it is a projection now, not the source of truth, and counting from a projection is how the
+  // page ended up disagreeing with itself.
   const rows = await env.DB.prepare(
-    `SELECT status, verify_reason, COUNT(*) AS n FROM companies
-     WHERE profile_id = ? GROUP BY status, verify_reason`,
+    `SELECT identity_status, job_source_status, COUNT(*) AS n FROM companies
+     WHERE profile_id = ? GROUP BY identity_status, job_source_status`,
   )
     .bind(profileId)
-    .all<{ status: string; verify_reason: string; n: number }>();
+    .all<{ identity_status: string; job_source_status: string; n: number }>();
 
   const counts: Record<string, number> = {
-    discovered: 0,
-    verified: 0,
-    unverified: 0,
-    unverified_no_website: 0,
-    unverified_no_job_board: 0,
-    unverified_unsupported_ats: 0,
-    unverified_board_unreachable: 0,
-    unverified_ambiguous: 0,
-    dismissed: 0,
+    identity_pending: 0, identity_verified: 0, identity_ambiguous: 0,
+    identity_unresolved: 0, identity_not_a_company: 0, identity_dismissed: 0,
+    source_pending: 0, source_supported: 0, source_unsupported_ats: 0,
+    source_careers_only: 0, source_no_board: 0, source_board_unreachable: 0,
   };
   let total = 0;
   for (const row of rows.results ?? []) {
     total += row.n;
-    if (row.status === "dismissed") counts.dismissed += row.n;
-    else if (row.status === "discovered") counts.discovered += row.n;
-    else if (row.status === "verified") counts.verified += row.n;
-    else if (row.status === "unverified") {
-      counts.unverified += row.n;
-      const key = `unverified_${row.verify_reason}`;
-      if (key in counts) counts[key] += row.n;
+    const identityKey = `identity_${row.identity_status}`;
+    if (identityKey in counts) counts[identityKey] += row.n;
+    // Job-source counts are scoped to verified companies, matching the funnel: a pending job source
+    // on an unresolved company means "never reached", not "checked and found nothing".
+    if (row.identity_status === "verified") {
+      const sourceKey = `source_${row.job_source_status}`;
+      if (sourceKey in counts) counts[sourceKey] += row.n;
     }
   }
   counts.total = total;
-  // "Unique companies discovered" for the Discovery stage's secondary stat -- everything that isn't
-  // dismissed (dismissed is a removal decision, not a discovery-stage concept).
-  counts.discovery_companies = total - counts.dismissed;
 
   const streams = await env.DB.prepare(
     "SELECT COALESCE(SUM(postings_seen), 0) AS n FROM company_discovery_streams WHERE profile_id = ?",
@@ -1979,10 +2029,20 @@ async function companiesPipelineCounts(env: Env, profileId: string): Promise<Rec
     .first<{ n: number }>();
   counts.discovery_postings = streams?.n ?? 0;
 
+  // THE shared Pre-screen number. Same predicate Jobs uses, imported rather than restated, so the
+  // two pages cannot drift.
   const prescreen = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM job_postings WHERE company_id IS NOT NULL AND fit_status = 'unassessed'",
+    `SELECT COUNT(*) AS n FROM job_postings WHERE ${PRESCREEN_PREDICATE}`,
   ).first<{ n: number }>();
   counts.prescreen_jobs = prescreen?.n ?? 0;
+
+  // Legacy aliases, still read by parts of the UI not yet migrated. Derived from the new axes so
+  // they cannot disagree with them.
+  counts.verified = counts.identity_verified;
+  counts.discovered = counts.identity_pending;
+  counts.dismissed = counts.identity_dismissed;
+  counts.unverified = counts.identity_unresolved + counts.identity_ambiguous;
+  counts.discovery_companies = total - counts.identity_dismissed;
 
   return counts;
 }
@@ -2211,19 +2271,6 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
     return json({ id, applied: false });
   }
 
-  if (body.action === "restore_snapshot") {
-    // Undo for Jindr. Swipes only ever change manual_status/interested_at -- never fit_score/
-    // fit_status -- so undo just needs to revert those, safe since Jindr only ever swipes cards
-    // that started out at manual_status='normal'.
-    await env.DB.prepare(
-      `UPDATE job_postings SET manual_status = 'normal', interested_at = NULL, removed_at = NULL,
-       removed_from_status = NULL, removal_reason = '' WHERE id = ?`,
-    )
-      .bind(id)
-      .run();
-    return json({ id, manual_status: "normal" });
-  }
-
   return json({ error: "unknown_action" }, 400);
 }
 
@@ -2326,15 +2373,17 @@ async function listCompanies(request: Request, env: Env): Promise<Response> {
   if (auth instanceof Response) return auth;
   const profileId = await getOrCreateProfileId(env);
   const rows = await env.DB.prepare(
-    `SELECT id, name, website, careers_url, bio, ats_provider, status, verify_reason, source,
-            scan_note, last_scanned_at, last_verified_at, open_jobs, created_at, signal, location,
-            website_source, website_confidence
+    `SELECT id, name, source_name, website, careers_url, board_url, bio, ats_provider, source,
+            identity_status, job_source_status, status, verify_reason,
+            scan_note, last_scanned_at, last_verified_at, job_source_checked_at, open_jobs,
+            created_at, signal, location, website_source, website_confidence, website_evidence
      FROM companies WHERE profile_id = ? ORDER BY name COLLATE NOCASE ASC`,
   )
     .bind(profileId)
     .all();
   const pending = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status = 'verified' AND last_scanned_at IS NULL",
+    `SELECT COUNT(*) AS n FROM companies WHERE profile_id = ?
+       AND identity_status = 'verified' AND job_source_status = 'pending'`,
   )
     .bind(profileId)
     .first<{ n: number }>();
@@ -2360,6 +2409,13 @@ async function listCompanies(request: Request, env: Env): Promise<Response> {
   });
 }
 
+/**
+ * The single insert path for a company, and the only place a new row's state is decided.
+ *
+ * Everything written here goes through companyIdentity (so the raw aggregator string is preserved
+ * as source_name while the display name is cleaned) and reconcileCompanyState (so an impossible
+ * identity/job-source combination is corrected here rather than surfacing in the UI later).
+ */
 async function addCompanyRow(
   env: Env,
   profileId: string,
@@ -2369,35 +2425,82 @@ async function addCompanyRow(
     careers_url: string;
     bio: string;
     location: string;
-    status: string;
     source: string;
-    verify_reason?: string;
+    identity?: IdentityStatus;
+    jobSource?: JobSourceStatus;
+    websiteConfidence?: number | null;
+    websiteEvidence?: string;
+    websiteSource?: string;
+    boardUrl?: string;
     scan_note?: string;
     signal?: string;
   },
 ): Promise<boolean> {
+  const identity = companyIdentity(company.name);
+  const { state } = reconcileCompanyState({
+    identity: company.identity ?? "pending",
+    jobSource: company.jobSource ?? "pending",
+    website: company.website,
+    websiteConfidence: company.websiteConfidence ?? null,
+    websiteEvidence: company.websiteEvidence ?? "",
+    boardUrl: company.boardUrl ?? "",
+    atsProvider: "",
+    atsToken: "",
+  });
+
   const result = await env.DB.prepare(
     `INSERT OR IGNORE INTO companies
-       (id, profile_id, name, name_key, website, careers_url, bio, location, status, verify_reason, source, scan_note, signal)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, profile_id, name, name_key, source_name, website, careers_url, bio, location,
+        status, verify_reason, identity_status, job_source_status, website_source,
+        website_confidence, website_evidence, board_url, source, scan_note, signal)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       crypto.randomUUID(),
       profileId,
-      company.name,
-      companyNameKey(company.name),
-      company.website,
+      identity.displayName,
+      identity.matchKey,
+      identity.sourceName,
+      state.website,
       company.careers_url,
       company.bio,
       company.location,
-      company.status,
-      company.verify_reason ?? "",
+      // Legacy status/verify_reason are still written for one release so a rollback stays possible.
+      legacyStatusFor(state),
+      legacyVerifyReasonFor(state),
+      state.identity,
+      state.jobSource,
+      company.websiteSource ?? "",
+      state.websiteConfidence,
+      state.websiteEvidence,
+      state.boardUrl,
       company.source,
       company.scan_note ?? "",
       company.signal ?? "",
     )
     .run();
   return result.meta.changes > 0;
+}
+
+/** Legacy `status` projection, kept in sync so an older reader still sees something coherent. */
+function legacyStatusFor(state: { identity: IdentityStatus; jobSource: JobSourceStatus }): string {
+  if (state.identity === "dismissed") return "dismissed";
+  if (state.identity !== "verified") return state.identity === "pending" ? "discovered" : "unverified";
+  return state.jobSource === "supported" ? "verified" : state.jobSource === "pending" ? "discovered" : "unverified";
+}
+
+/** Legacy `verify_reason` projection. */
+function legacyVerifyReasonFor(state: { identity: IdentityStatus; jobSource: JobSourceStatus }): string {
+  if (state.identity === "unresolved") return "no_website";
+  if (state.identity === "ambiguous") return "ambiguous";
+  if (state.identity !== "verified") return "";
+  switch (state.jobSource) {
+    case "unsupported_ats": return "unsupported_ats";
+    case "board_unreachable": return "board_unreachable";
+    case "no_board":
+    case "careers_only": return "no_job_board";
+    default: return "";
+  }
 }
 
 async function createCompany(request: Request, env: Env): Promise<Response> {
@@ -2419,7 +2522,10 @@ async function createCompany(request: Request, env: Env): Promise<Response> {
     careers_url: (body.careers_url ?? "").trim(),
     bio: (body.bio ?? "").trim(),
     location: (body.location ?? "").trim(),
-    status: "discovered",
+    // A website the candidate typed themselves is identity evidence -- they know who they meant, so
+    // it needs no resolver confirmation. Without one, identity stays pending for the resolver.
+    identity: (body.website ?? "").trim() ? "verified" : "pending",
+    websiteSource: (body.website ?? "").trim() ? "manual" : "",
     source: "manual",
   });
   return json({ added }, added ? 201 : 200);
@@ -2482,7 +2588,8 @@ async function bulkAddCompanies(request: Request, env: Env): Promise<Response> {
       careers_url: "",
       bio: "",
       location: "",
-      status: "discovered",
+      identity: company.website ? "verified" : "pending",
+      websiteSource: company.website ? "manual" : "",
       source: "manual",
     });
     if (wasAdded) added += 1;
@@ -2683,7 +2790,7 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
   const existing = await env.DB.prepare("SELECT name FROM companies WHERE profile_id = ?")
     .bind(profileId)
     .all<{ name: string }>();
-  const known = new Set((existing.results ?? []).map((r) => companyNameKey(r.name)));
+  const known = new Set((existing.results ?? []).map((r) => companyIdentity(r.name).matchKey));
 
   return ndjsonResponse(ctx, async (emit) => {
     await emit({
@@ -2741,13 +2848,22 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
     );
 
     const aggregated = aggregateCompanies(allPostings);
-    const discovered = aggregated.filter((c) => {
-      const key = companyNameKey(c.name);
+
+    // Employer fields that held an ATS page title rather than a company ("Careers Listing", "Job
+    // Board"). Dropped before dedupe so they never become company rows to resolve, display, or
+    // explain -- there is no website to find for a string that names no employer.
+    const namedCompanies = aggregated.filter((c) => !isNonCompanyName(c.name));
+    const notCompanies = aggregated.length - namedCompanies.length;
+
+    const discovered = namedCompanies.filter((c) => {
+      // companyIdentity's match key, not the old companyNameKey: it merges "Sargent & Lundy LLC."
+      // with "Sargent Lundy" while keeping genuinely distinct employers apart.
+      const key = companyIdentity(c.name).matchKey;
       if (!key || known.has(key)) return false;
       known.add(key);
       return true;
     });
-    const duplicates = aggregated.length - discovered.length;
+    const duplicates = namedCompanies.length - discovered.length;
 
     // Adzuna's `where` filter is soft-matched on its end, so the same location check is enforced
     // locally too, rather than trusted blindly -- a filter stated to an external system is still
@@ -2772,23 +2888,41 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
     await runPooled(
       fresh,
       6,
-      async (company) => resolveCompanyDomain(company.name),
-      async (company, domain) => {
+      // The full waterfall, not the old bare slug guess: cleaned-name domain candidates, each one
+      // confirmed against what the page says about itself before it is accepted. Discovery evidence
+      // (the posting URL the aggregator gave us) is tried first and outranks any guess.
+      async (company): Promise<Awaited<ReturnType<typeof resolveWebsiteDeterministic>>> => {
+        const evidence: DiscoveryEvidence = {
+          name: company.name,
+          location: company.location,
+          signal: company.signal,
+          urls: company.urls ?? [],
+        };
+        return resolveWebsiteDeterministic(evidence);
+      },
+      async (company, outcome) => {
         checked += 1;
-        if (domain) domainResolved += 1;
+        if (outcome.status === "resolved") domainResolved += 1;
         else domainUnresolved += 1;
+
+        const resolved = outcome.status === "resolved";
+        const ambiguous = outcome.status === "ambiguous";
         const inserted = await addCompanyRow(env, profileId, {
           name: company.name,
-          website: domain ?? "",
+          website: outcome.status === "unresolved" ? "" : outcome.website,
           careers_url: "",
           bio: "",
           location: company.location,
-          status: domain ? "discovered" : "unverified",
-          verify_reason: domain ? "" : "no_website",
+          identity: resolved ? "verified" : ambiguous ? "ambiguous" : "unresolved",
+          websiteSource: resolved || ambiguous ? outcome.source : "",
+          websiteConfidence: resolved || ambiguous ? outcome.confidence : null,
+          websiteEvidence: outcome.evidence,
           source: "adzuna",
-          scan_note: domain
-            ? "Website found from the company's name; checking its careers page and supported job boards."
-            : "Discovered from real job postings. No matching website was confirmed automatically yet -- this is retried the next time you scan, including a search-grounded fallback, or add the website by hand.",
+          scan_note: resolved
+            ? "Website confirmed; checking its careers page and job board next."
+            : ambiguous
+              ? "A possible website was found but could not be confirmed to be this company. Left unverified rather than guessed -- confirm or correct it by hand."
+              : "Discovered from real job postings. No website confirmed yet; retried automatically on the next run, and you can add one by hand.",
           signal: company.signal,
         });
         if (inserted) added += 1;
@@ -2798,7 +2932,8 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
           done: checked,
           total: fresh.length,
           company: company.name,
-          resolved: Boolean(domain),
+          resolved: outcome.status === "resolved",
+          outcome: outcome.status,
         });
       },
     );
@@ -2811,6 +2946,7 @@ async function discoverCompanies(request: Request, env: Env, ctx: ExecutionConte
       domain_resolved: domainResolved,
       domain_unresolved: domainUnresolved,
       locations: desiredLocations,
+      not_companies: notCompanies,
       query_errors: queryErrors,
       rate_limited: rateLimited,
       streams_processed: searched,
@@ -2844,7 +2980,7 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
   const limit = Math.min(Math.max(Number(body.limit) || 6, 1), 500);
   const targets = body.company_id
     ? await env.DB.prepare(
-        "SELECT id, name, website, careers_url, ats_provider, ats_token, last_scanned_at, location, signal FROM companies WHERE id = ? AND profile_id = ?",
+        "SELECT id, name, website, careers_url, ats_provider, ats_token, last_scanned_at, location, signal, board_url FROM companies WHERE id = ? AND profile_id = ?",
       )
         .bind(body.company_id, profileId)
         .all<CompanyScanRow>()
@@ -2869,10 +3005,11 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
         // can't reach everyone in one request -- each round's just-checked companies get a fresh
         // last_scanned_at and sort to the back, so a multi-round run still ends up covering every
         // company exactly once.
-        `SELECT id, name, website, careers_url, ats_provider, ats_token, last_scanned_at, location, signal
+        `SELECT id, name, website, careers_url, ats_provider, ats_token, last_scanned_at, location, signal, board_url
          FROM companies
-         WHERE profile_id = ? AND status != 'dismissed'
-           AND NOT (verify_reason = 'unsupported_ats' AND last_verified_at > datetime('now', '-14 days'))
+         WHERE profile_id = ? AND identity_status NOT IN ('dismissed', 'not_a_company')
+           AND NOT (job_source_status = 'unsupported_ats' AND job_source_checked_at > datetime('now', '-14 days'))
+           AND NOT (job_source_status IN ('no_board', 'careers_only') AND job_source_checked_at > datetime('now', '-3 days'))
          ORDER BY last_scanned_at IS NOT NULL, last_scanned_at ASC
          LIMIT ?`,
       )
@@ -2924,8 +3061,9 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
     // target query above applies) -- the client uses this against however many it's scanned so
     // far across this click's rounds to know when a Find Jobs run has covered everyone.
     const eligible = await env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND status != 'dismissed'
-       AND NOT (verify_reason = 'unsupported_ats' AND last_verified_at > datetime('now', '-14 days'))`,
+      `SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND identity_status NOT IN ('dismissed', 'not_a_company')
+       AND NOT (job_source_status = 'unsupported_ats' AND job_source_checked_at > datetime('now', '-14 days'))
+       AND NOT (job_source_status IN ('no_board', 'careers_only') AND job_source_checked_at > datetime('now', '-3 days'))`,
     )
       .bind(profileId)
       .first<{ n: number }>();
@@ -2944,11 +3082,105 @@ type CompanyScanRow = {
   last_scanned_at: string | null;
   location: string;
   signal: string;
+  board_url: string;
 };
 
 /** Minimum confidence resolveWebsiteViaSearch must report before its answer is even attempted --
  *  below this, it's treated the same as "ambiguous", not silently trusted. */
 const WEBSITE_SEARCH_CONFIDENCE_FLOOR = 60;
+
+/**
+ * The single update path for a company's pipeline state, and the only place scan outcomes are
+ * persisted. Everything runs through reconcileCompanyState first, so a caller that computes an
+ * impossible combination gets it corrected here instead of writing a contradictory row.
+ *
+ * Legacy status/verify_reason are projected alongside the new axes for one release, so an older
+ * reader (or a rollback) still sees a coherent value.
+ */
+async function writeCompanyState(
+  env: Env,
+  companyId: string,
+  desired: {
+    identity: IdentityStatus;
+    jobSource: JobSourceStatus;
+    website?: string;
+    websiteConfidence?: number | null;
+    websiteEvidence?: string;
+    websiteSource?: string;
+    boardUrl?: string;
+    atsProvider?: string;
+    atsToken?: string;
+    careersUrl?: string;
+    scanNote?: string;
+    touchScanned?: boolean;
+  },
+): Promise<{ identity: IdentityStatus; jobSource: JobSourceStatus; repaired: string[] }> {
+  const { state, repaired } = reconcileCompanyState({
+    identity: desired.identity,
+    jobSource: desired.jobSource,
+    website: desired.website ?? "",
+    websiteConfidence: desired.websiteConfidence ?? null,
+    websiteEvidence: desired.websiteEvidence ?? "",
+    boardUrl: desired.boardUrl ?? "",
+    atsProvider: desired.atsProvider ?? "",
+    atsToken: desired.atsToken ?? "",
+  });
+
+  await env.DB.prepare(
+    `UPDATE companies SET
+       identity_status = ?, job_source_status = ?, status = ?, verify_reason = ?,
+       website = COALESCE(NULLIF(?, ''), website),
+       website_confidence = COALESCE(?, website_confidence),
+       website_evidence = COALESCE(NULLIF(?, ''), website_evidence),
+       website_source = COALESCE(NULLIF(?, ''), website_source),
+       board_url = COALESCE(NULLIF(?, ''), board_url),
+       ats_provider = COALESCE(NULLIF(?, ''), ats_provider),
+       ats_token = COALESCE(NULLIF(?, ''), ats_token),
+       careers_url = COALESCE(NULLIF(?, ''), careers_url),
+       scan_note = COALESCE(NULLIF(?, ''), scan_note),
+       last_verified_at = CURRENT_TIMESTAMP,
+       job_source_checked_at = CURRENT_TIMESTAMP,
+       last_scanned_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_scanned_at END,
+       updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  )
+    .bind(
+      state.identity,
+      state.jobSource,
+      legacyStatusFor(state),
+      legacyVerifyReasonFor(state),
+      state.website,
+      state.websiteConfidence,
+      state.websiteEvidence,
+      desired.websiteSource ?? "",
+      state.boardUrl,
+      state.atsProvider,
+      state.atsToken,
+      desired.careersUrl ?? "",
+      desired.scanNote ?? "",
+      desired.touchScanned === false ? 0 : 1,
+      companyId,
+    )
+    .run();
+
+  return { identity: state.identity, jobSource: state.jobSource, repaired };
+}
+
+/** The public board URL for a resolved provider/token pair. One definition, so a board link and a
+ *  board read can never disagree about where the board is. */
+function boardUrlFor(provider: AtsProvider, token: string): string {
+  switch (provider) {
+    case "greenhouse": return `https://job-boards.greenhouse.io/${token}`;
+    case "lever": return `https://jobs.lever.co/${token}`;
+    case "ashby": return `https://jobs.ashbyhq.com/${token}`;
+    case "smartrecruiters": return `https://careers.smartrecruiters.com/${token}`;
+    case "workday": {
+      const [tenant, pod, site] = token.split("|");
+      return tenant && pod && site ? `https://${tenant}.${pod}.myworkdayjobs.com/${site}` : "";
+    }
+    default: return token.includes(".") ? `https://${token}` : "";
+  }
+}
 
 async function scanOneCompany(
   env: Env,
@@ -2966,67 +3198,118 @@ async function scanOneCompany(
   // the way the free deterministic paths are; a manual "Save website" fix remains available
   // regardless of how this attempt goes.
   if (!company.website) {
-    if (!company.last_scanned_at) {
+    // Free deterministic waterfall first (cleaned-name candidates, each confirmed against what the
+    // page says about itself). It runs on every scan, because it costs nothing beyond a couple of
+    // HTTP requests and a company unresolvable last week may be resolvable today.
+    const deterministic = await resolveWebsiteDeterministic({
+      name: company.name,
+      location: company.location,
+      signal: company.signal,
+    });
+    if (deterministic.status === "resolved") {
+      await writeCompanyState(env, company.id, {
+        identity: "verified",
+        jobSource: "pending",
+        website: deterministic.website,
+        websiteConfidence: deterministic.confidence,
+        websiteEvidence: deterministic.evidence,
+        websiteSource: deterministic.source,
+        scanNote: "Website confirmed; checking its job board next.",
+        touchScanned: false,
+      });
+      company = { ...company, website: deterministic.website };
+    } else if (!company.last_scanned_at) {
+      // Paid, search-grounded fallback. Only on a company's first scan: it costs real money, so it
+      // is not worth re-spending on every click the way the free paths above are. Manual entry
+      // stays available regardless of how this goes.
       const found = await resolveWebsiteViaSearch(env, { name: company.name, location: company.location, signal: company.signal });
       if (found && found.official_website && found.confidence >= WEBSITE_SEARCH_CONFIDENCE_FLOOR) {
-        const reachable = await verifyWebsite(found.official_website);
-        if (reachable) {
-          await env.DB.prepare(
-            `UPDATE companies SET website = ?, careers_url = ?, website_source = 'search', website_confidence = ?,
-             updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-          )
-            .bind(found.official_website, found.careers_url || company.careers_url, found.confidence, company.id)
-            .run();
-          // Fall through into the normal resolved-website path below with the freshly found site --
-          // no reason to make the candidate wait for a second click just to attempt board resolution.
-          company = { ...company, website: found.official_website, careers_url: found.careers_url || company.careers_url };
+        // Never trusted on the model's word: the proposed URL is re-verified against real page
+        // evidence, exactly like a guessed one.
+        const confirmed = await verifyCandidate(company.name, found.official_website);
+        if (confirmed && confirmed.score >= CONFIDENCE_FLOOR) {
+          await writeCompanyState(env, company.id, {
+            identity: "verified",
+            jobSource: "pending",
+            website: confirmed.url,
+            websiteConfidence: confirmed.score,
+            websiteEvidence: `search: ${found.reason} | confirmed: ${confirmed.evidence}`,
+            websiteSource: "search",
+            careersUrl: found.careers_url || "",
+            scanNote: "Website found by search and confirmed; checking its job board next.",
+            touchScanned: false,
+          });
+          company = { ...company, website: confirmed.url, careers_url: found.careers_url || company.careers_url };
+        } else {
+          await writeCompanyState(env, company.id, {
+            identity: "ambiguous",
+            jobSource: "pending",
+            website: found.official_website,
+            websiteConfidence: confirmed?.score ?? found.confidence,
+            websiteEvidence: `search proposed ${found.official_website} but the page did not confirm it: ${confirmed?.evidence ?? "unreachable"}`,
+            websiteSource: "search",
+            scanNote: "A website was proposed but could not be confirmed as this company. Confirm or correct it by hand.",
+          });
+          return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
         }
       } else if (found && found.official_website) {
-        // A URL was proposed, but the model itself wasn't confident this is the right company for
-        // a name this ambiguous -- reporting it as found-but-wrong-company would be worse than not
-        // finding it at all, so this is its own reason, not folded into no_website.
-        await env.DB.prepare(
-          `UPDATE companies SET status = 'unverified', verify_reason = 'ambiguous', scan_note = ?,
-           last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-           WHERE id = ?`,
-        )
-          .bind(`Multiple companies could match this name. ${found.reason}`.trim(), company.id)
-          .run();
+        await writeCompanyState(env, company.id, {
+          identity: "ambiguous",
+          jobSource: "pending",
+          website: found.official_website,
+          websiteConfidence: found.confidence,
+          websiteEvidence: found.reason,
+          websiteSource: "search",
+          scanNote: `Multiple companies could match this name. ${found.reason}`.trim(),
+        });
         return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
       }
+    } else if (deterministic.status === "ambiguous") {
+      await writeCompanyState(env, company.id, {
+        identity: "ambiguous",
+        jobSource: "pending",
+        website: deterministic.website,
+        websiteConfidence: deterministic.confidence,
+        websiteEvidence: deterministic.evidence,
+        websiteSource: deterministic.source,
+        scanNote: "A possible website was found but not confirmed as this company. Confirm or correct it by hand.",
+      });
+      return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
     }
   }
   if (!company.website) {
-    await env.DB.prepare(
-      `UPDATE companies SET status = 'unverified', verify_reason = 'no_website', scan_note = ?,
-       last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
-    )
-      .bind("No website on file for this company yet. Add one to include it in scanning.", company.id)
-      .run();
-    return { jobs: 0, newJobs: 0, note: "no website on file", status: "unverified" };
+    await writeCompanyState(env, company.id, {
+      identity: "unresolved",
+      jobSource: "pending",
+      scanNote: "No website could be confirmed for this company yet. Retried automatically, or add one by hand.",
+    });
+    return { jobs: 0, newJobs: 0, note: "no website confirmed", status: "unverified" };
   }
 
   let provider = company.ats_provider as AtsProvider | "" | "none";
   let token = company.ats_token;
 
   if (!provider || provider === "none") {
-    const resolved = await resolveBoard(company.website, company.careers_url, company.name, budget);
+    // Any URL already on the row may itself name an ATS. This is free and used to be skipped
+    // entirely: the patterns only ever ran against careers-page HTML, never against a URL already
+    // resolved and stored, which is how a readable Greenhouse board sat on a row labelled "no job
+    // board" with its jobs never imported.
+    const fromStoredUrl = detectAtsFromUrl(company.careers_url) ?? detectAtsFromUrl(company.board_url ?? "");
+    const resolved = fromStoredUrl ?? (await resolveBoard(company.website, company.careers_url, company.name, budget));
     if (!resolved) {
-      const { status, verify_reason } = classifyVerification(true, null, false, false);
-      await env.DB.prepare(
-        `UPDATE companies SET status = ?, verify_reason = ?, ats_provider = 'none', scan_note = ?,
-         last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?`,
-      )
-        .bind(
-          status,
-          verify_reason,
-          "Checked the company careers page and common careers-page paths, then tested likely Greenhouse, Lever, Ashby, and SmartRecruiters board addresses. No accessible supported job board was found.",
-          company.id,
-        )
-        .run();
-      return { jobs: 0, newJobs: 0, note: "no supported board found", status: "unverified" };
+      // A careers page we found but could not classify is NOT "no job board" -- the link is the
+      // useful thing to show. Only a company with no hiring surface at all gets no_board.
+      const careersUrl = company.careers_url || "";
+      await writeCompanyState(env, company.id, {
+        identity: "verified",
+        jobSource: careersUrl ? "careers_only" : "no_board",
+        website: company.website,
+        boardUrl: careersUrl,
+        scanNote: careersUrl
+          ? "Careers page found, but it does not run on a job-board system this app can read. Use the link to browse it directly."
+          : "Checked the careers page, common careers paths, and likely Greenhouse, Lever, Ashby, and SmartRecruiters addresses. No job board was found.",
+      });
+      return { jobs: 0, newJobs: 0, note: careersUrl ? "careers page only" : "no job board found", status: "unverified" };
     }
     provider = resolved.provider;
     token = resolved.token;
@@ -3041,15 +3324,20 @@ async function scanOneCompany(
   // above entirely and would otherwise fall through into fetchBoardJobs with a provider it has no
   // case for.
   if (!isReadableAtsProvider(provider as AtsProvider)) {
-    const boardUrl = `https://${token}`;
+    const boardUrl = token.includes(".") ? `https://${token}` : company.careers_url || company.website;
     const label = atsDisplayName(provider as AtsProvider);
-    const { status, verify_reason } = classifyVerification(true, { provider: provider as AtsProvider, token }, false, false);
-    await env.DB.prepare(
-      `UPDATE companies SET status = ?, verify_reason = ?, ats_provider = ?, ats_token = ?, careers_url = ?, scan_note = ?,
-       last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    )
-      .bind(status, verify_reason, provider, token, boardUrl, `Uses ${label} for hiring. View current openings directly.`, company.id)
-      .run();
+    // Verified company, unsupported board. The limitation is ApplyGo's, not the employer's, and the
+    // state model now says so instead of filing this under "unverified".
+    await writeCompanyState(env, company.id, {
+      identity: "verified",
+      jobSource: "unsupported_ats",
+      website: company.website,
+      atsProvider: provider,
+      atsToken: token,
+      boardUrl,
+      careersUrl: boardUrl,
+      scanNote: `Hires through ${label}, which this app cannot read automatically yet. View current openings directly.`,
+    });
     return { jobs: 0, newJobs: 0, note: `uses ${label}, view directly`, status: "unverified" };
   }
 
@@ -3063,19 +3351,17 @@ async function scanOneCompany(
     budget.remaining -= 1;
     scanned = await fetchBoardJobs(provider as AtsProvider, token);
   } catch (err) {
-    const { status, verify_reason } = classifyVerification(
-      true,
-      { provider: provider as AtsProvider, token },
-      true,
-      hadPriorSuccess,
-    );
-    await env.DB.prepare(
-      `UPDATE companies SET status = ?, verify_reason = ?, scan_note = ?, last_scanned_at = CURRENT_TIMESTAMP,
-       last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    )
-      .bind(status, verify_reason, `Board read failed: ${(err as Error).message}`, company.id)
-      .run();
-    return { jobs: 0, newJobs: 0, note: "board read failed", status };
+    // A company that has read successfully before is never demoted by one transient failure.
+    await writeCompanyState(env, company.id, {
+      identity: "verified",
+      jobSource: hadPriorSuccess ? "supported" : "board_unreachable",
+      website: company.website,
+      atsProvider: provider,
+      atsToken: token,
+      boardUrl: boardUrlFor(provider as AtsProvider, token),
+      scanNote: `Board read failed: ${(err as Error).message}`,
+    });
+    return { jobs: 0, newJobs: 0, note: "board read failed", status: hadPriorSuccess ? "verified" : "unverified" };
   }
 
   // A company can qualify on location while most of its postings don't, so each posting is
@@ -3144,12 +3430,16 @@ async function scanOneCompany(
       ? `${scanned.length} open role${scanned.length === 1 ? "" : "s"} on their board.`
       : `${relevant.length} of ${scanned.length} open roles match your target roles and locations.`;
 
-  await env.DB.prepare(
-    `UPDATE companies SET status = 'verified', verify_reason = '', ats_provider = ?, ats_token = ?, open_jobs = ?, scan_note = ?,
-     last_scanned_at = CURRENT_TIMESTAMP, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-  )
-    .bind(provider, token, total?.n ?? 0, note, company.id)
-    .run();
+  await writeCompanyState(env, company.id, {
+    identity: "verified",
+    jobSource: "supported",
+    website: company.website,
+    atsProvider: provider,
+    atsToken: token,
+    boardUrl: boardUrlFor(provider as AtsProvider, token),
+    scanNote: note,
+  });
+  await env.DB.prepare("UPDATE companies SET open_jobs = ? WHERE id = ?").bind(total?.n ?? 0, company.id).run();
 
   return { jobs: relevant.length, newJobs, note, status: "verified" };
 }
@@ -3163,73 +3453,70 @@ async function updateCompany(request: Request, env: Env, id: string): Promise<Re
     careers_url?: string;
   };
 
-  // A website supplied for an 'unverified'/no_website row is the manual-fix path: re-verify it the
-  // same way discovery would have, and only clear the ATS provider (so the next scan re-resolves
-  // the board from scratch against the corrected domain) if it actually resolves, rather than
-  // trusting whatever was typed in. Set back to 'discovered' on success so the routine verify/scan
-  // pass picks it up naturally -- no separate "retry" endpoint needed.
+  // A website the candidate typed is the manual-fix path. It is still verified before being
+  // trusted -- but held to a lower bar than a machine guess: they know which company they meant,
+  // so reachability is enough and page-evidence scoring is not required.
   const website = (body.website ?? "").trim();
   if (website) {
-    const reachable = await verifyWebsite(website.match(/^https?:\/\//i) ? website : `https://${website}`);
-    const status = reachable ? "discovered" : "unverified";
-    const verifyReason: VerifyReason = reachable ? "" : "no_website";
-    const result = await env.DB.prepare(
-      `UPDATE companies SET website = ?, careers_url = ?, status = ?, verify_reason = ?,
-       website_source = 'manual', website_confidence = NULL,
-       ats_provider = CASE WHEN ? THEN '' ELSE ats_provider END, scan_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    )
-      .bind(
-        website,
-        (body.careers_url ?? "").trim(),
-        status,
-        verifyReason,
-        reachable ? 1 : 0,
-        reachable
-          ? "Website verified; checking its careers page and supported job boards."
-          : "That website could not be reached -- double-check the address.",
-        id,
-      )
-      .run();
-    return json({ updated: result.meta.changes > 0, status, reachable });
+    const normalized = website.match(/^https?:\/\//i) ? website : `https://${website}`;
+    const reachable = await verifyWebsite(normalized);
+    const { identity } = await writeCompanyState(env, id, {
+      identity: reachable ? "verified" : "unresolved",
+      // Force a fresh board resolution against the corrected domain: whatever was resolved before
+      // belonged to the old (wrong) website.
+      jobSource: "pending",
+      website: reachable ? normalized : "",
+      websiteConfidence: reachable ? 100 : null,
+      websiteEvidence: reachable ? "entered by hand" : "entered by hand but unreachable",
+      websiteSource: "manual",
+      careersUrl: (body.careers_url ?? "").trim(),
+      scanNote: reachable
+        ? "Website set by hand; checking its careers page and job board next."
+        : "That website could not be reached -- double-check the address.",
+      touchScanned: false,
+    });
+    if (reachable) {
+      await env.DB.prepare("UPDATE companies SET ats_provider = '', ats_token = '', board_url = '' WHERE id = ?").bind(id).run();
+    }
+    return json({ updated: true, status: identity, reachable });
   }
 
   if (body.status === "dismissed") {
     const result = await env.DB.prepare(
-      "UPDATE companies SET status = 'dismissed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      "UPDATE companies SET identity_status = 'dismissed', status = 'dismissed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
       .bind(id)
       .run();
     return json({ updated: result.meta.changes > 0, status: "dismissed" });
   }
 
-  // Re-add: restore whatever verify state the row's already-known ats_provider/website implies,
-  // rather than blindly resetting to 'discovered' -- a previously-verified company (working board,
-  // real postings) should read as Verified again immediately, not sit mislabeled as freshly
-  // discovered until its next scan happens to run. No network call needed; this is the same
-  // classification the 0027 migration's backfill already used for exactly this reason.
-  const row = await env.DB.prepare("SELECT website, ats_provider FROM companies WHERE id = ?")
+  // Re-add: restore the state the row's own stored evidence implies rather than resetting to
+  // "discovered" -- a company with a confirmed website and a working board should read as Verified
+  // again immediately, not sit mislabeled until its next scan. reconcileCompanyState does the
+  // deriving, so this agrees with every other write path by construction.
+  const row = await env.DB.prepare("SELECT website, ats_provider, ats_token, board_url, website_confidence FROM companies WHERE id = ?")
     .bind(id)
-    .first<{ website: string; ats_provider: string }>();
-  let status = "discovered";
-  let verifyReason: VerifyReason = "";
-  if (!row?.website) {
-    status = "unverified";
-    verifyReason = "no_website";
-  } else if (row.ats_provider === "none") {
-    status = "unverified";
-    verifyReason = "no_job_board";
-  } else if (row.ats_provider && !isReadableAtsProvider(row.ats_provider as AtsProvider)) {
-    status = "unverified";
-    verifyReason = "unsupported_ats";
-  } else if (row.ats_provider) {
-    status = "verified";
-  }
-  const result = await env.DB.prepare(
-    "UPDATE companies SET status = ?, verify_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-  )
-    .bind(status, verifyReason, id)
-    .run();
-  return json({ updated: result.meta.changes > 0, status });
+    .first<{ website: string; ats_provider: string; ats_token: string; board_url: string; website_confidence: number | null }>();
+  const readable = row?.ats_provider ? isReadableAtsProvider(row.ats_provider as AtsProvider) : false;
+  const { identity } = await writeCompanyState(env, id, {
+    identity: row?.website ? "verified" : "pending",
+    jobSource: !row?.website
+      ? "pending"
+      : readable
+        ? "supported"
+        : row.ats_provider
+          ? "unsupported_ats"
+          : row.board_url
+            ? "careers_only"
+            : "pending",
+    website: row?.website ?? "",
+    websiteConfidence: row?.website_confidence ?? null,
+    atsProvider: row?.ats_provider ?? "",
+    atsToken: row?.ats_token ?? "",
+    boardUrl: row?.board_url ?? "",
+    touchScanned: false,
+  });
+  return json({ updated: true, status: identity });
 }
 
 async function deleteCompany(request: Request, env: Env, id: string): Promise<Response> {
@@ -6175,8 +6462,8 @@ Let me check the placeholder embraces like a variable name, gets its value when 
      back in seconds, so they stay quiet and only redden on hover. These two -- resetting a whole
      pipeline stage, deleting an entire collection -- can throw away hours of scanning, and a
      confirm() dialog that only appears after the click is too late to be the first warning. Same
-     red-outline vocabulary Jindr's "Not for me" already established, so it reads as a known shape
-     rather than a new one. */
+     red-outline vocabulary the Jobs cards' own "Not for me" already established, so it reads as a
+     known shape rather than a new one. */
   .row-actions button.destructive {
     border-color: var(--error); color: var(--error);
   }
@@ -6341,15 +6628,11 @@ Let me check the placeholder embraces like a variable name, gets its value when 
      flow-conserving ribbon across that boundary would visually claim a company-to-job unit that
      doesn't exist. */
   #companies-pipeline-row { display: flex; align-items: center; gap: 0.5rem; }
-  /* Fixed at 58% (not 100%) of the row on purpose: the viewBox below (vbW 770) is tightly cropped
-     to this diagram's real 2-stage content using Jobs' own per-stage constants (COL_MARGIN,
-     COL_STEP, node/font CSS -- all shared, unchanged), rather than Jobs' full 3-stage vbW (1320).
-     Stretching that narrower viewBox to 100% of a full-width row would scale every node/font/stroke
-     up by ~1320/770, i.e. visibly larger than Jobs' -- exactly the "too large" complaint. Capping
-     the container to the matching 770/1320 fraction keeps 1 viewBox unit equal to the same real
-     pixel size in both diagrams, so node size/typography/density genuinely match, not just the
-     stage-graph logic. */
-  #companies-pipeline { flex: 0 0 58%; max-width: 58%; margin: 0.6rem 0 0.5rem; }
+  /* Same viewBox and constants as #jobs-pipeline (vbW 1320, three stages), so one viewBox unit is
+     the same real pixel size in both diagrams and the two read at identical node size, typography,
+     and density -- they are two windows onto one pipeline, not two charts that happen to sit on
+     different pages. */
+  #companies-pipeline { flex: 1 1 auto; min-width: 0; margin: 0.6rem 0 0.5rem; }
   #companies-pipeline svg { display: block; width: 100%; height: auto; overflow: visible; }
   .cpf-arrow { flex: 0 0 auto; font-size: 15px; color: var(--text-muted); }
   .cpf-stage-handoff {
@@ -6397,25 +6680,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     font-size: 0.9rem; border-left: 3px solid var(--accent); padding: 0.5rem 0.75rem;
     background: var(--surface-2, rgba(127,127,127,0.08)); border-radius: 0 0.4rem 0.4rem 0;
   }
-  /* One-at-a-time review card. touch-action:pan-y leaves vertical scroll to the browser and hands
-     horizontal movement to the drag handler; select:none stops a fast swipe from also highlighting
-     the card's text on desktop. */
-  /* Jindr is the one screen built around a single decision, so it gets to look like one instead of
-     like a Jobs row that happens to be alone on the page. Capping the section and centring it
-     stops the card stranding itself in the top-left corner of a wide window; the extra padding and
-     larger type inside are what make it read as "look at this one thing" rather than "here is a
-     list of length one". */
-  #jindr-section { max-width: 34rem; margin-inline: auto; }
-  .jindr-card {
-    border: 1px solid var(--border); border-radius: var(--radius); padding: 1.6rem 1.5rem;
-    background: var(--surface-2); touch-action: pan-y; user-select: none; cursor: grab;
-  }
-  .jindr-card .row-title { font-size: 1.25rem; line-height: 1.3; }
-  .jindr-card .row-title-line { gap: 0.55rem; margin-bottom: 0.15rem; }
-  .jindr-card .job-reason { font-size: 0.95rem; margin-top: 0.7rem; }
-  .jindr-card.dragging { cursor: grabbing; transition: none; }
-  .jindr-facts, .row-facts { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.6rem 0; }
-  .row-facts { margin: 0.3rem 0 0; }
+  .row-facts { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.3rem 0 0; }
   /* Label above value, not squeezed onto one line -- a long value (e.g. a full remote/onsite
      policy sentence) used to force a single-line badge past the edge of the card/screen instead
      of wrapping. min-width:0 lets the value actually wrap inside a flex-wrap parent. */
@@ -6429,12 +6694,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     color: var(--text-muted);
   }
   .fact-chip .fact-value { color: var(--text); word-break: break-word; }
-  .jindr-actions { display: flex; gap: 0.75rem; margin-top: 1.1rem; }
-  .jindr-actions button { flex: 1; font-size: 0.95rem; padding: 0.75rem; margin-top: 0; }
-  .jindr-actions button.danger {
-    background: var(--surface); border: 1px solid var(--error); color: var(--error);
-  }
-  .jindr-actions button.danger:hover:not(:disabled) { background: var(--error-soft); opacity: 1; }
   /* Compact green action -- Recommended/Not Recommended's "Interested" and Removed's "Re-add" -- same quiet,
      colors-on-hover convention as .danger, just green instead of red. */
   .row-actions button.success:hover:not(:disabled) { color: var(--success); border-color: var(--success); }
@@ -6551,7 +6810,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     <button class="tab" data-tab="resume" type="button">CV</button>
     <button class="tab" data-tab="companies" type="button">Companies</button>
     <button class="tab" data-tab="jobs" type="button">Jobs</button>
-    <button class="tab" data-tab="jindr" type="button">Jindr</button>
     <button class="tab tab-icon" data-tab="settings" type="button" aria-label="Settings" title="Settings">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="12" r="3"></circle>
@@ -6811,7 +7069,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     <div class="segmented-control" id="companies-view-tabs" role="group" aria-label="Company sections">
       <button class="active" data-companies-view="find" type="button" aria-pressed="true">Search</button>
       <button data-companies-view="verified" type="button" aria-pressed="false">Verified <span id="companies-verified-count"></span></button>
-      <button data-companies-view="unverified" type="button" aria-pressed="false">Unverified <span id="companies-unverified-count"></span></button>
+      <button data-companies-view="unresolved" type="button" aria-pressed="false">Unresolved <span id="companies-unresolved-count"></span></button>
       <button data-companies-view="removed" type="button" aria-pressed="false">Removed <span id="companies-removed-count"></span></button>
     </div>
 
@@ -6852,9 +7110,9 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         </div>
       </div>
       <div class="pf-legend">
-        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--accent)"></span>Discovered</span>
-        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--error)"></span>Unverified</span>
-        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--success)"></span>Verified</span>
+        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--accent)"></span>Awaiting checks</span>
+        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--error)"></span>Unresolved / unreadable</span>
+        <span class="pf-legend-item"><span class="pf-swatch" style="background:var(--success)"></span>Verified &amp; scannable</span>
       </div>
 
       <button id="companies-discover-button" type="button">Find companies</button>
@@ -6881,13 +7139,23 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     <section id="companies-list-section" style="display:none">
           <label for="companies-filter">Filter</label>
           <input id="companies-filter" placeholder="Search by name, location, or description">
-          <div class="segmented-control" id="companies-unverified-filters" role="group" aria-label="Unverified reason" style="display:none">
-            <button class="active" data-unverified-reason="" type="button" aria-pressed="true">All <span id="companies-reason-all-count"></span></button>
-            <button data-unverified-reason="no_website" type="button" aria-pressed="false">No website <span id="companies-reason-no_website-count"></span></button>
-            <button data-unverified-reason="no_job_board" type="button" aria-pressed="false">No job board <span id="companies-reason-no_job_board-count"></span></button>
-            <button data-unverified-reason="unsupported_ats" type="button" aria-pressed="false">Unsupported board <span id="companies-reason-unsupported_ats-count"></span></button>
-            <button data-unverified-reason="board_unreachable" type="button" aria-pressed="false">Board unreachable <span id="companies-reason-board_unreachable-count"></span></button>
-            <button data-unverified-reason="ambiguous" type="button" aria-pressed="false">Ambiguous <span id="companies-reason-ambiguous-count"></span></button>
+          <!-- Inside Verified: these companies are all confirmed employers. This filters by whether
+               ApplyGo can read their jobs, which is a separate question from who they are. -->
+          <div class="segmented-control" id="companies-source-filters" role="group" aria-label="Job source" style="display:none">
+            <button class="active" data-source-filter="" type="button" aria-pressed="true">All <span id="companies-source-all-count"></span></button>
+            <button data-source-filter="supported" type="button" aria-pressed="false">Scannable <span id="companies-source-supported-count"></span></button>
+            <button data-source-filter="unsupported_ats" type="button" aria-pressed="false">Unsupported board <span id="companies-source-unsupported_ats-count"></span></button>
+            <button data-source-filter="careers_only" type="button" aria-pressed="false">Careers page only <span id="companies-source-careers_only-count"></span></button>
+            <button data-source-filter="no_board" type="button" aria-pressed="false">No job board <span id="companies-source-no_board-count"></span></button>
+            <button data-source-filter="board_unreachable" type="button" aria-pressed="false">Board unavailable <span id="companies-source-board_unreachable-count"></span></button>
+            <button data-source-filter="pending" type="button" aria-pressed="false">Not checked yet <span id="companies-source-pending-count"></span></button>
+          </div>
+          <!-- Inside Unresolved: why identity could not be established. -->
+          <div class="segmented-control" id="companies-identity-filters" role="group" aria-label="Reason unresolved" style="display:none">
+            <button class="active" data-identity-filter="" type="button" aria-pressed="true">All <span id="companies-identity-all-count"></span></button>
+            <button data-identity-filter="unresolved" type="button" aria-pressed="false">No website found <span id="companies-identity-unresolved-count"></span></button>
+            <button data-identity-filter="ambiguous" type="button" aria-pressed="false">Ambiguous <span id="companies-identity-ambiguous-count"></span></button>
+            <button data-identity-filter="not_a_company" type="button" aria-pressed="false">Not a company <span id="companies-identity-not_a_company-count"></span></button>
           </div>
           <div id="companies-list"><p class="empty">Loading…</p></div>
     </section>
@@ -7074,31 +7342,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       <p id="gmail-not-connected-hint" class="hint" style="display:none">Connect Gmail in Settings &rarr; Email to check for replies here.</p>
       <p id="gmail-check-status" class="status" role="status" aria-live="polite"></p>
       <div id="applied-list"><p class="empty">Loading…</p></div>
-    </section>
-  </div>
-
-  <div id="panel-jindr" class="panel">
-    <section id="jindr-section">
-      <h2>Jindr</h2>
-      <p class="hint">One posting at a time, best match first. Judge it and move on -- the same Interested/Not-for-me decision the Jobs tab makes, just without the scrolling.</p>
-      <p id="jindr-progress" class="summary-line"></p>
-      <div id="jindr-empty" class="empty" style="display:none">All caught up -- nothing left to review. New matches will show up here after your next "Find my matches" pass.</div>
-      <div id="jindr-card" class="jindr-card" style="display:none">
-        <div class="row-title-line">
-          <a id="jindr-title" class="row-title" target="_blank" rel="noopener"></a>
-          <span id="jindr-score" class="badge strong"></span>
-        </div>
-        <div id="jindr-meta" class="row-meta"></div>
-        <div id="jindr-facts" class="jindr-facts"></div>
-        <p id="jindr-reason" class="job-reason"></p>
-        <div id="jindr-missing"></div>
-        <div class="jindr-actions">
-          <button id="jindr-reject" class="danger" type="button">✕ Not for me</button>
-          <button id="jindr-interested" type="button">♥ Interested</button>
-        </div>
-      </div>
-      <button id="jindr-undo" class="secondary" type="button" style="display:none">Undo</button>
-      <p id="jindr-status" class="status" role="status" aria-live="polite"></p>
     </section>
   </div>
 
@@ -7456,7 +7699,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     }
     function text(value) { return document.createTextNode(value); }
 
-    // Shared by the Jindr card and the Jobs tab rows -- label above value so a long value (a full
+    // Shared by every Jobs tab row -- label above value so a long value (a full
     // sentence, not just a short word) wraps inside the chip instead of forcing a single-line
     // badge past the edge of the card or screen.
     function factChip(fact) {
@@ -7529,26 +7772,49 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     // soon as it's in -- used for long-running operations (scanning boards, filtering hundreds
     // of postings) so progress shows up while the work is happening, not just at the end.
     // Returns the final {type: "done", ...} event's payload, or throws on a {type: "error"} event.
+    //
+    // A stream that ends without its 'done' event is NOT reported as a failure, which is what
+    // 'stream_ended_unexpectedly' used to do. Every long operation behind these endpoints writes
+    // its progress to the database as it goes -- discovery advances a per-query cursor, scanning
+    // marks each company as it finishes -- so a dropped stream means the reporting channel broke,
+    // not that the work was lost or has to be redone. (Streams drop for ordinary reasons: the
+    // isolate is recycled mid-request, a laptop sleeps, a proxy times out an idle connection.)
+    // Reporting that as an error told the candidate their run had failed when in fact it had
+    // partly succeeded and was safe to continue, so it is surfaced as partial progress instead and
+    // the caller's own round loop picks up where the cursor left off.
     async function readNdjson(res, onEvent) {
       var reader = res.body.getReader();
       var decoder = new TextDecoder();
       var buffer = '';
       var result = null;
-      while (true) {
-        var chunk = await reader.read();
-        if (chunk.done) break;
-        buffer += decoder.decode(chunk.value, { stream: true });
-        var lines = buffer.split('\\n');
-        buffer = lines.pop();
-        for (var i = 0; i < lines.length; i++) {
-          if (!lines[i]) continue;
-          var event = JSON.parse(lines[i]);
-          if (event.type === 'error') throw new Error(event.message || 'stream_failed');
-          if (event.type === 'done') { result = event; continue; }
-          onEvent(event);
+      var sawProgress = false;
+      try {
+        while (true) {
+          var chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder.decode(chunk.value, { stream: true });
+          var lines = buffer.split('\\n');
+          buffer = lines.pop();
+          for (var i = 0; i < lines.length; i++) {
+            if (!lines[i]) continue;
+            var event;
+            try { event = JSON.parse(lines[i]); } catch (parseError) { continue; }
+            if (event.type === 'error') throw new Error(event.message || 'stream_failed');
+            if (event.type === 'done') { result = event; continue; }
+            sawProgress = true;
+            onEvent(event);
+          }
         }
+      } catch (readError) {
+        // An explicit {type:'error'} event is a real failure and must propagate. A transport-level
+        // read failure is the same interrupted-stream case handled below.
+        if (readError && readError.message && readError.message !== 'stream_failed' &&
+            String(readError.name) !== 'TypeError' && !/network|aborted|reset/i.test(readError.message)) {
+          throw readError;
+        }
+        if (!result && !sawProgress) throw readError;
       }
-      if (!result) throw new Error('stream_ended_unexpectedly');
+      if (!result) return { interrupted: true, partial: sawProgress };
       return result;
     }
 
@@ -7558,7 +7824,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     });
 
     // Shows what the saved free text was actually understood to mean, using the same chip the
-    // Jindr and Jobs cards use -- so the columns you'll see there are visible before any scan runs.
+    // Jobs cards use -- so the columns you'll see there are visible before any scan runs.
     function renderCareAboutTopics(topics) {
       var host = document.getElementById('care-about-topics');
       host.innerHTML = '';
@@ -8928,16 +9194,47 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     // The reason a failed company shows in the Unverified tab, in plain language -- see
     // classifyVerification in src/companies.ts and the search-fallback confidence floor in
     // src/websearch.ts for where these five codes come from.
-    var VERIFY_REASON_LABELS = {
-      no_website: 'No website could be confirmed for this company.',
-      no_job_board: 'A website was confirmed, but no job board could be found on it.',
-      unsupported_ats: 'This company’s job board uses a system this app can’t automatically read yet.',
-      board_unreachable: 'A supported job board was found, but reading it failed. This is often temporary.',
-      ambiguous: 'A possible website was found, but not with enough confidence to trust automatically — this is a common-name collision, not a missing website.',
+    // Mirrors IDENTITY_LABELS / JOB_SOURCE_LABELS / explainState in src/companystate.ts. The two
+    // axes are labelled separately here for the same reason they are stored separately: "we could
+    // not work out who this employer is" and "we know exactly who they are but cannot read their
+    // job board" are different problems with different fixes.
+    var IDENTITY_LABELS = {
+      pending: 'Not checked yet',
+      verified: 'Verified',
+      ambiguous: 'Ambiguous',
+      unresolved: 'Unresolved',
+      not_a_company: 'Not a company',
+      dismissed: 'Removed',
     };
-
+    var JOB_SOURCE_LABELS = {
+      pending: 'Board not checked yet',
+      supported: 'Scannable',
+      unsupported_ats: 'Unsupported board',
+      careers_only: 'Careers page only',
+      no_board: 'No job board',
+      board_unreachable: 'Board unavailable',
+    };
+    var STATE_EXPLANATIONS = {
+      'identity:pending': 'Discovered from a real job posting. Identity has not been checked yet.',
+      'identity:unresolved': 'No website could be confirmed for this company. It stays on the list and is retried automatically.',
+      'identity:ambiguous': 'A possible website was found, but not with enough evidence to be sure it is this company rather than a similarly named one.',
+      'identity:not_a_company': 'This employer field held a job-board page title rather than a company name.',
+      'source:pending': 'Website confirmed. Its job board has not been checked yet.',
+      'source:supported': 'Website and job board confirmed. Jobs are imported from it automatically.',
+      'source:unsupported_ats': 'Website confirmed. They hire through a system ApplyGo cannot read automatically yet — use the board link to browse it directly.',
+      'source:careers_only': 'Website and careers page confirmed, but the careers page does not run on a job-board system ApplyGo can read.',
+      'source:no_board': 'Website confirmed, but no job board or careers page could be found on it.',
+      'source:board_unreachable': 'Website and job board confirmed, but reading the board failed. This is usually temporary and is retried.',
+    };
+    function explainCompanyState(company) {
+      if (company.identity_status !== 'verified') {
+        return STATE_EXPLANATIONS['identity:' + company.identity_status] || '';
+      }
+      return STATE_EXPLANATIONS['source:' + company.job_source_status] || '';
+    }
     var companiesView = 'find';
-    var companiesUnverifiedReason = '';
+    var companiesSourceFilter = '';
+    var companiesIdentityFilter = '';
     var companiesPipeline = {};
 
     function renderCompanyRows(list, companies) {
@@ -8954,13 +9251,22 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         if (company.open_jobs > 0) {
           titleChildren.push(el('span', { className: 'badge jobs', textContent: company.open_jobs + ' open' }));
         }
-        if (company.status === 'verified') {
+        if (company.identity_status === 'verified') {
           titleChildren.push(el('span', { className: 'badge strong', textContent: 'verified' }));
-        } else if (company.status === 'unverified') {
-          titleChildren.push(el('span', { className: 'badge warn', textContent: company.verify_reason ? company.verify_reason.replace(/_/g, ' ') : 'unverified' }));
-        }
-        if (company.status === 'dismissed') {
+          // Only shown once it means something: before the board is checked, "pending" is noise.
+          if (company.job_source_status && company.job_source_status !== 'pending') {
+            titleChildren.push(el('span', {
+              className: 'badge ' + (company.job_source_status === 'supported' ? 'jobs' : 'warn'),
+              textContent: (JOB_SOURCE_LABELS[company.job_source_status] || company.job_source_status).toLowerCase(),
+            }));
+          }
+        } else if (company.identity_status === 'dismissed') {
           titleChildren.push(el('span', { className: 'badge', textContent: 'removed' }));
+        } else if (company.identity_status) {
+          titleChildren.push(el('span', {
+            className: 'badge warn',
+            textContent: (IDENTITY_LABELS[company.identity_status] || company.identity_status).toLowerCase(),
+          }));
         }
         if (company.off_target) {
           titleChildren.push(el('span', { className: 'badge warn', textContent: 'outside your locations' }));
@@ -8977,27 +9283,34 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         if (company.bio) body.push(el('p', { className: 'company-bio', textContent: company.bio }));
         // Prominent, plain-language failure reason -- debugging why a company didn't make it in
         // matters for an open-source app the candidate might need to fix themselves.
-        if (company.status === 'unverified') {
-          body.push(el('p', {
-            className: 'company-why',
-            textContent: 'Why verification failed: ' + (VERIFY_REASON_LABELS[company.verify_reason] || 'Unknown reason.'),
-          }));
+        // Shown for anything not fully scannable -- including verified companies, where the
+        // explanation is about ApplyGo's reach rather than the company.
+        if (!(company.identity_status === 'verified' && company.job_source_status === 'supported') &&
+            company.identity_status !== 'dismissed') {
+          var explanation = explainCompanyState(company);
+          if (explanation) body.push(el('p', { className: 'company-why', textContent: explanation }));
+          // The evidence behind the decision, for an ambiguous or unresolved row where the
+          // candidate may want to judge it themselves.
+          if (company.website_evidence && company.identity_status !== 'verified') {
+            body.push(el('div', { className: 'row-meta', textContent: 'Evidence: ' + company.website_evidence }));
+          }
         }
         if (company.scan_note) body.push(el('div', { className: 'row-meta', textContent: company.scan_note }));
         // Resolved once this company was checked -- the actual careers/board link the site
         // publishes, not just its homepage. Most useful for a detected-but-unsupported ATS (ADP,
         // iCIMS, ...), where this is the only way to actually see the postings, but shown whenever
         // it's known since "click through and look yourself" is always a fair fallback.
-        if (company.careers_url) {
+        var boardLink = company.board_url || company.careers_url;
+        if (boardLink) {
           body.push(el('div', { className: 'row-meta' }, [
-            el('a', { href: company.careers_url, target: '_blank', rel: 'noopener', textContent: 'View job board ↗' }),
+            el('a', { href: boardLink, target: '_blank', rel: 'noopener', textContent: 'View job board ↗' }),
           ]));
         }
 
         // The manual-fix path for any unverified company: typing a real website here re-verifies it
         // the same way discovery would have, and clears any stale board resolution so the next scan
         // starts fresh against the corrected domain.
-        if (company.status === 'unverified') {
+        if (company.identity_status !== 'verified' && company.identity_status !== 'dismissed') {
           var websiteInput = el('input', { type: 'url', placeholder: 'https://example.com' });
           var websiteButton = el('button', { type: 'button', textContent: 'Save website' });
           var websiteStatus = el('span', { className: 'row-meta' });
@@ -9019,19 +9332,19 @@ Let me check the placeholder embraces like a variable name, gets its value when 
 
         var changeStatus = el('button', {
           type: 'button',
-          textContent: company.status === 'dismissed' ? 'Re-add' : 'Remove',
-          className: company.status === 'dismissed' ? '' : 'danger',
+          textContent: company.identity_status === 'dismissed' ? 'Re-add' : 'Remove',
+          className: company.identity_status === 'dismissed' ? '' : 'danger',
         });
         changeStatus.addEventListener('click', async function () {
           await api('/companies/' + encodeURIComponent(company.id), {
             method: 'PATCH',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ status: company.status === 'dismissed' ? 'reachable' : 'dismissed' }),
+            body: JSON.stringify({ status: company.identity_status === 'dismissed' ? 'reachable' : 'dismissed' }),
           });
           loadCompanies();
         });
 
-        var muted = company.status === 'dismissed' || company.status === 'unverified';
+        var muted = company.identity_status === 'dismissed' || company.identity_status === 'unresolved';
         list.appendChild(el('div', { className: 'row-item' + (muted ? ' is-muted' : '') }, [
           el('div', { className: 'row' }, [
             el('div', {}, body),
@@ -9045,7 +9358,8 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       var finding = companiesView === 'find';
       document.getElementById('companies-find-panel').style.display = finding ? 'block' : 'none';
       document.getElementById('companies-list-section').style.display = finding ? 'none' : 'block';
-      document.getElementById('companies-unverified-filters').style.display = companiesView === 'unverified' ? 'flex' : 'none';
+      document.getElementById('companies-source-filters').style.display = companiesView === 'verified' ? 'flex' : 'none';
+      document.getElementById('companies-identity-filters').style.display = companiesView === 'unresolved' ? 'flex' : 'none';
       if (finding) return;
 
       var needle = document.getElementById('companies-filter').value.trim();
@@ -9055,12 +9369,19 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       var matching = allCompanies.filter(function (c) {
         return matchesFilter([c.name, c.location, c.bio, c.signal].join(' '), needle);
       });
+      // Tabs filter on identity; the sub-filter inside Verified filters on job source. Keeping
+      // those on separate axes is the whole point -- a verified company with an unreadable board
+      // belongs under Verified, not hidden away under a failure tab.
       var visible = matching.filter(function (c) {
-        if (companiesView === 'removed') return c.status === 'dismissed';
-        if (companiesView === 'verified') return c.status === 'verified';
-        if (companiesView === 'unverified') {
-          if (c.status !== 'unverified') return false;
-          return !companiesUnverifiedReason || c.verify_reason === companiesUnverifiedReason;
+        if (companiesView === 'removed') return c.identity_status === 'dismissed';
+        if (companiesView === 'verified') {
+          if (c.identity_status !== 'verified') return false;
+          return !companiesSourceFilter || c.job_source_status === companiesSourceFilter;
+        }
+        if (companiesView === 'unresolved') {
+          var unresolvedStates = { unresolved: true, ambiguous: true, not_a_company: true };
+          if (!unresolvedStates[c.identity_status]) return false;
+          return !companiesIdentityFilter || c.identity_status === companiesIdentityFilter;
         }
         return false;
       });
@@ -9155,54 +9476,80 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       }
     });
 
-    // ---- Companies -> Search: Discovery -> Verify -----------------------------------------------
+    // ---- Companies -> Search: Identity -> Job source --------------------------------------------
     // Same generic engine Jobs uses (createPipelineFlow, defined further down -- function
     // declarations are hoisted, so calling it here before its own textual definition is fine).
-    // Only two stages, and deliberately no accumulator edge overrides: unlike Jobs' review_queue,
-    // neither 'verified' nor 'unverified' feeds a further stage in this diagram, so the default
-    // rule (an edge's committed volume is simply its target node's own count) is exactly right for
-    // both edges here. The Companies -> Jobs handoff (a jobs COUNT, not a companies one) sits in
-    // the same row, visually joined, but is deliberately not folded into this ribbon graph -- see
-    // the HTML/CSS comment on #companies-pipeline-row.
+    //
+    // Three columns now, matching the two real state axes plus the handoff. Both ribbon stages
+    // count COMPANIES, which is what makes a conserved flow honest between them: every discovered
+    // company lands in exactly one identity outcome, and every verified company lands in exactly
+    // one job-source outcome. The Pre-screen figure counts JOBS and is deliberately not a ribbon
+    // stage -- it sits in the same row, visually joined, but nothing about 24 companies producing
+    // 722 jobs conserves a quantity. See the CSS comment on #companies-pipeline-row.
     var CPF_NODES = [
-      { id: 'discovery_gate', label: 'Discovered', stage: 0, kind: 'gate' },
-      { id: 'unverified', label: 'Unverified', stage: 1, kind: 'reject' },
+      { id: 'discovered', label: 'Discovered', stage: 0, kind: 'gate' },
+      { id: 'unresolved', label: 'Unresolved', stage: 1, kind: 'reject' },
       { id: 'verified', label: 'Verified', stage: 1, kind: 'success' },
+      { id: 'no_source', label: 'No readable board', stage: 2, kind: 'reject' },
+      { id: 'scannable', label: 'Scannable', stage: 2, kind: 'success' },
     ];
-    var CPF_BRANCHES = { discovery_gate: ['unverified', 'verified'] };
-    var CPF_STAGE_TITLES = ['Discovery', 'Verify'];
-    // vbH/sourceHeight/colStep are Jobs' own #jobs-pipeline constants, unchanged. vbW=770 is those
-    // same constants' natural width for 2 stages instead of 3 (COL_MARGIN 66 + 1*colStep 550 +
-    // node width 10 + the same ~144-unit label margin Jobs reserves) -- see the CSS comment on
-    // #companies-pipeline for how this stays visually the same size as Jobs despite the smaller
-    // viewBox.
-    var companiesFlow = createPipelineFlow({ svgId: 'cpf-svg', nodes: CPF_NODES, branches: CPF_BRANCHES, stageTitles: CPF_STAGE_TITLES, vbW: 770, vbH: 340, sourceHeight: 200, colStep: 550 });
+    var CPF_BRANCHES = {
+      discovered: ['unresolved', 'verified'],
+      verified: ['no_source', 'scannable'],
+    };
+    var CPF_STAGE_TITLES = ['Discovery', 'Identity', 'Job source'];
+    // Jobs' own #jobs-pipeline constants, unchanged, so the two diagrams read at the same density.
+    var companiesFlow = createPipelineFlow({ svgId: 'cpf-svg', nodes: CPF_NODES, branches: CPF_BRANCHES, stageTitles: CPF_STAGE_TITLES, vbW: 1320, vbH: 340, sourceHeight: 200, colStep: 550 });
 
-    var cpfDiscovered = 0, cpfVerified = 0, cpfUnverified = 0;
+    var cpfCounts = { discovered: 0, unresolved: 0, verified: 0, no_source: 0, scannable: 0 };
 
     function cpfRefresh() {
-      var nodeCounts = { discovery_gate: Math.max(0, cpfDiscovered), unverified: cpfUnverified, verified: cpfVerified };
-      companiesFlow.setCounts(nodeCounts, { total: nodeCounts.discovery_gate + nodeCounts.unverified + nodeCounts.verified });
+      // 'verified' is an accumulator: it is both an outcome of Identity and the input to Job
+      // source, so its own node count is what still sits there un-forwarded, while the edge into it
+      // carries the full verified volume. Same shape as Jobs' review_queue.
+      var verifiedTotal = cpfCounts.verified;
+      var forwarded = cpfCounts.no_source + cpfCounts.scannable;
+      var nodeCounts = {
+        discovered: Math.max(0, cpfCounts.discovered),
+        unresolved: cpfCounts.unresolved,
+        verified: Math.max(0, verifiedTotal - forwarded),
+        no_source: cpfCounts.no_source,
+        scannable: cpfCounts.scannable,
+      };
+      companiesFlow.setCounts(nodeCounts, {
+        total: nodeCounts.discovered + cpfCounts.unresolved + verifiedTotal,
+        edgeOverrides: { 'discovered->verified': verifiedTotal },
+      });
     }
 
-    // Full reconciliation from the authoritative backend counts -- every /companies load resets
-    // Discovery/Verify from here, the same role setPfCounts plays for Jobs. Never bursts on its
-    // own; live per-company bursts come only from the discover/scan progress handlers below, which
-    // is where a real, individually-resolved company outcome actually becomes known.
-    // Every number here is explicitly unit-labeled and never combined with a number of a different
-    // unit as if they were comparable -- Discovery counts job postings (with unique companies as a
-    // secondary figure), Verify counts companies, Pre-screen counts jobs. E.g. never "found 269,
-    // verified 214, imported 57"; always "269 companies discovered, 214 verified, 57 jobs imported".
+    // Full reconciliation from the authoritative backend counts. Every figure comes from
+    // company_pipeline, which is computed once server-side (see companiesPipelineCounts and
+    // src/pipeline.ts) -- the diagram and the sentence below it read the same numbers, so they
+    // cannot disagree the way two independent client-side calculations could.
     function renderCompanyPipelineStats() {
       var p = companiesPipeline;
-      cpfDiscovered = p.discovered || 0;
-      cpfVerified = p.verified || 0;
-      cpfUnverified = p.unverified || 0;
+      var discovered = (p.identity_pending || 0) + (p.identity_verified || 0) + (p.identity_ambiguous || 0) +
+        (p.identity_unresolved || 0) + (p.identity_not_a_company || 0);
+
+      cpfCounts.discovered = p.identity_pending || 0;
+      // Ambiguous and not-a-company are identity failures alongside unresolved: none of them
+      // produced a company we can go read jobs from.
+      cpfCounts.unresolved = (p.identity_unresolved || 0) + (p.identity_ambiguous || 0) + (p.identity_not_a_company || 0);
+      cpfCounts.verified = p.identity_verified || 0;
+      cpfCounts.scannable = p.source_supported || 0;
+      cpfCounts.no_source = (p.source_unsupported_ats || 0) + (p.source_careers_only || 0) +
+        (p.source_no_board || 0) + (p.source_board_unreachable || 0);
       cpfRefresh();
+
       document.getElementById('cpfStatPrescreen').textContent = p.prescreen_jobs || 0;
+
+      // Every number carries its unit, and company figures are never added to job figures.
+      var plural = function (n, one, many) { return n + ' ' + (n === 1 ? one : many); };
       document.getElementById('companies-pipeline-summary').textContent =
-        (p.discovery_postings || 0) + ' job postings searched across ' + (p.discovery_companies || 0) + ' compan' + ((p.discovery_companies || 0) === 1 ? 'y' : 'ies') +
-        ' · ' + cpfVerified + ' verified · ' + cpfUnverified + ' unverified · ' + (p.prescreen_jobs || 0) + ' jobs imported into Jobs → Pre-screen.';
+        plural(discovered, 'company', 'companies') + ' discovered · ' +
+        (p.identity_verified || 0) + ' verified · ' +
+        plural(cpfCounts.scannable, 'company', 'companies') + ' with a readable job board · ' +
+        plural(p.prescreen_jobs || 0, 'job', 'jobs') + ' waiting in Jobs → Pre-screen.';
     }
 
     async function loadCompanies() {
@@ -9210,13 +9557,27 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       var data = await res.json();
       allCompanies = data.companies || [];
       companiesPipeline = data.company_pipeline || {};
-      document.getElementById('companies-verified-count').textContent = '(' + (companiesPipeline.verified || 0) + ')';
-      document.getElementById('companies-unverified-count').textContent = '(' + (companiesPipeline.unverified || 0) + ')';
-      document.getElementById('companies-removed-count').textContent = '(' + (companiesPipeline.dismissed || 0) + ')';
-      ['no_website', 'no_job_board', 'unsupported_ats', 'board_unreachable', 'ambiguous'].forEach(function (reason) {
-        document.getElementById('companies-reason-' + reason + '-count').textContent = '(' + (companiesPipeline['unverified_' + reason] || 0) + ')';
+      var p = companiesPipeline;
+      var unresolvedTotal = (p.identity_unresolved || 0) + (p.identity_ambiguous || 0) + (p.identity_not_a_company || 0);
+      var setCount = function (id, n) {
+        var node = document.getElementById(id);
+        if (node) node.textContent = '(' + (n || 0) + ')';
+      };
+      setCount('companies-verified-count', p.identity_verified);
+      setCount('companies-unresolved-count', unresolvedTotal);
+      setCount('companies-removed-count', p.identity_dismissed);
+
+      // Job-source sub-filter counts, scoped to verified companies -- same scoping the backend
+      // uses, so the tab total and the sum of its filters agree.
+      setCount('companies-source-all-count', p.identity_verified);
+      ['supported', 'unsupported_ats', 'careers_only', 'no_board', 'board_unreachable', 'pending'].forEach(function (k) {
+        setCount('companies-source-' + k + '-count', p['source_' + k]);
       });
-      document.getElementById('companies-reason-all-count').textContent = '(' + (companiesPipeline.unverified || 0) + ')';
+
+      setCount('companies-identity-all-count', unresolvedTotal);
+      ['unresolved', 'ambiguous', 'not_a_company'].forEach(function (k) {
+        setCount('companies-identity-' + k + '-count', p['identity_' + k]);
+      });
       renderCompanyPipelineStats();
       renderCompanies();
     }
@@ -9234,18 +9595,22 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         renderCompanies();
       });
     });
-    document.querySelectorAll('[data-unverified-reason]').forEach(function (button) {
-      button.addEventListener('click', function () {
-        companiesUnverifiedReason = button.dataset.unverifiedReason;
-        document.querySelectorAll('[data-unverified-reason]').forEach(function (item) {
-          item.classList.remove('active');
-          item.setAttribute('aria-pressed', 'false');
+    function wireSegmented(selector, datasetKey, onPick) {
+      document.querySelectorAll(selector).forEach(function (button) {
+        button.addEventListener('click', function () {
+          onPick(button.dataset[datasetKey]);
+          document.querySelectorAll(selector).forEach(function (item) {
+            item.classList.remove('active');
+            item.setAttribute('aria-pressed', 'false');
+          });
+          button.classList.add('active');
+          button.setAttribute('aria-pressed', 'true');
+          renderCompanies();
         });
-        button.classList.add('active');
-        button.setAttribute('aria-pressed', 'true');
-        renderCompanies();
       });
-    });
+    }
+    wireSegmented('[data-source-filter]', 'sourceFilter', function (v) { companiesSourceFilter = v; });
+    wireSegmented('[data-identity-filter]', 'identityFilter', function (v) { companiesIdentityFilter = v; });
 
     async function scanNewCompanies(statusEl) {
       var res = await api('/companies/scan', {
@@ -9261,10 +9626,11 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         // resolution alone (the discover-button handler below) only gets it as far as the
         // Discovery gate. One real per-company burst per event, same idea as Jobs' pipeline events.
         if (typeof event.verified === 'boolean') {
-          cpfDiscovered = Math.max(0, cpfDiscovered - 1);
-          if (event.verified) cpfVerified += 1; else cpfUnverified += 1;
+          // A scan result is a job-source outcome for an already-verified company, so it moves the
+          // company out of the Verified reservoir into one of the third-stage buckets.
+          if (event.verified) cpfCounts.scannable += 1; else cpfCounts.no_source += 1;
           cpfRefresh();
-          companiesFlow.burst(event.verified ? 'discovery_gate->verified' : 'discovery_gate->unverified', 1);
+          companiesFlow.burst(event.verified ? 'verified->scannable' : 'verified->no_source', 1);
         }
       });
     }
@@ -9288,6 +9654,13 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       statusEl.textContent = 'Searching real job postings…';
       statusEl.className = 'status';
       try {
+        // One press runs the configured search to completion. The old loop stopped after a bounded
+        // batch and told the candidate to click again ("19 search queries remaining"), which made
+        // them the scheduler for their own backlog. Every round resumes from a persisted per-query
+        // cursor, so this is continuation, not repetition, and stopping early only loses the round
+        // in flight.
+        var MAX_DISCOVERY_ROUNDS = 200;
+        var RATE_LIMIT_BACKOFF_SECONDS = 20;
         var round = 0, totalAdded = 0, totalDuplicates = 0, totalOffTarget = 0;
         var totalResolved = 0, totalUnresolved = 0, discoverData;
         do {
@@ -9310,13 +9683,15 @@ Let me check the placeholder embraces like a variable name, gets its value when 
             // already fully classified Unverified -- no board check could ever help it.
             if (event.stage === 'resolve' && event.company) {
               if (event.resolved) {
-                cpfDiscovered += 1;
+                // A confirmed website is an Identity outcome: the company moves from the
+                // Discovery gate into Verified, where the job-source stage picks it up.
+                cpfCounts.verified += 1;
                 cpfRefresh();
-                companiesFlow.burstIntoGate('discovery_gate', 1);
+                companiesFlow.burst('discovered->verified', 1);
               } else {
-                cpfUnverified += 1;
+                cpfCounts.unresolved += 1;
                 cpfRefresh();
-                companiesFlow.burst('discovery_gate->unverified', 1);
+                companiesFlow.burst('discovered->unresolved', 1);
               }
             }
           });
@@ -9325,7 +9700,15 @@ Let me check the placeholder embraces like a variable name, gets its value when 
           totalOffTarget += discoverData.off_target || 0;
           totalResolved += discoverData.domain_resolved || 0;
           totalUnresolved += discoverData.domain_unresolved || 0;
-        } while (round < 10 && !discoverData.rate_limited && discoverData.streams_remaining > 0);
+          // Rate limited: wait and continue rather than stopping and asking for another click.
+          // The cursor is untouched by a 429, so resuming re-fetches the same page safely.
+          if (discoverData.rate_limited && round < MAX_DISCOVERY_ROUNDS) {
+            for (var wait = RATE_LIMIT_BACKOFF_SECONDS; wait > 0; wait -= 1) {
+              statusEl.textContent = 'Paused at the job board rate limit — resuming in ' + wait + 's…';
+              await new Promise(function (r) { setTimeout(r, 1000); });
+            }
+          }
+        } while (round < MAX_DISCOVERY_ROUNDS && (discoverData.streams_remaining > 0 || discoverData.rate_limited));
 
         // Always re-check job boards, not only when this click found something new -- scanCompanies
         // covers every eligible company each call (including prior Unverified rows worth retrying,
@@ -9343,10 +9726,12 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         }
         if (totalDuplicates) parts.push(totalDuplicates + ' already on your list.');
         if (totalOffTarget) parts.push(totalOffTarget + ' rejected as outside ' + (discoverData.locations || 'your locations') + '.');
-        if (discoverData.rate_limited) {
-          parts.push('Search paused at the job board’s rate limit — click Find companies again to continue.');
-        } else if (discoverData.streams_remaining > 0) {
-          parts.push(discoverData.streams_remaining + ' search quer' + (discoverData.streams_remaining === 1 ? 'y' : 'ies') + ' left to check — click Find companies again to continue.');
+        if (discoverData.streams_remaining > 0) {
+          parts.push(discoverData.streams_remaining + ' search quer' + (discoverData.streams_remaining === 1 ? 'y' : 'ies') +
+            ' still queued; they resume automatically on the next run.');
+        }
+        if (discoverData.interrupted) {
+          parts.push('The progress stream dropped before the end — everything completed so far is saved.');
         }
         if (discoverData.query_errors && discoverData.query_errors.length) {
           parts.push(discoverData.query_errors.length + ' quer' + (discoverData.query_errors.length === 1 ? 'y' : 'ies') + ' failed and will retry next run.');
@@ -9437,11 +9822,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       interested: { text: 'Interested', cls: 'strong' },
       applied: { text: 'Applied', cls: 'strong' },
     };
-    // Jindr still queues directly off the AI pipeline's own fit_status buckets -- it only ever
-    // shows already-rated, not-yet-decided postings, independent of the Jobs page's six subtabs.
-    var QUEUED_STATUSES = { unassessed: true, screened_in: true };
-    var RULED_OUT_STATUSES = { reject: true, screened_out: true };
-
     var matchThreshold = 70;
     var jobsView = 'search';
 
@@ -9481,164 +9861,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       if (reload !== false) await loadJobs();
       return data;
     }
-
-    // Jindr: the same judged-matches bucket the Jobs tab shows, one at a time instead of scrolled,
-    // always ordered best-match-first regardless of whatever sort the Jobs tab currently has
-    // selected. The queue is a plain snapshot taken when the tab is opened -- not rebuilt on every
-    // loadJobs() -- so a background scan or reassess finishing mid-review doesn't reshuffle the
-    // stack out from under you.
-    var jindrQueue = [];
-    var jindrIndex = 0;
-    var jindrLastSwipe = null;
-
-    function jindrBuildQueue() {
-      jindrQueue = allJobs.filter(function (j) {
-        return !QUEUED_STATUSES[j.fit_status] && !RULED_OUT_STATUSES[j.fit_status] && j.manual_status === 'normal';
-      }).sort(jobSortComparator('score'));
-      jindrIndex = 0;
-      jindrLastSwipe = null;
-      renderJindrCard();
-    }
-
-    function renderJindrCard() {
-      document.getElementById('jindr-undo').style.display = jindrLastSwipe ? 'inline-block' : 'none';
-      document.getElementById('jindr-status').textContent = '';
-
-      if (jindrIndex >= jindrQueue.length) {
-        document.getElementById('jindr-progress').textContent = jindrQueue.length
-          ? 'Reviewed all ' + jindrQueue.length + '.' : '';
-        document.getElementById('jindr-card').style.display = 'none';
-        document.getElementById('jindr-empty').style.display = 'block';
-        return;
-      }
-
-      document.getElementById('jindr-empty').style.display = 'none';
-      document.getElementById('jindr-card').style.display = 'block';
-      var card = document.getElementById('jindr-card');
-      card.style.transform = '';
-      card.classList.remove('dragging');
-
-      var job = jindrQueue[jindrIndex];
-      document.getElementById('jindr-progress').textContent = (jindrIndex + 1) + ' of ' + jindrQueue.length + ' to review';
-
-      var titleEl = document.getElementById('jindr-title');
-      titleEl.textContent = job.title;
-      if (job.source_url) { titleEl.href = job.source_url; } else { titleEl.removeAttribute('href'); }
-
-      var hasScore = job.fit_score !== null && job.fit_score !== undefined;
-      var scoreEl = document.getElementById('jindr-score');
-      scoreEl.textContent = hasScore ? job.fit_score + '% match' : 'Not yet scored';
-      // The class was hardcoded to "strong" in the markup, so a 55% here looked exactly as settled
-      // as a 92% -- the same flattening the Jobs rows had. Derive it from the posting's own status
-      // via the shared label table instead.
-      var scoreInfo = FIT_LABELS[job.fit_status] || FIT_LABELS.unassessed;
-      scoreEl.className = ('badge ' + scoreInfo.cls).trim();
-
-      document.getElementById('jindr-meta').textContent = [job.company, job.location].filter(Boolean).join(' · ');
-
-      var detail = {};
-      try { detail = JSON.parse(job.fit_detail_json || '{}'); } catch (e) { detail = {}; }
-      var factsHost = document.getElementById('jindr-facts');
-      factsHost.innerHTML = '';
-      (detail.facts || []).map(factChip).filter(Boolean).forEach(function (chip) { factsHost.appendChild(chip); });
-
-      document.getElementById('jindr-reason').textContent = job.fit_reason || '';
-
-      var missing = [];
-      try { missing = JSON.parse(job.fit_missing_json || '[]'); } catch (e) { missing = []; }
-      var missingHost = document.getElementById('jindr-missing');
-      missingHost.innerHTML = '';
-      if (missing.length) {
-        missingHost.appendChild(el('p', { className: 'job-missing', textContent: 'Gaps: ' + missing.join('; ') }));
-      }
-    }
-
-    function jindrSwipe(action) {
-      if (jindrIndex >= jindrQueue.length) return;
-      var job = jindrQueue[jindrIndex];
-      // Swipes only ever change manual_status/interested_at, never fit_score/fit_status, so undo
-      // just needs the job id to revert -- there's no AI-field snapshot to hold onto anymore.
-      jindrLastSwipe = job.id;
-      jindrIndex += 1;
-      renderJindrCard();
-      // Fired after the UI has already moved on -- reviewing one posting shouldn't stall on a
-      // round trip the same way a swipe app never waits for the server before showing the next card.
-      submitJobFit(job.id, action).catch(function (err) {
-        document.getElementById('jindr-status').textContent = 'Error saving that decision: ' + err.message;
-        document.getElementById('jindr-status').className = 'status error';
-      });
-    }
-
-    document.getElementById('jindr-interested').addEventListener('click', function () { jindrSwipe('interested'); });
-    document.getElementById('jindr-reject').addEventListener('click', function () { jindrSwipe('removed'); });
-
-    document.getElementById('jindr-undo').addEventListener('click', async function () {
-      if (!jindrLastSwipe) return;
-      var jobId = jindrLastSwipe;
-      var button = this;
-      button.disabled = true;
-      try {
-        await api('/jobs/' + encodeURIComponent(jobId) + '/fit', {
-          method: 'PATCH',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ action: 'restore_snapshot' }),
-        });
-        jindrIndex -= 1;
-        jindrLastSwipe = null;
-        renderJindrCard();
-        await loadJobs();
-      } catch (err) {
-        document.getElementById('jindr-status').textContent = 'Error: ' + err.message;
-        document.getElementById('jindr-status').className = 'status error';
-      } finally {
-        button.disabled = false;
-      }
-    });
-
-    // Drag-to-swipe: a bonus on top of the buttons above, not a replacement -- pointer events so
-    // it works with both touch and mouse, translateX follows the pointer, releasing past a distance
-    // threshold commits to the same action the corresponding button would.
-    (function () {
-      var card = document.getElementById('jindr-card');
-      var dragging = false;
-      var startX = 0;
-      var dx = 0;
-      var THRESHOLD = 100;
-
-      card.addEventListener('pointerdown', function (event) {
-        if (jindrIndex >= jindrQueue.length) return;
-        // The buttons are children of the card -- without this, pressing one starts a drag first
-        // (capturing the pointer to the card) and the button never sees its own click at all.
-        if (event.target.closest('.jindr-actions')) return;
-        dragging = true;
-        startX = event.clientX;
-        dx = 0;
-        card.classList.add('dragging');
-        card.setPointerCapture(event.pointerId);
-      });
-      card.addEventListener('pointermove', function (event) {
-        if (!dragging) return;
-        dx = event.clientX - startX;
-        card.style.transform = 'translateX(' + dx + 'px) rotate(' + (dx / 20) + 'deg)';
-      });
-      function endDrag() {
-        if (!dragging) return;
-        dragging = false;
-        card.classList.remove('dragging');
-        if (dx > THRESHOLD) {
-          jindrSwipe('interested');
-        } else if (dx < -THRESHOLD) {
-          jindrSwipe('removed');
-        } else {
-          card.style.transform = '';
-        }
-        dx = 0;
-      }
-      card.addEventListener('pointerup', endDrag);
-      card.addEventListener('pointercancel', endDrag);
-    })();
-
-    document.querySelector('[data-tab="jindr"]').addEventListener('click', jindrBuildQueue);
 
     // Shared title/badge/meta/facts/reason/missing block for Recommended, Not Recommended, Unrated,
     // AI Ruled Out, and manually removed cards.
@@ -12004,6 +12226,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "GET" && url.pathname === "/companies") return listCompanies(request, env);
     if (request.method === "POST" && url.pathname === "/companies") return createCompany(request, env);
     if (request.method === "POST" && url.pathname === "/companies/bulk") return bulkAddCompanies(request, env);
+    if (request.method === "POST" && url.pathname === "/devices/read-only") return createReadOnlyToken(request, env);
     if (request.method === "GET" && url.pathname === "/companies/search-terms") return getCompanySearchTerms(request, env);
     if (request.method === "PUT" && url.pathname === "/companies/search-terms") return setCompanySearchTerms(request, env);
     if (request.method === "POST" && url.pathname === "/companies/search-terms/regenerate") return regenerateCompanySearchTerms(request, env);

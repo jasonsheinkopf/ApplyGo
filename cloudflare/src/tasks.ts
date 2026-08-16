@@ -23,6 +23,7 @@ export type LlmTaskId =
   | "profile.improve_apply"
   | "roles.analyze"
   | "roles.research"
+  | "companies.resolve_website"
   | "review.question"
   | "resume.build"
   | "resume.requirements"
@@ -38,7 +39,7 @@ export type LlmTaskInfo = {
   /** Short human name, for the console's task list. */
   name: string;
   /** Which pipeline stage this belongs to, for grouping. */
-  stage: "Find matches" | "Profile" | "Apply" | "Developer tools";
+  stage: "Find companies" | "Find matches" | "Profile" | "Apply" | "Developer tools";
   tier: Tier;
   /** What the call is asked to do, and what shape comes back. */
   what: string;
@@ -146,6 +147,21 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     tier: "reason",
     what: "Structured. Reads labor-market documents retrieved from external sources and reports only what they support -- never salary or outlook figures recalled from training data.",
     source: "src/market.ts -> researchRoleMarket",
+    batched: false,
+    replayable: false,
+  },
+  {
+    id: "companies.resolve_website",
+    name: "Resolve a company website",
+    stage: "Find companies",
+    tier: "reason",
+    what:
+      "The one model call in company discovery, and only for a company the deterministic waterfall " +
+      "could not place. Uses Claude's server-side web search rather than model memory, because a " +
+      "company name alone cannot identify an employer -- names collide, and recalling a domain is " +
+      "how you get a confident wrong answer. Its result is never trusted as-is: the proposed URL is " +
+      "re-fetched and scored against real page evidence before it is accepted.",
+    source: "src/websearch.ts -> resolveWebsiteViaSearch",
     batched: false,
     replayable: false,
   },
