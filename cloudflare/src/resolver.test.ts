@@ -226,3 +226,69 @@ test("resolveWebsiteDeterministic never fabricates a website for a junk employer
     globalThis.fetch = previous;
   }
 });
+
+// ---------------------------------------------------------------------------
+// Shared fetch budget -- this is what a scan batch's subrequest cap actually relies on staying
+// accurate across every candidate URL this module tries, not just the ones resolveBoard knows about.
+// ---------------------------------------------------------------------------
+
+test("verifyCandidate never fetches once the shared budget is exhausted", async () => {
+  const previous = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    fetchCount += 1;
+    return mockFetch({ "acme.com": { html: page({ title: "Acme", orgName: "Acme Inc" }) } })(input);
+  }) as typeof fetch;
+  try {
+    const budget = { remaining: 0 };
+    const result = await verifyCandidate("Acme", "https://acme.com", budget);
+    assert.equal(result, null, "an exhausted budget must refuse the fetch, not silently ignore it");
+    assert.equal(fetchCount, 0);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+test("verifyCandidate decrements a shared budget by exactly one per real fetch", async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = mockFetch({ "acme.com": { html: page({ title: "Acme", orgName: "Acme Inc" }) } });
+  try {
+    const budget = { remaining: 3 };
+    await verifyCandidate("Acme", "https://acme.com", budget);
+    assert.equal(budget.remaining, 2);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+test("resolveWebsiteDeterministic stops trying candidates once the shared budget runs out mid-probe", async () => {
+  const previous = globalThis.fetch;
+  const attempted: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    attempted.push(new URL(String(input)).hostname);
+    throw new Error("ENOTFOUND");
+  }) as typeof fetch;
+  try {
+    // probePlan("Some Company") normally tries 10 candidate URLs; a budget of 2 must cap it at 2.
+    const budget = { remaining: 2 };
+    const out = await resolveWebsiteDeterministic({ name: "Some Company" }, budget);
+    assert.equal(out.status, "unresolved");
+    assert.equal(attempted.length, 2, "must not spend more real fetches than the shared budget allows");
+    assert.equal(budget.remaining, 0);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+test("resolveWebsiteDeterministic with no budget argument behaves exactly as before (unmetered)", async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = mockFetch({
+    "docusign.com": { html: page({ title: "DocuSign", siteName: "DocuSign", orgName: "DocuSign, Inc.", body: "Careers" }) },
+  });
+  try {
+    const out = await resolveWebsiteDeterministic({ name: "DocuSign Inc" });
+    assert.equal(out.status, "resolved");
+  } finally {
+    globalThis.fetch = previous;
+  }
+});

@@ -3213,12 +3213,15 @@ async function scanOneCompany(
   if (!company.website) {
     // Free deterministic waterfall first (cleaned-name candidates, each confirmed against what the
     // page says about itself). It runs on every scan, because it costs nothing beyond a couple of
-    // HTTP requests and a company unresolvable last week may be resolvable today.
-    const deterministic = await resolveWebsiteDeterministic({
-      name: company.name,
-      location: company.location,
-      signal: company.signal,
-    });
+    // HTTP requests and a company unresolvable last week may be resolvable today. `budget` is
+    // passed through so its fetches count against the same shared cap resolveBoard below already
+    // respects -- previously this ran unmetered and could burn well past the tracked budget on a
+    // batch with many not-yet-resolved companies (up to ~10 real fetches each), which is what
+    // actually blew through Cloudflare's own subrequest cap even after that cap was lowered.
+    const deterministic = await resolveWebsiteDeterministic(
+      { name: company.name, location: company.location, signal: company.signal },
+      budget,
+    );
     if (deterministic.status === "resolved") {
       await writeCompanyState(env, company.id, {
         identity: "verified",
@@ -3231,15 +3234,18 @@ async function scanOneCompany(
         touchScanned: false,
       });
       company = { ...company, website: deterministic.website };
-    } else if (!company.last_scanned_at) {
+    } else if (!company.last_scanned_at && budget.remaining > 1) {
       // Paid, search-grounded fallback. Only on a company's first scan: it costs real money, so it
       // is not worth re-spending on every click the way the free paths above are. Manual entry
-      // stays available regardless of how this goes.
+      // stays available regardless of how this goes. Also skipped once the shared fetch budget is
+      // nearly spent -- the LLM call itself plus the verifyCandidate re-check below are each a real
+      // subrequest, so this needs at least 2 remaining to be worth starting.
+      budget.remaining -= 1;
       const found = await resolveWebsiteViaSearch(env, { name: company.name, location: company.location, signal: company.signal });
       if (found && found.official_website && found.confidence >= WEBSITE_SEARCH_CONFIDENCE_FLOOR) {
         // Never trusted on the model's word: the proposed URL is re-verified against real page
         // evidence, exactly like a guessed one.
-        const confirmed = await verifyCandidate(company.name, found.official_website);
+        const confirmed = await verifyCandidate(company.name, found.official_website, budget);
         if (confirmed && confirmed.score >= CONFIDENCE_FLOOR) {
           await writeCompanyState(env, company.id, {
             identity: "verified",
