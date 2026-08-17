@@ -30,11 +30,11 @@ Both commands are safe to repeat. When everything is current, `prompts:sync` mak
 
 ## Why this can be one command
 
-[`cloudflare/src/prompts.ts`](../../cloudflare/src/prompts.ts) is already a machine-readable
+`cloudflare/src/prompts.ts` is already a machine-readable
 registry: `PROMPT_DEFAULTS` maps each **Langfuse prompt name** to its canonical text plus a
 `requires` list naming the variables a template must reference to count as current.
 
-[`scripts/sync-langfuse-prompts.mjs`](../../cloudflare/scripts/sync-langfuse-prompts.mjs) imports
+`cloudflare/scripts/sync-langfuse-prompts.mjs` imports
 that registry directly — it does not parse the file or keep a duplicate copy, because either would
 reintroduce exactly the drift this mechanism exists to prevent. It then applies the *same*
 staleness rule the runtime applies (`isPromptCompatible` in `src/langfuse.ts`), so the report always

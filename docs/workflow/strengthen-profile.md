@@ -20,7 +20,7 @@ time. That is the feature working, not running out of ideas.
 
 ## Stages
 
-Implemented as explicit stages in [`cloudflare/src/strengthen.ts`](../../cloudflare/src/strengthen.ts).
+Implemented as explicit stages in `cloudflare/src/strengthen.ts`.
 
 | # | Stage | Implementation | LLM task id |
 |---|---|---|---|

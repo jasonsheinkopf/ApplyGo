@@ -12,7 +12,7 @@ resume philosophies — a keyword-matching one and an evidence-based one — tha
 ## Where the canonical text actually lives
 
 The authoritative version of these rules is **`RESUME_GUIDANCE` in
-[`cloudflare/src/philosophy.ts`](../../cloudflare/src/philosophy.ts)**, as a string constant.
+`cloudflare/src/philosophy.ts`**, as a string constant.
 
 This page explains and justifies it; it does not restate it. If the two ever disagree, the constant
 wins and this page is out of date.
