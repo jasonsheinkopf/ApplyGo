@@ -63,6 +63,7 @@ import {
   renderPlanDirective,
 } from "./philosophy";
 import { type InterestedJobGap, relatedJobIdsFor, renderJobRequirementContext, requirementDedupeKey } from "./interested";
+import { acquireScanLock, releaseScanLock, runPooled } from "./scanlock";
 import {
   type AtsProvider,
   type CompanySearchTerm,
@@ -224,32 +225,6 @@ function ndjsonResponse(ctx: ExecutionContext, run: (emit: (event: unknown) => P
   );
 
   return new Response(readable, { headers: { "content-type": "application/x-ndjson; charset=utf-8" } });
-}
-
-/**
- * Runs `fn` over `items` with at most `concurrency` in flight at once, calling `onSettle` as each
- * one finishes (in completion order, not list order) so progress can still stream live rather than
- * only once the whole batch is done. Company board scans and job-fit LLM calls are both purely
- * I/O-bound -- almost all of their time is spent waiting on a fetch or a model response, not on
- * CPU -- so running a handful at once instead of one after another cuts wall-clock time roughly by
- * the concurrency factor for free, which is what turns "several minutes across multiple rounds"
- * into "under a minute in one click" for a realistic company list or posting backlog.
- */
-async function runPooled<T, R>(
-  items: T[],
-  concurrency: number,
-  fn: (item: T) => Promise<R>,
-  onSettle: (item: T, result: R) => Promise<void>,
-): Promise<void> {
-  let next = 0;
-  async function worker(): Promise<void> {
-    while (next < items.length) {
-      const item = items[next++];
-      const result = await fn(item);
-      await onSettle(item, result);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, () => worker()));
 }
 
 /**
@@ -451,6 +426,12 @@ const ADDITIVE_TABLES = [
      generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
    )`,
   "CREATE INDEX IF NOT EXISTS idx_job_requirement_coverage_profile ON job_requirement_coverage(profile_id)",
+  // 0034_scan_locks.sql
+  `CREATE TABLE IF NOT EXISTS scan_locks (
+     scan_type TEXT PRIMARY KEY,
+     run_id TEXT NOT NULL,
+     started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+   )`,
 ];
 
 /**
@@ -1710,7 +1691,7 @@ function toAssessable(rows: JobRow[]) {
 // Same reasoning as the company-scan concurrency: an assess call is one LLM request per batch of
 // FIT_BATCH_SIZE postings, and the batches don't depend on each other, so several run at once
 // instead of one after another.
-const ASSESS_CONCURRENCY = 8;
+const ASSESS_CONCURRENCY = 6;
 
 /**
  * Tier-2 assessment over an already-fetched set of rows: batches them, fires the batches
@@ -1828,121 +1809,128 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
   // covering a whole batch of postings (60 for screen, 8 for assess), and firing several of those
   // at once instead of one after another is what lets a realistic backlog clear in one click.
   const budget = { remaining: Math.min(Math.max(Number(body.calls) || 6, 1), 24) };
-  const LLM_CONCURRENCY = 8;
+  const LLM_CONCURRENCY = 6;
+
+  const runId = await acquireScanLock(env.DB, "process");
+  if (!runId) return json({ error: "scan_already_running", detail: "A Find Jobs run is already in progress. Wait for it to finish, then try again." }, 409);
 
   return ndjsonResponse(ctx, async (emit) => {
-    const errors: string[] = [];
-    let screened = 0;
-    let screenedOut = 0;
-    let assessed = 0;
+    try {
+      const errors: string[] = [];
+      let screened = 0;
+      let screenedOut = 0;
+      let assessed = 0;
 
-    // Reported against the full backlog, not just what this click's budget can reach, so
-    // "screened 50 of 243" stays meaningful across however many clicks it takes to clear it.
-    const screenTotal = (await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'unassessed'").first<{ n: number }>())?.n ?? 0;
+      // Reported against the full backlog, not just what this click's budget can reach, so
+      // "screened 50 of 243" stays meaningful across however many clicks it takes to clear it.
+      const screenTotal = (await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'unassessed'").first<{ n: number }>())?.n ?? 0;
 
-    // The shared budget is split up front rather than handed to tier 1 first-come-first-served:
-    // a large enough raw backlog (screening 60 at a time) can otherwise consume the entire budget
-    // every single round, leaving tier 2 permanently at zero calls even though postings are
-    // already sitting there screened_in, already paid for, waiting on the one step that actually
-    // produces a verdict. Reserving half for assessment up front means a screened_in backlog
-    // always gets worked down alongside the raw one, not only after it's entirely gone -- and
-    // whichever tier doesn't need its full half (because there simply isn't that much of it left)
-    // gives the unused portion back to the other rather than leaving it idle.
-    const assessShare = Math.floor(budget.remaining / 2);
-    const screenShare = budget.remaining - assessShare;
+      // The shared budget is split up front rather than handed to tier 1 first-come-first-served:
+      // a large enough raw backlog (screening 60 at a time) can otherwise consume the entire budget
+      // every single round, leaving tier 2 permanently at zero calls even though postings are
+      // already sitting there screened_in, already paid for, waiting on the one step that actually
+      // produces a verdict. Reserving half for assessment up front means a screened_in backlog
+      // always gets worked down alongside the raw one, not only after it's entirely gone -- and
+      // whichever tier doesn't need its full half (because there simply isn't that much of it left)
+      // gives the unused portion back to the other rather than leaving it idle.
+      const assessShare = Math.floor(budget.remaining / 2);
+      const screenShare = budget.remaining - assessShare;
 
-    // Tier 1: cheap bulk screen over everything untouched. Every batch this round's screen share
-    // can afford is fetched up front and split into disjoint chunks (so concurrent calls never see
-    // overlapping rows), then fired at once -- batches don't depend on each other, so there's no
-    // reason to wait for one to finish before starting the next.
-    const screenRows = await env.DB.prepare(
-      `SELECT id, title, company, location, raw_description FROM job_postings
-       WHERE fit_status = 'unassessed' ORDER BY created_at ASC LIMIT ?`,
-    )
-      .bind(screenShare * SCREEN_BATCH_SIZE)
-      .all<JobRow>();
-    const screenItems = toAssessable(screenRows.results ?? []);
-    const screenBatches: (typeof screenItems)[] = [];
-    for (let i = 0; i < screenItems.length; i += SCREEN_BATCH_SIZE) screenBatches.push(screenItems.slice(i, i + SCREEN_BATCH_SIZE));
-    // Tier 2 below reads budget.remaining, so any of the screen share left unused (the raw
-    // backlog ran out before using its whole half) rolls forward into assessment's share instead
-    // of just being dropped on the floor for this round.
-    budget.remaining = assessShare + (screenShare - screenBatches.length);
+      // Tier 1: cheap bulk screen over everything untouched. Every batch this round's screen share
+      // can afford is fetched up front and split into disjoint chunks (so concurrent calls never see
+      // overlapping rows), then fired at once -- batches don't depend on each other, so there's no
+      // reason to wait for one to finish before starting the next.
+      const screenRows = await env.DB.prepare(
+        `SELECT id, title, company, location, raw_description FROM job_postings
+         WHERE fit_status = 'unassessed' ORDER BY created_at ASC LIMIT ?`,
+      )
+        .bind(screenShare * SCREEN_BATCH_SIZE)
+        .all<JobRow>();
+      const screenItems = toAssessable(screenRows.results ?? []);
+      const screenBatches: (typeof screenItems)[] = [];
+      for (let i = 0; i < screenItems.length; i += SCREEN_BATCH_SIZE) screenBatches.push(screenItems.slice(i, i + SCREEN_BATCH_SIZE));
+      // Tier 2 below reads budget.remaining, so any of the screen share left unused (the raw
+      // backlog ran out before using its whole half) rolls forward into assessment's share instead
+      // of just being dropped on the floor for this round.
+      budget.remaining = assessShare + (screenShare - screenBatches.length);
 
-    let screenFailed = false;
-    await runPooled(
-      screenBatches,
-      LLM_CONCURRENCY,
-      async (batch) => {
-        if (screenFailed) return null;
-        await emit({ type: "pipeline", stage: "screen", phase: "dispatched", ids: batch.map((item) => item.id) });
-        try {
-          return await screenJobsBatch(env, provider, matchProfile, desiredRoles, disqualifiers, batch);
-        } catch (err) {
-          errors.push(`screen: ${(err as Error).message}`);
-          screenFailed = true;
-          await emit({ type: "pipeline", stage: "screen", phase: "failed", ids: batch.map((item) => item.id) });
-          return null;
-        }
-      },
-      async (_batch, results) => {
-        if (!results) return;
-        for (const result of results) {
-          // Written immediately, one posting at a time, so a dropped connection loses at most
-          // the still-in-flight batches -- everything already screened stays screened.
-          await env.DB.prepare(
-            "UPDATE job_postings SET fit_status = ?, fit_reason = ?, screened_at = CURRENT_TIMESTAMP WHERE id = ?",
-          )
-            .bind(result.keep ? "screened_in" : "screened_out", result.keep ? "" : result.note, result.id)
-            .run();
-          if (!result.keep) screenedOut += 1;
-        }
-        screened += results.length;
-        await emit({
-          type: "pipeline",
-          stage: "screen",
-          phase: "resolved",
-          outcomes: results.map((result) => ({ id: result.id, outcome: result.keep ? "passed" : "rejected" })),
-        });
-        // screened_in/screened_out here are cumulative within this call, not lifetime totals --
-        // the Search tab's live pipeline diagram uses them as real per-batch deltas (this posting
-        // really was just screened out, right now) rather than inferring a split from done/total,
-        // which carries no accept/reject information at all.
-        await emit({
-          type: "progress",
-          stage: "screen",
-          done: screened,
-          total: screenTotal,
-          screened_in: screened - screenedOut,
-          screened_out: screenedOut,
-        });
-      },
-    );
+      let screenFailed = false;
+      await runPooled(
+        screenBatches,
+        LLM_CONCURRENCY,
+        async (batch) => {
+          if (screenFailed) return null;
+          await emit({ type: "pipeline", stage: "screen", phase: "dispatched", ids: batch.map((item) => item.id) });
+          try {
+            return await screenJobsBatch(env, provider, matchProfile, desiredRoles, disqualifiers, batch);
+          } catch (err) {
+            errors.push(`screen: ${(err as Error).message}`);
+            screenFailed = true;
+            await emit({ type: "pipeline", stage: "screen", phase: "failed", ids: batch.map((item) => item.id) });
+            return null;
+          }
+        },
+        async (_batch, results) => {
+          if (!results) return;
+          for (const result of results) {
+            // Written immediately, one posting at a time, so a dropped connection loses at most
+            // the still-in-flight batches -- everything already screened stays screened.
+            await env.DB.prepare(
+              "UPDATE job_postings SET fit_status = ?, fit_reason = ?, screened_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+              .bind(result.keep ? "screened_in" : "screened_out", result.keep ? "" : result.note, result.id)
+              .run();
+            if (!result.keep) screenedOut += 1;
+          }
+          screened += results.length;
+          await emit({
+            type: "pipeline",
+            stage: "screen",
+            phase: "resolved",
+            outcomes: results.map((result) => ({ id: result.id, outcome: result.keep ? "passed" : "rejected" })),
+          });
+          // screened_in/screened_out here are cumulative within this call, not lifetime totals --
+          // the Search tab's live pipeline diagram uses them as real per-batch deltas (this posting
+          // really was just screened out, right now) rather than inferring a split from done/total,
+          // which carries no accept/reject information at all.
+          await emit({
+            type: "progress",
+            stage: "screen",
+            done: screened,
+            total: screenTotal,
+            screened_in: screened - screenedOut,
+            screened_out: screenedOut,
+          });
+        },
+      );
 
-    // Tier 2: strong model, only on survivors. Total is snapshotted now rather than at the top
-    // of the function, since tier 1 above is what populates this queue in the first place.
-    const assessTotal = (await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'screened_in'").first<{ n: number }>())?.n ?? 0;
+      // Tier 2: strong model, only on survivors. Total is snapshotted now rather than at the top
+      // of the function, since tier 1 above is what populates this queue in the first place.
+      const assessTotal = (await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'screened_in'").first<{ n: number }>())?.n ?? 0;
 
-    const assessRows = await env.DB.prepare(
-      `SELECT id, title, company, location, raw_description FROM job_postings
-       WHERE fit_status = 'screened_in' ORDER BY created_at ASC LIMIT ?`,
-    )
-      .bind(budget.remaining * FIT_BATCH_SIZE)
-      .all<JobRow>();
+      const assessRows = await env.DB.prepare(
+        `SELECT id, title, company, location, raw_description FROM job_postings
+         WHERE fit_status = 'screened_in' ORDER BY created_at ASC LIMIT ?`,
+      )
+        .bind(budget.remaining * FIT_BATCH_SIZE)
+        .all<JobRow>();
 
-    const dealbreakers = readDealbreakers(profileRow?.preferences_json ?? "{}");
-    const careAboutTopics = await ensureCareAboutTopics(env, provider, profileId, profileRow?.preferences_json ?? "{}");
-    const assessResult = await assessRowsBatched(
-      env, provider, structured, desiredRoles, disqualifiers, dealbreakers, careAboutTopics,
-      assessRows.results ?? [], assessTotal, readMatchThreshold(profileRow?.preferences_json ?? "{}"), emit,
-    );
-    assessed = assessResult.assessed;
-    errors.push(...assessResult.errors);
+      const dealbreakers = readDealbreakers(profileRow?.preferences_json ?? "{}");
+      const careAboutTopics = await ensureCareAboutTopics(env, provider, profileId, profileRow?.preferences_json ?? "{}");
+      const assessResult = await assessRowsBatched(
+        env, provider, structured, desiredRoles, disqualifiers, dealbreakers, careAboutTopics,
+        assessRows.results ?? [], assessTotal, readMatchThreshold(profileRow?.preferences_json ?? "{}"), emit,
+      );
+      assessed = assessResult.assessed;
+      errors.push(...assessResult.errors);
 
-    return {
-      screened, screened_out: screenedOut, assessed, errors,
-      counts: await jobPipelineCounts(env, readMatchThreshold(profileRow?.preferences_json ?? "{}")),
-    };
+      return {
+        screened, screened_out: screenedOut, assessed, errors,
+        counts: await jobPipelineCounts(env, readMatchThreshold(profileRow?.preferences_json ?? "{}")),
+      };
+    } finally {
+      await releaseScanLock(env.DB, "process", runId);
+    }
   });
 }
 
@@ -3082,70 +3070,96 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
 
   const companies = targets.results ?? [];
 
+  const runId = await acquireScanLock(env.DB, "scan");
+  if (!runId) return json({ error: "scan_already_running", detail: "A Find Jobs run is already in progress. Wait for it to finish, then try again." }, 409);
+
   return ndjsonResponse(ctx, async (emit) => {
-    // Cloudflare enforces a hard subrequest cap per Worker invocation -- 50 on the Free plan, 1000
-    // on Paid -- and every plain fetch inside scanOneCompany (and the resolveBoard/resolveWebsite
-    // helpers it calls) decrements this budget 1:1, so it doubles as that cap. It intentionally
-    // stays well under even the Free-plan ceiling: 8 companies run concurrently and all check
-    // `budget.remaining` before any of them have decremented it, so a single round can overshoot
-    // this number by roughly the concurrency factor before anyone notices it's exhausted. A cap
-    // hit mid-scan isn't just wasted work either -- Cloudflare can kill the isolate outright rather
-    // than raising a catchable error, which drops the whole ndjson stream with no 'done' event and
-    // no "Too many API requests" message the client can even show. Staying safely under the limit
-    // (instead of the 150 this used to be, sized only for a Paid-plan ceiling) is cheaper than
-    // needing several extra "still queued" rounds.
-    const budget = { remaining: 35 };
-    const results: { company: string; jobs: number; new_jobs: number; note: string }[] = [];
-    let newListings = 0;
-    let done = 0;
+    try {
+      const scanRunId = runId;
+      const started = Date.now();
+      // Cloudflare's real per-invocation external-subrequest cap is 50 on the Free plan; on Workers
+      // Paid it defaults to 10,000 (see https://developers.cloudflare.com/workers/platform/limits/#subrequests).
+      // This budget is the app-level backstop underneath that platform ceiling, not a substitute for
+      // it: every plain fetch inside scanOneCompany (and the resolveWebsiteDeterministic/resolveBoard/
+      // fetchBoardJobs/fetchMissingDescriptions helpers it calls) decrements this 1:1, so a runaway
+      // company (a huge board, a slow-to-resolve website) still gets cut off well before it could run
+      // up real cost or approach the platform's own limit -- with headroom to spare underneath 1,500
+      // even counting the concurrency-driven overshoot described below.
+      //
+      // A cap hit mid-scan isn't just wasted work either -- if this budget were ever raised past what
+      // the platform allows, Cloudflare can kill the isolate outright rather than raising a catchable
+      // error, dropping the whole ndjson stream with no 'done' event and no "Too many API requests"
+      // message the client can even show. Staying well under the configured platform limit avoids that.
+      const budget = { remaining: 1500 };
+      const startingBudget = budget.remaining;
+      const results: { company: string; jobs: number; new_jobs: number; note: string }[] = [];
+      let newListings = 0;
+      let done = 0;
 
-    // Companies don't depend on each other, and scanning one is almost entirely waiting on a fetch
-    // to that company's own board plus a few DB writes -- essentially no CPU time. Running several
-    // at once instead of one after another turns "minutes across multiple rounds" into one click.
-    await runPooled(
-      companies,
-      8,
-      async (company) => {
-        if (budget.remaining <= 8) return null;
-        // scanOneCompany already writes each company's listings to the database before returning,
-        // so a company already reported here is durably saved even if others in flight never finish.
-        // Isolated per-company: one company's board timing out, returning garbage, or (rarely)
-        // tripping the platform's own subrequest cap must not abort every other company still in
-        // flight in this same batch, nor crash the response stream out from under the client.
-        try {
-          return await scanOneCompany(env, company, desiredRoles, locationTerms, budget, titleTerms);
-        } catch (err) {
-          return { jobs: 0, newJobs: 0, note: `scan_failed: ${(err as Error).message}`, status: "unverified" as const };
-        }
-      },
-      async (company, outcome) => {
-        if (!outcome) return;
-        done += 1;
-        results.push({ company: company.name, jobs: outcome.jobs, new_jobs: outcome.newJobs, note: outcome.note });
-        newListings += outcome.newJobs;
-        await emit({
-          type: "progress",
-          done,
-          total: companies.length,
-          company: company.name,
-          new_jobs: outcome.newJobs,
-          verified: outcome.status === "verified",
-        });
-      },
-    );
+      // Companies don't depend on each other, and scanning one is almost entirely waiting on a fetch
+      // to that company's own board plus a few DB writes -- essentially no CPU time. Running several
+      // at once instead of one after another turns "minutes across multiple rounds" into one click.
+      // 6 concurrent, not higher: several companies all check `budget.remaining` before any of them
+      // have decremented it, so a single round can overshoot the budget by roughly this many requests
+      // before anyone notices it's exhausted -- a small, deliberate concurrency factor keeps that
+      // overshoot small too.
+      const SCAN_CONCURRENCY = 6;
+      await runPooled(
+        companies,
+        SCAN_CONCURRENCY,
+        async (company) => {
+          if (budget.remaining <= SCAN_CONCURRENCY) return null;
+          // scanOneCompany already writes each company's listings to the database before returning,
+          // so a company already reported here is durably saved even if others in flight never finish.
+          // Isolated per-company: one company's board timing out, returning garbage, or (rarely)
+          // tripping the platform's own subrequest cap must not abort every other company still in
+          // flight in this same batch, nor crash the response stream out from under the client.
+          try {
+            return await scanOneCompany(env, company, desiredRoles, locationTerms, budget, titleTerms);
+          } catch (err) {
+            return { jobs: 0, newJobs: 0, note: `scan_failed: ${(err as Error).message}`, status: "unverified" as const };
+          }
+        },
+        async (company, outcome) => {
+          if (!outcome) return;
+          done += 1;
+          results.push({ company: company.name, jobs: outcome.jobs, new_jobs: outcome.newJobs, note: outcome.note });
+          newListings += outcome.newJobs;
+          await emit({
+            type: "progress",
+            done,
+            total: companies.length,
+            company: company.name,
+            new_jobs: outcome.newJobs,
+            verified: outcome.status === "verified",
+          });
+        },
+      );
 
-    // Total eligible companies, not time-gated (beyond the same unsupported_ats cooldown the
-    // target query above applies) -- the client uses this against however many it's scanned so
-    // far across this click's rounds to know when a Find Jobs run has covered everyone.
-    const eligible = await env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND identity_status NOT IN ('dismissed', 'not_a_company')
-       AND NOT (job_source_status = 'unsupported_ats' AND job_source_checked_at > datetime('now', '-14 days'))
-       AND NOT (job_source_status IN ('no_board', 'careers_only') AND job_source_checked_at > datetime('now', '-3 days'))`,
-    )
-      .bind(profileId)
-      .first<{ n: number }>();
+      // Total eligible companies, not time-gated (beyond the same unsupported_ats cooldown the
+      // target query above applies) -- the client uses this against however many it's scanned so
+      // far across this click's rounds to know when a Find Jobs run has covered everyone.
+      const eligible = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM companies WHERE profile_id = ? AND identity_status NOT IN ('dismissed', 'not_a_company')
+         AND NOT (job_source_status = 'unsupported_ats' AND job_source_checked_at > datetime('now', '-14 days'))
+         AND NOT (job_source_status IN ('no_board', 'careers_only') AND job_source_checked_at > datetime('now', '-3 days'))`,
+      )
+        .bind(profileId)
+        .first<{ n: number }>();
 
-    return { scanned: results.length, results, new_listings: newListings, eligible_total: eligible?.n ?? 0 };
+      // Structured, greppable instrumentation (point 6): makes it obvious from `wrangler tail` /
+      // Workers Logs whether a scan used 100, 500, or 1500 outbound requests, without adding any new
+      // storage or infrastructure -- this Worker already has `observability.enabled` in wrangler.jsonc.
+      const externalRequests = startingBudget - budget.remaining;
+      console.log(
+        `scan_run scanRunId=${scanRunId} companiesScanned=${results.length} externalRequests=${externalRequests} ` +
+          `jobsAdded=${newListings} duration=${Date.now() - started}ms`,
+      );
+
+      return { scanned: results.length, results, new_listings: newListings, eligible_total: eligible?.n ?? 0 };
+    } finally {
+      await releaseScanLock(env.DB, "scan", runId);
+    }
   });
 }
 
