@@ -6,7 +6,6 @@ import {
   type Provider,
   type TraceSink,
   callStructured,
-  callText,
   friendlyMessage,
   normalizeProvider,
   providerKeyMissing,
@@ -63,6 +62,7 @@ import {
   planEvidence,
   renderPlanDirective,
 } from "./philosophy";
+import { type InterestedJobGap, relatedJobIdsFor, renderJobRequirementContext, requirementDedupeKey } from "./interested";
 import {
   type AtsProvider,
   type CompanySearchTerm,
@@ -352,6 +352,8 @@ const ADDITIVE_COLUMNS = [
   // 0028_company_discovery_streams.sql
   "ALTER TABLE companies ADD COLUMN website_source TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE companies ADD COLUMN website_confidence INTEGER",
+  // 0033_job_requirement_coverage.sql
+  "ALTER TABLE profile_improvement_questions ADD COLUMN related_job_ids TEXT NOT NULL DEFAULT '[]'",
 ];
 
 /**
@@ -438,6 +440,17 @@ const ADDITIVE_TABLES = [
      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
    )`,
   "CREATE INDEX IF NOT EXISTS idx_improve_audits_profile ON profile_improvement_audits(profile_id, created_at DESC)",
+  // 0033_job_requirement_coverage.sql
+  `CREATE TABLE IF NOT EXISTS job_requirement_coverage (
+     job_id TEXT PRIMARY KEY REFERENCES job_postings(id) ON DELETE CASCADE,
+     profile_id TEXT NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
+     plan_json TEXT NOT NULL DEFAULT '{}',
+     profile_version TEXT NOT NULL DEFAULT '',
+     provider TEXT NOT NULL DEFAULT '',
+     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'ready', 'failed')),
+     generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+   )`,
+  "CREATE INDEX IF NOT EXISTS idx_job_requirement_coverage_profile ON job_requirement_coverage(profile_id)",
 ];
 
 /**
@@ -1633,16 +1646,34 @@ async function listJobs(request: Request, env: Env): Promise<Response> {
             company_id, fit_status, fit_score, fit_reason, fit_missing_json, fit_detail_json, interested_at, applied_at, created_at,
             assessed_at, manual_status, removed_at, removed_from_status, removal_reason,
             EXISTS(SELECT 1 FROM resumes r WHERE r.job_id = job_postings.id) AS has_resume,
-            EXISTS(SELECT 1 FROM cover_letters c WHERE c.job_id = job_postings.id) AS has_cover_letter
+            EXISTS(SELECT 1 FROM cover_letters c WHERE c.job_id = job_postings.id) AS has_cover_letter,
+            jrc.status AS coverage_status, jrc.plan_json AS coverage_plan_json
      FROM job_postings
+     LEFT JOIN job_requirement_coverage jrc ON jrc.job_id = job_postings.id
      ORDER BY COALESCE(posted_at, created_at) DESC`,
-  ).all();
+  ).all<Record<string, unknown> & { coverage_status: string | null; coverage_plan_json: string | null }>();
   const profileId = await getOrCreateProfileId(env);
   const profileRow = await env.DB.prepare("SELECT preferences_json FROM candidate_profiles WHERE id = ?")
     .bind(profileId)
     .first<{ preferences_json: string }>();
   const matchThreshold = readMatchThreshold(profileRow?.preferences_json ?? "{}");
-  return json({ jobs: jobs.results, counts: await jobPipelineCounts(env, matchThreshold), match_threshold: matchThreshold });
+  // Only the unproven count (not the whole plan) is worth shipping to the list view -- this is
+  // what powers each Interested card's "Profile ready" / "N profile improvements available" pill.
+  // The full plan (with which requirements and what evidence) is fetched on demand, same as
+  // fit_missing_json's detail already works.
+  const withCoverage = (jobs.results ?? []).map((row) => {
+    const { coverage_plan_json, ...rest } = row;
+    let coverageUnproven: number | null = null;
+    if (row.coverage_status === "ready" && coverage_plan_json) {
+      try {
+        coverageUnproven = coverageSummary(JSON.parse(coverage_plan_json as string) as EvidencePlan).unproven;
+      } catch {
+        coverageUnproven = null;
+      }
+    }
+    return { ...rest, coverage_unproven: coverageUnproven };
+  });
+  return json({ jobs: withCoverage, counts: await jobPipelineCounts(env, matchThreshold), match_threshold: matchThreshold });
 }
 
 /** Recent user-confirmed disqualifier reasons, most recent first, deduped case-insensitively. */
@@ -2191,10 +2222,69 @@ async function storeFitResults(env: Env, results: FitResult[]): Promise<void> {
   }
 }
 
+/**
+ * Requirement/evidence analysis for one Interested job -- "analyze per job" from the Interested +
+ * Improve redesign. Reuses the same requirement extraction and evidence plan the resume pipeline
+ * already runs for job-tailored resumes (loadEvidencePlan, below), but triggered once a job enters
+ * Interested and persisted to job_requirement_coverage so an Interested card can show a
+ * "Profile ready" / "N profile improvements available" indicator without generating a resume
+ * first, and without re-deriving it on every render (see loadEvidencePlan's own header comment for
+ * why requirements are cached and the plan is recomputed).
+ *
+ * Never throws: a planner outage must not block marking a job Interested. A failure just leaves the
+ * job's coverage row as 'failed' (or absent, if no key is configured) until the next retry -- see
+ * retryJobRequirementCoverage (manual) and applyImproveAnswers' targeted reanalysis (automatic,
+ * after an Improve answer resolving one of this job's gaps is applied) further below.
+ */
+async function analyzeJobRequirementCoverage(env: Env, provider: Provider, jobId: string, profileId: string): Promise<void> {
+  const upsertFailed = async (versionTag: string) => {
+    await env.DB.prepare(
+      `INSERT INTO job_requirement_coverage (job_id, profile_id, status, provider, profile_version)
+       VALUES (?, ?, 'failed', ?, ?)
+       ON CONFLICT(job_id) DO UPDATE SET status = 'failed', provider = excluded.provider,
+         profile_version = excluded.profile_version, generated_at = CURRENT_TIMESTAMP`,
+    )
+      .bind(jobId, profileId, provider, versionTag)
+      .run();
+  };
+
+  const job = await env.DB.prepare(
+    "SELECT title, company, raw_description, requirements_json FROM job_postings WHERE id = ?",
+  )
+    .bind(jobId)
+    .first<{ title: string; company: string; raw_description: string; requirements_json: string }>();
+  if (!job) return;
+
+  const profileRow = await env.DB.prepare("SELECT structured_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ structured_json: string }>();
+  const versionTag = await profileVersionTag(profileRow?.structured_json ?? "{}");
+  const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
+  if (!structured) {
+    await upsertFailed(versionTag);
+    return;
+  }
+
+  const plan = await loadEvidencePlan(env, provider, jobId, job, structured);
+  if (!plan) {
+    await upsertFailed(versionTag);
+    return;
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO job_requirement_coverage (job_id, profile_id, plan_json, profile_version, provider, status)
+     VALUES (?, ?, ?, ?, ?, 'ready')
+     ON CONFLICT(job_id) DO UPDATE SET plan_json = excluded.plan_json, profile_version = excluded.profile_version,
+       provider = excluded.provider, status = 'ready', generated_at = CURRENT_TIMESTAMP`,
+  )
+    .bind(jobId, profileId, JSON.stringify(plan), versionTag, provider)
+    .run();
+}
+
 async function setJobFit(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { action?: string; reason?: string };
+  const body = (await request.json().catch(() => ({}))) as { action?: string; reason?: string; provider?: string };
   const job = await env.DB.prepare("SELECT title, company, manual_status, removed_from_status FROM job_postings WHERE id = ?")
     .bind(id)
     .first<{ title: string; company: string; manual_status: string; removed_from_status: string | null }>();
@@ -2208,6 +2298,23 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
     )
       .bind(id)
       .run();
+    // Automatic requirement/profile analysis, the moment a job becomes Interested -- the candidate
+    // should never have to separately ask for it. Awaited inline (this is a single click, not a
+    // batch pipeline) rather than fire-and-forgotten via ctx.waitUntil, so the coverage row is
+    // guaranteed to exist by the time the client reloads the job list right after this call
+    // resolves. A missing/invalid provider or key just skips analysis silently -- the job is still
+    // marked Interested either way, and the card shows a neutral "not yet analyzed" state until a
+    // provider is configured and the candidate reopens it.
+    const provider = normalizeProvider(body.provider);
+    if (!providerKeyMissing(env, provider)) {
+      const profileId = await getOrCreateProfileId(env);
+      try {
+        await analyzeJobRequirementCoverage(env, provider, id, profileId);
+      } catch {
+        // storeFitResults-style callers already treat a planner outage as "degrade, don't block" --
+        // same here. The job stays Interested; the coverage row (if any) is left as it was.
+      }
+    }
     return json({ id, manual_status: "interested" });
   }
 
@@ -2275,12 +2382,14 @@ async function setJobFit(request: Request, env: Env, id: string): Promise<Respon
 }
 
 /**
- * Asks one short, conversational clarifying question about a gap between what this specific
- * job asks for and what the candidate's profile currently shows evidence of. Nothing is written
- * to the DB here -- the question is only saved (as a candidate_evidence row) once the candidate
- * actually answers it, via createJobReviewAnswer below.
+ * Manual retry for a job's requirement/evidence analysis -- surfaced as "Retry analysis" on an
+ * Interested card whose coverage is 'failed' (the automatic run at mark-Interested time errored,
+ * most often a missing/invalid provider key) or still absent/'pending' (no key was configured yet
+ * when it was marked Interested). Just re-runs analyzeJobRequirementCoverage; requirements_json is
+ * still cached from the earlier attempt if it got that far, so this only redoes the step that
+ * actually failed.
  */
-async function reviewJobQuestion(request: Request, env: Env, id: string): Promise<Response> {
+async function retryJobRequirementCoverage(request: Request, env: Env, id: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
   const body = (await request.json().catch(() => ({}))) as { provider?: string };
@@ -2288,81 +2397,36 @@ async function reviewJobQuestion(request: Request, env: Env, id: string): Promis
   const keyError = providerKeyMissing(env, provider);
   if (keyError) return json({ error: keyError }, 501);
 
-  const job = await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
+  const job = await env.DB.prepare("SELECT id FROM job_postings WHERE id = ? AND manual_status = 'interested'")
     .bind(id)
-    .first<{ title: string; company: string; raw_description: string }>();
-  if (!job) return json({ error: "not_found" }, 404);
-
-  const profile = await loadProfileForResume(env);
-  if (profile instanceof Response) return profile;
-
-  // Prior answers for this same job, so a second (or third) click asks about something new
-  // rather than circling back to ground already covered.
-  const prior = await env.DB.prepare(
-    "SELECT claim FROM candidate_evidence WHERE job_id = ? AND category = 'job_review' ORDER BY created_at ASC",
-  )
-    .bind(id)
-    .all<{ claim: string }>();
-
-  const prompt = await getManagedPrompt(env, "jobs/review_question", {
-    prior_answers_rule: (prior.results ?? []).length
-      ? "- Don't repeat ground already covered by these previous answers for this same job:\n" +
-        prior.results.map((r) => `  - ${r.claim}`).join("\n")
-      : "",
-    job_title: job.title,
-    company: job.company,
-    job_description: job.raw_description.slice(0, 3000),
-    candidate_profile: JSON.stringify(profile.structured),
-  });
-
-  try {
-    const question = await callText(env, provider, "review.question", prompt);
-    return json({ question: question.trim() });
-  } catch (err) {
-    return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
-  }
-}
-
-async function listJobReview(request: Request, env: Env, id: string): Promise<Response> {
-  const auth = await requireSession(request, env);
-  if (auth instanceof Response) return auth;
-  const rows = await env.DB.prepare(
-    "SELECT id, claim, created_at FROM candidate_evidence WHERE job_id = ? AND category = 'job_review' ORDER BY created_at ASC",
-  )
-    .bind(id)
-    .all();
-  return json({ entries: rows.results });
-}
-
-async function createJobReviewAnswer(request: Request, env: Env, id: string): Promise<Response> {
-  const auth = await requireSession(request, env);
-  if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { question?: string; answer?: string };
-  const answer = (body.answer ?? "").trim();
-  if (!answer) return json({ error: "answer_required" }, 400);
-  const question = (body.question ?? "").trim();
-
-  const job = await env.DB.prepare("SELECT id FROM job_postings WHERE id = ?").bind(id).first();
+    .first<{ id: string }>();
   if (!job) return json({ error: "not_found" }, 404);
 
   const profileId = await getOrCreateProfileId(env);
-  // Keeping the question alongside the answer makes the saved evidence self-explanatory later --
-  // "Q: ... / A: ..." reads sensibly on its own, unlike a bare answer with no context.
-  const claim = question ? `Q: ${question}\nA: ${answer}` : answer;
-  const evidenceId = crypto.randomUUID();
-  await env.DB.prepare(
-    "INSERT INTO candidate_evidence (id, profile_id, category, claim, usable_in_applications, job_id) VALUES (?, ?, 'job_review', ?, 1, ?)",
-  )
-    .bind(evidenceId, profileId, claim, id)
-    .run();
-
-  const rows = await env.DB.prepare(
-    "SELECT id, claim, created_at FROM candidate_evidence WHERE job_id = ? AND category = 'job_review' ORDER BY created_at ASC",
-  )
+  await analyzeJobRequirementCoverage(env, provider, id, profileId);
+  const row = await env.DB.prepare("SELECT status, plan_json FROM job_requirement_coverage WHERE job_id = ?")
     .bind(id)
-    .all();
-  return json({ id: evidenceId, entries: rows.results }, 201);
+    .first<{ status: string; plan_json: string }>();
+  let unproven: number | null = null;
+  if (row?.status === "ready") {
+    try {
+      unproven = coverageSummary(JSON.parse(row.plan_json) as EvidencePlan).unproven;
+    } catch {
+      unproven = null;
+    }
+  }
+  return json({ id, coverage_status: row?.status ?? "failed", coverage_unproven: unproven });
 }
+
+// Per-job "Ask" question/answer used to live here (reviewJobQuestion / listJobReview /
+// createJobReviewAnswer), asking a one-off clarifying question scoped to a single posting. Removed
+// in favor of centralizing all candidate-facing questions in Profile > Improve (see
+// runImproveAudit's job_requirement_context and analyzeJobRequirementCoverage above): the same gap
+// -- "no evidence of SQL" -- showing up on ten postings should produce one question the candidate
+// answers once, not ten separate ones. Historical answers already saved this way remain readable
+// (candidate_evidence.category = 'job_review', still queried by loadJobReviewClaims below for
+// resume/cover-letter composition) since they are still real, user-confirmed evidence -- only the
+// UI and endpoints for creating new ones this way are gone.
 
 // ---------------------------------------------------------------------------
 // Companies
@@ -4320,6 +4384,8 @@ type ImproveQuestionRow = {
   created_at: string;
   answered_at: string | null;
   applied_at: string | null;
+  /** JSON array of job_postings ids this question's gap was raised by -- see relatedJobIdsFor. */
+  related_job_ids: string;
 };
 
 /**
@@ -4374,6 +4440,57 @@ type ImproveAuditResult =
  * in-process after a successful apply without constructing a second authenticated request -- this
  * runs strictly after its caller has already checked the session and the profile exists.
  */
+/**
+ * "Analyze per job, question globally": gathers every Interested job's persisted requirement
+ * coverage (job_requirement_coverage, written by analyzeJobRequirementCoverage when the job was
+ * marked Interested) and collapses the unproven/partial requirements into one deduplicated list --
+ * five jobs each wanting SQL become one entry with a job count, not five prompt lines. No LLM call
+ * here: this only reads what analyzeJobRequirementCoverage already computed and cached, which is
+ * the entire point of persisting it (see #16 in the redesign: avoid unnecessary LLM calls).
+ *
+ * The dedup/rendering/matching logic itself lives in src/interested.ts as pure, unit-tested
+ * functions; this is just the D1 read that feeds them, kept here alongside the rest of this file's
+ * env-touching handlers.
+ */
+async function loadInterestedJobGaps(env: Env): Promise<Map<string, InterestedJobGap>> {
+  const rows = await env.DB.prepare(
+    `SELECT jp.id AS job_id, jp.title, jp.company, jrc.plan_json
+     FROM job_postings jp
+     JOIN job_requirement_coverage jrc ON jrc.job_id = jp.id
+     WHERE jp.manual_status = 'interested' AND jrc.status = 'ready'`,
+  ).all<{ job_id: string; title: string; company: string; plan_json: string }>();
+
+  const gaps = new Map<string, InterestedJobGap>();
+  for (const row of rows.results ?? []) {
+    let plan: EvidencePlan;
+    try {
+      plan = JSON.parse(row.plan_json) as EvidencePlan;
+    } catch {
+      continue;
+    }
+    const label = [row.title, row.company].filter(Boolean).join(" @ ");
+    for (const item of plan.coverage ?? []) {
+      // partial is included alongside unproven: "related evidence exists but is weak" is exactly
+      // the ambiguous case the redesign wants surfaced (POSSIBLE/PARTIALLY_SUPPORTED), not silently
+      // treated as good enough. proven requirements need no question and are skipped.
+      if (item.status !== "unproven" && item.status !== "partial") continue;
+      const key = requirementDedupeKey(item.requirement);
+      if (!key) continue;
+      const existing = gaps.get(key);
+      if (existing) {
+        if (!existing.jobIds.includes(row.job_id)) {
+          existing.jobIds.push(row.job_id);
+          existing.jobLabels.push(label);
+        }
+        if (item.kind === "must_have") existing.kind = "must_have";
+      } else {
+        gaps.set(key, { requirement: item.requirement, kind: item.kind, jobIds: [row.job_id], jobLabels: [label] });
+      }
+    }
+  }
+  return gaps;
+}
+
 async function runImproveAudit(env: Env, profileId: string, provider: Provider): Promise<ImproveAuditResult> {
   const row = await env.DB.prepare("SELECT structured_json FROM candidate_profiles WHERE id = ?")
     .bind(profileId)
@@ -4400,10 +4517,15 @@ async function runImproveAudit(env: Env, profileId: string, provider: Provider):
         .join("\n")
     : "(no prior questions -- this is the first audit of this profile)";
 
+  const jobGaps = await loadInterestedJobGaps(env);
   const prompt = await getManagedPrompt(
     env,
     "profile/improve-audit",
-    { career_profile: renderCareerProfile(structured), prior_question_state: priorState },
+    {
+      career_profile: renderCareerProfile(structured),
+      prior_question_state: priorState,
+      job_requirement_context: renderJobRequirementContext(jobGaps),
+    },
     PROFILE_IMPROVE_AUDIT_PROMPT,
   );
 
@@ -4433,12 +4555,13 @@ async function runImproveAudit(env: Env, profileId: string, provider: Provider):
     const key = questionDedupeKey(q.entity_type, q.entity_id, q.target_field);
     if (existingKeys.has(key)) continue;
     existingKeys.add(key);
+    const relatedJobIds = relatedJobIdsFor(q, jobGaps);
     await env.DB.prepare(
       `INSERT INTO profile_improvement_questions
-       (id, profile_id, profile_version, entity_type, entity_id, entity_label, target_field, category, priority, question, why_it_matters, answer_type, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+       (id, profile_id, profile_version, entity_type, entity_id, entity_label, target_field, category, priority, question, why_it_matters, answer_type, status, related_job_ids)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
     )
-      .bind(q.id, profileId, versionTag, q.entity_type, q.entity_id, q.entity_label, q.target_field, q.category, q.priority, q.question, q.why_it_matters, q.answer_type)
+      .bind(q.id, profileId, versionTag, q.entity_type, q.entity_id, q.entity_label, q.target_field, q.category, q.priority, q.question, q.why_it_matters, q.answer_type, JSON.stringify(relatedJobIds))
       .run();
     inserted += 1;
   }
@@ -4601,6 +4724,28 @@ async function applyImproveAnswers(request: Request, env: Env): Promise<Response
     )
       .bind(id)
       .run();
+  }
+
+  // Targeted reanalysis (redesign point #15): re-run the requirement/evidence analysis only for
+  // the Interested jobs whose gap raised one of the answers just applied -- never every Interested
+  // job on every apply, which is exactly the "recompute everything unnecessarily" #16 warns
+  // against. This is what turns "Job A: 3 improvements" into "Job A: 2 improvements" (or "Profile
+  // ready") right after answering, instead of only on the job's next unrelated re-analysis.
+  const affectedJobIds = new Set<string>();
+  for (const q of answered.results) {
+    try {
+      for (const jobId of JSON.parse(q.related_job_ids || "[]") as string[]) affectedJobIds.add(jobId);
+    } catch {
+      // Malformed related_job_ids on an old row is the same as none.
+    }
+  }
+  for (const jobId of affectedJobIds) {
+    try {
+      await analyzeJobRequirementCoverage(env, provider, jobId, profileId);
+    } catch {
+      // One job's re-analysis failing must not undo the profile update or the other jobs' refresh --
+      // its coverage row just stays as it was until the next successful analysis.
+    }
   }
 
   // Re-audit immediately against the newly-applied profile, so the loop (Create -> Analyze -> Ask ->
@@ -7264,7 +7409,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
            separate selected-job area below the list. -->
       <div id="jobs-interested-section" style="display:none">
         <section id="interested-list-section">
-          <p class="hint">Jobs you've marked "Interested". Click anywhere on a card except its posting link or buttons to expand Ask, Resume, Cover Letter, and Apply tools inline.</p>
+          <p class="hint">Jobs you've marked "Interested". Click anywhere on a card except its posting link or buttons to expand Resume, Cover Letter, and Apply tools inline. Profile gaps ApplyGo found for a job are answered in one place for every job -- see the Profile ready / improvements-available note on each card, which links to Profile → Improve.</p>
           <div id="interested-list"><p class="empty">Loading…</p></div>
         </section>
 
@@ -7273,28 +7418,20 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         <div id="interested-detail-home" style="display:none">
         <section id="interested-detail-section" style="display:none">
 
-          <!-- Assistant/Resume/Cover letter/Apply are sub-tabs, not stacked sections -- only one shows
-               at a time, the same way the top-level dashboard tabs work, so opening one doesn't leave
-               the others piled up underneath with no way to get back to just looking at one thing. -->
+          <!-- Resume/Cover letter/Apply are sub-tabs, not stacked sections -- only one shows at a
+               time, the same way the top-level dashboard tabs work, so opening one doesn't leave the
+               others piled up underneath with no way to get back to just looking at one thing.
+               There used to be a fourth "Ask" sub-tab here for a per-job clarifying question; that
+               workflow is gone in favor of Profile → Improve, which asks the same kind of question
+               once for every job that shares the gap instead of once per job -- see
+               loadInterestedJobGaps/runImproveAudit in src/index.ts. -->
           <div class="subtabs">
-            <button id="interested-subtab-assistant" type="button">Ask</button>
-            <button id="interested-subtab-resume" class="secondary" type="button">Resume</button>
+            <button id="interested-subtab-resume" type="button">Resume</button>
             <button id="interested-subtab-cover" class="secondary" type="button">Cover Letter</button>
             <button id="interested-subtab-apply" class="secondary" type="button">Apply</button>
           </div>
 
-          <div id="interested-assistant-panel">
-            <p id="interested-review-status" class="status" role="status" aria-live="polite"></p>
-            <button id="interested-review-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Ask a question</button>
-            <div id="interested-review-section" style="display:none">
-              <p id="interested-review-question" class="job-reason"></p>
-              <textarea id="interested-review-answer" placeholder="Answer in your own words — this gets added to your profile evidence for this job."></textarea>
-              <button id="interested-review-submit" type="button">Submit answer</button>
-            </div>
-            <div id="interested-review-history"></div>
-          </div>
-
-          <div id="interested-resume-panel" style="display:none">
+          <div id="interested-resume-panel">
             <p id="interested-resume-status" class="status" role="status" aria-live="polite"></p>
             <button id="interested-resume-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Generate tailored resume</button>
             <div id="interested-resume-section" style="display:none">
@@ -7521,6 +7658,12 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         document.querySelectorAll('#panel-profile > .subpanel').forEach(function (panel) { panel.classList.remove('active'); });
         subtabButton.classList.add('active');
         document.getElementById('profile-subpanel-' + subtabButton.dataset.profileSubtab).classList.add('active');
+        // improveFocusJobId only holds for the one visit jumpToImproveForJob sent the candidate on
+        // -- leaving Improve for anything else (including coming back to it later on its own) drops
+        // back to the normal priority-only ordering.
+        if (subtabButton.dataset.profileSubtab !== 'improve' && typeof improveFocusJobId !== 'undefined') {
+          improveFocusJobId = null;
+        }
       });
     });
 
@@ -8699,6 +8842,19 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     var improveQuestions = [];
     var improveHasAudited = false;
     var improveBusy = false;
+    // Set by jumpToImproveForJob (an Interested card's "N profile improvements available" pill) so
+    // this one visit to Improve can surface that job's questions first. Not a filter -- every open
+    // question is still shown, and answering any of them updates the same global profile either way.
+    var improveFocusJobId = null;
+
+    function questionRelatedJobIds(question) {
+      try {
+        var ids = JSON.parse(question.related_job_ids || '[]');
+        return Array.isArray(ids) ? ids : [];
+      } catch (e) {
+        return [];
+      }
+    }
 
     function improveCategoryLabel(category) {
       return (category || 'other').replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
@@ -8727,13 +8883,36 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         progress.style.display = '';
         progress.textContent = answeredCount + ' answered · ' + pendingCount + ' remaining';
       }
+
+      // Redesign point #8: a nonblocking nudge, not an interrupt -- marking a new job Interested
+      // (or any other open-question change) shows up here the next time this button re-renders,
+      // without a modal or forced navigation.
+      var subtabButton = document.querySelector('[data-profile-subtab="improve"]');
+      if (subtabButton) {
+        var existingBadge = subtabButton.querySelector('.badge');
+        if (existingBadge) existingBadge.remove();
+        subtabButton.textContent = 'Improve';
+        if (pendingCount > 0) {
+          subtabButton.appendChild(el('span', { className: 'badge strong', style: 'margin-left:0.4rem', textContent: String(pendingCount) }));
+        }
+      }
     }
 
     function renderImproveQuestionCard(question) {
-      var card = el('div', { className: 'profile-card' });
+      var relatedJobIds = questionRelatedJobIds(question);
+      var card = el('div', { className: 'profile-card' + (improveFocusJobId && relatedJobIds.indexOf(improveFocusJobId) !== -1 ? ' is-expanded' : '') });
       var titleRow = el('div', { className: 'row-title-line', style: 'display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap' });
       titleRow.appendChild(el('span', { className: 'badge', textContent: improveCategoryLabel(question.category) }));
       if (question.status === 'answered') titleRow.appendChild(el('span', { className: 'badge', textContent: 'Answered', style: 'background:var(--success,#2e7d32);color:#fff' }));
+      // Redesign point #11 ("why we're asking") -- the rest of the card already explains the
+      // reasoning via why_it_matters; this just makes visible that the reasoning came in part from
+      // Interested jobs, and how many, without repeating the full job_requirement_context prose.
+      if (relatedJobIds.length) {
+        titleRow.appendChild(el('span', {
+          className: 'badge',
+          textContent: relatedJobIds.length + ' interested job' + (relatedJobIds.length === 1 ? '' : 's'),
+        }));
+      }
       card.appendChild(titleRow);
       card.appendChild(el('p', { className: 'row-title', textContent: question.question, style: 'margin-top:0.4rem' }));
       if (question.why_it_matters) {
@@ -8814,7 +8993,17 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         if (!groups[key]) { groups[key] = []; order.push(key); }
         groups[key].push(q);
       });
+      function groupTouchesFocusJob(key) {
+        if (!improveFocusJobId) return false;
+        return groups[key].some(function (q) { return questionRelatedJobIds(q).indexOf(improveFocusJobId) !== -1; });
+      }
       order.sort(function (a, b) {
+        // A group with a question tied to the job the candidate just clicked in from goes first,
+        // regardless of priority -- that is the whole point of the "N profile improvements
+        // available" link (redesign point #7); priority still decides ties within/outside that.
+        var focusA = groupTouchesFocusJob(a);
+        var focusB = groupTouchesFocusJob(b);
+        if (focusA !== focusB) return focusA ? -1 : 1;
         var maxA = Math.max.apply(null, groups[a].map(function (q) { return q.priority; }));
         var maxB = Math.max.apply(null, groups[b].map(function (q) { return q.priority; }));
         return maxB - maxA;
@@ -9864,10 +10053,15 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     }
 
     async function submitJobFit(jobId, action, reason, reload) {
+      // 'interested' triggers the automatic requirement/profile analysis server-side (redesign
+      // point #3) and needs a provider for that LLM call; every other action ignores it. Reusing
+      // the Search tab's own provider selector rather than adding a new one -- marking a job
+      // Interested only ever happens from a Search-tab card.
+      var providerEl = document.getElementById('jobs-provider');
       var res = await api('/jobs/' + encodeURIComponent(jobId) + '/fit', {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ action: action, reason: reason || '' }),
+        body: JSON.stringify({ action: action, reason: reason || '', provider: providerEl ? providerEl.value : undefined }),
       });
       if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'Could not update this job.'));
       var data = await res.json();
@@ -9921,7 +10115,20 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       jobs.forEach(function (job) {
         var body = buildJobCardBody(job);
         var interested = el('button', { className: 'success', type: 'button', textContent: 'Interested' });
-        interested.addEventListener('click', function () { submitJobFit(job.id, 'interested'); });
+        interested.addEventListener('click', function () {
+          // The click awaits analyzeJobRequirementCoverage server-side (redesign point #3), so
+          // this is not instant the way Remove is -- disable and relabel for the wait rather than
+          // leaving the button looking clickable while a real request (and up to two LLM calls)
+          // is in flight. loadJobs() (inside submitJobFit) re-renders this card away on success
+          // either way, so there is no separate "done" state to restore here.
+          interested.disabled = true;
+          interested.textContent = 'Adding…';
+          submitJobFit(job.id, 'interested').catch(function (err) {
+            interested.disabled = false;
+            interested.textContent = 'Interested';
+            window.alert('Could not mark this job Interested: ' + err.message);
+          });
+        });
         var remove = el('button', { className: 'danger', type: 'button', textContent: 'Remove' });
         remove.addEventListener('click', function () { submitJobFit(job.id, 'removed'); });
 
@@ -10911,25 +11118,11 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     var activeInterestedResumeId = null;
     var resumeAutoLoadedForJob = false;
     var coverAutoLoadedForJob = false;
-    var pendingReviewQuestion = null;
 
-    function renderReviewHistory(entries) {
-      var host = document.getElementById('interested-review-history');
-      host.innerHTML = '';
-      if (!entries.length) return;
-      host.appendChild(el('h3', { className: 'subhead', textContent: 'Answered so far' }));
-      entries.forEach(function (entry) {
-        host.appendChild(el('p', { className: 'job-reason', textContent: entry.claim }));
-      });
-    }
-
-    async function loadJobReviewHistory(jobId) {
-      var res = await api('/jobs/' + encodeURIComponent(jobId) + '/review');
-      var data = await res.json();
-      renderReviewHistory(data.entries || []);
-    }
-
-    var INTERESTED_SUBTABS = ['assistant', 'resume', 'cover', 'apply'];
+    // Ask (per-job clarifying question) used to live here as a fourth "assistant" subtab. Removed:
+    // see the comment on the subtabs markup above for why, and jumpToImproveForJob further below
+    // for what replaced it.
+    var INTERESTED_SUBTABS = ['resume', 'cover', 'apply'];
 
     function showInterestedSubtab(name) {
       INTERESTED_SUBTABS.forEach(function (tab) {
@@ -10983,18 +11176,12 @@ Let me check the placeholder embraces like a variable name, gets its value when 
 
     function showInterestedDetail(job, inlineHost) {
       activeInterestedJobId = job.id;
-      showInterestedSubtab('assistant');
+      showInterestedSubtab('resume');
       var section = document.getElementById('interested-detail-section');
       inlineHost.appendChild(section);
       section.style.display = 'block';
-      // Review, resume, and cover-letter state are all per-job -- switching to a different job
-      // shouldn't carry over a pending question, answer, or preview that belonged to the last one.
-      pendingReviewQuestion = null;
-      document.getElementById('interested-review-section').style.display = 'none';
-      document.getElementById('interested-review-answer').value = '';
-      document.getElementById('interested-review-status').textContent = '';
-      loadJobReviewHistory(job.id);
-
+      // Resume and cover-letter state are per-job -- switching to a different job shouldn't carry
+      // over a preview that belonged to the last one.
       activeInterestedResumeId = null;
       resumeAutoLoadedForJob = false;
       document.getElementById('interested-resume-section').style.display = 'none';
@@ -11091,6 +11278,79 @@ Let me check the placeholder embraces like a variable name, gets its value when 
 
     // candidateJobs is renderJobs()'s already-search/age/score-filtered array, so the Interested
     // subtab's list respects the same shared filter controls as the other five subtabs.
+    /** Shared "not analyzed yet" / "analysis failed" state for renderCoveragePill below, with a
+     * manual retry against /jobs/:id/requirement-coverage/retry. */
+    function renderCoverageRetry(job, label) {
+      var wrap = el('p', { className: 'row-meta', textContent: label + ' ' });
+      var retryBtn = el('button', { type: 'button', className: 'secondary', textContent: 'Retry analysis' });
+      retryBtn.addEventListener('click', async function (event) {
+        event.stopPropagation();
+        var providerEl = document.getElementById('jobs-provider');
+        retryBtn.disabled = true;
+        retryBtn.textContent = 'Retrying…';
+        try {
+          var res = await api('/jobs/' + encodeURIComponent(job.id) + '/requirement-coverage/retry', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ provider: providerEl ? providerEl.value : undefined }),
+          });
+          if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'retry_failed'));
+          await loadJobs();
+        } catch (err) {
+          retryBtn.disabled = false;
+          retryBtn.textContent = 'Retry analysis';
+          window.alert('Could not analyze this job: ' + err.message);
+        }
+      });
+      wrap.appendChild(retryBtn);
+      return wrap;
+    }
+
+    /**
+     * Compact per-card readiness indicator (redesign point #6). Reads job.coverage_status /
+     * coverage_unproven, both computed server-side in listJobs from job_requirement_coverage --
+     * the per-job requirement/evidence analysis that ran automatically when this job was marked
+     * Interested (see analyzeJobRequirementCoverage in src/index.ts). Never a match percentage:
+     * only "is there anything ApplyGo thinks might be true about you but doesn't have evidence for
+     * yet", which is the thing answering an Improve question can actually change.
+     */
+    function renderCoveragePill(job) {
+      if (job.coverage_status === 'failed') {
+        return renderCoverageRetry(job, 'Profile fit analysis failed.');
+      }
+      if (job.coverage_status !== 'ready' || job.coverage_unproven == null) {
+        return renderCoverageRetry(job, 'Profile fit not analyzed yet.');
+      }
+      if (job.coverage_unproven === 0) {
+        return el('span', { className: 'badge', style: 'background:var(--success,#2e7d32);color:#fff', textContent: 'Profile ready' });
+      }
+      var pill = el('button', {
+        type: 'button',
+        className: 'badge strong',
+        style: 'border:0;cursor:pointer',
+        textContent: job.coverage_unproven + ' profile improvement' + (job.coverage_unproven === 1 ? '' : 's') + ' available',
+      });
+      pill.addEventListener('click', function (event) {
+        event.stopPropagation();
+        jumpToImproveForJob(job.id);
+      });
+      return pill;
+    }
+
+    /**
+     * Redesign point #7: clicking an Interested card's improvements indicator goes straight to
+     * Profile → Improve, not a job-specific page -- there is no per-job question view any more.
+     * improveFocusJobId (read by renderImproveQuestions) just reorders the already-loaded open
+     * questions so ones tied to this job surface first; the answer still updates the one global
+     * profile, exactly as clicking "Find Improvements" from Improve directly would.
+     */
+    function jumpToImproveForJob(jobId) {
+      improveFocusJobId = jobId;
+      document.querySelector('.tab[data-tab="profile"]').click();
+      document.querySelector('[data-profile-subtab="improve"]').click();
+      renderImproveQuestions(improveQuestions);
+    }
+
     function renderInterestedList(candidateJobs) {
       var list = document.getElementById('interested-list');
       var expandedJobId = activeInterestedJobId;
@@ -11131,6 +11391,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
           job.posted_at ? 'posted ' + new Date(job.posted_at).toLocaleDateString() : '',
         ].filter(Boolean).join(' · ');
         var body = [el('div', { className: 'row-title-line' }, titleLine), el('div', { className: 'row-meta', textContent: meta })];
+        body.push(renderCoveragePill(job));
 
         // The handoff point: opens the employer's own application page, where the extension's
         // in-page agent takes over (see extension/agent.js). Disabled rather than hidden when a
@@ -11209,65 +11470,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         activeInterestedJobId = null;
       }
     }
-
-    document.getElementById('interested-review-button').addEventListener('click', async function () {
-      if (!activeInterestedJobId) return;
-      var statusEl = document.getElementById('interested-review-status');
-      var button = this;
-      button.disabled = true;
-      statusEl.textContent = 'Thinking of a question…';
-      statusEl.className = 'status';
-      try {
-        var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/review', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({}),
-        });
-        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'review_failed'));
-        var data = await res.json();
-        pendingReviewQuestion = data.question;
-        document.getElementById('interested-review-question').textContent = data.question;
-        document.getElementById('interested-review-section').style.display = 'block';
-        document.getElementById('interested-review-answer').value = '';
-        statusEl.textContent = '';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      } finally {
-        button.disabled = false;
-      }
-    });
-
-    document.getElementById('interested-review-submit').addEventListener('click', async function () {
-      if (!activeInterestedJobId) return;
-      var answer = document.getElementById('interested-review-answer').value.trim();
-      if (!answer) return;
-      var statusEl = document.getElementById('interested-review-status');
-      var button = this;
-      button.disabled = true;
-      statusEl.textContent = 'Saving…';
-      statusEl.className = 'status';
-      try {
-        var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/review-answer', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ question: pendingReviewQuestion, answer: answer }),
-        });
-        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'save_failed'));
-        var data = await res.json();
-        renderReviewHistory(data.entries || []);
-        document.getElementById('interested-review-section').style.display = 'none';
-        document.getElementById('interested-review-answer').value = '';
-        pendingReviewQuestion = null;
-        statusEl.textContent = 'Saved — added to your profile evidence for this job.';
-        statusEl.className = 'status success';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      } finally {
-        button.disabled = false;
-      }
-    });
 
     function renderInterestedResumeChecks(checks) {
       var host = document.getElementById('interested-resume-checks');
@@ -12268,11 +12470,11 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "POST" && url.pathname === "/data/purge-collection") return purgeCollection(request, env);
     const jobFitMatch = url.pathname.match(/^\/jobs\/([^/]+)\/fit$/);
     if (request.method === "PATCH" && jobFitMatch) return setJobFit(request, env, jobFitMatch[1]);
-    const jobReviewMatch = url.pathname.match(/^\/jobs\/([^/]+)\/review$/);
-    if (request.method === "GET" && jobReviewMatch) return listJobReview(request, env, jobReviewMatch[1]);
-    if (request.method === "POST" && jobReviewMatch) return reviewJobQuestion(request, env, jobReviewMatch[1]);
-    const jobReviewAnswerMatch = url.pathname.match(/^\/jobs\/([^/]+)\/review-answer$/);
-    if (request.method === "POST" && jobReviewAnswerMatch) return createJobReviewAnswer(request, env, jobReviewAnswerMatch[1]);
+    // /jobs/:id/review and /jobs/:id/review-answer (the per-job Ask endpoints) were removed here --
+    // see the comment above where reviewJobQuestion/listJobReview/createJobReviewAnswer used to be
+    // defined.
+    const jobRequirementsRetryMatch = url.pathname.match(/^\/jobs\/([^/]+)\/requirement-coverage\/retry$/);
+    if (request.method === "POST" && jobRequirementsRetryMatch) return retryJobRequirementCoverage(request, env, jobRequirementsRetryMatch[1]);
     const jobResumeMatch = url.pathname.match(/^\/jobs\/([^/]+)\/resume$/);
     if (request.method === "POST" && jobResumeMatch) return buildJobResume(request, env, jobResumeMatch[1]);
     const jobCoverLetterMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cover-letter$/);

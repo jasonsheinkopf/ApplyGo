@@ -248,8 +248,8 @@ Return only the structured output.`,
  * explicitly an audit, not a chat -- it never writes to the profile itself.
  */
 export const PROFILE_IMPROVE_AUDIT_PROMPT: PromptDefault = {
-  requires: ["career_profile", "prior_question_state"],
-  schemaVersion: 3,
+  requires: ["career_profile", "prior_question_state", "job_requirement_context"],
+  schemaVersion: 4,
   text: `You are auditing one person's CAREER EVIDENCE RECORD to find the highest-value missing
 evidence, then writing targeted questions to ask them for it.
 
@@ -262,6 +262,8 @@ CAREER EVIDENCE RECORD:
 PRIOR QUESTION STATE (questions already asked in earlier audits, with their current status --
 pending, answered, applied, dismissed, or obsolete):
 {{prior_question_state}}
+
+{{job_requirement_context}}
 
 DO NOT RE-ASK RESOLVED QUESTIONS
 Never regenerate a question that prior question state shows as answered, applied, or dismissed for
@@ -349,9 +351,12 @@ PRIORITY (0-100)
 High priority: missing outcome for a major or recent project, missing scope for a leadership claim,
 unclear ownership, missing quantitative evidence where a metric plausibly exists, ambiguity that
 affects credibility, missing context around a distinctive accomplishment, unclear result of an
-important initiative.
+important initiative, and -- when INTERESTED JOB GAPS is present above -- a gap shared by several of
+those jobs, especially one marked "required". A gap several Interested jobs share should generally
+outrank an equally-real gap that only satisfies general profile completeness, since answering it
+moves the candidate's readiness for actual jobs they want, not just the record's completeness.
 Lower priority: minor historical detail, redundant evidence, low-relevance hobby detail, information
-unlikely to matter later.
+unlikely to matter later, or an Interested-job gap only one job mentions and only as a nice-to-have.
 
 VOLUME
 Generate as many genuinely useful questions as the record warrants, but do not pad to hit a number.
