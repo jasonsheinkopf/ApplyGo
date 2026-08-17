@@ -3432,7 +3432,7 @@ async function scanOneCompany(
   let scanned;
   try {
     budget.remaining -= 1;
-    scanned = await fetchBoardJobs(provider as AtsProvider, token);
+    scanned = await fetchBoardJobs(provider as AtsProvider, token, budget);
   } catch (err) {
     // A company that has read successfully before is never demoted by one transient failure.
     await writeCompanyState(env, company.id, {
