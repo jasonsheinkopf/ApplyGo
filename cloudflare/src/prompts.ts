@@ -413,11 +413,183 @@ YOUR JOB
 Return only the structured output.`,
 };
 
+/**
+ * The cover-letter writer, now given the same structured job analysis the resume gets.
+ *
+ * This entry is new, and adding it deliberately supersedes whatever `cover_letter/compose` version
+ * is currently live in Langfuse: `requires` names `job_analysis`, which no existing template
+ * mentions, so `getManagedPrompt` treats the live one as stale and serves this text until a
+ * matching version is promoted. That is the mechanism this module exists for (see the top-of-file
+ * comment) and it is the right trade here -- a letter written without the coverage report can
+ * cheerfully claim a requirement the candidate cannot prove, which is the exact failure the
+ * analysis was built to prevent. Everything the previous template received is still passed, so the
+ * only behavioral difference is the added grounding.
+ */
+export const COVER_LETTER_COMPOSE_PROMPT: PromptDefault = {
+  // ONLY the genuinely new variable, and that is load-bearing rather than lazy. `requires` is
+  // tested with `.some()` (see isPromptCompatible), so a live template counts as current if it
+  // mentions ANY listed variable. Listing a pre-existing one like `candidate_profile` -- which
+  // every previous version of this prompt already references -- would make the live prompt pass the
+  // staleness test forever, this bundled text would never be served, and cover letters would go on
+  // being written with no coverage report at all. The whole point is that only a template updated
+  // for the new contract can satisfy this.
+  requires: ["job_analysis"],
+  schemaVersion: 3,
+  text: `You are writing one cover letter for one specific job application.
+
+THE JOB: {{job_title}} at {{company}}
+
+JOB DESCRIPTION:
+{{job_description}}
+
+{{job_analysis}}
+
+{{review_answers}}{{contact_line}}
+THE CANDIDATE'S CAREER EVIDENCE RECORD:
+{{candidate_profile}}
+
+WHAT THIS LETTER IS FOR
+A cover letter is not a prose version of the resume. The reader already has the resume. This letter
+earns its place only by doing something the resume cannot: connecting a small number of specific
+things this candidate has actually done to what this specific employer says they need, and saying
+why that connection is real.
+
+So: pick the two or three strongest genuine connections and develop them. Do not inventory the
+candidate's history, do not walk through the requirement list, and do not restate bullets.
+
+GROUNDING -- THIS IS THE HARD CONSTRAINT
+The job analysis above has already been verified against the candidate's record in code. Treat it
+as authoritative:
+- Things listed as strongest genuine connections are safe to build the letter on.
+- Things listed as partial matches must be described as what they actually are. Name the real
+  technology or the real scope. Never let adjacent experience read as the exact thing asked for.
+- Things listed as not supported must not appear at all -- not as a claim, not as an implication,
+  not as enthusiasm phrased to sound like experience ("excited to bring my Kubernetes experience"
+  when there is none). Silence about a gap is correct and expected.
+
+Never invent a metric, a responsibility, a scale figure, a technology, an outcome, a title, a date,
+a customer, a deployment, or a credential. If a detail is not in the record above, it does not exist
+for the purposes of this letter.
+
+VOICE AND FORM
+- Address the specific company and role. Never write a placeholder like [Company Name].
+- Open with something substantive. No "I am writing to apply for the position of...".
+- Plain, direct, professional. No breathless enthusiasm, no self-assessment adjectives
+  ("passionate", "hard-working", "detail-oriented"), no cliches about being a perfect fit.
+- Concrete over abstract: what was built, what problem it solved, what happened as a result.
+- Roughly 3 short paragraphs, under 300 words, unless instructions above say otherwise. A tight
+  letter that a busy reader finishes beats a thorough one they abandon.
+- Plain paragraphs separated by blank lines. No markdown, no bullet points, no headers.
+- End with a simple sign-off.
+
+Return only the structured output.`,
+};
+
+/**
+ * Strengthen Profile's one new model call: graded requirement coverage in, targeted questions out.
+ *
+ * The whole reason this is a separate prompt from `profile/improve-audit` rather than a variant of
+ * it: the generic audit has to guess which of a candidate's gaps matter, so it spreads thin across
+ * every dimension of every entity. This one is told exactly what a specific employer asked for and
+ * exactly which of those things the record can and cannot currently prove, so it can spend all of
+ * its attention on the handful of questions whose answers would actually change this application.
+ */
+export const STRENGTHEN_QUESTIONS_PROMPT: PromptDefault = {
+  requires: ["requirement_coverage", "career_profile", "prior_question_state"],
+  schemaVersion: 3,
+  text: `You are helping one candidate remember evidence they already have but have not yet written
+down, using a specific job they want as the prompt.
+
+You are NOT writing a resume, NOT giving career advice, and NOT helping them acquire qualifications
+they lack. Your only job: find the places where this posting asks for something the candidate's
+record cannot currently prove, and ask a question that could plausibly uncover real evidence they
+genuinely have.
+
+THE JOB: {{job_title}} at {{company}}
+WHAT THE ROLE IS: {{role_summary}}
+
+REQUIREMENT COVERAGE (already computed -- each requirement, how important it is, whether the record
+currently proves it, and the best supporting evidence found):
+{{requirement_coverage}}
+
+THE CANDIDATE'S CAREER EVIDENCE RECORD:
+{{career_profile}}
+
+PROFILE ENTITY IDS you may target (entity_type | entity_id | label). Copy an id EXACTLY; never
+invent one:
+{{profile_entity_ids}}
+
+ALREADY ASKED BEFORE (across every job and every earlier pass, with status):
+{{prior_question_state}}
+
+WHAT MAKES EVIDENCE STRONG (use this to judge whether existing evidence is actually good enough,
+and to decide what a question should ask for):
+{{resume_guidance}}
+
+WHERE TO SPEND QUESTIONS
+- [unproven] requirements are the priority IF it is plausible this candidate has relevant
+  experience they simply have not recorded. Their record is in front of you -- use it to judge.
+- [partial] requirements are often the most valuable of all: the candidate has adjacent experience,
+  and the question is whether the real thing is hiding behind a thin description.
+- [proven] requirements are usually finished. Ask about one ONLY when a genuinely valuable metric,
+  outcome, or scale figure is missing from otherwise strong evidence.
+- Weight by importance: a must_have the record cannot prove matters far more than a nice-to-have.
+
+DO NOT ASK
+- Anything the prior question state shows as answered, applied, or dismissed for the same entity
+  and the same kind of detail. That ground is covered, or the candidate has already declined it.
+  This matters more than anything else here: this candidate will do this for many jobs, and the
+  number of questions is supposed to fall as their record fills in. Re-asking makes it useless.
+- Anything the career record already answers somewhere else. The full record is given to you
+  precisely so you can check before asking.
+- Anything about a requirement where it is implausible this candidate has hidden experience. If the
+  posting wants 10 years of embedded firmware and the record is entirely teaching and web work,
+  there is nothing to uncover. Leave the gap alone -- an honest gap is a valid outcome.
+- Questions that ask the candidate to acquire, estimate, or manufacture something. You are looking
+  for what already happened.
+
+HOW TO WRITE THE QUESTION
+Ground every question in something the record already contains, and name it. The candidate should
+be able to tell instantly which piece of their own history you are asking about.
+
+  Bad:  "Do you have experience with model evaluation?"
+  Good: "This role emphasizes evaluating ML systems before deployment. In your vehicle
+         personalization work at Bosch, did you define or run any process for comparing models,
+         validating personalization quality, or deciding whether an approach was good enough to
+         continue? If so, what did you measure and what did you decide?"
+
+- Offer a menu of plausible answer shapes rather than assuming which one is true. "Was there a
+  measurable result -- a before/after number, a count, a time saved, or a decision that changed?"
+  is fair. "How much money did this save?" is not: it presumes savings happened.
+- Accept "no" as a real answer. Phrase questions so that "I didn't do that" is a natural response
+  and not a failure. A truthful gap is better than a stretched claim.
+- One question should ask for one thing. If a role needs three separate details, that is up to
+  three questions, each targeted at its own field.
+- A question may be leading about WHERE to look ("your profile says you led part of the PoC --
+  did that include coordinating requirements with stakeholders?"). It may never be leading about
+  WHAT THE ANSWER IS.
+
+ADJACENT IS NOT THE SAME THING
+If the posting asks for D3.js and the record shows Plotly, you may ask whether they have also used
+D3.js, or what the visualization work actually involved. You may NOT phrase the question so that
+answering it implies D3.js experience, and you may not treat the Plotly work as though it were
+D3.js. The same holds for every technology, seniority level, scale figure, and outcome.
+
+VOLUME
+Return at most 12 questions, best first. Returning 4 excellent questions is a better outcome than
+12 padded ones. If the record already covers everything this posting reasonably probes, return an
+empty questions array -- that is a success, not a failure.
+
+Return only the structured output.`,
+};
+
 /** Registry consulted by getManagedPrompt. Prompts absent here behave exactly as before. */
 export const PROMPT_DEFAULTS: Record<string, PromptDefault> = {
   "profile/create": PROFILE_CREATE_PROMPT,
   "profile/improve-audit": PROFILE_IMPROVE_AUDIT_PROMPT,
   "profile/improve-apply": PROFILE_IMPROVE_APPLY_PROMPT,
+  "job/strengthen-questions": STRENGTHEN_QUESTIONS_PROMPT,
+  "cover_letter/compose": COVER_LETTER_COMPOSE_PROMPT,
   "roles/analyze": ROLES_ANALYZE_PROMPT,
   "roles/research": ROLES_RESEARCH_PROMPT,
 };

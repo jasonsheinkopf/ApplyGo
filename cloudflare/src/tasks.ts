@@ -25,6 +25,7 @@ export type LlmTaskId =
   | "roles.research"
   | "companies.resolve_website"
   | "review.question"
+  | "strengthen.questions"
   | "resume.build"
   | "resume.requirements"
   | "resume.plan_evidence"
@@ -172,6 +173,20 @@ export const LLM_TASKS: LlmTaskInfo[] = [
     tier: "reason",
     what: "Free text. One conversational question about whatever the posting wants that the profile does not yet cover.",
     source: "src/index.ts -> jobReviewQuestion",
+    batched: false,
+    replayable: true,
+  },
+  {
+    id: "strengthen.questions",
+    name: "Ask targeted evidence questions",
+    stage: "Apply",
+    tier: "reason",
+    what:
+      "Stage D of Strengthen Profile. Given a posting's requirements already graded proven/partial/" +
+      "unproven against the career record, plus every question this candidate has ever been asked, " +
+      "writes the short list of questions whose answers would actually uncover missing evidence. " +
+      "Stages A-C are resume.requirements and resume.plan_evidence, which this reuses rather than repeats.",
+    source: "src/strengthen.ts -> generateClarificationQuestions",
     batched: false,
     replayable: true,
   },

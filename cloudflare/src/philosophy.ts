@@ -48,10 +48,108 @@
 // the candidate's profile. A confident fabrication is the one failure mode that makes this whole
 // feature worse than useless, so it is caught in code rather than trusted to a prompt.
 
-import { type LlmEnv, type Provider, callStructured } from "./llm";
-import { getManagedPrompt } from "./langfuse";
+import { type LlmEnv, type Provider, callStructured } from "./llm.ts";
+import { getManagedPrompt } from "./langfuse.ts";
 import type { StructuredProfile } from "./resume";
-import { profileEvidenceStrings, renderCareerProfile } from "./profile";
+import { profileEvidenceStrings, renderCareerProfile } from "./profile.ts";
+
+// ---------------------------------------------------------------------------
+// Canonical resume guidance -- the one authoritative statement of house style
+// ---------------------------------------------------------------------------
+
+/**
+ * The single source of truth for how ApplyGo writes and evaluates resume evidence.
+ *
+ * This lives in code rather than only in a Markdown file because it has two consumers that must
+ * not drift apart: the resume writer (which must follow it) and the Strengthen Profile question
+ * generator (which must know what *makes* evidence resume-grade, so it can tell that "Used PyTorch
+ * for machine learning" is a weak claim worth asking about). A doc alone would let those two
+ * quietly diverge; a shared constant cannot. `docs/product/resume-guidelines.md` is the prose
+ * companion and cites this constant as the canonical version rather than restating the rules.
+ *
+ * Sources, synthesized rather than copied:
+ *   - The r/EngineeringResumes wiki (mirrored at github.com/r-engineeringresumes/subreddit-wiki),
+ *     which is where the bullet-level craft rules come from: STAR/CAR/XYZ as reasoning frames,
+ *     strong past-tense action verbs and the specific weak-verb blocklist, 1-2 line bullets ordered
+ *     most-relevant-first, no personal pronouns, no adjective/adverb padding, digits over words,
+ *     context over parts-lists ("why integration matters"), skills as a comma-separated list of
+ *     things actually used rather than a buzzword dump, and the "your resume is not your job
+ *     description" framing that separates accomplishments from duties.
+ *   - The research already cited at the top of this file (Randazzo; Berkeley; Harvard; NACE; Yale;
+ *     Neumark/Burn/Button), which governs selection: what earns space, and why.
+ *
+ * The two agree more than they disagree. Where the wiki gives a formatting rule that this app's
+ * renderer already owns deterministically (fonts, margins, date alignment, page count), that rule
+ * is deliberately NOT repeated here -- it belongs to `renderResumeHtml`/`LayoutSpec`, and telling a
+ * language model to control typography it cannot see would be noise.
+ */
+export const RESUME_GUIDANCE = `HOW TO WRITE THIS RESUME (house style -- these are not suggestions):
+
+EVIDENCE, NOT DUTIES
+- A resume is not a job description. A bullet that only names a responsibility ("Responsible for
+  maintaining the data pipeline") is wasted space when an accomplishment is available.
+- Every bullet should do at least one of: show the technical work actually done, show a real
+  problem/constraint that was overcome, or show what resulted.
+- STAR (situation/task/action/result), CAR (challenge/action/result) and XYZ (accomplished X as
+  measured by Y by doing Z) are reasoning frames for finding the missing half of a weak bullet.
+  Use them to think, not as a template -- bullets that all follow one visible formula read as
+  generated. Vary the sentence shape.
+
+BULLET CRAFT
+- Start each bullet with a strong past-tense action verb: analyzed, architected, automated, built,
+  created, decreased, designed, developed, implemented, improved, migrated, optimized, reduced,
+  refactored, shipped, validated.
+- Do NOT open with weak or filler verbs: aided, assisted, collaborated, communicated, executed,
+  exposed to, gained experience, helped, participated, used, utilized, worked on. Do not use
+  inflated verbs either: spearheaded, orchestrated, pioneered, revolutionized, engineered (as a
+  generic verb), leveraged, enhanced, crafted, fostered.
+- One sentence per bullet, 1-2 lines. Order bullets within a role most relevant/impressive first.
+- No personal pronouns (I, we, my, our). No terminal periods on bullets.
+- Cut adjectives and adverbs that carry no evidence: excellent, innovative, expert, world-class,
+  successfully, diligently, meticulously, strategically. If a claim needs an adjective to sound
+  impressive, it is not yet evidence.
+- Use digits for numbers (8, not eight).
+
+TECHNICAL SPECIFICITY AND CONTEXT
+- Name the technology in the context of the work it did, never as a bare parts list. "Used Kafka,
+  Redis, and Postgres" tells the reader nothing; what the system did, what constraint forced that
+  choice, and what it achieved does.
+- Prefer the engineering judgment over the tool. The tool is how; the interesting part is what
+  problem was identified and what decision was made.
+- Spell out a non-obvious abbreviation once, at first use.
+
+QUANTIFICATION -- ONLY WHEN REAL
+- Include a metric when the evidence genuinely contains one, and put it early in the bullet.
+- Never invent, estimate, round, extrapolate, or "reasonably infer" a number. A fabricated metric
+  is the single worst failure mode of this system.
+- A strong qualitative outcome (a decision changed, a system shipped, a customer accepted it, a
+  process replaced) is legitimate evidence and belongs on the page when no number exists. Do not
+  drop a real accomplishment because it has no percentage attached.
+
+SKILLS
+- List skills actually used, drawn from evidence that appears elsewhere in the record. A skill in
+  the skills list with no supporting history is a claim with no evidence behind it.
+- Do not list soft skills (teamwork, leadership, communication) -- demonstrate them in bullets.
+- Do not list assumed tools (IDEs, operating systems, word processors, Git hosting sites; "Git" is
+  a skill, "GitHub" is not).
+- Order most relevant first, and keep proper capitalization (SolidWorks, LabVIEW, PyTorch).
+
+TAILORING, TERMINOLOGY, AND WHAT THIS IS NOT
+- Emphasis is tailored to the target: the same career yields different resumes for different roles
+  because the question changed, not because the facts did.
+- Use the posting's own exact terminology WHEN it truthfully describes what the candidate did --
+  that is how both a human reader and a keyword search recognize the match.
+- Do NOT keyword-stuff, and do NOT restate a requirement as if it were experience. If the candidate
+  used an adjacent tool, say the adjacent tool by its real name. Never upgrade adjacent experience
+  into the exact thing the posting asked for.
+- A visible gap is an acceptable, honest outcome. Nobody satisfies 100% of a posting.
+
+MODERN SCREENING, REALISTICALLY
+- There is no universal "ATS score" to optimize against. Real pipelines mix parsing, structured
+  filters and knockout questions, exact keyword search, semantic matching, AI-assisted criteria
+  evaluation, ranking, and human review.
+- The single strategy that serves all of them is the same one that serves a human reader: accurate,
+  specific, well-organized evidence in the words the field actually uses. Write for that.`;
 
 // ---------------------------------------------------------------------------
 // Requirements model -- what the target actually asks for
@@ -349,6 +447,7 @@ export function normalizePlan(
   });
 
   const haystack = profileHaystack(profile);
+  const vocabulary = profileVocabulary(profile);
   const byRequirement = new Map<string, { status: CoverageStatus; evidence: string }>();
   for (const c of raw.coverage ?? []) {
     const key = matchKey(String(c?.requirement ?? ""));
@@ -368,7 +467,16 @@ export function normalizePlan(
     // requirement is an honest, useful signal ("you can't show this yet"), while a repaired one
     // would be a guess presented as a fact.
     const supported = evidence.length > 0 && evidenceTracesToProfile(evidence, haystack);
-    const status: CoverageStatus = claimed === "unproven" ? "unproven" : supported ? claimed : "unproven";
+    let status: CoverageStatus = claimed === "unproven" ? "unproven" : supported ? claimed : "unproven";
+    // Second, narrower check, and the one that catches the harder failure. The test above only asks
+    // "is this evidence text real?", which a model can satisfy while still citing the wrong thing:
+    // quoting genuine Plotly work as proof of a D3.js requirement passes it, because every word of
+    // the quote really is in the profile. What that misses is whether the evidence is about *this
+    // requirement*. So a `proven` claim additionally has to show that the requirement's own
+    // distinctive vocabulary appears somewhere in the record -- and when it doesn't, the honest
+    // grade is `partial` rather than `unproven`: the model did find real adjacent experience, it
+    // just isn't the named thing, and saying so is more useful to the candidate than silence.
+    if (status === "proven" && !requirementVocabularyPresent(r.text, vocabulary)) status = "partial";
     return { requirement: r.text, kind: r.kind, status, evidence: status === "unproven" ? "" : evidence };
   });
 
@@ -407,6 +515,24 @@ function profileHaystack(profile: StructuredProfile): Set<string> {
 }
 
 /**
+ * The same walk as `profileHaystack`, but keeping short tokens.
+ *
+ * A separate set rather than a loosened threshold on the one above, because these two checks want
+ * opposite things from short words. `evidenceTracesToProfile` compares a *sentence* against the
+ * record and drops them as noise -- "the", "was", "for" would match everything and inflate its
+ * overlap ratio. `requirementVocabularyPresent` compares a *term*, where the short ones are
+ * frequently the whole point: SQL, AWS, C++, R, Go, ETL, CAD. Filtering those out would silently
+ * demote genuine matches for exactly the skills most likely to be named as a hard requirement.
+ */
+function profileVocabulary(profile: StructuredProfile): Set<string> {
+  const words = new Set<string>();
+  for (const value of profileEvidenceStrings(profile)) {
+    for (const word of matchKey(value).split(" ")) if (word.length > 1) words.add(word);
+  }
+  return words;
+}
+
+/**
  * Deliberately a content-word overlap test, not an exact-substring one.
  *
  * The model is *asked* to paraphrase evidence, and legitimate paraphrase ("delivered CRM
@@ -420,6 +546,56 @@ function evidenceTracesToProfile(evidence: string, haystack: Set<string>): boole
   if (!words.length) return false;
   const hits = words.filter((w) => haystack.has(w)).length;
   return hits / words.length >= 0.4;
+}
+
+/**
+ * Words too generic to identify what a requirement is actually asking for.
+ *
+ * Requirements are phrased as prose ("experience with strong knowledge of Kubernetes"), and the
+ * filler carries no evidentiary weight -- if these counted, virtually every requirement would find
+ * a match in virtually every profile and the check below would pass everything.
+ */
+const REQUIREMENT_STOPWORDS = new Set([
+  "ability", "advanced", "and", "background", "based", "best", "building", "collaborate",
+  "deep", "demonstrated", "developing", "environment", "excellent", "experience", "expertise",
+  "familiarity", "for", "from", "good", "hands", "have", "high", "including", "knowledge",
+  "level", "modern", "practical", "practices", "proficiency", "proven", "related", "relevant",
+  "skills", "solid", "strong", "the", "them", "these", "this", "understanding", "using", "with",
+  "work", "working", "year", "years",
+]);
+
+/**
+ * Whether the record mentions what this requirement actually names.
+ *
+ * Deliberately a very low bar -- ONE distinctive term is enough -- because it is a veto on the
+ * strongest claim, not a scoring function. Requiring more would demote genuine matches whenever the
+ * candidate happens to describe the same competency in different words ("stakeholder communication"
+ * evidenced by "presented to stakeholders"), which is exactly the honest paraphrase the sibling
+ * check above exists to protect. What it does reliably catch is the case that matters: a named
+ * technology, tool, certification or framework that appears nowhere in the candidate's history.
+ *
+ * Prefix matching rather than exact, for tokens long enough that a shared prefix means something,
+ * so ordinary morphology (stakeholder/stakeholders, deploy/deployment) is not read as a mismatch.
+ * Short tokens like "d3" or "go" must match exactly -- a prefix rule would let "go" match
+ * "governance", which is how a check like this turns into a rubber stamp.
+ */
+export function requirementVocabularyPresent(requirement: string, haystack: Set<string>): boolean {
+  const tokens = matchKey(requirement)
+    .split(" ")
+    .filter((t) => t.length > 1 && !REQUIREMENT_STOPWORDS.has(t));
+  // Nothing distinctive to check (a requirement made entirely of filler) is not evidence of
+  // fabrication, so it passes rather than demoting a claim on a technicality.
+  if (!tokens.length) return true;
+
+  for (const token of tokens) {
+    if (haystack.has(token)) return true;
+    if (token.length >= 4) {
+      for (const word of haystack) {
+        if (word.startsWith(token) || token.startsWith(word)) return true;
+      }
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
