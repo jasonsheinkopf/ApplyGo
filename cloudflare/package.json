@@ -18,7 +18,9 @@
     "migrate:remote:production": "wrangler d1 migrations apply applygo-prod-db --remote --env production",
     "release:production": "npm run migrate:remote:production && npm run deploy:production",
     "enroll": "node scripts/create-enrollment.mjs",
-    "enroll:local": "node scripts/create-local-enrollment.mjs"
+    "enroll:local": "node scripts/create-local-enrollment.mjs",
+    "prompts:check": "node scripts/sync-langfuse-prompts.mjs",
+    "prompts:sync": "node scripts/sync-langfuse-prompts.mjs --apply"
   },
   "dependencies": {
     "@cloudflare/puppeteer": "latest",

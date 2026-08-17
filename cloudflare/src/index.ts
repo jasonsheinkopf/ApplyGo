@@ -47,6 +47,7 @@ import {
   renderCareerProfile,
 } from "./profile";
 import {
+  COVER_LETTER_COMPOSE_PROMPT,
   PROFILE_CREATE_PROMPT,
   PROFILE_IMPROVE_APPLY_PROMPT,
   PROFILE_IMPROVE_AUDIT_PROMPT,
@@ -63,6 +64,17 @@ import {
   planEvidence,
   renderPlanDirective,
 } from "./philosophy";
+import {
+  type JobEvidenceAnalysis,
+  type StrengthenQuestion,
+  STRENGTHEN_QUESTIONS_SCHEMA,
+  analyzeJobEvidence,
+  coverageCounts,
+  generateClarificationQuestions,
+  readJobEvidenceAnalysis,
+  renderCoverLetterEvidence,
+  renderPriorQuestionState,
+} from "./strengthen";
 import {
   type AtsProvider,
   type CompanySearchTerm,
@@ -352,6 +364,10 @@ const ADDITIVE_COLUMNS = [
   // 0028_company_discovery_streams.sql
   "ALTER TABLE companies ADD COLUMN website_source TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE companies ADD COLUMN website_confidence INTEGER",
+  // 0033_strengthen_profile.sql
+  "ALTER TABLE profile_improvement_questions ADD COLUMN job_id TEXT REFERENCES job_postings(id) ON DELETE SET NULL",
+  "ALTER TABLE profile_improvement_questions ADD COLUMN requirement_id TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE profile_improvement_questions ADD COLUMN requirement_text TEXT NOT NULL DEFAULT ''",
 ];
 
 /**
@@ -438,6 +454,20 @@ const ADDITIVE_TABLES = [
      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
    )`,
   "CREATE INDEX IF NOT EXISTS idx_improve_audits_profile ON profile_improvement_audits(profile_id, created_at DESC)",
+  // 0033_strengthen_profile.sql
+  `CREATE TABLE IF NOT EXISTS job_evidence_analysis (
+     job_id TEXT PRIMARY KEY REFERENCES job_postings(id) ON DELETE CASCADE,
+     profile_id TEXT NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
+     profile_version TEXT NOT NULL DEFAULT '',
+     analysis_json TEXT NOT NULL,
+     proven_count INTEGER NOT NULL DEFAULT 0,
+     partial_count INTEGER NOT NULL DEFAULT 0,
+     unproven_count INTEGER NOT NULL DEFAULT 0,
+     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+   )`,
+  "CREATE INDEX IF NOT EXISTS idx_job_evidence_profile ON job_evidence_analysis(profile_id)",
+  "CREATE INDEX IF NOT EXISTS idx_improve_questions_job ON profile_improvement_questions(job_id, status)",
 ];
 
 /**
@@ -4228,23 +4258,32 @@ async function generateProfile(request: Request, env: Env): Promise<Response> {
   )
     .bind(profileId)
     .all<{ original_name: string; extracted_text: string }>();
-  // Answers the candidate has already given through Improve and that have been integrated into the
-  // profile once are first-person evidence too -- surfaced here as supplementary source material so
-  // a regeneration that reconsiders the whole record from scratch (see the prompt's "do NOT simply
-  // copy the current profile forward" instruction) doesn't need the integration in current_profile
-  // alone to survive; the candidate never has to copy anything into Notes by hand.
+  // Answers the candidate has already given and that have been integrated into the profile once are
+  // first-person evidence too -- surfaced here as supplementary source material so a regeneration
+  // that reconsiders the whole record from scratch (see the prompt's "do NOT simply copy the current
+  // profile forward" instruction) doesn't need the integration in current_profile alone to survive;
+  // the candidate never has to copy anything into Notes by hand.
+  //
+  // This covers Strengthen Profile answers automatically, because they live in the same table --
+  // which is the payoff of having kept one profile-wide question history instead of a per-job one.
+  // The job title is carried through as provenance so the record can say where an answer came from.
   const appliedAnswers = await env.DB.prepare(
-    `SELECT entity_label, question, answer FROM profile_improvement_questions
-     WHERE profile_id = ? AND status = 'applied' ORDER BY applied_at ASC`,
+    `SELECT q.entity_label, q.question, q.answer, j.title AS job_title, j.company AS job_company
+     FROM profile_improvement_questions q
+     LEFT JOIN job_postings j ON j.id = q.job_id
+     WHERE q.profile_id = ? AND q.status = 'applied' ORDER BY q.applied_at ASC`,
   )
     .bind(profileId)
-    .all<{ entity_label: string; question: string; answer: string }>();
+    .all<{ entity_label: string; question: string; answer: string; job_title: string | null; job_company: string | null }>();
 
   const sourceParts: string[] = [];
   for (const note of notes.results) sourceParts.push(`Note: ${note.claim}`);
   for (const qa of appliedAnswers.results) {
+    const origin = qa.job_title
+      ? `asked while preparing an application for ${qa.job_title}${qa.job_company ? ` at ${qa.job_company}` : ""}`
+      : "profile interview";
     sourceParts.push(
-      `Improve interview answer${qa.entity_label ? ` (${qa.entity_label})` : ""} — Q: ${qa.question}\nA: ${qa.answer}`,
+      `Candidate interview answer (${origin})${qa.entity_label ? ` about ${qa.entity_label}` : ""} — Q: ${qa.question}\nA: ${qa.answer}`,
     );
   }
   for (const doc of docs.results) {
@@ -4320,6 +4359,10 @@ type ImproveQuestionRow = {
   created_at: string;
   answered_at: string | null;
   applied_at: string | null;
+  /** Provenance: the posting whose Strengthen run raised this. NULL for profile-wide questions. */
+  job_id: string | null;
+  requirement_id: string;
+  requirement_text: string;
 };
 
 /**
@@ -4519,35 +4562,37 @@ async function dismissImproveQuestion(request: Request, env: Env, questionId: st
 }
 
 /**
- * State D's "Apply Answers & Continue": integrates every saved-but-unapplied answer into the
- * canonical profile via an LLM pass, then immediately re-audits so the next round of questions is
- * ready without a second click. Atomic in the sense the spec asks for: a question is marked
- * `applied` only after both the LLM integration call AND the structured_json write have succeeded,
- * and a failure at either step leaves every saved answer exactly as it was, retryable.
+ * Stages E+F of the Strengthen workflow (extract_profile_updates, merge_profile_updates), and the
+ * whole of the Improve workflow's apply step. One implementation, two callers.
+ *
+ * Factored out of `applyImproveAnswers` when Strengthen Profile shipped, deliberately without
+ * changing what it does: "turn saved answers into structured profile updates without inventing
+ * anything and without dropping unrelated evidence" is exactly the same problem whether the
+ * question came from a profile-wide audit or from a specific posting, and forking it would have
+ * given the app two merge semantics to keep in sync. The only thing the caller chooses is which
+ * answered questions to integrate.
+ *
+ * Returns a discriminated result rather than a Response so the job-scoped caller can carry on and
+ * reassess coverage afterwards instead of returning immediately.
  */
-async function applyImproveAnswers(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSession(request, env);
-  if (auth instanceof Response) return auth;
-  const body = (await request.json().catch(() => ({}))) as { provider?: string };
-  const provider = normalizeProvider(body.provider);
-  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
-  if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
+type ApplyAnswersResult =
+  | { ok: true; profile: CareerProfile; applied: ImproveQuestionRow[] }
+  | { ok: false; status: number; error: string; detail?: string };
 
-  const profileId = await getOrCreateProfileId(env);
+async function applyAnsweredQuestions(
+  env: Env,
+  profileId: string,
+  provider: Provider,
+  answered: ImproveQuestionRow[],
+): Promise<ApplyAnswersResult> {
   const row = await env.DB.prepare("SELECT structured_json FROM candidate_profiles WHERE id = ?")
     .bind(profileId)
     .first<{ structured_json: string }>();
   const structured = readCareerProfile(row?.structured_json ?? "{}");
-  if (!structured) return json({ error: "no_profile_yet" }, 400);
+  if (!structured) return { ok: false, status: 400, error: "no_profile_yet" };
+  if (!answered.length) return { ok: false, status: 400, error: "no_answers_to_apply" };
 
-  const answered = await env.DB.prepare(
-    "SELECT * FROM profile_improvement_questions WHERE profile_id = ? AND status = 'answered' ORDER BY created_at ASC",
-  )
-    .bind(profileId)
-    .all<ImproveQuestionRow>();
-  if (!answered.results.length) return json({ error: "no_answers_to_apply" }, 400);
-
-  const answeredText = answered.results
+  const answeredText = answered
     .map((q) =>
       `- entity_type: ${q.entity_type}\n  entity_id: ${q.entity_id}\n  entity_label: ${q.entity_label}\n  ` +
       `target_field: ${q.target_field}\n  question: ${q.question}\n  why_it_matters: ${q.why_it_matters}\n  answer: ${q.answer}`,
@@ -4577,12 +4622,12 @@ async function applyImproveAnswers(request: Request, env: Env): Promise<Response
     // materially fewer organizations/institutions than it started from is a failed integration
     // (truncated response, model lost its place), not a legitimate edit, and must not be written.
     const { profile: accepted, rejected } = acceptRegeneratedProfile(structured, normalized);
-    if (rejected) return json({ error: "apply_rejected_incomplete" }, 502);
+    if (rejected) return { ok: false, status: 502, error: "apply_rejected_incomplete" };
     updated = accepted;
   } catch (err) {
     // No question is marked applied and structured_json is untouched -- every saved answer is
     // exactly as retryable as it was before this call.
-    return json({ error: "apply_failed", detail: friendlyMessage(err) }, 502);
+    return { ok: false, status: 502, error: "apply_failed", detail: friendlyMessage(err) };
   }
 
   // The write and the status flip happen together, after the LLM call has already succeeded, so a
@@ -4594,14 +4639,48 @@ async function applyImproveAnswers(request: Request, env: Env): Promise<Response
     .bind(JSON.stringify(updated), updated.career_summary.narrative_summary.slice(0, 4000), buildMatchProfile(updated), profileId)
     .run();
 
-  const appliedIds = answered.results.map((q) => q.id);
-  for (const id of appliedIds) {
+  for (const q of answered) {
     await env.DB.prepare(
       "UPDATE profile_improvement_questions SET status = 'applied', applied_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
-      .bind(id)
+      .bind(q.id)
       .run();
   }
+
+  return { ok: true, profile: updated, applied: answered };
+}
+
+/**
+ * The profile-wide Improve workflow's "Apply Answers & Continue": integrates every
+ * saved-but-unapplied answer into the canonical profile, then immediately re-audits so the next
+ * round of questions is ready without a second click. Atomic in the sense the spec asks for: a
+ * question is marked `applied` only after both the LLM integration call AND the structured_json
+ * write have succeeded, and a failure at either step leaves every saved answer exactly as it was,
+ * retryable.
+ *
+ * No longer reachable from the dashboard -- Strengthen Profile replaced the Improve subtab -- but
+ * kept because it is the profile-wide entry point to the same merge, and its task id is referenced
+ * by saved eval cases and existing traces.
+ */
+async function applyImproveAnswers(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string };
+  const provider = normalizeProvider(body.provider);
+  if (provider === "anthropic" && !env.ANTHROPIC_API_KEY) return json({ error: "anthropic_not_configured" }, 501);
+  if (provider === "openai" && !env.OPENAI_API_KEY) return json({ error: "openai_not_configured" }, 501);
+
+  const profileId = await getOrCreateProfileId(env);
+  const answered = await env.DB.prepare(
+    "SELECT * FROM profile_improvement_questions WHERE profile_id = ? AND status = 'answered' ORDER BY created_at ASC",
+  )
+    .bind(profileId)
+    .all<ImproveQuestionRow>();
+
+  const result = await applyAnsweredQuestions(env, profileId, provider, answered.results);
+  if (!result.ok) return json({ error: result.error, detail: result.detail }, result.status);
+  const updated = result.profile;
+  const appliedIds = result.applied.map((q) => q.id);
 
   // Re-audit immediately against the newly-applied profile, so the loop (Create -> Analyze -> Ask ->
   // Answer -> Save -> Apply -> Reanalyze -> Ask Again) advances in one action from the user's side.
@@ -4617,6 +4696,406 @@ async function applyImproveAnswers(request: Request, env: Env): Promise<Response
     pending_count: reaudit.ok ? reaudit.pending_count : 0,
     reaudit_error: reaudit.ok ? null : reaudit.error,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Strengthen Profile -- the job-scoped evidence workflow (see src/strengthen.ts)
+// ---------------------------------------------------------------------------
+
+/** Reads the saved analysis for one posting, or null when it has never been analyzed. */
+async function loadJobEvidenceAnalysis(
+  env: Env,
+  jobId: string,
+): Promise<{ analysis: JobEvidenceAnalysis; profile_version: string; updated_at: string } | null> {
+  const row = await env.DB.prepare(
+    "SELECT analysis_json, profile_version, updated_at FROM job_evidence_analysis WHERE job_id = ?",
+  )
+    .bind(jobId)
+    .first<{ analysis_json: string; profile_version: string; updated_at: string }>();
+  const analysis = readJobEvidenceAnalysis(row?.analysis_json);
+  if (!analysis) return null;
+  return { analysis, profile_version: row!.profile_version, updated_at: row!.updated_at };
+}
+
+async function saveJobEvidenceAnalysis(
+  env: Env,
+  jobId: string,
+  profileId: string,
+  analysis: JobEvidenceAnalysis,
+): Promise<void> {
+  const counts = coverageCounts(analysis.plan);
+  await env.DB.prepare(
+    `INSERT INTO job_evidence_analysis
+       (job_id, profile_id, profile_version, analysis_json, proven_count, partial_count, unproven_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(job_id) DO UPDATE SET
+       profile_id = excluded.profile_id,
+       profile_version = excluded.profile_version,
+       analysis_json = excluded.analysis_json,
+       proven_count = excluded.proven_count,
+       partial_count = excluded.partial_count,
+       unproven_count = excluded.unproven_count,
+       updated_at = CURRENT_TIMESTAMP`,
+  )
+    .bind(jobId, profileId, analysis.profile_version, JSON.stringify(analysis), counts.proven, counts.partial, counts.unproven)
+    .run();
+}
+
+/**
+ * Every question ever asked of this candidate, for the "don't re-ask" input.
+ *
+ * Intentionally NOT filtered to this job. The cumulative-benefit property the whole feature exists
+ * for depends on the generator seeing that a question was already answered while looking at some
+ * other posting -- filtering by job_id here would quietly reintroduce the repetition it is meant to
+ * eliminate. Capped because this grows without bound and the oldest entries are the least useful.
+ */
+async function loadPriorQuestionState(env: Env, profileId: string): Promise<string> {
+  const rows = await env.DB.prepare(
+    `SELECT entity_type, entity_label, target_field, category, question, answer, status
+     FROM profile_improvement_questions WHERE profile_id = ? ORDER BY created_at DESC LIMIT 120`,
+  )
+    .bind(profileId)
+    .all<{
+      entity_type: string; entity_label: string; target_field: string;
+      category: string; question: string; answer: string; status: string;
+    }>();
+  return renderPriorQuestionState(rows.results.slice().reverse());
+}
+
+/** The open questions raised for one posting, newest run first. */
+async function loadJobQuestions(env: Env, profileId: string, jobId: string): Promise<ImproveQuestionRow[]> {
+  const rows = await env.DB.prepare(
+    `SELECT * FROM profile_improvement_questions
+     WHERE profile_id = ? AND job_id = ? AND status IN ('pending', 'answered')
+     ORDER BY priority DESC, created_at ASC`,
+  )
+    .bind(profileId, jobId)
+    .all<ImproveQuestionRow>();
+  return rows.results;
+}
+
+/**
+ * Assembles the single-page view the Strengthen tab renders.
+ *
+ * Built server-side rather than in the browser so the ordering rule -- weakest and most important
+ * requirements first, so the candidate's attention lands where an answer is worth most -- lives in
+ * one place next to the data instead of being reimplemented in page script.
+ */
+function buildStrengthenView(analysis: JobEvidenceAnalysis, questions: ImproveQuestionRow[]) {
+  const byRequirementId = new Map<string, ImproveQuestionRow[]>();
+  const general: ImproveQuestionRow[] = [];
+  for (const q of questions) {
+    if (!q.requirement_id) {
+      general.push(q);
+      continue;
+    }
+    const list = byRequirementId.get(q.requirement_id) ?? [];
+    list.push(q);
+    byRequirementId.set(q.requirement_id, list);
+  }
+
+  const coverageByText = new Map(analysis.plan.coverage.map((c) => [c.requirement, c] as const));
+  const statusRank = { unproven: 0, partial: 1, proven: 2 } as const;
+  const kindRank = { must_have: 0, responsibility: 1, preferred: 2, competency: 3 } as const;
+
+  const items = analysis.requirements.requirements.map((r) => {
+    const coverage = coverageByText.get(r.text);
+    return {
+      requirement_id: r.id,
+      requirement: r.text,
+      kind: r.kind,
+      status: coverage?.status ?? "unproven",
+      evidence: coverage?.evidence ?? "",
+      questions: byRequirementId.get(r.id) ?? [],
+    };
+  });
+
+  items.sort((a, b) => {
+    // A question waiting to be answered is the actionable thing on this page, so anything carrying
+    // one outranks everything that doesn't, regardless of how the requirement itself is graded.
+    const aq = a.questions.length ? 0 : 1;
+    const bq = b.questions.length ? 0 : 1;
+    if (aq !== bq) return aq - bq;
+    const as = statusRank[a.status as keyof typeof statusRank] ?? 0;
+    const bs = statusRank[b.status as keyof typeof statusRank] ?? 0;
+    if (as !== bs) return as - bs;
+    return (kindRank[a.kind] ?? 9) - (kindRank[b.kind] ?? 9);
+  });
+
+  return {
+    role_summary: analysis.requirements.role_summary,
+    analyzed_at: analysis.analyzed_at,
+    profile_version: analysis.profile_version,
+    counts: coverageCounts(analysis.plan),
+    notes: analysis.plan.notes,
+    items,
+    general_questions: general,
+  };
+}
+
+/** GET /jobs/:id/strengthen -- whatever already exists, without ever starting a model call. */
+async function getJobStrengthen(request: Request, env: Env, jobId: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+
+  const profileId = await getOrCreateProfileId(env);
+  const saved = await loadJobEvidenceAnalysis(env, jobId);
+  if (!saved) {
+    // Not an error: every posting that predates this feature, and every newly-interested one,
+    // legitimately has no analysis until the candidate asks for one.
+    return json({ analysis: null, questions: [], stale: false });
+  }
+
+  const questions = await loadJobQuestions(env, profileId, jobId);
+  const profileRow = await env.DB.prepare("SELECT structured_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ structured_json: string }>();
+  const currentVersion = await profileVersionTag(profileRow?.structured_json ?? "{}");
+
+  return json({
+    analysis: buildStrengthenView(saved.analysis, questions),
+    questions,
+    // The profile has gained evidence since this was graded, so the coverage shown may understate
+    // what the record can now prove. Surfaced rather than silently re-run: reanalysis costs money.
+    stale: currentVersion !== saved.profile_version,
+  });
+}
+
+/**
+ * POST /jobs/:id/strengthen/analyze -- stages A through D.
+ *
+ * Lazy by design: nothing analyzes a posting until the candidate opens Strengthen Profile for it,
+ * which is what keeps this affordable when a candidate marks twenty jobs interesting in one sitting
+ * and what makes the feature safe to ship against a database full of pre-existing postings.
+ */
+async function analyzeJobStrengthen(request: Request, env: Env, jobId: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string };
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const job = await env.DB.prepare(
+    "SELECT title, company, raw_description, requirements_json FROM job_postings WHERE id = ?",
+  )
+    .bind(jobId)
+    .first<{ title: string; company: string; raw_description: string; requirements_json: string }>();
+  if (!job) return json({ error: "not_found" }, 404);
+
+  const profileId = await getOrCreateProfileId(env);
+  const profileRow = await env.DB.prepare("SELECT structured_json FROM candidate_profiles WHERE id = ?")
+    .bind(profileId)
+    .first<{ structured_json: string }>();
+  const structured = readCareerProfile(profileRow?.structured_json ?? "{}");
+  if (!structured) return json({ error: "no_profile_yet" }, 400);
+  const profileVersion = await profileVersionTag(profileRow?.structured_json ?? "{}");
+
+  let cachedRequirements: JobRequirements | null = null;
+  try {
+    const parsed = JSON.parse(job.requirements_json || "{}") as JobRequirements;
+    if (parsed?.requirements?.length) cachedRequirements = parsed;
+  } catch {
+    // Unparseable cache is the same as no cache.
+  }
+
+  let analysis: JobEvidenceAnalysis | null;
+  try {
+    analysis = await analyzeJobEvidence(
+      env,
+      provider,
+      { title: job.title, company: job.company, description: job.raw_description ?? "" },
+      structured,
+      profileVersion,
+      cachedRequirements,
+    );
+  } catch (err) {
+    return json({ error: "analysis_failed", detail: friendlyMessage(err) }, 502);
+  }
+  if (!analysis) return json({ error: "no_requirements_found" }, 422);
+
+  // Cache the requirements on the posting itself, exactly where the resume builder already looks
+  // for them, so the two paths keep sharing one extraction rather than each paying for their own.
+  if (!cachedRequirements) {
+    await env.DB.prepare("UPDATE job_postings SET requirements_json = ? WHERE id = ?")
+      .bind(JSON.stringify(analysis.requirements), jobId)
+      .run();
+  }
+  await saveJobEvidenceAnalysis(env, jobId, profileId, analysis);
+
+  // Stage D. A failure here leaves a complete, useful analysis on the page rather than losing the
+  // stages that already succeeded and were already paid for.
+  let generated: StrengthenQuestion[] = [];
+  let questionError: string | null = null;
+  try {
+    generated = await generateClarificationQuestions(
+      env,
+      provider,
+      structured,
+      analysis,
+      { title: job.title, company: job.company },
+      await loadPriorQuestionState(env, profileId),
+    );
+  } catch (err) {
+    questionError = friendlyMessage(err);
+  }
+
+  // Supersede this job's still-unanswered questions from any previous run rather than accumulating
+  // near-duplicates across reanalyses. Answered and applied ones are untouched -- that is evidence
+  // the candidate has already given, and it belongs to the profile now, not to this run.
+  await env.DB.prepare(
+    "UPDATE profile_improvement_questions SET status = 'obsolete' WHERE profile_id = ? AND job_id = ? AND status = 'pending'",
+  )
+    .bind(profileId, jobId)
+    .run();
+
+  // The same deterministic dedupe the profile-wide audit uses, extended across jobs: if a question
+  // for this entity and field is already open from another posting, don't ask it a second time.
+  const openElsewhere = await env.DB.prepare(
+    `SELECT entity_type, entity_id, target_field FROM profile_improvement_questions
+     WHERE profile_id = ? AND status IN ('pending', 'answered')`,
+  )
+    .bind(profileId)
+    .all<{ entity_type: string; entity_id: string; target_field: string }>();
+  const existingKeys = new Set(
+    openElsewhere.results.map((q) => questionDedupeKey(q.entity_type, q.entity_id, q.target_field)),
+  );
+
+  let inserted = 0;
+  for (const q of generated) {
+    const key = questionDedupeKey(q.entity_type, q.entity_id, q.target_field);
+    if (existingKeys.has(key)) continue;
+    existingKeys.add(key);
+    await env.DB.prepare(
+      `INSERT INTO profile_improvement_questions
+       (id, profile_id, profile_version, entity_type, entity_id, entity_label, target_field, category,
+        priority, question, why_it_matters, answer_type, status, job_id, requirement_id, requirement_text)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+    )
+      .bind(
+        q.id, profileId, profileVersion, q.entity_type, q.entity_id, q.entity_label, q.target_field,
+        q.category, q.priority, q.question, q.why_it_matters, q.answer_type, jobId, q.requirement_id, q.requirement_text,
+      )
+      .run();
+    inserted += 1;
+  }
+
+  const questions = await loadJobQuestions(env, profileId, jobId);
+  return json({
+    analysis: buildStrengthenView(analysis, questions),
+    questions,
+    stale: false,
+    questions_generated: inserted,
+    question_error: questionError,
+  });
+}
+
+/**
+ * POST /jobs/:id/strengthen/apply -- the page's one primary action.
+ *
+ * Saves every answer the candidate typed, integrates them into the canonical profile, then
+ * re-grades this posting against the enriched record so the coverage they see reflects what they
+ * just added. Deliberately one endpoint rather than a save-per-question plus a separate apply: the
+ * brief asks for a single button, and doing it in one call also means the profile write and the
+ * regrade cannot interleave with a half-saved answer set.
+ */
+async function applyJobStrengthen(request: Request, env: Env, jobId: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as {
+    provider?: string;
+    answers?: { id?: string; answer?: string }[];
+  };
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const profileId = await getOrCreateProfileId(env);
+
+  // Persist answers first, so a failure in the (expensive, fallible) integration step below never
+  // loses what the candidate typed. Every one of these rows stays 'answered' and retryable.
+  let saved = 0;
+  for (const entry of body.answers ?? []) {
+    const id = String(entry?.id ?? "").trim();
+    const answer = String(entry?.answer ?? "").trim();
+    if (!id || !answer) continue;
+    const result = await env.DB.prepare(
+      `UPDATE profile_improvement_questions SET answer = ?, status = 'answered', answered_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND profile_id = ? AND status IN ('pending', 'answered')`,
+    )
+      .bind(answer, id, profileId)
+      .run();
+    if (result.meta.changes) saved += 1;
+  }
+
+  const answered = await env.DB.prepare(
+    "SELECT * FROM profile_improvement_questions WHERE profile_id = ? AND job_id = ? AND status = 'answered' ORDER BY created_at ASC",
+  )
+    .bind(profileId, jobId)
+    .all<ImproveQuestionRow>();
+
+  if (!answered.results.length) return json({ error: "no_answers_to_apply", saved }, 400);
+
+  const applied = await applyAnsweredQuestions(env, profileId, provider, answered.results);
+  if (!applied.ok) return json({ error: applied.error, detail: applied.detail, saved }, applied.status);
+
+  // Stage G: regrade this posting against the profile the answers just enriched. The requirements
+  // are reused from the saved artifact -- the posting did not change, only the candidate did -- so
+  // this costs one model call, not two. A failure leaves the successful profile update in place.
+  const savedAnalysis = await loadJobEvidenceAnalysis(env, jobId);
+  const job = await env.DB.prepare("SELECT title, company, raw_description FROM job_postings WHERE id = ?")
+    .bind(jobId)
+    .first<{ title: string; company: string; raw_description: string }>();
+
+  let reassessed: JobEvidenceAnalysis | null = null;
+  let reassessError: string | null = null;
+  if (savedAnalysis && job) {
+    try {
+      const structuredJson = JSON.stringify(applied.profile);
+      reassessed = await analyzeJobEvidence(
+        env,
+        provider,
+        { title: job.title, company: job.company, description: job.raw_description ?? "" },
+        applied.profile,
+        await profileVersionTag(structuredJson),
+        savedAnalysis.analysis.requirements,
+      );
+      if (reassessed) await saveJobEvidenceAnalysis(env, jobId, profileId, reassessed);
+    } catch (err) {
+      reassessError = friendlyMessage(err);
+    }
+  }
+
+  const analysis = reassessed ?? savedAnalysis?.analysis ?? null;
+  const questions = await loadJobQuestions(env, profileId, jobId);
+  return json({
+    saved,
+    applied_count: applied.applied.length,
+    structured: applied.profile,
+    analysis: analysis ? buildStrengthenView(analysis, questions) : null,
+    questions,
+    stale: false,
+    reassess_error: reassessError,
+  });
+}
+
+/** POST /jobs/:id/strengthen/questions/:qid/dismiss -- "I haven't done this", kept as a real answer. */
+async function dismissJobStrengthenQuestion(request: Request, env: Env, questionId: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const profileId = await getOrCreateProfileId(env);
+  const existing = await env.DB.prepare(
+    "SELECT status FROM profile_improvement_questions WHERE id = ? AND profile_id = ?",
+  )
+    .bind(questionId, profileId)
+    .first<{ status: string }>();
+  if (!existing) return json({ error: "not_found" }, 404);
+  // Dismissed is durable and profile-wide on purpose: it is how the candidate says "I don't have
+  // this", and it is what stops the next posting from asking them the same thing again.
+  await env.DB.prepare("UPDATE profile_improvement_questions SET status = 'dismissed' WHERE id = ?")
+    .bind(questionId)
+    .run();
+  return json({ ok: true });
 }
 
 async function listResumes(request: Request, env: Env): Promise<Response> {
@@ -5201,6 +5680,22 @@ async function loadEvidencePlan(
   structured: StructuredProfile,
 ): Promise<EvidencePlan | null> {
   try {
+    // Strengthen Profile already computed and saved exactly this, against exactly this profile.
+    // Reusing it is the point of persisting the artifact: it saves two model calls per resume
+    // build, and -- more importantly -- makes the resume agree with the coverage the candidate was
+    // just shown, instead of silently re-deriving a second opinion that might disagree with it.
+    const saved = await loadJobEvidenceAnalysis(env, jobId);
+    if (saved) {
+      const currentVersion = await profileVersionTag(JSON.stringify(structured));
+      if (currentVersion === saved.profile_version) return saved.analysis.plan;
+      // The profile moved since the analysis was graded, so the saved coverage may understate what
+      // the record can now prove. The requirements are still valid (the posting didn't change), so
+      // re-plan against them rather than re-extracting from scratch.
+      return await planEvidence(
+        env, provider, structured, saved.analysis.requirements, `${job.title} at ${job.company}`,
+      );
+    }
+
     let requirements: JobRequirements | null = null;
     try {
       const cached = JSON.parse(job.requirements_json || "{}") as JobRequirements;
@@ -5412,11 +5907,15 @@ async function composeCoverLetter(
   job: { title: string; company: string; raw_description: string },
   reviewAnswers: string[],
   resumeContactLine: string,
+  analysis: JobEvidenceAnalysis | null,
 ): Promise<string> {
   const prompt = await getManagedPrompt(env, "cover_letter/compose", {
     job_title: job.title,
     company: job.company,
     job_description: job.raw_description.slice(0, 3000),
+    // The verified requirement/evidence mapping from Strengthen Profile. Empty for a posting that
+    // has never been analyzed, which is why the prompt has to read as complete without it.
+    job_analysis: analysis ? renderCoverLetterEvidence(analysis) : "",
     review_answers: reviewAnswers.length
       ? [
           "The candidate answered follow-up questions specifically for this application, in their own words",
@@ -5431,8 +5930,8 @@ async function composeCoverLetter(
           "",
         ].join("\n") : "",
     contact_line: resumeContactLine ? `CONTACT LINE (for reference, do not repeat verbatim in the letter body): ${resumeContactLine}\n` : "",
-    candidate_profile: JSON.stringify(profile),
-  });
+    candidate_profile: renderCareerProfile(profile),
+  }, COVER_LETTER_COMPOSE_PROMPT);
 
   const result = await callStructured<{ letter_body: string }>(
     env,
@@ -5526,6 +6025,11 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
     }
   }
 
+  // Same saved artifact the resume reads. Null for a posting the candidate never ran Strengthen
+  // Profile on, in which case the letter is written from the profile and posting alone, exactly as
+  // it always was -- this grounds the letter when the analysis exists, it does not gate it.
+  const savedAnalysis = await loadJobEvidenceAnalysis(env, id);
+
   let letterBody: string;
   try {
     letterBody = await composeCoverLetter(
@@ -5535,6 +6039,7 @@ async function buildCoverLetter(request: Request, env: Env, id: string): Promise
       job,
       (reviewAnswers.results ?? []).map((r) => r.claim),
       contactLine,
+      savedAnalysis?.analysis ?? null,
     );
   } catch (err) {
     return json({ error: "generation_failed", detail: friendlyMessage(err) }, 502);
@@ -6440,7 +6945,7 @@ const DASHBOARD_PAGE = `<!doctype html>
   section {
     margin: 0 0 1.1rem; padding: 1.15rem 1.25rem; background: var(--surface);
     border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
-Let me check the placeholder embraces like a variable name, gets its value when the prompt is compile careful. This is one of the prompts I'm using and the response first read it and let's talk about it. All right, so basically this gets used to analyze what kind of roles are suitable for you. So the idea would be you know if you are let's say you're a teacher and you put all your experience maybe it can like tell you that you're suitable for there's other rules suitable for you for me right I was a teacher and I did a lot of different snake things in tech I can't I'm not sure exactly what you know what what roles are suitable for me out like I don't know what those rules are so the idea is this is supposed to build a profile of like the kind of things my skills my strengths and stuff like that and then the next step is it's gonna take that and it's gonna analyze like what kind of roles I'm suitable for and explain what those roles are okay so right now this is just generating the profile and then you want to take out somewhere else and have it run against potential jobs so even before that I'm going to have another language model call that's basically going to look at this and say like okay like I'm trying to basically work through if you actually went in imagine you went into a service that helps you find a job and you paid them a lot of money and they're super professional I imagine the first thing you would do is they'd want to know like tell me everything about you tell me everything you've done before all your past history and like everything like this and it builds a profile of your skills and everything and then the next step after that is okay now I know everything about you now let me look at the job market and see what kind of roles actually exist that match that which is that makes sense yeah so what kind of helps you on here so basically I want to restructure this prompt like you could see the prompt and I agree the writing style completely be gone that's not necessary that's a mistake but I like of course we don't want to invent stuff but like basically what we want to do is like create a complete you know profile of them and I don't know like I guess maybe if we I don't know the example of the perfect structured output but maybe that's a good idea for us to have I suppose but like what would you suggest like if would it make sense for this to be structured for the next language models to look at let me take us like and think through a concrete structure i think your instinct is right here so separating out the steps into something like evidence to profile to career analysis to role generation each step is clean and focused and you build on each step in order and then the final job evaluation step compare jobs against that structured profile plus the preferences and then your first prompt is just about building that deep profile not focused on optimized for job matching yet the profiles richer than a resume right shouldn't this profile should be structured and so like wouldn't it make sense because like of course your resume is not going to include a lot of stuff but like later on like for example what I'm gonna want to do is have an agent that like talks to you like when you make a resume there's certain like later on there's certain things you need like you know did a project with seven percent growth like you you you want to like say certain stuff people don't know to add that so like here you're just kind of putting everything to everything like you're saying it's like you go to your taxes here's everything I have you know you ingest it you make a structured profile that I guess you know it's pretty obvious we should have like school a category for school like I guess it would be all the different categories of things that go into a resume like written in a way where it's easy later for someone who's good at like putting together the resume to grab pieces from it and so we probably want to be structured so what would be like the standard structure you would have like you know education and then for each education you have like what the school is when you went there you know what like what you what you majored in like all like yeah all this kind of stuff and then it would be like education previous roles skills you know maybe maybe like technical skills not technical skills like so can you can you right now I'm gonna turn off voice mode I want you to basically suggest a structured profile that would like encapsulate everything even with I guess in other category that everything should go absolutely okay this is good but not specifically just for me like I don't know if maybe like mentoring but like mentoring if you're mentoring it would be within a specific job so the idea here is like within each job you know these things like anything you do that is mentoring should be within a job you know like everything should be related to that job because like later what we're gonna do is probably pick the jobs that matter like the jobs to include that matter and same thing it's like I guess awards and honors are like if you get an award and an honor and it's you know inside school it goes with that school but it makes sense that where's honors are here outside school community outreach is good actually this is pretty good okay great so now I want you now we need to make the prompt and I think for the prompt we probably want to give it the correct schema so I'm going to give you the prompt we have now because that'll show the variables and I suppose you need to give the exact schema with like an example with fake information and make sure you have something for each so it knows the format so like make something up for each section and like it should know how to do it if there's multiple for example if there's two schools that should be clear if there's projects and research make a full prompt that gives that example in it actually before you do that can you tell me if I'm giving an example schema and I am working in lag fuse what's the smart way to have the example schema because I suppose it's gonna like scored for how well it matches like how good should I just manually build it in here or does it go somewhere else I ordered some CBD oh thank you so that's what I currently have for the prompt so you want you to fix the prompt based on this but I think if the current profile doesn't match the schema make sure the new one does, but maybe we don't even need to say that actually you have a connector can you connect to GitHub and you check this project apply go and check this for me so I'm worried I'm looking here and I see it gives you the current profile and source material for new material question is when this prompt is going through when it gives you the new material is that all of the material or only the stuff that's been added recently because I'm worried if you if this generate if this did a bad job before then we're only looking at like the structured profile although we do need the structured profile so my question is currently does the source material everything or just the new stuff and what should we do about that so just answer me that how do I erase so like when I put answers into apply go hello yeah like the pull down tab it shows a check mark first name checkmark last name and I think my problem is I wrote down it's like recalling the wrong thing like when's the earliest you want to start working with us and so it's gotten its memory how to answer these questions and some of these are pulled down tabs and for the pull down tabs it didn't it's I think it's still not recognizing them am I doing something wrong like I got to reload the extension okay hold on a second it's still not recognizing that pull down tab for country if I click it it shows different countries but we need to figure out a better way of extracting like you know doing these pull downs you can see it I like that it shows it didn't accept it but I need a way to do this I need a way can you find a way to make it automatic also you said there were other changes that were not committed can you check them and if you think they're a good idea tell me what they are and then commit them if you think they're a good idea okay do let's change it like you said and let's also get rid of that character limit or at least make it a character limit I think no one's gonna upload pages that are you know more than five pages so any document that's more than five pages worth of characters you can get rid of it you can truncate it or maybe ten pages no no one's gonna do it but do that and so I think all you need to do is give me the prompt yeah the prompt and the config which I think you're saying is the structured output so if you can give me first the prompt autonik config is for like an example structure so where are we supposed to add the example structure it's supposed to be in the prompt okay knowing all that give me the perfect prompt that's totally complete right now this one is supposed to find rolls like the result supposed to tell you like what kind of jobs what kind of job roles like imagine you don't really know what jobs are called like what job roles are actually probably a decent fit the ones that are worth like worth looking for like basically yeah the result the result of this will support company discovery so which kind of companies should even look for but then also which kind of jobs are suitable like it'll do like a filter you know and only pull back jobs that like are like this that are similar to this also you have access to the repo so take a look and I want you to find the meaning of these variables I'm assuming candidate background is their profile but I'm not sure notes locations deal breakers these are all like the criteria for what they want to do so I think the idea here is yeah I want you to look through the repo and make sure this all still makes sense right now I have two language model calls I think profile structure and rolesanalyze I think that's right is that it's creating your profile. Let's talk about can you check the workflow of all this so you understand where the information comes from and then let's talk about it all right let's kind of think this through together and I think what we're going to do is come up with a plan and I'm going to give this to like Claude Opus and have it make these changes and also like connect to update the prompts like automatically and lang fuse let's think about this so the idea I had was like you go in order forced rolls then resume then companies so it's like okay roles but I guess the question really is with the current way we're doing this if you go in order then you're looking through roles and try to come up with roles before it looks at your resume right right yeah so really you'd want the resume first the full picture and then roll second then companies is that what you're getting at I wonder if we should change roles like call roles to profile maybe and but we do kind of want like people come if they want a job it's like there's the concept of like your profile and then there's like what is it you want and then we work on resumes so like the idea is currently the resume tab now the idea was you know you upload everything all the your resume stuff and then it makes your master resume and that kind of like has everything and then from there you have like custom resumes for each job where their master resume you would never send that out but it's just like basically has kind of everything for each job even if it's not formatted the correct way I mean it's formatted the correct way but you know all that information does it make sense even to have a master resume like that i think there's a cleaner separation than what you have right now where roles becomes your profile first like who is this candidate and that's fed by resume and notes and then after that you go into career direction which is like what kinds of roles and companies should we target and then after that you can get to resume tailoring which is just about presentation and not about changing the underlying data and on your master resume point I'd probably rename that to a master career profile not a resume just to remove the idea of page limits and marketing constraints and then just keep it as a canonical data record then you can generate tailored resumes from that without losing any of the source information in the process of tailoring all right so for the tabs what are you saying right now it's rolls resume what do you think for the first tab should be I call the first tab profile and make it the canonical career record like your structured facts about the person then the second could be brolls and targets or maybe career direction something that makes it clear that it's about discovery and not just titles and then resumes come after that as a presentation layer that ordering lines up with the actual table profile careers resume oh yeah that's even cleaner profile is talk about what goes in profile profile is yeah profile would include your work history details accomplishments responsibilities skills education media short narrative arc but it's all factual no preferences or job targets just the evidence so profile should be where you upload your documents like your resume exactly upload everything there your resume CV notes anything and that builds the structure profile underneath okay so let's talk about then the careers tab so in profile right now like in resume I have a documents tab so let's imagine that's going to move into profile okay so within profile docs makes sense as one subtab then another could be structured profile where you see and can lightly edit what the system extract it keep it minimal but transparent how about it's yeah docs should be the one where you okay so there's one tab docs and there you just it works just like the resume documents tab now where you're basically choosing a file and uploading it and that's it yeah that works simple upload extra logs like the from the resume we have the notes tab this is where they can also just paste in information paste more stuff they can add you know a bunch of notes they can also invoice go voice to text and just talk so like this is where they're just adding like text instead of a document yeah nice so within profile choose subtops dogs for files notes for free form text or voice under the hood both feed into the same structured profile builder you have those two and then let's talk about what happens you so you add those two and you would want to like then see your structured profile like it's basically should take those because now it has everything about yeah but if like your profile so so for example your profile doesn't include you want to work remotely that's more to do with like job right so profile is purely background that's like super structure that has your job your all the colleges you went to and everything that's it that's where the education job skills accomplishments live no preferences yet okay so then how how are we going to get it like I guess we want to like generate it and have to be able to see it in some nice pretty printed JSON format and yeah totally after Docs and notes are processed show the structured profile in a breedable JSON due blood people notes and then a third tab is what we call it because we shouldn't call it profile because we're already on the profile tab should be something analysis analysis or maybe extracted profile something that signals this is what we understood what are some more options sure parsed profile profile preview structured view review and confirm for like put it all together consolidate profile or unified profile how about summary just summary short and clear summary when you go to the summary tab now there's like a little button you press that's basically like regenerate or generate if you've never generated a regenerate profile and then it does this prompt this prompt that takes that information and then consolidates it and like make makes that structure json file and it's not formatted like a resume but it's in that structure like exactly the structure we saw and it shouldn't show like you know curly braces like it should look pretty printed should look really nice with with like you know the indentations are good like really easy for human to read right a clean human friendly view with I'm sorry but you've reached your daily GPT Live One limit for today you can continue with GPT Live One can hear me loud and clear what's on your mind so do you remember what we were just talking about quick summary what did we just talk about right we were talking about reorganizing the apt tabs so that it's profile careers resume and within profile subtops for docs uploads do careers and so for careers here this is like what it is that you want which comes from like the roles and so if you look at current what we have for roles it was like what are you looking for pace job links and so I think what we want is a couple we want we want one of them which is like you kind of you would be able to write you know unstructured text about what kind of jobs you're looking for as you might know so what do we call that not targets but like maybe desired roles or role role preferences something like that it signals what you want without forcing a specific drop type that's good preferences and then here the idea is like here you're supposed to loosely write about you know it's okay you can just basically say what jobs you want so you can say you can say the exact name of the role the official name or you could say like oh I want to roll where I do this and this and I get to do this and this so it needs to be able to be loose but also like give you the exact answer if you give the exact answer or they can be like loose either one and that's that's this first one right okay maybe call that roll signals or roll notes do what I said I said career preferences call it preferences in the next one preferences let's have it be examples and then this is the one where there's like good like you can you it's optional but you can put in job links you found that are good and like basically you can add one add to like good or bad or desired or undesired and then you can like put a job link and you can have like a text optional where you explain why and then for example you could say oh i don't like this job because it requires you know such and such experience so you can add those so this is like examples of good jobs and bad jobs checking i like that so in careers you'd have preferences for free form wants like exact titles or things to avoid then examples good and bad job postings with URLs and notes and location which is already what we have in roles but this isn't careers same thing deal breakers and then also criterion works the way it works now and then we need you know to and then the idea here is like okay that its own subtap call the button analyze careers it takes profile plus all careers inputs and outputs a rolls subtab then roll shows a summary role families keywords and why they fit with a re analyze button and maybe rename criteria to priori yeah you're right rename criteria to priorities this is good and then for analysis yeah i guess we'll put it yeah let's call it rolls because i think we're not using that now so instead of what it currently says analysis it says rolls and then that kind of operates like it does now where you analyze or reanalyze and it takes everything and it tells you like the kind of careers that you're looking for and I think what actually would be a good idea is like to say like for each one like for example I got I got a result of applied A engineer and it explains what it is and that's good but maybe like you said maybe like it shows that it gives the name of the job the kind of the job title and then maybe we should do the thing where you like click it and expand so imagine you've got ten of them you click it and expands and there it should show like why it shows it for you it should show like you know like analysis of like if this is a career that is you know increasing you know with government reports or whatever in that location and also like the expected salary for you know for your experience level checking yeah I like that extended cards per roll default shows role title and a short match summary span to see so now we said we have profile what was it profile career and what was the next one resume resume we've already uploaded everything so the current resume tab we don't need the documents anymore and I guess we don't need the notes anymore because we already added that somewhere else checking right so resume becomes just generate application documents so a master resume tailored resumes per job and cover letters that keeps profile as the canonical data it probably doesn't maybe it didn't make sense to be said to have like one giant master resume that's like five pages long I think right so maybe it just makes sense I don't know maybe we don't need sub tabs like basically all the resumes but then I think it would make sense is like we're I think we're gonna have a lot of different resumes but I think it would make sense is like for each of those job roles to generate a resume for that job role keep a general resume as the default then generate tailored versions per roll posting profile is the source of true let's say it puts you to like five different types of jobs five different like roles I would like to have a way where it makes your you make a resume for like to start with you make a resume for each roll type right so after analyzed careers generate a base resume per role type like applied AI engineer resume and then tailor from that you could also link each expandable role card in the roles page to generate resume button yeah how about that in the careers in the role yeah in the careers page under roles like where we were expanding each one no you know what maybe let's not do that let's do it in the resume page we got to have this in the resumes page we've got why don't we have like a rolls we think I'm trying to find a way to organize it checking I shift to organizing the resumes themselves so you see cards for each resume with roll tags attached symbolists no extra subtabs for example applied AI engineer resume last updated today open or regenerate then you can have career resumes as base versions and job specific resumes clearly linked back to those I think something like that makes sense I think you can use your best judgment on that because I'm going to have to make you have you make a prompt for that but I think that's what we want to do and what I want you to do now okay so I want you to do now is I'm going to ask you to make a prompt for opus so this can be like a big task and this is basically going to make all those changes and make sure like the it looks at the prompts and make you know and the prompts lying fuse and like actually updates everything this is going to be like kind of a big restructure to do all this check in I think this war in a big refactor pumped for opus make it an architecture migration restructure Ui tabs to profile I think I might go shopping so that's my credits replenish in ten minutes and I can send a big job in or I need bread cheese we have mayonise I'm sure covers are good here wipes tonight we don't use to do it tomorrow right tomorrow is Sunday we really don't have any food huh so maybe I'll cook once twice pork chip I get chicken again pork chicken we went rice right progress I see it read them now but it should be pretty obvious like it should know like basically it should have the line I want the language model to think about it and answer it should be pretty obvious which of these is America and if it's not only if it's not obvious ask me sort of like a virtual world I think and you and other people walk around and sort of maybe solve puzzles I've never played but we'll check it out and let you know do you want to go in a couple minutes you don't what y'all go about a new arrival by myself again this cookies for me actually a problem here is like it showed me all these to pick from and I picked it but it still didn't accept it so somehow like even though it's reading them it's not able to write them all right let's do it what's that package only a meat can be here so where do we go beans and broke always first I have a lot of that give me one of the lives do you have plugin everything away it's on drink back probably  }
+  }
   h2 { font-size: 1.0rem; font-weight: 650; margin: 0 0 0.7rem; letter-spacing: -0.01em; }
   h3 { font-size: 0.92rem; font-weight: 650; margin: 1.4rem 0 0.5rem; }
   p.hint { color: var(--text-muted); font-size: 0.85rem; line-height: 1.45; margin: -0.35rem 0 0.85rem; }
@@ -6730,6 +7235,39 @@ Let me check the placeholder embraces like a variable name, gets its value when 
   .badge.jobs, .badge.strong { background: var(--success-soft); color: var(--success); }
   .badge.warn { background: var(--error-soft); color: var(--error); }
   .badge.possible, .badge.queued { background: var(--warning-soft); color: var(--warning); }
+  /* Strengthen Profile. The visual job here is triage: a requirement the record already proves
+     should be readable at a glance and then ignored, while one carrying a question should pull the
+     eye. So coverage is carried by a left border (scannable down the page without reading a word)
+     and the questions themselves get the only boxed, indented treatment on the page. */
+  .strengthen-counts { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.5rem 0 0.2rem; }
+  .badge-proven { background: var(--success-soft); color: var(--success); }
+  .badge-partial { background: var(--warning-soft); color: var(--warning); }
+  .badge-unproven { background: var(--surface-2); color: var(--text-muted); }
+  .strengthen-item {
+    margin: 0.6rem 0; padding: 0.7rem 0.9rem; border: 1px solid var(--border);
+    border-left: 4px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface);
+  }
+  .strengthen-item.status-proven { border-left-color: var(--success); }
+  .strengthen-item.status-partial { border-left-color: var(--warning); }
+  .strengthen-item.status-unproven { border-left-color: var(--border-strong); }
+  .strengthen-item-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.45rem; }
+  .strengthen-evidence {
+    font-size: 0.85rem; color: var(--text-muted); margin: 0.4rem 0 0;
+    padding-left: 0.55rem; border-left: 2px solid var(--border);
+  }
+  .strengthen-question {
+    margin-top: 0.7rem; padding: 0.7rem 0.8rem; border-radius: var(--radius-sm);
+    background: var(--surface-2); border: 1px solid var(--border);
+  }
+  .strengthen-question-text { margin: 0 0 0.2rem; font-weight: 600; }
+  .strengthen-question textarea { min-height: 4.5rem; margin: 0.45rem 0 0.5rem; }
+  /* The trailing space keeps the sticky action bar from permanently covering the last requirement
+     card -- without it the bottom card scrolls under the footer and can never be fully read. */
+  #strengthen-requirements { padding-bottom: 0.5rem; }
+  #strengthen-footer {
+    position: sticky; bottom: 0; margin-top: 1rem; padding: 0.8rem 0 0.4rem;
+    background: var(--surface); border-top: 1px solid var(--border);
+  }
   .row-title-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
   .company-bio { font-size: 0.85rem; margin: 0.35rem 0 0; line-height: 1.5; }
   .company-why { font-size: 0.82rem; color: var(--text-muted); margin: 0.3rem 0 0; padding-left: 0.55rem; border-left: 2px solid var(--border-strong); }
@@ -6950,7 +7488,6 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       <button class="subtab active" data-profile-subtab="docs" type="button">Docs</button>
       <button class="subtab" data-profile-subtab="notes" type="button">Notes</button>
       <button class="subtab" data-profile-subtab="summary" type="button">Create</button>
-      <button class="subtab" data-profile-subtab="improve" type="button">Improve</button>
     </div>
 
     <div id="profile-subpanel-docs" class="subpanel active">
@@ -7000,27 +7537,12 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       </section>
     </div>
 
-    <div id="profile-subpanel-improve" class="subpanel">
-      <section id="improve-section">
-        <h2>Improve</h2>
-        <p class="hint">A guided interview that asks about specific, high-value gaps in your Career Evidence Record -- never generic "tell me more" prompts, and never resume-writing advice. Answer any question, several, or all, in any order, then apply them to fold the answers into your profile.</p>
-        <div id="improve-no-profile" class="empty" style="display:none">
-          Create your profile before improving it.
-          <button id="improve-go-to-create" class="secondary" type="button" style="margin-left:0.5rem">Go to Create</button>
-        </div>
-        <div id="improve-controls">
-          <div id="improve-progress" class="summary-line" style="display:none"></div>
-          <label for="improve-provider">Analyze using</label>
-          <select id="improve-provider">
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI</option>
-          </select>
-          <button id="improve-action-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Find Improvements</button>
-          <p id="improve-status" class="status" role="status" aria-live="polite"></p>
-        </div>
-        <div id="improve-questions"></div>
-      </section>
-    </div>
+    <!-- The profile-wide "Improve" subtab used to sit here. It was removed when Strengthen Profile
+         shipped: a generic audit has no way to rank one gap above another, so it asked broad
+         questions the candidate had little reason to answer, while the job-scoped version knows
+         exactly what a specific employer wants and asks a short, motivated list instead. The
+         machinery it used was not deleted -- the question table, the apply/merge pass, and the
+         /profile/improve/* endpoints are all still here and are what Strengthen Profile runs on. -->
   </div>
 
   <div id="panel-resume" class="panel">
@@ -7264,7 +7786,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
            separate selected-job area below the list. -->
       <div id="jobs-interested-section" style="display:none">
         <section id="interested-list-section">
-          <p class="hint">Jobs you've marked "Interested". Click anywhere on a card except its posting link or buttons to expand Ask, Resume, Cover Letter, and Apply tools inline.</p>
+          <p class="hint">Jobs you've marked "Interested". Click anywhere on a card except its posting link or buttons to expand Strengthen Profile, Resume, Cover Letter, and Apply tools inline.</p>
           <div id="interested-list"><p class="empty">Loading…</p></div>
         </section>
 
@@ -7273,25 +7795,45 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         <div id="interested-detail-home" style="display:none">
         <section id="interested-detail-section" style="display:none">
 
-          <!-- Assistant/Resume/Cover letter/Apply are sub-tabs, not stacked sections -- only one shows
+          <!-- Strengthen/Resume/Cover letter/Apply are sub-tabs, not stacked sections -- only one shows
                at a time, the same way the top-level dashboard tabs work, so opening one doesn't leave
-               the others piled up underneath with no way to get back to just looking at one thing. -->
+               the others piled up underneath with no way to get back to just looking at one thing.
+               The order is the workflow order: strengthen the evidence first, then write from it. -->
           <div class="subtabs">
-            <button id="interested-subtab-assistant" type="button">Ask</button>
+            <button id="interested-subtab-strengthen" type="button">Strengthen Profile</button>
             <button id="interested-subtab-resume" class="secondary" type="button">Resume</button>
             <button id="interested-subtab-cover" class="secondary" type="button">Cover Letter</button>
             <button id="interested-subtab-apply" class="secondary" type="button">Apply</button>
           </div>
 
-          <div id="interested-assistant-panel">
-            <p id="interested-review-status" class="status" role="status" aria-live="polite"></p>
-            <button id="interested-review-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Ask a question</button>
-            <div id="interested-review-section" style="display:none">
-              <p id="interested-review-question" class="job-reason"></p>
-              <textarea id="interested-review-answer" placeholder="Answer in your own words — this gets added to your profile evidence for this job."></textarea>
-              <button id="interested-review-submit" type="button">Submit answer</button>
+          <!-- One long scrollable page, not a wizard: the analysis summary, then every requirement
+               with its evidence and any question, then a single primary action at the bottom. -->
+          <div id="interested-strengthen-panel">
+            <p class="hint">
+              ApplyGo reads what this job asks for, checks it against your profile, and asks only about
+              the gaps worth chasing. Your answers go into your profile — so every job you do this for
+              makes the next one need fewer questions.
+            </p>
+            <div id="strengthen-no-profile" class="empty" style="display:none">
+              Create your profile first — there's nothing to compare this job against yet.
             </div>
-            <div id="interested-review-history"></div>
+            <div id="strengthen-controls">
+              <label for="strengthen-provider">Analyze using</label>
+              <select id="strengthen-provider">
+                <option value="anthropic">Anthropic (Claude)</option>
+                <option value="openai">OpenAI</option>
+              </select>
+              <button id="strengthen-analyze-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Analyze this job</button>
+              <p id="strengthen-status" class="status" role="status" aria-live="polite"></p>
+            </div>
+            <div id="strengthen-stale" class="summary-line" style="display:none"></div>
+            <div id="strengthen-summary" style="display:none"></div>
+            <div id="strengthen-requirements"></div>
+            <div id="strengthen-footer" style="display:none">
+              <p id="strengthen-apply-hint" class="hint"></p>
+              <button id="strengthen-apply-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Update Profile</button>
+              <p id="strengthen-apply-status" class="status" role="status" aria-live="polite"></p>
+            </div>
           </div>
 
           <div id="interested-resume-panel" style="display:none">
@@ -8121,8 +8663,9 @@ Let me check the placeholder embraces like a variable name, gets its value when 
         var hasProfile = Boolean(data.profile.structured);
         document.getElementById('resume-no-profile').style.display = hasProfile ? 'none' : '';
         document.getElementById('resume-build-controls').style.display = hasProfile ? '' : 'none';
-        setImproveProfileAvailability(hasProfile);
-        if (hasProfile) loadImproveQuestions();
+        // Strengthen Profile compares a posting against the career record, so it needs one to exist.
+        hasCareerProfile = hasProfile;
+        applyStrengthenAvailability();
         maybeReanalyzeRoles();
       }
     }
@@ -8688,216 +9231,279 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       }
     });
 
-    // --- Profile → Improve: guided evidence interview ---
+    // --- Job → Strengthen Profile: the job-scoped evidence workflow ---
     //
-    // One state-driven primary action button, per the spec: "Find Improvements" (no audit run yet,
-    // or the open questions have all been resolved), "Apply Answers & Continue" (at least one saved
-    // answer waiting to be integrated), "Improving Profile…" (a call is in flight), or
-    // "Check Again" (the last audit found nothing valuable). Never a chat UI, never separate
-    // technical buttons for "run audit" vs "integrate JSON".
+    // Replaces both the Profile tab's generic Improve interview and the old freeform "Ask a
+    // question" box. One long page per job: a coverage summary, every requirement with the evidence
+    // the profile already holds, inline questions where an answer would actually help, and exactly
+    // one primary action at the bottom. See src/strengthen.ts for the stages behind it.
 
-    var improveQuestions = [];
-    var improveHasAudited = false;
-    var improveBusy = false;
+    var strengthenView = null;
+    var strengthenBusy = false;
+    var hasCareerProfile = false;
 
-    function improveCategoryLabel(category) {
-      return (category || 'other').replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+    // Gating lives in its own function because the profile load and the per-job panel open can
+    // happen in either order -- whichever runs second has to be able to re-apply the current state.
+    function applyStrengthenAvailability() {
+      var empty = document.getElementById('strengthen-no-profile');
+      var controls = document.getElementById('strengthen-controls');
+      if (!empty || !controls) return;
+      empty.style.display = hasCareerProfile ? 'none' : '';
+      controls.style.display = hasCareerProfile ? '' : 'none';
+    }
+    // Answers survive a re-render (and a tab switch away and back) because they live here rather
+    // than only in the DOM -- losing typed answers to an accidental click would be unforgivable.
+    var strengthenAnswers = {};
+
+    function strengthenStatusLabel(status) {
+      if (status === 'proven') return 'Strong evidence';
+      if (status === 'partial') return 'Partial evidence';
+      return 'No evidence yet';
     }
 
-    function updateImproveButton() {
-      var button = document.getElementById('improve-action-button');
-      if (!button) return;
-      var answeredCount = improveQuestions.filter(function (q) { return q.status === 'answered'; }).length;
-      var pendingCount = improveQuestions.filter(function (q) { return q.status === 'pending'; }).length;
-      if (improveBusy) {
-        button.textContent = 'Improving Profile…';
-      } else if (answeredCount > 0) {
-        button.textContent = 'Apply Answers & Continue';
-      } else if (improveHasAudited && pendingCount === 0) {
-        button.textContent = 'Check Again';
-      } else {
-        button.textContent = 'Find Improvements';
-      }
-      button.disabled = improveBusy;
-
-      var progress = document.getElementById('improve-progress');
-      if (pendingCount === 0 && answeredCount === 0) {
-        progress.style.display = 'none';
-      } else {
-        progress.style.display = '';
-        progress.textContent = answeredCount + ' answered · ' + pendingCount + ' remaining';
-      }
+    function strengthenKindLabel(kind) {
+      if (kind === 'must_have') return 'Required';
+      if (kind === 'preferred') return 'Preferred';
+      if (kind === 'competency') return 'Competency';
+      return 'Responsibility';
     }
 
-    function renderImproveQuestionCard(question) {
-      var card = el('div', { className: 'profile-card' });
-      var titleRow = el('div', { className: 'row-title-line', style: 'display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap' });
-      titleRow.appendChild(el('span', { className: 'badge', textContent: improveCategoryLabel(question.category) }));
-      if (question.status === 'answered') titleRow.appendChild(el('span', { className: 'badge', textContent: 'Answered', style: 'background:var(--success,#2e7d32);color:#fff' }));
-      card.appendChild(titleRow);
-      card.appendChild(el('p', { className: 'row-title', textContent: question.question, style: 'margin-top:0.4rem' }));
+    function countAnsweredInputs() {
+      return Object.keys(strengthenAnswers).filter(function (id) {
+        return (strengthenAnswers[id] || '').trim().length > 0;
+      }).length;
+    }
+
+    function updateStrengthenFooter() {
+      var footer = document.getElementById('strengthen-footer');
+      if (!footer) return;
+      var questionCount = strengthenView ? strengthenView.question_count : 0;
+      footer.style.display = questionCount > 0 ? '' : 'none';
+      var answered = countAnsweredInputs();
+      var button = document.getElementById('strengthen-apply-button');
+      button.disabled = strengthenBusy || answered === 0;
+      button.textContent = strengthenBusy ? 'Updating Profile…' : 'Update Profile';
+      document.getElementById('strengthen-apply-hint').textContent = answered === 0
+        ? 'Answer whatever you can — skipping a question is fine, and "I have not done this" is a real answer.'
+        : answered + ' answer' + (answered === 1 ? '' : 's') + ' ready to add to your profile.';
+    }
+
+    function renderStrengthenQuestion(question) {
+      var wrap = el('div', { className: 'strengthen-question' });
+      wrap.appendChild(el('p', { className: 'strengthen-question-text', textContent: question.question }));
       if (question.why_it_matters) {
-        card.appendChild(el('p', { className: 'row-meta', textContent: 'Why it matters: ' + question.why_it_matters }));
+        wrap.appendChild(el('p', { className: 'hint', textContent: question.why_it_matters }));
       }
+
       var textarea = el('textarea', {
-        placeholder: 'Your answer…',
-        value: question.answer || '',
-        style: 'min-height:4.5rem',
+        value: strengthenAnswers[question.id] !== undefined ? strengthenAnswers[question.id] : (question.answer || ''),
+        placeholder: 'Answer in your own words. Specifics help most: what you did, how, and what came of it.',
       });
-      card.appendChild(textarea);
-      var actions = el('div', { className: 'row-actions', style: 'margin-top:0.5rem' });
-      var statusMsg = el('span', { className: 'status' });
-      var saveBtn = el('button', { type: 'button', textContent: question.status === 'answered' ? 'Update Answer' : 'Save' });
-      saveBtn.addEventListener('click', async function () {
-        var value = textarea.value.trim();
-        if (!value) { statusMsg.textContent = 'Enter an answer first.'; statusMsg.className = 'status error'; return; }
-        saveBtn.disabled = true;
+      textarea.addEventListener('input', function () {
+        strengthenAnswers[question.id] = textarea.value;
+        updateStrengthenFooter();
+      });
+      // Seed the store so an answer saved in a previous session counts toward the footer total.
+      if (strengthenAnswers[question.id] === undefined && question.answer) {
+        strengthenAnswers[question.id] = question.answer;
+      }
+      wrap.appendChild(textarea);
+
+      var dismiss = el('button', { className: 'secondary', type: 'button', textContent: "I haven't done this" });
+      dismiss.addEventListener('click', async function () {
+        dismiss.disabled = true;
         try {
-          var res = await api('/profile/improve/questions/' + encodeURIComponent(question.id), {
-            method: 'PUT',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ answer: value }),
-          });
-          var data = await requireJsonResponse(res, 'save_failed');
-          question.status = data.question.status;
-          question.answer = data.question.answer;
-          statusMsg.textContent = 'Saved.';
-          statusMsg.className = 'status success';
-          updateImproveButton();
-          renderImproveQuestions(improveQuestions);
+          await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/strengthen/questions/' + encodeURIComponent(question.id) + '/dismiss', { method: 'POST' });
+          delete strengthenAnswers[question.id];
+          wrap.remove();
+          if (strengthenView) strengthenView.question_count -= 1;
+          updateStrengthenFooter();
         } catch (err) {
-          statusMsg.textContent = 'Error: ' + err.message;
-          statusMsg.className = 'status error';
-          saveBtn.disabled = false;
+          dismiss.disabled = false;
         }
       });
-      var dismissBtn = el('button', { type: 'button', className: 'secondary', textContent: 'Skip / Dismiss' });
-      dismissBtn.addEventListener('click', async function () {
-        dismissBtn.disabled = true;
-        try {
-          await api('/profile/improve/questions/' + encodeURIComponent(question.id) + '/dismiss', { method: 'POST' });
-          improveQuestions = improveQuestions.filter(function (q) { return q.id !== question.id; });
-          updateImproveButton();
-          renderImproveQuestions(improveQuestions);
-        } catch (err) {
-          statusMsg.textContent = 'Error: ' + err.message;
-          statusMsg.className = 'status error';
-          dismissBtn.disabled = false;
-        }
-      });
-      actions.appendChild(saveBtn);
-      actions.appendChild(dismissBtn);
-      card.appendChild(actions);
-      card.appendChild(statusMsg);
-      return card;
+      wrap.appendChild(dismiss);
+      return wrap;
     }
 
-    /** Grouped by entity, highest-priority question in each group first, groups ordered by their
-     * own best question -- so the candidate sees the most valuable open thread first but can still
-     * jump straight to any other role or project's questions. */
-    function renderImproveQuestions(questions) {
-      var container = document.getElementById('improve-questions');
-      container.innerHTML = '';
-      if (!questions.length) {
-        if (improveHasAudited) {
-          container.appendChild(el('p', {
-            className: 'empty',
-            textContent: 'No high-value questions found right now. Your Career Evidence Record already contains strong detail across the areas this review checks.',
-          }));
-        }
+    function renderStrengthen(view) {
+      strengthenView = view;
+      var summary = document.getElementById('strengthen-summary');
+      var container = document.getElementById('strengthen-requirements');
+      summary.textContent = '';
+      container.textContent = '';
+
+      if (!view) {
+        summary.style.display = 'none';
+        updateStrengthenFooter();
         return;
       }
-      var groups = {};
-      var order = [];
-      questions.forEach(function (q) {
-        var key = q.entity_label || 'General';
-        if (!groups[key]) { groups[key] = []; order.push(key); }
-        groups[key].push(q);
+
+      summary.style.display = '';
+      if (view.role_summary) {
+        summary.appendChild(el('p', { className: 'job-reason', textContent: view.role_summary }));
+      }
+      var counts = view.counts || { proven: 0, partial: 0, unproven: 0 };
+      var row = el('div', { className: 'strengthen-counts' });
+      row.appendChild(el('span', { className: 'badge badge-proven', textContent: counts.proven + ' strong' }));
+      row.appendChild(el('span', { className: 'badge badge-partial', textContent: counts.partial + ' partial' }));
+      row.appendChild(el('span', { className: 'badge badge-unproven', textContent: counts.unproven + ' not shown yet' }));
+      summary.appendChild(row);
+      summary.appendChild(el('p', {
+        className: 'hint',
+        textContent: 'Nothing here is a verdict on you. A posting you cannot fully cover is normal — the point is to make sure everything you HAVE done is actually written down.',
+      }));
+
+      var questionCount = 0;
+      (view.items || []).forEach(function (item) {
+        var card = el('div', { className: 'strengthen-item status-' + item.status });
+        var head = el('div', { className: 'strengthen-item-head' });
+        head.appendChild(el('strong', { textContent: item.requirement }));
+        head.appendChild(el('span', { className: 'badge', textContent: strengthenKindLabel(item.kind) }));
+        head.appendChild(el('span', {
+          className: 'badge badge-' + item.status,
+          textContent: strengthenStatusLabel(item.status),
+        }));
+        card.appendChild(head);
+
+        if (item.evidence) {
+          card.appendChild(el('p', { className: 'strengthen-evidence', textContent: item.evidence }));
+        } else {
+          card.appendChild(el('p', {
+            className: 'empty',
+            textContent: 'Your profile does not currently show anything for this.',
+          }));
+        }
+
+        (item.questions || []).forEach(function (question) {
+          questionCount += 1;
+          card.appendChild(renderStrengthenQuestion(question));
+        });
+        container.appendChild(card);
       });
-      order.sort(function (a, b) {
-        var maxA = Math.max.apply(null, groups[a].map(function (q) { return q.priority; }));
-        var maxB = Math.max.apply(null, groups[b].map(function (q) { return q.priority; }));
-        return maxB - maxA;
+
+      (view.general_questions || []).forEach(function (question) {
+        questionCount += 1;
+        var card = el('div', { className: 'strengthen-item' });
+        card.appendChild(el('div', { className: 'strengthen-item-head' }, [
+          el('strong', { textContent: 'About your background generally' }),
+        ]));
+        card.appendChild(renderStrengthenQuestion(question));
+        container.appendChild(card);
       });
-      order.forEach(function (key) {
-        var items = groups[key].slice().sort(function (a, b) { return b.priority - a.priority; });
-        var group = profileGroup(key, items.length, true);
-        items.forEach(function (q) { group.appendChild(renderImproveQuestionCard(q)); });
-        container.appendChild(group);
-      });
+
+      view.question_count = questionCount;
+      if (!questionCount) {
+        container.appendChild(el('p', {
+          className: 'empty',
+          textContent: 'No questions for this one — your profile already covers what this posting reasonably probes. Go straight to Resume.',
+        }));
+      }
+      updateStrengthenFooter();
     }
 
-    /** Called from loadProfile so Improve reflects "no profile yet" (state A) without an extra
-     * round trip, and so a profile that already has open questions shows them immediately. */
-    function setImproveProfileAvailability(hasProfile) {
-      document.getElementById('improve-no-profile').style.display = hasProfile ? 'none' : '';
-      document.getElementById('improve-controls').style.display = hasProfile ? '' : 'none';
-      document.getElementById('improve-questions').style.display = hasProfile ? '' : 'none';
+    function setStrengthenAnalyzeLabel(hasAnalysis) {
+      var button = document.getElementById('strengthen-analyze-button');
+      button.disabled = strengthenBusy;
+      button.textContent = strengthenBusy
+        ? 'Analyzing…'
+        : (hasAnalysis ? 'Re-analyze this job' : 'Analyze this job');
     }
 
-    async function loadImproveQuestions() {
+    async function loadStrengthen(jobId) {
+      applyStrengthenAvailability();
+      strengthenAnswers = {};
+      renderStrengthen(null);
+      document.getElementById('strengthen-status').textContent = '';
+      document.getElementById('strengthen-stale').style.display = 'none';
+      setStrengthenAnalyzeLabel(false);
       try {
-        var res = await api('/profile/improve/questions');
+        var res = await api('/jobs/' + encodeURIComponent(jobId) + '/strengthen');
+        if (!res.ok) return;
         var data = await res.json();
-        improveQuestions = data.questions || [];
-        if (improveQuestions.length) improveHasAudited = true;
-        renderImproveQuestions(improveQuestions);
-        updateImproveButton();
+        // A job that has never been analyzed is the normal state, not an error -- analysis is lazy
+        // so that marking twenty jobs interesting doesn't fire twenty rounds of model calls.
+        renderStrengthen(data.analysis);
+        setStrengthenAnalyzeLabel(Boolean(data.analysis));
+        if (data.stale) {
+          var stale = document.getElementById('strengthen-stale');
+          stale.textContent = 'Your profile has changed since this was analyzed. Re-analyze to see what it can now show.';
+          stale.style.display = '';
+        }
       } catch (err) {
-        // Best-effort on initial load; the action button still lets the candidate try explicitly.
+        // Leaving the panel empty is fine; the analyze button is still there.
       }
     }
 
-    document.getElementById('improve-go-to-create').addEventListener('click', function () {
-      document.querySelector('[data-profile-subtab="summary"]').click();
+    document.getElementById('strengthen-analyze-button').addEventListener('click', async function () {
+      if (!activeInterestedJobId) return;
+      var statusEl = document.getElementById('strengthen-status');
+      strengthenBusy = true;
+      setStrengthenAnalyzeLabel(Boolean(strengthenView));
+      updateStrengthenFooter();
+      statusEl.className = 'status';
+      statusEl.textContent = 'Reading the posting and checking it against your profile…';
+      try {
+        var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/strengthen/analyze', {
+          method: 'POST',
+          body: JSON.stringify({ provider: document.getElementById('strengthen-provider').value }),
+        });
+        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'analysis_failed'));
+        var data = await res.json();
+        strengthenAnswers = {};
+        renderStrengthen(data.analysis);
+        document.getElementById('strengthen-stale').style.display = 'none';
+        statusEl.className = 'status success';
+        statusEl.textContent = data.question_error
+          ? 'Analyzed. Questions could not be generated this time — you can retry.'
+          : 'Analyzed.';
+      } catch (err) {
+        statusEl.className = 'status error';
+        statusEl.textContent = 'Error: ' + err.message;
+      } finally {
+        strengthenBusy = false;
+        setStrengthenAnalyzeLabel(Boolean(strengthenView));
+        updateStrengthenFooter();
+      }
     });
 
-    document.getElementById('improve-action-button').addEventListener('click', async function () {
-      var statusEl = document.getElementById('improve-status');
-      var provider = document.getElementById('improve-provider').value;
-      var answeredCount = improveQuestions.filter(function (q) { return q.status === 'answered'; }).length;
-      improveBusy = true;
-      updateImproveButton();
-      statusEl.textContent = answeredCount > 0
-        ? 'Integrating your answers into the profile…'
-        : 'Reviewing your Career Evidence Record for high-value gaps…';
+    document.getElementById('strengthen-apply-button').addEventListener('click', async function () {
+      if (!activeInterestedJobId) return;
+      var statusEl = document.getElementById('strengthen-apply-status');
+      var answers = Object.keys(strengthenAnswers)
+        .filter(function (id) { return (strengthenAnswers[id] || '').trim().length > 0; })
+        .map(function (id) { return { id: id, answer: strengthenAnswers[id] }; });
+      if (!answers.length) return;
+
+      strengthenBusy = true;
+      updateStrengthenFooter();
       statusEl.className = 'status';
+      statusEl.textContent = 'Adding your answers to your profile…';
       try {
-        if (answeredCount > 0) {
-          var applyRes = await api('/profile/improve/apply', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ provider: provider }),
-          });
-          var applyData = await requireJsonResponse(applyRes, 'apply_failed');
-          renderStructuredProfileView('career-profile-view', applyData.structured);
-          setProfileButtonMode(true);
-          improveQuestions = applyData.questions || [];
-          improveHasAudited = true;
-          statusEl.textContent = applyData.applied_count + ' answer' + (applyData.applied_count === 1 ? '' : 's') +
-            ' applied to your profile.' + (applyData.reaudit_error ? ' (Could not check for new questions -- try Check Again.)' : '');
-          statusEl.className = 'status success';
-        } else {
-          var auditRes = await api('/profile/improve/audit', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ provider: provider }),
-          });
-          var auditData = await requireJsonResponse(auditRes, 'audit_failed');
-          improveQuestions = auditData.questions || [];
-          improveHasAudited = true;
-          statusEl.textContent = auditData.inserted > 0
-            ? 'Found ' + auditData.inserted + ' new question' + (auditData.inserted === 1 ? '' : 's') + '.'
-            : 'No new questions this time.';
-          statusEl.className = 'status success';
-        }
-        renderImproveQuestions(improveQuestions);
+        var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/strengthen/apply', {
+          method: 'POST',
+          body: JSON.stringify({
+            provider: document.getElementById('strengthen-provider').value,
+            answers: answers,
+          }),
+        });
+        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'apply_failed'));
+        var data = await res.json();
+        strengthenAnswers = {};
+        renderStrengthen(data.analysis);
+        document.getElementById('strengthen-stale').style.display = 'none';
+        statusEl.className = 'status success';
+        statusEl.textContent = 'Profile updated with ' + data.applied_count +
+          ' answer' + (data.applied_count === 1 ? '' : 's') + '. Your resume and cover letter will use it.';
+        // The profile changed, so anything already built for this job is now out of date.
+        resumeAutoLoadedForJob = false;
+        coverAutoLoadedForJob = false;
       } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
         statusEl.className = 'status error';
+        statusEl.textContent = 'Error: ' + err.message;
       } finally {
-        improveBusy = false;
-        updateImproveButton();
+        strengthenBusy = false;
+        updateStrengthenFooter();
       }
     });
 
@@ -10911,25 +11517,7 @@ Let me check the placeholder embraces like a variable name, gets its value when 
     var activeInterestedResumeId = null;
     var resumeAutoLoadedForJob = false;
     var coverAutoLoadedForJob = false;
-    var pendingReviewQuestion = null;
-
-    function renderReviewHistory(entries) {
-      var host = document.getElementById('interested-review-history');
-      host.innerHTML = '';
-      if (!entries.length) return;
-      host.appendChild(el('h3', { className: 'subhead', textContent: 'Answered so far' }));
-      entries.forEach(function (entry) {
-        host.appendChild(el('p', { className: 'job-reason', textContent: entry.claim }));
-      });
-    }
-
-    async function loadJobReviewHistory(jobId) {
-      var res = await api('/jobs/' + encodeURIComponent(jobId) + '/review');
-      var data = await res.json();
-      renderReviewHistory(data.entries || []);
-    }
-
-    var INTERESTED_SUBTABS = ['assistant', 'resume', 'cover', 'apply'];
+    var INTERESTED_SUBTABS = ['strengthen', 'resume', 'cover', 'apply'];
 
     function showInterestedSubtab(name) {
       INTERESTED_SUBTABS.forEach(function (tab) {
@@ -10983,17 +11571,13 @@ Let me check the placeholder embraces like a variable name, gets its value when 
 
     function showInterestedDetail(job, inlineHost) {
       activeInterestedJobId = job.id;
-      showInterestedSubtab('assistant');
+      showInterestedSubtab('strengthen');
       var section = document.getElementById('interested-detail-section');
       inlineHost.appendChild(section);
       section.style.display = 'block';
       // Review, resume, and cover-letter state are all per-job -- switching to a different job
       // shouldn't carry over a pending question, answer, or preview that belonged to the last one.
-      pendingReviewQuestion = null;
-      document.getElementById('interested-review-section').style.display = 'none';
-      document.getElementById('interested-review-answer').value = '';
-      document.getElementById('interested-review-status').textContent = '';
-      loadJobReviewHistory(job.id);
+      loadStrengthen(job.id);
 
       activeInterestedResumeId = null;
       resumeAutoLoadedForJob = false;
@@ -11210,64 +11794,12 @@ Let me check the placeholder embraces like a variable name, gets its value when 
       }
     }
 
-    document.getElementById('interested-review-button').addEventListener('click', async function () {
-      if (!activeInterestedJobId) return;
-      var statusEl = document.getElementById('interested-review-status');
-      var button = this;
-      button.disabled = true;
-      statusEl.textContent = 'Thinking of a question…';
-      statusEl.className = 'status';
-      try {
-        var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/review', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({}),
-        });
-        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'review_failed'));
-        var data = await res.json();
-        pendingReviewQuestion = data.question;
-        document.getElementById('interested-review-question').textContent = data.question;
-        document.getElementById('interested-review-section').style.display = 'block';
-        document.getElementById('interested-review-answer').value = '';
-        statusEl.textContent = '';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      } finally {
-        button.disabled = false;
-      }
-    });
-
-    document.getElementById('interested-review-submit').addEventListener('click', async function () {
-      if (!activeInterestedJobId) return;
-      var answer = document.getElementById('interested-review-answer').value.trim();
-      if (!answer) return;
-      var statusEl = document.getElementById('interested-review-status');
-      var button = this;
-      button.disabled = true;
-      statusEl.textContent = 'Saving…';
-      statusEl.className = 'status';
-      try {
-        var res = await api('/jobs/' + encodeURIComponent(activeInterestedJobId) + '/review-answer', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ question: pendingReviewQuestion, answer: answer }),
-        });
-        if (!res.ok) throw new Error(await errorMessageFromResponse(res, 'save_failed'));
-        var data = await res.json();
-        renderReviewHistory(data.entries || []);
-        document.getElementById('interested-review-section').style.display = 'none';
-        document.getElementById('interested-review-answer').value = '';
-        pendingReviewQuestion = null;
-        statusEl.textContent = 'Saved — added to your profile evidence for this job.';
-        statusEl.className = 'status success';
-      } catch (err) {
-        statusEl.textContent = 'Error: ' + err.message;
-        statusEl.className = 'status error';
-      } finally {
-        button.disabled = false;
-      }
-    });
+    // The old "Ask a question" handlers lived here. Strengthen Profile replaced them: instead of
+    // one freeform question at a time with no idea whether the answer mattered, the workflow now
+    // grades the posting against the profile first and asks only where an answer would change a
+    // requirement's coverage. The /jobs/:id/review endpoints they called are still served (the
+    // browser extension and the application-answer generator read that evidence), so nothing that
+    // depended on those rows broke -- there is simply no longer a UI that writes them by hand.
 
     function renderInterestedResumeChecks(checks) {
       var host = document.getElementById('interested-resume-checks');
@@ -12053,6 +12585,8 @@ function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "structured", schema: PLAN_SCHEMA, toolName: "submit_plan", maxTokens: 4000 };
     case "resume.select_base":
       return { kind: "structured", schema: RESUME_BASE_SCHEMA, toolName: "submit_resume_base", maxTokens: 1000 };
+    case "strengthen.questions":
+      return { kind: "structured", schema: STRENGTHEN_QUESTIONS_SCHEMA, toolName: "submit_questions", maxTokens: 6000 };
     case "cover_letter.write":
       return { kind: "structured", schema: COVER_LETTER_SCHEMA, toolName: "submit_cover_letter", maxTokens: 2000 };
     case "application.generate_answer":
@@ -12273,6 +12807,15 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "POST" && jobReviewMatch) return reviewJobQuestion(request, env, jobReviewMatch[1]);
     const jobReviewAnswerMatch = url.pathname.match(/^\/jobs\/([^/]+)\/review-answer$/);
     if (request.method === "POST" && jobReviewAnswerMatch) return createJobReviewAnswer(request, env, jobReviewAnswerMatch[1]);
+    // Strengthen Profile. Ordered before the bare /jobs/:id match so the deeper paths win.
+    const jobStrengthenMatch = url.pathname.match(/^\/jobs\/([^/]+)\/strengthen$/);
+    if (request.method === "GET" && jobStrengthenMatch) return getJobStrengthen(request, env, jobStrengthenMatch[1]);
+    const jobStrengthenAnalyzeMatch = url.pathname.match(/^\/jobs\/([^/]+)\/strengthen\/analyze$/);
+    if (request.method === "POST" && jobStrengthenAnalyzeMatch) return analyzeJobStrengthen(request, env, jobStrengthenAnalyzeMatch[1]);
+    const jobStrengthenApplyMatch = url.pathname.match(/^\/jobs\/([^/]+)\/strengthen\/apply$/);
+    if (request.method === "POST" && jobStrengthenApplyMatch) return applyJobStrengthen(request, env, jobStrengthenApplyMatch[1]);
+    const jobStrengthenDismissMatch = url.pathname.match(/^\/jobs\/[^/]+\/strengthen\/questions\/([^/]+)\/dismiss$/);
+    if (request.method === "POST" && jobStrengthenDismissMatch) return dismissJobStrengthenQuestion(request, env, jobStrengthenDismissMatch[1]);
     const jobResumeMatch = url.pathname.match(/^\/jobs\/([^/]+)\/resume$/);
     if (request.method === "POST" && jobResumeMatch) return buildJobResume(request, env, jobResumeMatch[1]);
     const jobCoverLetterMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cover-letter$/);

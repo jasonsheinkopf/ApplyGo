@@ -53,6 +53,7 @@ nav:
       - Progressive Autonomy: product/progressive-autonomy.md
       - Capability Map: product/capability-map.md
       - Requirements: product/requirements.md
+      - Resume Guidelines: product/resume-guidelines.md
   - Architecture:
       - Local and Cloudflare Dual Mode: architecture/local-cloudflare-dual-mode.md
       - Task-Aware Model Routing: architecture/model-provider-routing.md
@@ -62,6 +63,10 @@ nav:
       - Browser Automation: technology/browser-automation.md
       - Models and Orchestration: technology/models-orchestration.md
       - Evaluation and Observability: technology/evaluation-observability.md
+      - Langfuse Prompt Sync: technology/langfuse-prompt-sync.md
+  - Workflow:
+      - Complete Agent Workflow: workflow/agent-workflow.md
+      - Strengthen Profile: workflow/strengthen-profile.md
   - Implementation Stages:
       - First Vertical Slice: stages/first-vertical-slice.md
       - Candidate Profile Workspace: stages/profile-workspace.md

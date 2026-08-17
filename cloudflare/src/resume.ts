@@ -25,6 +25,10 @@ import {
   profileEvidenceStrings,
   renderCareerProfile,
 } from "./profile";
+// Value import, and safe from a cycle: philosophy.ts only ever imports this module's *types*
+// (`import type { StructuredProfile }`), which erase at compile time, so there is no runtime edge
+// back from philosophy to resume.
+import { RESUME_GUIDANCE } from "./philosophy";
 
 export interface ResumeEnv extends LlmEnv {
   FILES: R2Bucket;
@@ -201,6 +205,23 @@ export const RESUME_DOC_SCHEMA = {
  */
 export type ComposeOptions = { master?: boolean; planDirective?: string };
 
+/**
+ * What gets sent through the managed prompt's `plan_directive` slot.
+ *
+ * The canonical house style (`RESUME_GUIDANCE`) leads, and the per-job evidence plan follows it
+ * when there is one. Both travel through the existing variable on purpose rather than through a
+ * new one: `resume/compose` is a large, layout-coupled Langfuse-managed prompt, and adding a
+ * required variable to it would mark the live production version stale (see src/prompts.ts) and
+ * silently swap in a bundled replacement written without sight of the current text. Reusing the
+ * slot that already means "pre-decided instructions the writer must follow" gets the guidance in
+ * front of the model on every compose, today, with no Langfuse change needed and nothing to
+ * regress. The master archive is deliberately excluded: it is an evidence dump, not a resume, and
+ * selection/bullet-craft rules would actively damage it.
+ */
+function composeDirective(planDirective: string | undefined): string {
+  return [RESUME_GUIDANCE, planDirective].filter(Boolean).join("\n\n");
+}
+
 async function composePrompt(
   env: ResumeEnv,
   profile: StructuredProfile,
@@ -228,7 +249,7 @@ async function composePrompt(
     summary_rule: layout.show_summary
       ? "Include a short summary."
       : "Omit the summary -- return an empty string for it. The page needs the space.",
-    plan_directive: options.planDirective ? `${options.planDirective}\n` : "",
+    plan_directive: `${composeDirective(options.planDirective)}\n`,
     target_roles: desiredRoles
       ? `TARGET ROLES (what this resume should be angled toward):\n${desiredRoles}`
       : "TARGET ROLES: none specified. Produce a strong general-purpose resume for the candidate's evident field.",
