@@ -326,3 +326,50 @@ test("fetchMissingDescriptions is still a no-op for providers whose listing alre
     globalThis.fetch = previous;
   }
 });
+
+test("fetchBoardJobs (Workday) stops paginating once the shared budget runs out", async () => {
+  const previous = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    // Every page reports a full page and a huge total, so the loop would otherwise keep paging
+    // all the way to MAX_WORKDAY_PAGES (10) on its own.
+    return Response.json({
+      total: 500,
+      jobPostings: Array.from({ length: 20 }, (_, i) => ({ title: `Job ${i}`, externalPath: `/job/${i}`, locationsText: "" })),
+    });
+  }) as typeof fetch;
+  try {
+    // Page 0 is priced by the caller (scanOneCompany's own `budget.remaining -= 1` before calling
+    // fetchBoardJobs, not exercised here), so fetchWorkdayJobs itself only meters pages 1+ -- a
+    // budget of 2 must cap it at 3 total real fetches (page 0, plus 2 more).
+    const budget = { remaining: 2 };
+    const jobs = await fetchBoardJobs("workday", "tenant|pod|site", budget);
+    assert.equal(calls, 3, "must not spend more real fetches paginating than the shared budget allows");
+    assert.equal(budget.remaining, 0);
+    assert.equal(jobs.length, 60, "3 pages of 20 postings each");
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+test("fetchBoardJobs (Workday) with no budget argument paginates fully, exactly as before", async () => {
+  const previous = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return Response.json({
+      total: 25,
+      jobPostings: calls === 1
+        ? Array.from({ length: 20 }, (_, i) => ({ title: `Job ${i}`, externalPath: `/job/${i}`, locationsText: "" }))
+        : Array.from({ length: 5 }, (_, i) => ({ title: `Job ${20 + i}`, externalPath: `/job/${20 + i}`, locationsText: "" })),
+    });
+  }) as typeof fetch;
+  try {
+    const jobs = await fetchBoardJobs("workday", "tenant|pod|site");
+    assert.equal(calls, 2);
+    assert.equal(jobs.length, 25);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});

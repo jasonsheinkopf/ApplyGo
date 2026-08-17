@@ -662,11 +662,24 @@ const DESCRIPTION_CAP = 8000;
 const MAX_WORKDAY_PAGES = 10;
 const WORKDAY_PAGE_SIZE = 20;
 
-async function fetchWorkdayJobs(tenant: string, pod: string, site: string): Promise<ScannedJob[]> {
+/**
+ * `budget` accounts only for pages *beyond the first* -- the caller (scanOneCompany) already
+ * decrements its shared budget by one before calling fetchBoardJobs, which correctly prices every
+ * other provider's single-fetch listing call. Without this, a Workday company's up to
+ * MAX_WORKDAY_PAGES real fetches were all absorbed into that same "1", silently undercounting
+ * exactly the same way resolveWebsiteDeterministic's unmetered probing once did (see its own fix's
+ * commit message) -- a large Workday board was enough on its own to blow past the tracked budget
+ * while it still showed plenty of headroom.
+ */
+async function fetchWorkdayJobs(tenant: string, pod: string, site: string, budget?: { remaining: number }): Promise<ScannedJob[]> {
   const base = `https://${tenant}.${pod}.myworkdayjobs.com/wday/cxs/${tenant}/${site}`;
   const jobs: ScannedJob[] = [];
 
   for (let page = 0; page < MAX_WORKDAY_PAGES; page++) {
+    if (page > 0 && budget) {
+      if (budget.remaining <= 0) break;
+      budget.remaining -= 1;
+    }
     const offset = page * WORKDAY_PAGE_SIZE;
     const res = await fetchWithTimeout(`${base}/jobs`, 12000, {
       method: "POST",
@@ -707,11 +720,11 @@ async function fetchWorkdayJobs(tenant: string, pod: string, site: string): Prom
   return jobs;
 }
 
-export async function fetchBoardJobs(provider: AtsProvider, token: string): Promise<ScannedJob[]> {
+export async function fetchBoardJobs(provider: AtsProvider, token: string, budget?: { remaining: number }): Promise<ScannedJob[]> {
   if (provider === "workday") {
     const [tenant, pod, site] = token.split("|");
     if (!tenant || !pod || !site) throw new Error("board_bad_token");
-    return fetchWorkdayJobs(tenant, pod, site);
+    return fetchWorkdayJobs(tenant, pod, site, budget);
   }
 
   const res = await fetchWithTimeout(boardApiUrl(provider, token), 12000);
