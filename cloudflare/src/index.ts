@@ -3078,13 +3078,12 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
       const scanRunId = runId;
       const started = Date.now();
       // Cloudflare's real per-invocation external-subrequest cap is 50 on the Free plan; on Workers
-      // Paid it defaults to 10,000 and this Worker explicitly sets it to 2,000 (see wrangler.jsonc's
-      // `limits.subrequests`, and https://developers.cloudflare.com/workers/platform/limits/#subrequests).
+      // Paid it defaults to 10,000 (see https://developers.cloudflare.com/workers/platform/limits/#subrequests).
       // This budget is the app-level backstop underneath that platform ceiling, not a substitute for
       // it: every plain fetch inside scanOneCompany (and the resolveWebsiteDeterministic/resolveBoard/
       // fetchBoardJobs/fetchMissingDescriptions helpers it calls) decrements this 1:1, so a runaway
       // company (a huge board, a slow-to-resolve website) still gets cut off well before it could run
-      // up real cost or approach the platform's own limit -- with headroom to spare underneath 2,000
+      // up real cost or approach the platform's own limit -- with headroom to spare underneath 1,500
       // even counting the concurrency-driven overshoot described below.
       //
       // A cap hit mid-scan isn't just wasted work either -- if this budget were ever raised past what

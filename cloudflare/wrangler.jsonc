@@ -24,18 +24,6 @@
   "observability": {
     "enabled": true
   },
-  // Explicit subrequest ceiling for this Worker, rather than relying on the platform default.
-  // Workers Free hard-caps external subrequests at 50/invocation regardless of this setting; on
-  // Workers Paid the default is 10,000 (configurable up to 10,000,000) -- see
-  // https://developers.cloudflare.com/workers/platform/limits/#subrequests. 2000 is deliberately
-  // far below both the Paid default and the maximum: findJobs's own scan budget (see
-  // scanCompanies in src/index.ts) stays well under this, so a normal or large scan never gets
-  // close, while a genuine runaway bug still hits a hard wall long before it could run up real
-  // API/board-read cost. Raise this (and the in-app scan budget alongside it) only if a legitimate
-  // large scan is later found to need more headroom.
-  "limits": {
-    "subrequests": 2000
-  },
   "vars": {
     "SESSION_DAYS": "90",
     "LOCAL_RENDER_URL": "http://127.0.0.1:8788"
@@ -46,9 +34,6 @@
   "env": {
     "production": {
       "name": "applygo-prod",
-      "limits": {
-        "subrequests": 2000
-      },
       "d1_databases": [
         {
           "binding": "DB",
