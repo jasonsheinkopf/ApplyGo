@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from applygo.db import Base
@@ -15,7 +15,7 @@ def new_id() -> str:
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class User(Base):
@@ -40,6 +40,8 @@ class CandidateProfile(Base):
     evidence: Mapped[list["CandidateEvidence"]] = relationship(back_populates="profile", cascade="all, delete-orphan")
     documents: Mapped[list["SourceDocument"]] = relationship(back_populates="profile", cascade="all, delete-orphan")
     resumes: Mapped[list["ResumeVersion"]] = relationship(back_populates="profile", cascade="all, delete-orphan")
+    jobs: Mapped[list["JobPosting"]] = relationship(back_populates="profile")
+    improve_questions: Mapped[list["ImproveQuestion"]] = relationship(back_populates="profile", cascade="all, delete-orphan")
 
 
 class SourceDocument(Base):
@@ -96,7 +98,18 @@ class JobPosting(Base):
     raw_description: Mapped[str] = mapped_column(Text)
     normalized: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    profile_id: Mapped[str | None] = mapped_column(ForeignKey("candidate_profiles.id"), nullable=True, index=True)
+    interested: Mapped[bool] = mapped_column(Boolean, default=False)
+    interested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Canonical, persisted "what this employer wants vs. what evidence this candidate has"
+    # representation. See services.analyze_job_requirements. Reused by résumé/cover-letter
+    # generation so those don't have to reinterpret the job from scratch.
+    requirements_analysis: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    analysis_profile_fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    analysis_job_fingerprint: Mapped[str] = mapped_column(String(64), default="")
     assessments: Mapped[list["FitAssessment"]] = relationship(back_populates="job", cascade="all, delete-orphan")
+    cover_letters: Mapped[list["CoverLetterVersion"]] = relationship(back_populates="job", cascade="all, delete-orphan")
+    profile: Mapped["CandidateProfile | None"] = relationship(back_populates="jobs")
 
 
 class FitAssessment(Base):
@@ -114,3 +127,50 @@ class FitAssessment(Base):
     token_usage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     job: Mapped["JobPosting"] = relationship(back_populates="assessments")
+
+
+class CoverLetterVersion(Base):
+    __tablename__ = "cover_letter_versions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    profile_id: Mapped[str] = mapped_column(ForeignKey("candidate_profiles.id"), index=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("job_postings.id"), index=True)
+    content_markdown: Mapped[str] = mapped_column(Text)
+    provider: Mapped[str] = mapped_column(String(80), default="mock")
+    model: Mapped[str] = mapped_column(String(120), default="mock")
+    source_evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    job: Mapped["JobPosting"] = relationship(back_populates="cover_letters")
+
+
+class ImproveQuestion(Base):
+    """A single, deduplicated, global profile-enrichment question.
+
+    One question can be raised by several Interested jobs that share the same
+    underlying requirement category (e.g. several jobs asking for SQL) - see
+    services.sync_improve_questions_for_job. Answering it adds evidence to the
+    global candidate profile, never to a single job.
+    """
+
+    __tablename__ = "improve_questions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    profile_id: Mapped[str] = mapped_column(ForeignKey("candidate_profiles.id"), index=True)
+    category: Mapped[str] = mapped_column(String(100), index=True)
+    requirement_text: Mapped[str] = mapped_column(String(300))
+    question_text: Mapped[str] = mapped_column(Text)
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="open")  # open, answered, dismissed
+    hard_constraint: Mapped[bool] = mapped_column(Boolean, default=False)
+    requirement_level: Mapped[str] = mapped_column(String(20), default="preferred")  # required, preferred
+    related_job_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    answer_text: Mapped[str] = mapped_column(Text, default="")
+    resulting_evidence_id: Mapped[str | None] = mapped_column(ForeignKey("candidate_evidence.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    profile: Mapped["CandidateProfile"] = relationship(back_populates="improve_questions")
+
+    @property
+    def priority(self) -> int:
+        weight = 2 if self.requirement_level == "required" else 1
+        return len(self.related_job_ids or []) * weight

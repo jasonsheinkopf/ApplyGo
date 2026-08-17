@@ -13,8 +13,28 @@ from sqlalchemy.orm import Session
 
 from applygo.config import get_settings
 from applygo.db import get_session, init_db
-from applygo.models import CandidateEvidence, CandidateProfile, JobPosting, ResumeVersion, User
-from applygo.services import create_evidence_from_text, generate_profile_summary, generate_resume_version, normalize_job, run_fit_assessment, store_document
+from applygo.models import (
+    CandidateEvidence,
+    CandidateProfile,
+    ImproveQuestion,
+    JobPosting,
+    ResumeVersion,
+    User,
+)
+from applygo.services import (
+    answer_improve_question,
+    create_evidence_from_text,
+    generate_cover_letter_version,
+    generate_profile_summary,
+    generate_resume_version,
+    job_improvement_count,
+    mark_job_interested,
+    normalize_job,
+    open_questions_for_profile,
+    run_fit_assessment,
+    store_document,
+    sync_general_improve_questions,
+)
 
 BASE_DIR = Path(__file__).parent
 app = FastAPI(title="ApplyGo", version="0.3.0")
@@ -105,7 +125,26 @@ def profile_page(profile_id: str, request: Request, session: Session = Depends(g
     profile = require_profile(session, profile_id)
     evidence = list(session.scalars(select(CandidateEvidence).where(CandidateEvidence.profile_id == profile.id).order_by(CandidateEvidence.created_at.desc())))
     resumes = list(session.scalars(select(ResumeVersion).where(ResumeVersion.profile_id == profile.id).order_by(ResumeVersion.created_at.desc())))
-    return templates.TemplateResponse(request, "profile.html", {"profile": profile, "evidence": evidence, "resumes": resumes, "documents": profile.documents})
+    interested_jobs = list(session.scalars(select(JobPosting).where(JobPosting.profile_id == profile.id, JobPosting.interested.is_(True)).order_by(JobPosting.interested_at.desc())))
+    if not interested_jobs:
+        sync_general_improve_questions(session, profile)
+    open_questions = open_questions_for_profile(session, profile.id)
+    focus_job_id = request.query_params.get("job")
+    improvement_counts = {job.id: job_improvement_count(job) for job in interested_jobs}
+    return templates.TemplateResponse(
+        request,
+        "profile.html",
+        {
+            "profile": profile,
+            "evidence": evidence,
+            "resumes": resumes,
+            "documents": profile.documents,
+            "interested_jobs": interested_jobs,
+            "improvement_counts": improvement_counts,
+            "open_questions": open_questions,
+            "focus_job_id": focus_job_id,
+        },
+    )
 
 
 @app.post("/profiles/{profile_id}/preferences")
@@ -203,9 +242,47 @@ def add_notes(profile_id: str, notes: str = Form(...), session: Session = Depend
 
 
 @app.post("/profiles/{profile_id}/resumes")
-def create_resume(profile_id: str, purpose: str = Form("General-purpose résumé"), session: Session = Depends(get_session)) -> RedirectResponse:
-    resume = generate_resume_version(session, require_profile(session, profile_id), purpose)
-    return RedirectResponse(f"/profiles/{profile_id}#resume-{resume.id}", status_code=303)
+def create_resume(profile_id: str, purpose: str = Form("General-purpose résumé"), job_id: str = Form(""), session: Session = Depends(get_session)) -> RedirectResponse:
+    profile = require_profile(session, profile_id)
+    job = session.get(JobPosting, job_id) if job_id else None
+    if job is not None and not purpose.strip():
+        purpose = f"Tailored for {job.title} at {job.company}"
+    resume = generate_resume_version(session, profile, purpose, job=job)
+    anchor = f"interested-{job.id}" if job is not None else f"resume-{resume.id}"
+    return RedirectResponse(f"/profiles/{profile_id}#{anchor}", status_code=303)
+
+
+@app.post("/jobs/{job_id}/cover-letters")
+def create_cover_letter(job_id: str, session: Session = Depends(get_session)) -> RedirectResponse:
+    job = session.get(JobPosting, job_id)
+    if job is None or job.profile_id is None:
+        raise HTTPException(404, "Job not found")
+    profile = require_profile(session, job.profile_id)
+    generate_cover_letter_version(session, profile, job)
+    return RedirectResponse(f"/profiles/{profile.id}#interested-{job.id}", status_code=303)
+
+
+@app.post("/jobs/{job_id}/interested")
+def toggle_interested(job_id: str, session: Session = Depends(get_session)) -> RedirectResponse:
+    job = session.get(JobPosting, job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job.profile_id is None:
+        raise HTTPException(400, "Job has no associated candidate profile")
+    profile = require_profile(session, job.profile_id)
+    mark_job_interested(session, profile, job)
+    return RedirectResponse(f"/jobs/{job.id}", status_code=303)
+
+
+@app.post("/improve/{question_id}/answer")
+def answer_question(question_id: str, answer: str = Form(...), session: Session = Depends(get_session)) -> RedirectResponse:
+    question = session.get(ImproveQuestion, question_id)
+    if question is None:
+        raise HTTPException(404, "Question not found")
+    profile = require_profile(session, question.profile_id)
+    if answer.strip():
+        answer_improve_question(session, profile, question, answer)
+    return RedirectResponse(f"/profiles/{profile.id}#improve", status_code=303)
 
 
 @app.post("/resumes/{resume_id}/delete")
@@ -234,12 +311,12 @@ def review_evidence(evidence_id: str, status: str = Form(...), usable: bool = Fo
 
 @app.post("/jobs")
 def create_job(profile_id: str = Form(...), title: str = Form(...), company: str = Form(...), source_url: str = Form(""), description: str = Form(...), session: Session = Depends(get_session)) -> RedirectResponse:
-    require_profile(session, profile_id)
-    job = JobPosting(title=title, company=company, source_url=source_url, raw_description=description, normalized=normalize_job(description))
+    profile = require_profile(session, profile_id)
+    job = JobPosting(title=title, company=company, source_url=source_url, raw_description=description, normalized=normalize_job(description), profile_id=profile.id)
     session.add(job)
     session.commit()
     session.refresh(job)
-    assessment = run_fit_assessment(session, require_profile(session, profile_id), job)
+    assessment = run_fit_assessment(session, profile, job)
     return RedirectResponse(f"/jobs/{job.id}?assessment={assessment.id}", status_code=303)
 
 
@@ -249,4 +326,5 @@ def job_page(job_id: str, request: Request, session: Session = Depends(get_sessi
     if job is None:
         raise HTTPException(404, "Job not found")
     assessments = sorted(job.assessments, key=lambda item: item.created_at, reverse=True)
-    return templates.TemplateResponse(request, "job.html", {"job": job, "assessments": assessments})
+    gap_count = job_improvement_count(job) if job.interested else 0
+    return templates.TemplateResponse(request, "job.html", {"job": job, "assessments": assessments, "gap_count": gap_count})

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ profile.user.display_name }} — ApplyGo{% endblock %}
 {% block content %}
-<section class="profile-hero"><a class="back" href="/">← All profiles</a><div class="profile-title"><span class="avatar large">{{ profile.user.display_name[:1] }}</span><div><span class="eyebrow">Candidate workspace</span><h1>{{ profile.user.display_name }}</h1><p>{{ profile.label }}</p></div></div><nav class="subnav"><a href="#profile">Profile</a><a href="#sources">Sources</a><a href="#evidence">Evidence</a><a href="#resumes">Résumés</a></nav></section>
+<section class="profile-hero"><a class="back" href="/">← All profiles</a><div class="profile-title"><span class="avatar large">{{ profile.user.display_name[:1] }}</span><div><span class="eyebrow">Candidate workspace</span><h1>{{ profile.user.display_name }}</h1><p>{{ profile.label }}</p></div></div><nav class="subnav"><a href="#profile">Profile</a><a href="#sources">Sources</a><a href="#evidence">Evidence</a><a href="#interested">Interested</a><a href="#improve">Improve{% if open_questions %} <span class="badge">{{ open_questions|length }}</span>{% endif %}</a><a href="#resumes">Résumés</a></nav></section>
 
 <section id="profile" class="workspace-grid">
 <div class="card summary-card"><div class="section-heading"><div><span class="eyebrow">Generated from approved evidence</span><h2>Professional profile</h2></div><div class="button-row"><form method="post" action="/profiles/{{ profile.id }}/generate-summary"><button class="secondary">Regenerate</button></form><a class="button secondary button-link" href="/profiles/{{ profile.id }}/export" download>Export</a></div></div><p class="lead">{{ profile.summary or 'Approve evidence, then generate your grounded professional summary.' }}</p>{% set generated = profile.preferences.get('generated_profile', {}) %}{% if generated.get('strengths') %}<h3>Core strengths</h3><div class="chips">{% for strength in generated.get('strengths', [])[:6] %}<span>{{ strength }}</span>{% endfor %}</div>{% endif %}</div>
@@ -11,6 +11,42 @@
 <section id="sources" class="card"><div class="section-heading"><div><span class="eyebrow">Originals remain unchanged</span><h2>Source documents</h2></div><span class="count">{{ documents|length }} files</span></div><div class="source-grid"><form class="upload-zone" method="post" action="/profiles/{{ profile.id }}/documents" enctype="multipart/form-data"><strong>Upload résumé or supporting document</strong><p>PDF, Markdown, or text. ApplyGo extracts reviewable evidence but never edits the original.</p><input type="file" name="file" accept=".pdf,.txt,.md" required><button>Upload and extract</button></form><form class="note-box" method="post" action="/profiles/{{ profile.id }}/notes"><strong>Add structured career notes</strong><p>Paste a ChatGPT summary, project history, achievements, or detailed context.</p><textarea name="notes" rows="8" required placeholder="Describe what you did, your impact, tools, scope, and results..."></textarea><button>Convert to evidence</button></form></div>{% if documents %}<div class="document-list">{% for doc in documents %}<div><span class="file-icon">DOC</span><span><strong>{{ doc.original_name }}</strong><small>{{ doc.media_type }} · {{ doc.created_at.strftime('%Y-%m-%d') }}</small></span></div>{% endfor %}</div>{% endif %}</section>
 
 <section id="evidence" class="card"><div class="section-heading"><div><span class="eyebrow">Human verification gate</span><h2>Evidence review</h2></div><span class="count">{{ evidence|length }} claims</span></div><p>Only evidence you confirm and mark usable can support profiles, résumés, and job applications.</p>{% if evidence %}<div class="evidence-list">{% for item in evidence %}<article class="evidence {% if item.usable_in_applications %}approved{% endif %}"><p>{{ item.claim }}</p><form method="post" action="/evidence/{{ item.id }}/review"><select name="status"><option value="unreviewed" {% if item.verification_status=='unreviewed' %}selected{% endif %}>Needs review</option><option value="user_confirmed" {% if item.verification_status=='user_confirmed' %}selected{% endif %}>I confirm this</option><option value="verified" {% if item.verification_status=='verified' %}selected{% endif %}>Verified</option><option value="rejected" {% if item.verification_status=='rejected' %}selected{% endif %}>Reject</option></select><label class="check"><input type="checkbox" name="usable" value="true" {% if item.usable_in_applications %}checked{% endif %}> Use in applications</label><button>Save</button></form></article>{% endfor %}</div>{% else %}<p class="empty">Upload a document or add notes to create evidence.</p>{% endif %}</section>
+
+<section id="interested" class="card"><div class="section-heading"><div><span class="eyebrow">Requirements compared against your profile</span><h2>Interested jobs</h2></div><span class="count">{{ interested_jobs|length }} jobs</span></div>
+{% if interested_jobs %}<div class="resume-list">
+{% for job in interested_jobs %}
+{% set gaps = improvement_counts.get(job.id, 0) %}
+<article id="interested-{{ job.id }}" class="resume-card">
+<div class="section-heading"><div><h3><a href="/jobs/{{ job.id }}">{{ job.title }}</a></h3><small>{{ job.company }}</small></div>
+{% if gaps %}<a class="pill gap" href="/profiles/{{ profile.id }}?job={{ job.id }}#improve">{{ gaps }} profile improvement{{ 's' if gaps != 1 else '' }} available</a>{% else %}<span class="pill ready">Profile ready</span>{% endif %}
+</div>
+<div class="button-row">
+<form method="post" action="/profiles/{{ profile.id }}/resumes"><input type="hidden" name="job_id" value="{{ job.id }}"><button class="secondary">Résumé</button></form>
+<form method="post" action="/jobs/{{ job.id }}/cover-letters"><button class="secondary">Cover letter</button></form>
+{% if job.source_url %}<a class="button" href="{{ job.source_url }}" target="_blank" rel="noopener">Apply</a>{% else %}<span class="button disabled" title="No application URL saved for this job">Apply</span>{% endif %}
+</div>
+{% if job.cover_letters %}<details><summary>Latest cover letter</summary><pre>{{ (job.cover_letters | sort(attribute='created_at') | last).content_markdown }}</pre></details>{% endif %}
+</article>
+{% endfor %}
+</div>{% else %}<p class="empty">Mark a job Interested to get an automatic requirements-vs-profile analysis, a résumé, and a cover letter for it.</p>{% endif %}</section>
+
+<section id="improve" class="card"><div class="section-heading"><div><span class="eyebrow">One global question, not one per job</span><h2>Profile → Improve</h2></div><span class="count">{{ open_questions|length }} open</span></div>
+{% if open_questions %}
+<p>Questions are deduplicated across your Interested jobs and ranked by how many roles need the answer.</p>
+<div class="evidence-list">
+{% for question in open_questions %}
+<article class="evidence {% if focus_job_id and focus_job_id in question.related_job_ids %}approved{% endif %}">
+<p><strong>{{ question.question_text }}</strong></p>
+{% if question.rationale %}<p class="notice">Why we're asking — {{ question.rationale }}</p>{% endif %}
+<form method="post" action="/improve/{{ question.id }}/answer">
+<textarea name="answer" rows="3" placeholder="Describe what you actually did, with tools and scope..." required></textarea>
+<button>Add to profile</button>
+</form>
+</article>
+{% endfor %}
+</div>
+{% else %}<p class="empty">No open questions right now. {% if not interested_jobs %}Add source documents or notes above, or mark a job Interested to get targeted questions.{% else %}Your profile currently covers everything ApplyGo could identify across your Interested jobs.{% endif %}</p>{% endif %}
+</section>
 
 <section id="resumes" class="card"><div class="section-heading"><div><span class="eyebrow">Versioned outputs</span><h2>Résumé studio</h2></div><span class="count">{{ resumes|length }} versions</span></div><form class="resume-generator" method="post" action="/profiles/{{ profile.id }}/resumes"><label>What should this résumé be optimized for?<textarea name="purpose" rows="3" placeholder="General applied AI résumé, developer advocate roles, automotive AI roles...">General-purpose résumé</textarea></label><button>Generate new version</button></form>{% if resumes %}<div class="resume-list">{% for resume in resumes %}<article id="resume-{{ resume.id }}" class="resume-card"><div class="section-heading"><div><h3>{{ resume.title }}</h3><small>{{ resume.purpose }} · {{ resume.provider }}/{{ resume.model }} · {{ resume.created_at.strftime('%Y-%m-%d %H:%M') }}</small></div><form method="post" action="/resumes/{{ resume.id }}/delete"><button class="danger">Delete</button></form></div><details><summary>View résumé</summary><pre>{{ resume.content_markdown }}</pre></details></article>{% endfor %}</div>{% else %}<p class="empty">No generated résumé versions yet. Approved evidence is required for useful output.</p>{% endif %}</section>
 {% endblock %}

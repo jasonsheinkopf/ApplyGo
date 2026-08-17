@@ -21,6 +21,7 @@ class ModelTask(StrEnum):
     DOCUMENT_DRAFTING = "document_drafting"
     BACKGROUND_RESEARCH = "background_research"
     INTERACTIVE_ASSISTANCE = "interactive_assistance"
+    REQUIREMENT_ANALYSIS = "requirement_analysis"
 
 
 class ExecutionMode(StrEnum):
