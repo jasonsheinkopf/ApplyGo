@@ -171,13 +171,24 @@ export function scoreSiteMatch(name: string, html: string, finalUrl = ""): { sco
  * Fetches a candidate URL and decides whether it really is this company.
  *
  * Returns null when the URL is unusable (unreachable, an aggregator, a redirect off to an unrelated
- * host). A non-null result still carries a score the caller must compare against CONFIDENCE_FLOOR.
+ * host, or the shared subrequest budget is exhausted). A non-null result still carries a score the
+ * caller must compare against CONFIDENCE_FLOOR.
+ *
+ * `budget` is optional (defaults to unmetered) so existing callers and tests are unaffected; a
+ * caller sharing one Worker invocation's fetch budget across many companies -- see
+ * resolveWebsiteDeterministic below, and scanOneCompany in src/index.ts, which is the caller that
+ * actually needs this -- passes the same `{ remaining: number }` object resolveBoard already
+ * decrements, so every real fetch a company scan makes counts against one total, not just the ones
+ * resolveBoard happens to know about.
  */
 export async function verifyCandidate(
   name: string,
   candidateUrl: string,
+  budget?: { remaining: number },
 ): Promise<{ url: string; score: number; evidence: string } | null> {
   if (isNonCompanyHost(candidateUrl)) return null;
+  if (budget && budget.remaining <= 0) return null;
+  if (budget) budget.remaining -= 1;
 
   const res = await fetchWithTimeout(candidateUrl, 8000, { method: "GET", redirect: "follow" });
   if (!res) return null;
@@ -243,7 +254,15 @@ export function probePlan(name: string, maxCandidates = 4): string[] {
  * lower bar than guesses, because a URL the aggregator itself published for this employer is
  * corroboration a hostname guess simply doesn't have.
  */
-export async function resolveWebsiteDeterministic(evidence: DiscoveryEvidence): Promise<ResolutionOutcome> {
+/**
+ * `budget`, like verifyCandidate's, is optional and shared across a whole scan batch when passed --
+ * see verifyCandidate's header comment. Tiers 2+3 alone can cost up to 10 real fetches for a single
+ * company (probePlan's cross product), which previously ran completely unmetered even when the
+ * caller (scanOneCompany) was already tracking a shared fetch budget for everything else in the
+ * same batch -- see PR history for the "Too many API requests by single Worker invocation" this
+ * caused once a scan touched enough companies with no website resolved yet.
+ */
+export async function resolveWebsiteDeterministic(evidence: DiscoveryEvidence, budget?: { remaining: number }): Promise<ResolutionOutcome> {
   const name = cleanCompanyName(evidence.name);
   if (!name) return { status: "unresolved", evidence: "no usable company name" };
 
@@ -251,8 +270,9 @@ export async function resolveWebsiteDeterministic(evidence: DiscoveryEvidence): 
 
   // --- Tier 1: URLs discovery already gave us -----------------------------------------------
   for (const raw of evidence.urls ?? []) {
+    if (budget && budget.remaining <= 0) break;
     if (!raw || isNonCompanyHost(raw)) continue;
-    const checked = await verifyCandidate(name, raw);
+    const checked = await verifyCandidate(name, raw, budget);
     if (!checked) continue;
     // +15 for being published evidence rather than a guess, capped at 100.
     const score = Math.min(100, checked.score + 15);
@@ -264,7 +284,8 @@ export async function resolveWebsiteDeterministic(evidence: DiscoveryEvidence): 
 
   // --- Tier 2 + 3: bounded guess, each one validated ----------------------------------------
   for (const candidate of probePlan(name)) {
-    const checked = await verifyCandidate(name, candidate);
+    if (budget && budget.remaining <= 0) break;
+    const checked = await verifyCandidate(name, candidate, budget);
     if (!checked) continue;
     if (!best || checked.score > best.score) best = { ...checked, source: "guess" };
     if (checked.score >= CONFIDENCE_FLOOR) {
