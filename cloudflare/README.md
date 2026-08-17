@@ -585,7 +585,7 @@ A prompt whose *contract* changes — a new structured-output schema, a new set 
 
 This does not move prompt ownership back into the repository. Langfuse still wins whenever it holds a compatible version, and the bundled text goes dormant the moment one is promoted. What it buys is that a schema deploy and a prompt promotion no longer have to happen in the same instant, and that the repo carries a readable record of what each prompt is supposed to say. A prompt served from the bundled default reports its name as `<name> (bundled default)` and version `0`, so it is obvious in a Langfuse trace.
 
-Prompts currently carrying a bundled default: `profile/structure`, `roles/analyze`, `roles/research`. To adopt one in Langfuse, copy its text from `src/prompts.ts` into a new version, keep every `{{variable}}` it references, and promote it to `production`.
+Every prompt registered in `PROMPT_DEFAULTS` (`profile/create`, `profile/improve-audit`, `profile/improve-apply`, `roles/analyze`, `roles/research`) currently has a matching `production` version in Langfuse, so the bundled text is dormant for all of them. If a schema change ever outruns the Langfuse promotion again, copy the new text from `src/prompts.ts` into a new Langfuse version, keep every `{{variable}}` it references, and promote it to `production`.
 
 ### Creating `applications/generate_answer`
 
