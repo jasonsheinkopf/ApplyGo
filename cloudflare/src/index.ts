@@ -3049,12 +3049,18 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
   const companies = targets.results ?? [];
 
   return ndjsonResponse(ctx, async (emit) => {
-    // Raised alongside the switch to concurrent scanning below: this was originally sized for a
-    // sequential loop where the real limit was how long one request could reasonably run, not how
-    // many subrequests were actually safe. Reading a board is a plain fetch with no LLM cost, so a
-    // higher shared cap just means a realistic company list (tens to a couple hundred) clears in
-    // one click instead of needing several.
-    const budget = { remaining: 150 };
+    // Cloudflare enforces a hard subrequest cap per Worker invocation -- 50 on the Free plan, 1000
+    // on Paid -- and every plain fetch inside scanOneCompany (and the resolveBoard/resolveWebsite
+    // helpers it calls) decrements this budget 1:1, so it doubles as that cap. It intentionally
+    // stays well under even the Free-plan ceiling: 8 companies run concurrently and all check
+    // `budget.remaining` before any of them have decremented it, so a single round can overshoot
+    // this number by roughly the concurrency factor before anyone notices it's exhausted. A cap
+    // hit mid-scan isn't just wasted work either -- Cloudflare can kill the isolate outright rather
+    // than raising a catchable error, which drops the whole ndjson stream with no 'done' event and
+    // no "Too many API requests" message the client can even show. Staying safely under the limit
+    // (instead of the 150 this used to be, sized only for a Paid-plan ceiling) is cheaper than
+    // needing several extra "still queued" rounds.
+    const budget = { remaining: 35 };
     const results: { company: string; jobs: number; new_jobs: number; note: string }[] = [];
     let newListings = 0;
     let done = 0;
@@ -3066,10 +3072,17 @@ async function scanCompanies(request: Request, env: Env, ctx: ExecutionContext):
       companies,
       8,
       async (company) => {
-        if (budget.remaining <= 2) return null;
+        if (budget.remaining <= 8) return null;
         // scanOneCompany already writes each company's listings to the database before returning,
         // so a company already reported here is durably saved even if others in flight never finish.
-        return scanOneCompany(env, company, desiredRoles, locationTerms, budget, titleTerms);
+        // Isolated per-company: one company's board timing out, returning garbage, or (rarely)
+        // tripping the platform's own subrequest cap must not abort every other company still in
+        // flight in this same batch, nor crash the response stream out from under the client.
+        try {
+          return await scanOneCompany(env, company, desiredRoles, locationTerms, budget, titleTerms);
+        } catch (err) {
+          return { jobs: 0, newJobs: 0, note: `scan_failed: ${(err as Error).message}`, status: "unverified" as const };
+        }
       },
       async (company, outcome) => {
         if (!outcome) return;
@@ -10768,7 +10781,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         // Stage 1: scan boards. One request only gets through as many companies as safely fit in
         // one call, so it re-fires on your behalf until every company's been reached this run --
         // capped so a real server problem can't spin forever.
-        var totalCompaniesScanned = 0, totalNewListings = 0;
+        var totalCompaniesScanned = 0, totalNewListings = 0, scanInterrupted = false;
         var scanRound = 0;
         var scanData;
         do {
@@ -10789,6 +10802,16 @@ const DASHBOARD_PAGE = `<!doctype html>
             pfBumpScanned(event.new_jobs);
             if (event.new_jobs) queueLiveJobsRefresh();
           });
+          // A round that never reached a 'done' event (isolate recycled, connection dropped, a
+          // platform-level limit killed the request outright) has no scanned/new_listings to add --
+          // previously this fell through to undefined, and total += undefined silently poisons the
+          // running total to NaN for the rest of the run. Stop cleanly instead: what was scanned
+          // before the drop is already durably saved (scanOneCompany writes before reporting), so
+          // this is honestly "some progress, try again", never a failure.
+          if (scanData.interrupted) {
+            scanInterrupted = true;
+            break;
+          }
           totalCompaniesScanned += scanData.scanned;
           totalNewListings += scanData.new_listings;
         } while (scanData.scanned > 0 && totalCompaniesScanned < scanData.eligible_total && scanRound < 25);
@@ -10839,6 +10862,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         var parts = [];
         parts.push('Scanned ' + totalCompaniesScanned + ' compan' + (totalCompaniesScanned === 1 ? 'y' : 'ies') +
           ', found ' + totalNewListings + ' new listing' + (totalNewListings === 1 ? '' : 's') + '.');
+        if (scanInterrupted) parts.push('Reading job boards was interrupted partway through — click Find Jobs again to pick up where it left off.');
         if (totalScreened) parts.push('Screened ' + totalScreened + ', dropped ' + totalScreenedOut + ' as clear misses.');
         if (totalAssessed) parts.push('Assessed ' + totalAssessed + ' in detail; ' + totalRecommended + ' newly recommended.');
         // Only reachable if the loop stopped without actually clearing the backlog: a real error,
@@ -10846,7 +10870,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         parts.push(left ? left + ' still queued — click Find Jobs again to continue.' : 'All caught up.');
         if (allErrors.length) parts.push('Some batches failed: ' + allErrors.join('; '));
         statusEl.textContent = parts.join(' ');
-        statusEl.className = allErrors.length ? 'status error' : 'status success';
+        statusEl.className = (allErrors.length || scanInterrupted) ? 'status error' : 'status success';
         await pfWaitForIdle();
         await loadCompanies();
         await loadJobs();

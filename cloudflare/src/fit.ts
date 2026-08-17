@@ -12,6 +12,7 @@
 
 import { type LlmEnv, type Provider, callStructured } from "./llm";
 import { getManagedPrompt } from "./langfuse";
+import { JOBS_PRESCREEN_PROMPT } from "./prompts";
 
 /**
  * The compact candidate rendering used by high-volume prescreening lives in src/profile.ts, next to
@@ -392,14 +393,19 @@ export async function screenJobsBatch(
   jobs: JobToAssess[],
 ): Promise<ScreenResult[]> {
   if (!jobs.length) return [];
-  const prompt = await getManagedPrompt(env, "jobs/prescreen", {
-    disqualifiers: disqualifiers.length
-      ? `The candidate has already rejected roles for these reasons:\n${disqualifiers.map((d) => `- ${d}`).join("\n")}\n`
-      : "",
-    target_roles: desiredRoles ? `WANTS (any ONE of the following, not all at once): ${desiredRoles.slice(0, 600)}\n` : "",
-    candidate_profile: matchProfile,
-    postings: JSON.stringify(jobs.map((j) => ({ id: j.id, title: j.title, location: j.location }))),
-  });
+  const prompt = await getManagedPrompt(
+    env,
+    "jobs/prescreen",
+    {
+      disqualifiers: disqualifiers.length
+        ? `The candidate has already rejected roles for these reasons:\n${disqualifiers.map((d) => `- ${d}`).join("\n")}\n`
+        : "",
+      target_roles: desiredRoles ? `WANTS (any ONE of the following, not all at once): ${desiredRoles.slice(0, 600)}\n` : "",
+      candidate_profile: matchProfile,
+      postings: JSON.stringify(jobs.map((j) => ({ id: j.id, title: j.title, location: j.location }))),
+    },
+    JOBS_PRESCREEN_PROMPT,
+  );
 
   const { results } = await callStructured<{ results: ScreenResult[] }>(
     env,

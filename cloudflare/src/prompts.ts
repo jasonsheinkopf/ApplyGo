@@ -414,6 +414,8 @@ Return only the structured output.`,
 };
 
 /**
+
+/**
  * The cover-letter writer, now given the same structured job analysis the resume gets.
  *
  * This entry is new, and adding it deliberately supersedes whatever `cover_letter/compose` version
@@ -583,6 +585,44 @@ empty questions array -- that is a success, not a failure.
 Return only the structured output.`,
 };
 
+/**
+ * Tier-1 job screening: a cheap yes/no pass over a batch of postings' titles and locations only
+ * (no description), run for every single new posting before anything more expensive touches it.
+ * That makes it the highest-volume LLM call in the app by a wide margin, which is exactly why it
+ * needs a bundled fallback -- a Langfuse hiccup here does not just degrade one feature, it stalls
+ * the entire "Find Jobs" pipeline (see fit.ts's screenJobsBatch, which is the only caller).
+ */
+export const JOBS_PRESCREEN_PROMPT: PromptDefault = {
+  requires: ["candidate_profile", "postings"],
+  schemaVersion: 1,
+  text: `You are the first, cheap pass over a batch of job postings, judging ONLY each posting's
+title and location -- you deliberately do not have the description. Your only job is to catch a
+posting that is obviously a different profession or field entirely, so it doesn't waste a full,
+expensive read later.
+
+{{target_roles}}{{disqualifiers}}
+CANDIDATE PROFILE (for field/profession context only -- do not judge seniority, specific skills, or
+detailed fit here; you don't have enough information to and shouldn't try):
+{{candidate_profile}}
+
+POSTINGS (id, title, location):
+{{postings}}
+
+RULES
+- Judge only whether the TITLE plausibly belongs to the same profession/field as the candidate --
+  e.g. a "Propulsion Engineer" posting is not a software fit no matter what its full description
+  might say, but you cannot see that description here, so never guess at it.
+- When genuinely unsure, keep the posting. A wrong "drop" here is invisible to the candidate and
+  permanently loses a posting a full read might have kept; a wrong "keep" only costs one more cheap
+  read later.
+- note is a short (under 15 word) reason, filled in ONLY when keep is false. Leave it empty when
+  keep is true.
+
+Return exactly one result per posting id in the input, with that same id, a keep boolean, and note.
+
+Return only the structured output.`,
+};
+
 /** Registry consulted by getManagedPrompt. Prompts absent here behave exactly as before. */
 export const PROMPT_DEFAULTS: Record<string, PromptDefault> = {
   "profile/create": PROFILE_CREATE_PROMPT,
@@ -592,4 +632,5 @@ export const PROMPT_DEFAULTS: Record<string, PromptDefault> = {
   "cover_letter/compose": COVER_LETTER_COMPOSE_PROMPT,
   "roles/analyze": ROLES_ANALYZE_PROMPT,
   "roles/research": ROLES_RESEARCH_PROMPT,
+  "jobs/prescreen": JOBS_PRESCREEN_PROMPT,
 };
