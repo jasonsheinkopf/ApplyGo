@@ -62,7 +62,14 @@ import {
   planEvidence,
   renderPlanDirective,
 } from "./philosophy";
-import { type InterestedJobGap, relatedJobIdsFor, renderJobRequirementContext, requirementDedupeKey } from "./interested";
+import {
+  type InterestedJobGap,
+  priorQuestionDedupeKeys,
+  questionDedupeKey,
+  relatedJobIdsFor,
+  renderJobRequirementContext,
+  requirementDedupeKey,
+} from "./interested";
 import {
   type AtsProvider,
   type CompanySearchTerm,
@@ -354,6 +361,11 @@ const ADDITIVE_COLUMNS = [
   "ALTER TABLE companies ADD COLUMN website_confidence INTEGER",
   // 0033_job_requirement_coverage.sql
   "ALTER TABLE profile_improvement_questions ADD COLUMN related_job_ids TEXT NOT NULL DEFAULT '[]'",
+  // 0034_job_analysis_followup.sql
+  "ALTER TABLE profile_improvement_questions ADD COLUMN confirmed_no INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE job_postings ADD COLUMN fit_score_previous INTEGER",
+  "ALTER TABLE job_postings ADD COLUMN fit_reason_previous TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE job_postings ADD COLUMN fit_reassessed_at TEXT",
 ];
 
 /**
@@ -2418,6 +2430,184 @@ async function retryJobRequirementCoverage(request: Request, env: Env, id: strin
   return json({ id, coverage_status: row?.status ?? "failed", coverage_unproven: unproven });
 }
 
+/**
+ * Recomputes a single Interested job's fit score/reason against the current profile, using the same
+ * assessJobFitBatch call the bulk pipeline uses (assessRowsBatched), just for one job instead of a
+ * batch. This is the "recompute the job's candidate-fit assessment after the updated Career Evidence
+ * Record has been integrated" step of the Analyze Job workflow: it only ever runs when the candidate
+ * explicitly re-analyzes a job (see reanalyzeJobAnalysis below), never automatically on every save,
+ * so the score only moves when newly captured evidence is actually re-read against the posting --
+ * not "because the user answered questions".
+ *
+ * The prior score/reason are preserved on fit_score_previous/fit_reason_previous so the workspace can
+ * show "72% -> 81%" rather than silently overwriting the number, per the spec's requirement to
+ * "preserve enough state to show that the new assessment is now, say, 81%, and explain what changed".
+ */
+async function recomputeJobFit(env: Env, provider: Provider, jobId: string, profileId: string): Promise<FitResult | null> {
+  const job = await env.DB.prepare(
+    "SELECT id, title, company, location, raw_description, fit_score, fit_reason FROM job_postings WHERE id = ?",
+  )
+    .bind(jobId)
+    .first<{ id: string; title: string; company: string; location: string; raw_description: string; fit_score: number | null; fit_reason: string }>();
+  if (!job) return null;
+
+  const profileRow = await env.DB.prepare(
+    "SELECT preferences_json, structured_json FROM candidate_profiles WHERE id = ?",
+  )
+    .bind(profileId)
+    .first<{ preferences_json: string; structured_json: string }>();
+  const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
+  if (!structured) return null;
+
+  const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
+  const disqualifiers = await loadDisqualifiers(env, profileId);
+  const dealbreakers = readDealbreakers(profileRow?.preferences_json ?? "{}");
+  const careAboutTopics = await ensureCareAboutTopics(env, provider, profileId, profileRow?.preferences_json ?? "{}");
+
+  const [result] = await assessJobFitBatch(
+    env, provider, renderCareerProfile(structured), desiredRoles, disqualifiers, dealbreakers, careAboutTopics,
+    [{ id: job.id, title: job.title, company: job.company, location: job.location, description: job.raw_description ?? "" }],
+  );
+  if (!result) return null;
+
+  const detail = { facts: result.facts };
+  await env.DB.prepare(
+    `UPDATE job_postings SET fit_score_previous = ?, fit_reason_previous = ?,
+     fit_status = ?, fit_score = ?, fit_reason = ?, fit_missing_json = ?, fit_detail_json = ?,
+     assessed_at = CURRENT_TIMESTAMP, fit_reassessed_at = CURRENT_TIMESTAMP WHERE id = ?`,
+  )
+    .bind(
+      job.fit_score, job.fit_reason ?? "",
+      verdictForScore(result.score), result.score, result.reason, JSON.stringify(result.missing), JSON.stringify(detail),
+      jobId,
+    )
+    .run();
+  return result;
+}
+
+/**
+ * One-stop read for the Interested-job workspace's Analyze tab: this job's cached requirement
+ * coverage (already computed by analyzeJobRequirementCoverage, never re-derived here -- rendering
+ * the page must not repeat LLM calls) plus the subset of Profile > Improve questions that concern
+ * this specific job, split into still-open (pending/answered) and confirmed-no (explicitly
+ * "I don't have this experience"), so the UI can keep those two states visually distinct per the
+ * spec's "We did not previously have evidence" vs "You confirmed you do not have this experience".
+ */
+async function getJobAnalysis(request: Request, env: Env, jobId: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const job = await env.DB.prepare(
+    `SELECT id, title, company, fit_score, fit_reason, fit_score_previous, fit_reason_previous, fit_reassessed_at
+     FROM job_postings WHERE id = ? AND manual_status = 'interested'`,
+  )
+    .bind(jobId)
+    .first<Record<string, unknown>>();
+  if (!job) return json({ error: "not_found" }, 404);
+
+  const coverageRow = await env.DB.prepare(
+    "SELECT status, plan_json, generated_at FROM job_requirement_coverage WHERE job_id = ?",
+  )
+    .bind(jobId)
+    .first<{ status: string; plan_json: string; generated_at: string }>();
+  let coverage: EvidencePlan | null = null;
+  if (coverageRow?.status === "ready") {
+    try {
+      coverage = JSON.parse(coverageRow.plan_json) as EvidencePlan;
+    } catch {
+      coverage = null;
+    }
+  }
+
+  const profileId = await getOrCreateProfileId(env);
+  const allRelevant = await env.DB.prepare(
+    `SELECT * FROM profile_improvement_questions
+     WHERE profile_id = ? AND status IN ('pending', 'answered', 'dismissed')
+     ORDER BY priority DESC, created_at ASC`,
+  )
+    .bind(profileId)
+    .all<ImproveQuestionRow>();
+  const forThisJob = (allRelevant.results ?? []).filter((q) => {
+    try {
+      return (JSON.parse(q.related_job_ids || "[]") as string[]).includes(jobId);
+    } catch {
+      return false;
+    }
+  });
+  const open = forThisJob.filter((q) => q.status === "pending" || q.status === "answered");
+  const confirmedGaps = forThisJob.filter((q) => q.status === "dismissed" && q.confirmed_no === 1);
+
+  return json({
+    job,
+    coverage_status: coverageRow?.status ?? "pending",
+    coverage_generated_at: coverageRow?.generated_at ?? null,
+    coverage: coverage ? { ...coverageSummary(coverage), items: coverage.coverage } : null,
+    questions: open,
+    confirmed_gaps: confirmedGaps,
+  });
+}
+
+/**
+ * "Re-analyze Job": integrates whatever answers the candidate has saved (server-side already, via
+ * saveImproveAnswer/dismissImproveQuestion -- the workspace never needs its own draft-buffering
+ * endpoint) into the canonical profile via the existing applyImproveAnswers pass, then recomputes
+ * this job's fit score against the now-updated profile. Reuses applyImproveAnswers rather than
+ * duplicating its integration logic; that call already re-runs requirement coverage for every
+ * Interested job an applied answer was tied to (including this one), so by the time recomputeJobFit
+ * runs, coverage is already current.
+ *
+ * If there is nothing answered yet, this just re-runs coverage + fit for the job as-is (equivalent
+ * to "Analyze Job" on a job that already has a coverage row) rather than erroring -- the primary
+ * button is the same action in both the first-analysis and re-analysis states.
+ */
+async function reanalyzeJobAnalysis(request: Request, env: Env, jobId: string): Promise<Response> {
+  const auth = await requireSession(request, env);
+  if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { provider?: string };
+  const provider = normalizeProvider(body.provider);
+  const keyError = providerKeyMissing(env, provider);
+  if (keyError) return json({ error: keyError }, 501);
+
+  const job = await env.DB.prepare("SELECT id FROM job_postings WHERE id = ? AND manual_status = 'interested'")
+    .bind(jobId)
+    .first<{ id: string }>();
+  if (!job) return json({ error: "not_found" }, 404);
+
+  const profileId = await getOrCreateProfileId(env);
+  const hasAnswers = await env.DB.prepare(
+    "SELECT 1 FROM profile_improvement_questions WHERE profile_id = ? AND status = 'answered' LIMIT 1",
+  )
+    .bind(profileId)
+    .first();
+  if (hasAnswers) {
+    const applyResponse = await applyImproveAnswers(
+      new Request(request.url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          cookie: request.headers.get("cookie") ?? "",
+          authorization: request.headers.get("authorization") ?? "",
+        },
+        body: JSON.stringify({ provider }),
+      }),
+      env,
+    );
+    if (!applyResponse.ok) return applyResponse;
+  } else {
+    // Nothing new to integrate -- still make sure coverage is current (covers the "Analyze Job"
+    // first-run case, and a manual retry after a prior analysis failure).
+    await analyzeJobRequirementCoverage(env, provider, jobId, profileId);
+  }
+
+  try {
+    await recomputeJobFit(env, provider, jobId, profileId);
+  } catch {
+    // Fit recompute failing must not undo the profile integration or coverage refresh above --
+    // the job keeps its previous score, retryable on the next Re-analyze.
+  }
+
+  return getJobAnalysis(request, env, jobId);
+}
+
 // Per-job "Ask" question/answer used to live here (reviewJobQuestion / listJobReview /
 // createJobReviewAnswer), asking a one-off clarifying question scoped to a single posting. Removed
 // in favor of centralizing all candidate-facing questions in Profile > Improve (see
@@ -4392,6 +4582,9 @@ type ImproveQuestionRow = {
   applied_at: string | null;
   /** JSON array of job_postings ids this question's gap was raised by -- see relatedJobIdsFor. */
   related_job_ids: string;
+  /** 1 when the candidate explicitly confirmed they lack this experience (as opposed to a plain
+   * skip/dismiss). See dismissImproveQuestion and the migration 0034 header comment. */
+  confirmed_no: number;
 };
 
 /**
@@ -4404,10 +4597,6 @@ async function profileVersionTag(structuredJson: string): Promise<string> {
   const bytes = new TextEncoder().encode(structuredJson);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest).slice(0, 8), (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function questionDedupeKey(entityType: string, entityId: string, targetField: string): string {
-  return `${entityType}|${entityId}|${targetField.trim().toLowerCase()}`;
 }
 
 async function loadOpenImproveQuestions(env: Env, profileId: string): Promise<ImproveQuestionRow[]> {
@@ -4553,8 +4742,12 @@ async function runImproveAudit(env: Env, profileId: string, provider: Provider):
   }
 
   const versionTag = await profileVersionTag(row?.structured_json ?? "{}");
-  const existingOpen = await loadOpenImproveQuestions(env, profileId);
-  const existingKeys = new Set(existingOpen.map((q) => questionDedupeKey(q.entity_type, q.entity_id, q.target_field)));
+  // Deliberately built from EVERY prior question (any status), not just the still-open ones: a
+  // dismissed or confirmed-no question must not be regenerated verbatim just because it no longer
+  // counts as "open". The prompt is also told not to re-ask resolved ground (priorState above), but
+  // that is a request, not a guarantee -- this is the deterministic backstop the spec requires
+  // ("a resolved negative or dismissed question must not simply be regenerated on the next pass").
+  const existingKeys = priorQuestionDedupeKeys(priorRows.results);
 
   let inserted = 0;
   for (const q of generated) {
@@ -4626,12 +4819,26 @@ async function saveImproveAnswer(request: Request, env: Env, questionId: string)
   return json({ question: updated });
 }
 
-/** Explicit dismiss -- "I don't remember" / "not applicable" / "don't want to add this" -- distinct
- * from simply leaving a question unanswered. Dismissed questions are excluded from the open set a
- * later audit is shown as still-pending, so they do not immediately resurface. */
+/**
+ * Explicit dismiss -- distinct from simply leaving a question unanswered, and split into two
+ * meanings the UI must never blur together (see the Interested-job workspace):
+ *
+ * - Plain skip/dismiss ("I don't remember" / "not applicable right now"): we simply never got
+ *   evidence either way. A later, better-targeted question about the same gap is still legitimate.
+ * - `no_experience: true` ("No, I don't have this"): the candidate affirmatively confirmed the gap.
+ *   This is a genuine qualification gap, not a missing-evidence problem, and must stay visibly
+ *   distinct rather than being silently treated the same as "not yet asked".
+ *
+ * Either way the question leaves the open set (excluded from loadOpenImproveQuestions) so it does
+ * not resurface on the next audit pass, and per the dedupe fix in runImproveAudit above, a
+ * questionDedupeKey match blocks the exact same question from being regenerated even after status
+ * changes underneath it.
+ */
 async function dismissImproveQuestion(request: Request, env: Env, questionId: string): Promise<Response> {
   const auth = await requireSession(request, env);
   if (auth instanceof Response) return auth;
+  const body = (await request.json().catch(() => ({}))) as { no_experience?: boolean };
+  const confirmedNo = body.no_experience === true;
   const profileId = await getOrCreateProfileId(env);
   const existing = await env.DB.prepare(
     "SELECT status FROM profile_improvement_questions WHERE id = ? AND profile_id = ?",
@@ -4641,10 +4848,12 @@ async function dismissImproveQuestion(request: Request, env: Env, questionId: st
   if (!existing) return json({ error: "question_not_found" }, 404);
   if (existing.status === "applied") return json({ error: "question_already_applied" }, 409);
 
-  await env.DB.prepare("UPDATE profile_improvement_questions SET status = 'dismissed' WHERE id = ?")
-    .bind(questionId)
+  await env.DB.prepare(
+    "UPDATE profile_improvement_questions SET status = 'dismissed', confirmed_no = ?, answered_at = CURRENT_TIMESTAMP WHERE id = ?",
+  )
+    .bind(confirmedNo ? 1 : 0, questionId)
     .run();
-  return json({ ok: true });
+  return json({ ok: true, confirmed_no: confirmedNo });
 }
 
 /**
@@ -7506,12 +7715,27 @@ const DASHBOARD_PAGE = `<!doctype html>
                once for every job that shares the gap instead of once per job -- see
                loadInterestedJobGaps/runImproveAudit in src/index.ts. -->
           <div class="subtabs">
-            <button id="interested-subtab-resume" type="button">Resume</button>
+            <button id="interested-subtab-analyze" type="button">Analyze</button>
+            <button id="interested-subtab-resume" class="secondary" type="button">Resume</button>
             <button id="interested-subtab-cover" class="secondary" type="button">Cover Letter</button>
             <button id="interested-subtab-apply" class="secondary" type="button">Apply</button>
           </div>
 
-          <div id="interested-resume-panel">
+          <div id="interested-analyze-panel">
+            <p class="hint">Analyze what this posting actually asks for, then check it against your Career Evidence Record. Weak or missing evidence turns into specific questions below -- answer what you can, then press the button again to fold your answers into your profile and re-check.</p>
+            <button id="interested-analyze-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Analyze Job</button>
+            <p id="interested-analyze-status" class="status" role="status" aria-live="polite"></p>
+
+            <div id="interested-analyze-fit" style="display:none"></div>
+
+            <div id="interested-analyze-requirements"></div>
+
+            <div id="interested-analyze-questions"></div>
+
+            <div id="interested-analyze-gaps"></div>
+          </div>
+
+          <div id="interested-resume-panel" style="display:none">
             <p id="interested-resume-status" class="status" role="status" aria-live="polite"></p>
             <button id="interested-resume-button" type="button"><span class="ai-icon" aria-hidden="true"></span>Generate tailored resume</button>
             <div id="interested-resume-section" style="display:none">
@@ -11143,11 +11367,17 @@ const DASHBOARD_PAGE = `<!doctype html>
     var activeInterestedResumeId = null;
     var resumeAutoLoadedForJob = false;
     var coverAutoLoadedForJob = false;
+    // Last /jobs/:id/analysis response for the open job's Analyze tab -- see loadJobAnalysis /
+    // renderJobAnalysis. Answers to individual questions save immediately (server-side, via the same
+    // per-question Save/No/Skip pattern Profile > Improve uses) but are not integrated into the
+    // profile until Analyze Job / Re-analyze Job is pressed again, so this cache just reflects what
+    // the last load or reanalyze call returned.
+    var jobAnalysis = null;
 
     // Ask (per-job clarifying question) used to live here as a fourth "assistant" subtab. Removed:
     // see the comment on the subtabs markup above for why, and jumpToImproveForJob further below
     // for what replaced it.
-    var INTERESTED_SUBTABS = ['resume', 'cover', 'apply'];
+    var INTERESTED_SUBTABS = ['analyze', 'resume', 'cover', 'apply'];
 
     function showInterestedSubtab(name) {
       INTERESTED_SUBTABS.forEach(function (tab) {
@@ -11161,6 +11391,7 @@ const DASHBOARD_PAGE = `<!doctype html>
     INTERESTED_SUBTABS.forEach(function (tab) {
       document.getElementById('interested-subtab-' + tab).addEventListener('click', function () {
         showInterestedSubtab(tab);
+        if (tab === 'analyze') loadJobAnalysis();
         if (tab === 'resume') maybeAutoLoadResume();
         if (tab === 'cover') maybeAutoLoadCoverLetter();
         // The bank is only ever fetched once at page load, so an answer saved since then (from the
@@ -11201,12 +11432,15 @@ const DASHBOARD_PAGE = `<!doctype html>
 
     function showInterestedDetail(job, inlineHost) {
       activeInterestedJobId = job.id;
-      showInterestedSubtab('resume');
+      showInterestedSubtab('analyze');
       var section = document.getElementById('interested-detail-section');
       inlineHost.appendChild(section);
       section.style.display = 'block';
-      // Resume and cover-letter state are per-job -- switching to a different job shouldn't carry
-      // over a preview that belonged to the last one.
+      // Analyze/Resume/Cover-letter state are all per-job -- switching to a different job shouldn't
+      // carry over an analysis or preview that belonged to the last one.
+      jobAnalysis = null;
+      renderJobAnalysis(null);
+      loadJobAnalysis();
       activeInterestedResumeId = null;
       resumeAutoLoadedForJob = false;
       document.getElementById('interested-resume-section').style.display = 'none';
@@ -11232,6 +11466,278 @@ const DASHBOARD_PAGE = `<!doctype html>
       if (currentSubtab === 'resume') maybeAutoLoadResume();
       if (currentSubtab === 'cover') maybeAutoLoadCoverLetter();
     }
+
+    // ---------------------------------------------------------------------
+    // Interested-job "Analyze Job" tab: requirements/coverage, this job's evidence questions, and
+    // the fit-score result. Mirrors Profile > Improve's answer/dismiss pattern (individual answers
+    // save immediately server-side as 'answered', nothing touches the canonical profile until the
+    // main action runs) rather than a second, page-local draft-buffering system.
+    // ---------------------------------------------------------------------
+
+    var analyzeBusy = false;
+
+    function analyzeStatusEl() { return document.getElementById('interested-analyze-status'); }
+
+    async function loadJobAnalysis() {
+      if (!activeInterestedJobId) return;
+      var jobId = activeInterestedJobId;
+      try {
+        var res = await api('/jobs/' + encodeURIComponent(jobId) + '/analysis');
+        var data = await requireJsonResponse(res, 'load_failed');
+        if (activeInterestedJobId !== jobId) return; // switched jobs while this was in flight
+        jobAnalysis = data;
+        renderJobAnalysis(data);
+      } catch (err) {
+        analyzeStatusEl().textContent = 'Error: ' + err.message;
+        analyzeStatusEl().className = 'status error';
+      }
+    }
+
+    function coverageStatusLabel(status) {
+      if (status === 'proven') return 'Supported';
+      if (status === 'partial') return 'Partially supported';
+      return 'Not yet shown';
+    }
+
+    function coverageKindLabel(kind) {
+      if (kind === 'must_have') return 'Required';
+      if (kind === 'preferred') return 'Preferred';
+      if (kind === 'competency') return 'Competency';
+      return 'Responsibility';
+    }
+
+    function renderAnalyzeRequirements(coverage) {
+      var host = document.getElementById('interested-analyze-requirements');
+      host.innerHTML = '';
+      if (!coverage || !coverage.items || !coverage.items.length) return;
+      host.appendChild(el('h3', { textContent: 'Requirements & evidence' }));
+      host.appendChild(el('p', {
+        className: 'hint',
+        textContent: coverage.proven + ' clearly supported, ' + coverage.partial + ' partially supported, ' +
+          coverage.unproven + ' with no evidence yet, based on your Career Evidence Record.',
+      }));
+      // Important first: must_have requirements before responsibility/preferred/competency, and
+      // within a kind, the ones with the least evidence first -- that is exactly what the candidate
+      // needs to look at, and what the questions below are about.
+      var kindRank = { must_have: 0, responsibility: 1, competency: 2, preferred: 3 };
+      var statusRank = { unproven: 0, partial: 1, proven: 2 };
+      var items = coverage.items.slice().sort(function (a, b) {
+        var kd = (kindRank[a.kind] ?? 9) - (kindRank[b.kind] ?? 9);
+        if (kd) return kd;
+        return (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9);
+      });
+      var list = el('div', { className: 'profile-card-list' });
+      items.forEach(function (item) {
+        var badgeStyle = item.status === 'proven' ? 'background:var(--success,#2e7d32);color:#fff'
+          : item.status === 'partial' ? 'background:var(--accent);color:#fff' : '';
+        var row = el('div', { className: 'row-item' }, [
+          el('div', { className: 'row-title-line', style: 'display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap' }, [
+            el('span', { className: 'badge', textContent: coverageKindLabel(item.kind) }),
+            el('span', { className: 'badge', style: badgeStyle, textContent: coverageStatusLabel(item.status) }),
+            el('span', { className: 'row-title', textContent: item.requirement }),
+          ]),
+        ]);
+        // Never fabricated: this is exactly the evidence text planEvidence pulled from the
+        // candidate's own profile for this requirement, never a claim invented for the occasion.
+        if (item.evidence) row.appendChild(el('p', { className: 'row-meta', textContent: item.evidence }));
+        list.appendChild(row);
+      });
+      host.appendChild(list);
+    }
+
+    function renderAnalyzeFit(job) {
+      var host = document.getElementById('interested-analyze-fit');
+      host.innerHTML = '';
+      if (!job || job.fit_score === null || job.fit_score === undefined) { host.style.display = 'none'; return; }
+      host.style.display = '';
+      var line = job.fit_score + '% match';
+      if (job.fit_reassessed_at && job.fit_score_previous !== null && job.fit_score_previous !== undefined) {
+        line += job.fit_score_previous === job.fit_score
+          ? ' (unchanged after re-analysis)'
+          : ' (was ' + job.fit_score_previous + '% before re-analysis)';
+      }
+      host.appendChild(el('p', { className: 'row-title', textContent: line }));
+      if (job.fit_reason) host.appendChild(el('p', { className: 'row-meta', textContent: job.fit_reason }));
+    }
+
+    /** One evidence-discovery question, scoped to this job. "No" and "Skip" are deliberately
+     * different actions -- see dismissImproveQuestion in src/index.ts -- because a confirmed "I
+     * don't have this" is a real, durable qualification gap, while a skip just leaves the question
+     * open to come back to. */
+    function renderAnalyzeQuestionCard(question) {
+      var card = el('div', { className: 'profile-card' });
+      var titleRow = el('div', { className: 'row-title-line', style: 'display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap' });
+      titleRow.appendChild(el('span', { className: 'badge', textContent: improveCategoryLabel(question.category) }));
+      if (question.status === 'answered') titleRow.appendChild(el('span', { className: 'badge', textContent: 'Answered', style: 'background:var(--success,#2e7d32);color:#fff' }));
+      card.appendChild(titleRow);
+      card.appendChild(el('p', { className: 'row-title', textContent: question.question, style: 'margin-top:0.4rem' }));
+      if (question.why_it_matters) {
+        card.appendChild(el('p', { className: 'row-meta', textContent: 'Why it matters: ' + question.why_it_matters }));
+      }
+      var textarea = el('textarea', { placeholder: 'Your answer…', value: question.answer || '', style: 'min-height:4.5rem' });
+      card.appendChild(textarea);
+      var actions = el('div', { className: 'row-actions', style: 'margin-top:0.5rem;flex-wrap:wrap' });
+      var statusMsg = el('span', { className: 'status' });
+
+      var saveBtn = el('button', { type: 'button', textContent: question.status === 'answered' ? 'Update Answer' : 'Save' });
+      saveBtn.addEventListener('click', async function () {
+        var value = textarea.value.trim();
+        if (!value) { statusMsg.textContent = 'Enter an answer first.'; statusMsg.className = 'status error'; return; }
+        saveBtn.disabled = true;
+        try {
+          var res = await api('/profile/improve/questions/' + encodeURIComponent(question.id), {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ answer: value }),
+          });
+          var data = await requireJsonResponse(res, 'save_failed');
+          question.status = data.question.status;
+          question.answer = data.question.answer;
+          statusMsg.textContent = 'Saved -- press ' + analyzeButtonLabel() + ' to fold this into your profile.';
+          statusMsg.className = 'status success';
+          updateAnalyzeButton();
+        } catch (err) {
+          statusMsg.textContent = 'Error: ' + err.message;
+          statusMsg.className = 'status error';
+          saveBtn.disabled = false;
+        }
+      });
+
+      var noBtn = el('button', { type: 'button', className: 'secondary', textContent: "No, I don't have this" });
+      noBtn.addEventListener('click', async function () {
+        noBtn.disabled = true;
+        try {
+          await api('/profile/improve/questions/' + encodeURIComponent(question.id) + '/dismiss', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ no_experience: true }),
+          });
+          await loadJobAnalysis();
+        } catch (err) {
+          statusMsg.textContent = 'Error: ' + err.message;
+          statusMsg.className = 'status error';
+          noBtn.disabled = false;
+        }
+      });
+
+      var skipBtn = el('button', { type: 'button', className: 'secondary', textContent: 'Skip for now' });
+      skipBtn.addEventListener('click', async function () {
+        skipBtn.disabled = true;
+        try {
+          await api('/profile/improve/questions/' + encodeURIComponent(question.id) + '/dismiss', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ no_experience: false }),
+          });
+          await loadJobAnalysis();
+        } catch (err) {
+          statusMsg.textContent = 'Error: ' + err.message;
+          statusMsg.className = 'status error';
+          skipBtn.disabled = false;
+        }
+      });
+
+      actions.appendChild(saveBtn);
+      actions.appendChild(noBtn);
+      actions.appendChild(skipBtn);
+      card.appendChild(actions);
+      card.appendChild(statusMsg);
+      return card;
+    }
+
+    function renderAnalyzeQuestions(questions) {
+      var host = document.getElementById('interested-analyze-questions');
+      host.innerHTML = '';
+      if (!questions || !questions.length) return;
+      host.appendChild(el('h3', { textContent: 'Evidence questions for this job' }));
+      host.appendChild(el('p', {
+        className: 'hint',
+        textContent: 'These come from your Career Evidence Record, not a generic checklist -- answer what applies, ' +
+          'say no where it genuinely doesn\'t, or skip and come back later.',
+      }));
+      questions.forEach(function (q) { host.appendChild(renderAnalyzeQuestionCard(q)); });
+    }
+
+    /** Confirmed gaps stay visible on purpose -- "you confirmed you do not have this experience" is a
+     * genuine qualification gap, not something a later pass should quietly re-ask or hide. */
+    function renderAnalyzeGaps(gaps) {
+      var host = document.getElementById('interested-analyze-gaps');
+      host.innerHTML = '';
+      if (!gaps || !gaps.length) return;
+      host.appendChild(el('h3', { textContent: 'Confirmed gaps' }));
+      host.appendChild(el('p', { className: 'hint', textContent: "You told ApplyGo you don't have these -- they won't be re-asked." }));
+      gaps.forEach(function (q) {
+        host.appendChild(el('div', { className: 'row-item' }, [
+          el('p', { className: 'row-title', textContent: q.question }),
+          el('p', { className: 'row-meta', textContent: q.entity_label || improveCategoryLabel(q.category) }),
+        ]));
+      });
+    }
+
+    function analyzeButtonLabel() {
+      return jobAnalysis && jobAnalysis.coverage_status === 'ready' ? 'Re-analyze Job' : 'Analyze Job';
+    }
+
+    function updateAnalyzeButton() {
+      var button = document.getElementById('interested-analyze-button');
+      if (!button) return;
+      button.textContent = analyzeBusy ? 'Analyzing…' : analyzeButtonLabel();
+      button.disabled = analyzeBusy;
+    }
+
+    function renderJobAnalysis(data) {
+      updateAnalyzeButton();
+      if (!data) {
+        document.getElementById('interested-analyze-fit').style.display = 'none';
+        document.getElementById('interested-analyze-requirements').innerHTML = '';
+        document.getElementById('interested-analyze-questions').innerHTML = '';
+        document.getElementById('interested-analyze-gaps').innerHTML = '';
+        analyzeStatusEl().textContent = '';
+        return;
+      }
+      renderAnalyzeFit(data.job);
+      renderAnalyzeRequirements(data.coverage);
+      renderAnalyzeQuestions(data.questions);
+      renderAnalyzeGaps(data.confirmed_gaps);
+      if (data.coverage_status === 'pending') {
+        analyzeStatusEl().textContent = 'Not analyzed yet -- press Analyze Job to read this posting\'s requirements against your profile.';
+        analyzeStatusEl().className = 'status';
+      } else if (data.coverage_status === 'failed') {
+        analyzeStatusEl().textContent = 'The last analysis attempt failed. Press Analyze Job to retry.';
+        analyzeStatusEl().className = 'status error';
+      } else {
+        analyzeStatusEl().textContent = '';
+      }
+    }
+
+    document.getElementById('interested-analyze-button').addEventListener('click', async function () {
+      if (!activeInterestedJobId || analyzeBusy) return;
+      var jobId = activeInterestedJobId;
+      analyzeBusy = true;
+      updateAnalyzeButton();
+      analyzeStatusEl().textContent = 'Analyzing…';
+      analyzeStatusEl().className = 'status';
+      try {
+        var providerEl = document.getElementById('jobs-provider');
+        var res = await api('/jobs/' + encodeURIComponent(jobId) + '/analysis/reanalyze', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ provider: providerEl ? providerEl.value : undefined }),
+        });
+        var data = await requireJsonResponse(res, 'analyze_failed');
+        if (activeInterestedJobId === jobId) {
+          jobAnalysis = data;
+          renderJobAnalysis(data);
+        }
+        await loadJobs();
+      } catch (err) {
+        analyzeStatusEl().textContent = 'Error: ' + err.message;
+        analyzeStatusEl().className = 'status error';
+      } finally {
+        analyzeBusy = false;
+        updateAnalyzeButton();
+      }
+    });
 
     function renderAppliedList() {
       var list = document.getElementById('applied-list');
@@ -12500,6 +13006,12 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     // defined.
     const jobRequirementsRetryMatch = url.pathname.match(/^\/jobs\/([^/]+)\/requirement-coverage\/retry$/);
     if (request.method === "POST" && jobRequirementsRetryMatch) return retryJobRequirementCoverage(request, env, jobRequirementsRetryMatch[1]);
+
+    const jobAnalysisMatch = url.pathname.match(/^\/jobs\/([^/]+)\/analysis$/);
+    if (request.method === "GET" && jobAnalysisMatch) return getJobAnalysis(request, env, jobAnalysisMatch[1]);
+
+    const jobReanalyzeMatch = url.pathname.match(/^\/jobs\/([^/]+)\/analysis\/reanalyze$/);
+    if (request.method === "POST" && jobReanalyzeMatch) return reanalyzeJobAnalysis(request, env, jobReanalyzeMatch[1]);
     const jobResumeMatch = url.pathname.match(/^\/jobs\/([^/]+)\/resume$/);
     if (request.method === "POST" && jobResumeMatch) return buildJobResume(request, env, jobResumeMatch[1]);
     const jobCoverLetterMatch = url.pathname.match(/^\/jobs\/([^/]+)\/cover-letter$/);
