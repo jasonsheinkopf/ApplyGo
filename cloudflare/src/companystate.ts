@@ -49,7 +49,25 @@ export type JobSourceStatus =
   /** Site reachable, no hiring surface found on it at all. */
   | "no_board"
   /** A known board that failed to respond. Usually transient. */
-  | "board_unreachable";
+  | "board_unreachable"
+  /**
+   * A fetch in this company's discovery hit deterministic evidence of a CAPTCHA, a Cloudflare/JS
+   * challenge, a login wall, or another deliberate access restriction -- see companies.ts's
+   * classifyFetchFailure and its FailureReason type for the specific evidence markers. Kept distinct
+   * from board_unreachable (a live board that simply errored) and no_board (nothing found at all):
+   * this is the "ApplyGo genuinely cannot access it" bucket the product brief asks to be able to
+   * tell apart from "the site is fine and our resolver is broken."
+   */
+  | "access_blocked";
+
+/**
+ * How the currently-stored website/board was found. Purely descriptive metadata -- reconciliation
+ * doesn't branch on it -- but persisted so a developer (or the Companies pipeline debug view) can
+ * see *how* ApplyGo got here without digging through scan_note prose: did this come from a database
+ * hit that needed no rediscovery at all, a direct ATS-provider sweep that never touched the
+ * company's website, the website/careers-page waterfall, or the paid web-search fallback.
+ */
+export type DiscoveryMethod = "" | "reuse" | "direct_ats" | "website" | "search" | "manual";
 
 export type CompanyState = {
   identity: IdentityStatus;
@@ -60,6 +78,11 @@ export type CompanyState = {
   boardUrl: string;
   atsProvider: string;
   atsToken: string;
+  /** Structured diagnostic for why the current jobSource is what it is, when it's a failure state.
+   *  See companies.ts's FailureReason for the taxonomy. Empty string when not applicable (e.g.
+   *  jobSource is "supported") or not known. */
+  failureReason: string;
+  discoveryMethod: DiscoveryMethod;
 };
 
 /** An identity state from which reading jobs is even meaningful. */
@@ -88,11 +111,15 @@ export function isScannable(state: Pick<CompanyState, "identity" | "jobSource">)
 export function stateViolations(state: CompanyState): string[] {
   const problems: string[] = [];
 
-  if (state.identity === "verified" && !state.website) {
-    problems.push("identity is verified but no website is stored");
+  if (state.identity === "verified" && !state.website && !state.boardUrl) {
+    // A verified identity needs *some* confirming evidence -- but that evidence can be a verified
+    // ATS board just as validly as a website. "The official website is useful evidence and useful
+    // metadata, but it is not the target" -- website_url == null must never by itself invalidate an
+    // otherwise-verified ATS.
+    problems.push("identity is verified but neither a website nor a board URL is stored");
   }
-  if (state.identity === "unresolved" && state.website) {
-    problems.push("identity is unresolved but a website is stored");
+  if (state.identity === "unresolved" && (state.website || state.boardUrl)) {
+    problems.push("identity is unresolved but a website or board URL is stored");
   }
   // The exact contradiction from the reported UI: a board URL displayed next to "no job board".
   if (state.jobSource === "no_board" && state.boardUrl) {
@@ -136,14 +163,15 @@ export function reconcileCompanyState(input: CompanyState): { state: CompanyStat
     return { state, repaired };
   }
 
-  if (state.identity === "verified" && !state.website) {
+  if (state.identity === "verified" && !state.website && !state.boardUrl) {
     state.identity = "unresolved";
-    repaired.push("verified without a website -> unresolved");
+    repaired.push("verified without a website or board URL -> unresolved");
   }
-  if (state.identity === "unresolved" && state.website) {
-    // A website is present, so this is at worst ambiguous, never "we found nothing".
+  if (state.identity === "unresolved" && (state.website || state.boardUrl)) {
+    // Evidence (a website or a verified board) is present, so this is at worst ambiguous, never
+    // "we found nothing".
     state.identity = "ambiguous";
-    repaired.push("unresolved despite a stored website -> ambiguous");
+    repaired.push("unresolved despite stored website/board evidence -> ambiguous");
   }
 
   // Job source only exists downstream of a verified identity.
@@ -201,6 +229,7 @@ export const JOB_SOURCE_LABELS: Record<JobSourceStatus, string> = {
   careers_only: "Careers page only",
   no_board: "No job board found",
   board_unreachable: "Board unavailable",
+  access_blocked: "Access blocked (CAPTCHA/challenge)",
 };
 
 /** Why a company sits where it does, for the detail view. */
@@ -232,5 +261,7 @@ export function explainState(state: Pick<CompanyState, "identity" | "jobSource" 
       return "Website confirmed, but no job board or careers page could be found on it.";
     case "board_unreachable":
       return "Website and job board confirmed, but reading the board failed. This is usually temporary and is retried.";
+    case "access_blocked":
+      return "A board or careers page was found, but the request was blocked by a CAPTCHA, a Cloudflare/JS challenge, or a login wall -- this is ApplyGo being unable to reach the page, not a defect in the employer's listing.";
   }
 }

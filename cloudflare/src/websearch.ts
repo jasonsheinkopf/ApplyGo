@@ -12,10 +12,22 @@
 
 import { type LlmEnv, callWithWebSearch } from "./llm.ts";
 import { getManagedPrompt } from "./langfuse.ts";
+import { atsDisplayName, ATS_SWEEP_PROVIDER_ORDER } from "./companies.ts";
+import { COMPANIES_RESOLVE_WEBSITE_PROMPT } from "./prompts.ts";
 
 export type WebsiteResolution = {
   official_website: string;
   careers_url: string;
+  /**
+   * A specific ATS/job-board URL the search turned up (e.g. a Greenhouse or Lever board page),
+   * proposed independent of whether official_website was found. This is the "propose" half of
+   * "model proposes, deterministic code verifies": index.ts's scanOneCompany never trusts this
+   * directly, and only accepts it once detectAtsFromUrl recognizes a supported provider AND the
+   * board's own public page confirms this employer's name via resolver.ts's scoreSiteMatch -- the
+   * exact discipline every other guessed candidate in this app already goes through. Empty string
+   * when search found no plausible board.
+   */
+  ats_board_url: string;
   confidence: number;
   reason: string;
 };
@@ -31,6 +43,12 @@ export const WEBSITE_RESOLUTION_SCHEMA = {
       type: "string",
       description: "Their careers/jobs page URL if you found one during search, else empty string.",
     },
+    ats_board_url: {
+      type: "string",
+      description:
+        "A specific job-board/ATS URL for this exact employer if search found one (e.g. https://job-boards.greenhouse.io/acme, " +
+        "https://jobs.lever.co/acme) -- even if you could not confirm their official homepage. Empty string if none found.",
+    },
     confidence: {
       type: "integer",
       minimum: 0,
@@ -42,7 +60,7 @@ export const WEBSITE_RESOLUTION_SCHEMA = {
       description: "One sentence citing what specifically confirmed the match, or explaining why you're unsure.",
     },
   },
-  required: ["official_website", "careers_url", "confidence", "reason"],
+  required: ["official_website", "careers_url", "ats_board_url", "confidence", "reason"],
 } as const;
 
 export type CompanyEvidence = { name: string; location: string; signal: string };
@@ -57,11 +75,18 @@ export type CompanyEvidence = { name: string; location: string; signal: string }
 export async function resolveWebsiteViaSearch(env: LlmEnv, evidence: CompanyEvidence): Promise<WebsiteResolution | null> {
   if (!env.ANTHROPIC_API_KEY) return null;
   try {
-    const prompt = await getManagedPrompt(env, "companies/resolve_website", {
-      company_name: evidence.name,
-      location: evidence.location || "not specified",
-      signal: evidence.signal || "not specified",
-    });
+    const atsProviders = ATS_SWEEP_PROVIDER_ORDER.map((p) => atsDisplayName(p)).join(", ");
+    const prompt = await getManagedPrompt(
+      env,
+      "companies/resolve_website",
+      {
+        company_name: evidence.name,
+        location: evidence.location || "not specified",
+        signal: evidence.signal || "not specified",
+        ats_providers: atsProviders,
+      },
+      COMPANIES_RESOLVE_WEBSITE_PROMPT,
+    );
     const result = await callWithWebSearch<WebsiteResolution>(
       env,
       "companies.resolve_website",
@@ -74,6 +99,7 @@ export async function resolveWebsiteViaSearch(env: LlmEnv, evidence: CompanyEvid
     return {
       official_website: String(result.official_website ?? "").trim(),
       careers_url: String(result.careers_url ?? "").trim(),
+      ats_board_url: String(result.ats_board_url ?? "").trim(),
       confidence: Number.isFinite(result.confidence) ? Math.max(0, Math.min(100, Math.round(result.confidence))) : 0,
       reason: String(result.reason ?? "").trim(),
     };

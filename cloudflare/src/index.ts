@@ -73,8 +73,10 @@ import {
 import {
   type AtsProvider,
   type CompanySearchTerm,
+  type FailureReason,
   type VerifyReason,
   atsDisplayName,
+  boardUrlFor,
   companyNameKey,
   detectAtsFromUrl,
   companySearchTermsFromTitles,
@@ -95,12 +97,14 @@ import { resolveWebsiteViaSearch } from "./websearch";
 import { companyIdentity, isNonCompanyName } from "./identity";
 import { PRESCREEN_PREDICATE, companyFunnel, companyToJobHandoff, funnelViolations } from "./pipeline";
 import {
+  type DiscoveryMethod,
   type IdentityStatus,
   type JobSourceStatus,
   isScannable,
   reconcileCompanyState,
 } from "./companystate";
-import { CONFIDENCE_FLOOR, type DiscoveryEvidence, resolveWebsiteDeterministic, verifyCandidate } from "./resolver";
+import { CONFIDENCE_FLOOR, type DiscoveryEvidence, resolveWebsiteDeterministic, scoreSiteMatch, verifyCandidate } from "./resolver";
+import { ATS_IDENTITY_FLOOR, sweepAtsProviders } from "./atsdiscovery";
 
 import {
   CARE_ABOUT_TOPICS_SCHEMA,
@@ -366,6 +370,10 @@ const ADDITIVE_COLUMNS = [
   "ALTER TABLE job_postings ADD COLUMN fit_score_previous INTEGER",
   "ALTER TABLE job_postings ADD COLUMN fit_reason_previous TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE job_postings ADD COLUMN fit_reassessed_at TEXT",
+  // 0035_ats_direct_discovery.sql
+  "ALTER TABLE companies ADD COLUMN failure_reason TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE companies ADD COLUMN discovery_method TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE companies ADD COLUMN ats_verified_at TEXT",
 ];
 
 /**
@@ -2050,6 +2058,7 @@ async function companiesPipelineCounts(env: Env, profileId: string): Promise<Rec
     identity_unresolved: 0, identity_not_a_company: 0, identity_dismissed: 0,
     source_pending: 0, source_supported: 0, source_unsupported_ats: 0,
     source_careers_only: 0, source_no_board: 0, source_board_unreachable: 0,
+    source_access_blocked: 0,
   };
   let total = 0;
   for (const row of rows.results ?? []) {
@@ -2630,7 +2639,8 @@ async function listCompanies(request: Request, env: Env): Promise<Response> {
     `SELECT id, name, source_name, website, careers_url, board_url, bio, ats_provider, source,
             identity_status, job_source_status, status, verify_reason,
             scan_note, last_scanned_at, last_verified_at, job_source_checked_at, open_jobs,
-            created_at, signal, location, website_source, website_confidence, website_evidence
+            created_at, signal, location, website_source, website_confidence, website_evidence,
+            failure_reason, discovery_method, ats_verified_at
      FROM companies WHERE profile_id = ? ORDER BY name COLLATE NOCASE ASC`,
   )
     .bind(profileId)
@@ -2700,6 +2710,8 @@ async function addCompanyRow(
     boardUrl: company.boardUrl ?? "",
     atsProvider: "",
     atsToken: "",
+    failureReason: "",
+    discoveryMethod: "",
   });
 
   const result = await env.DB.prepare(
@@ -3380,6 +3392,12 @@ async function writeCompanyState(
     careersUrl?: string;
     scanNote?: string;
     touchScanned?: boolean;
+    /** Structured diagnostic for a failure jobSource -- see companies.ts's FailureReason. Written
+     *  unconditionally (including as '', to clear a stale reason on success), unlike the
+     *  COALESCE-if-empty fields below, since a failure reason that used to apply and no longer does
+     *  is itself information worth persisting accurately. */
+    failureReason?: string;
+    discoveryMethod?: DiscoveryMethod;
   },
 ): Promise<{ identity: IdentityStatus; jobSource: JobSourceStatus; repaired: string[] }> {
   const { state, repaired } = reconcileCompanyState({
@@ -3391,6 +3409,8 @@ async function writeCompanyState(
     boardUrl: desired.boardUrl ?? "",
     atsProvider: desired.atsProvider ?? "",
     atsToken: desired.atsToken ?? "",
+    failureReason: desired.failureReason ?? "",
+    discoveryMethod: desired.discoveryMethod ?? "",
   });
 
   await env.DB.prepare(
@@ -3405,6 +3425,9 @@ async function writeCompanyState(
        ats_token = COALESCE(NULLIF(?, ''), ats_token),
        careers_url = COALESCE(NULLIF(?, ''), careers_url),
        scan_note = COALESCE(NULLIF(?, ''), scan_note),
+       failure_reason = ?,
+       discovery_method = COALESCE(NULLIF(?, ''), discovery_method),
+       ats_verified_at = CASE WHEN ? != '' THEN CURRENT_TIMESTAMP ELSE ats_verified_at END,
        last_verified_at = CURRENT_TIMESTAMP,
        job_source_checked_at = CURRENT_TIMESTAMP,
        last_scanned_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_scanned_at END,
@@ -3425,28 +3448,15 @@ async function writeCompanyState(
       state.atsToken,
       desired.careersUrl ?? "",
       desired.scanNote ?? "",
+      state.failureReason,
+      state.discoveryMethod,
+      state.atsProvider,
       desired.touchScanned === false ? 0 : 1,
       companyId,
     )
     .run();
 
   return { identity: state.identity, jobSource: state.jobSource, repaired };
-}
-
-/** The public board URL for a resolved provider/token pair. One definition, so a board link and a
- *  board read can never disagree about where the board is. */
-function boardUrlFor(provider: AtsProvider, token: string): string {
-  switch (provider) {
-    case "greenhouse": return `https://job-boards.greenhouse.io/${token}`;
-    case "lever": return `https://jobs.lever.co/${token}`;
-    case "ashby": return `https://jobs.ashbyhq.com/${token}`;
-    case "smartrecruiters": return `https://careers.smartrecruiters.com/${token}`;
-    case "workday": {
-      const [tenant, pod, site] = token.split("|");
-      return tenant && pod && site ? `https://${tenant}.${pod}.myworkdayjobs.com/${site}` : "";
-    }
-    default: return token.includes(".") ? `https://${token}` : "";
-  }
 }
 
 async function scanOneCompany(
@@ -3457,135 +3467,222 @@ async function scanOneCompany(
   budget: { remaining: number },
   titleTerms: string[] = [],
 ): Promise<{ jobs: number; newJobs: number; note: string; status: "verified" | "unverified" }> {
-  // No website at all -- nothing for resolveBoard to even try. Can happen for a manually-added
-  // company with just a name, a discovered row that reached this query before its domain
-  // resolution ever ran, or a company the deterministic slug-guess in discoverCompanies couldn't
-  // place. Only ever tried once per company (gated on last_scanned_at being unset) -- the search
-  // fallback costs real money, so it isn't worth re-attempting on every single Find companies click
-  // the way the free deterministic paths are; a manual "Save website" fix remains available
-  // regardless of how this attempt goes.
-  if (!company.website) {
-    // Free deterministic waterfall first (cleaned-name candidates, each confirmed against what the
-    // page says about itself). It runs on every scan, because it costs nothing beyond a couple of
-    // HTTP requests and a company unresolvable last week may be resolvable today. `budget` is
-    // passed through so its fetches count against the same shared cap resolveBoard below already
-    // respects -- previously this ran unmetered and could burn well past the tracked budget on a
-    // batch with many not-yet-resolved companies (up to ~10 real fetches each), which is what
-    // actually blew through Cloudflare's own subrequest cap even after that cap was lowered.
-    const deterministic = await resolveWebsiteDeterministic(
-      { name: company.name, location: company.location, signal: company.signal },
-      budget,
-    );
-    if (deterministic.status === "resolved") {
-      await writeCompanyState(env, company.id, {
-        identity: "verified",
-        jobSource: "pending",
-        website: deterministic.website,
-        websiteConfidence: deterministic.confidence,
-        websiteEvidence: deterministic.evidence,
-        websiteSource: deterministic.source,
-        scanNote: "Website confirmed; checking its job board next.",
-        touchScanned: false,
-      });
-      company = { ...company, website: deterministic.website };
-    } else if (!company.last_scanned_at && budget.remaining > 1) {
-      // Paid, search-grounded fallback. Only on a company's first scan: it costs real money, so it
-      // is not worth re-spending on every click the way the free paths above are. Manual entry
-      // stays available regardless of how this goes. Also skipped once the shared fetch budget is
-      // nearly spent -- the LLM call itself plus the verifyCandidate re-check below are each a real
-      // subrequest, so this needs at least 2 remaining to be worth starting.
-      budget.remaining -= 1;
-      const found = await resolveWebsiteViaSearch(env, { name: company.name, location: company.location, signal: company.signal });
-      if (found && found.official_website && found.confidence >= WEBSITE_SEARCH_CONFIDENCE_FLOOR) {
-        // Never trusted on the model's word: the proposed URL is re-verified against real page
-        // evidence, exactly like a guessed one.
-        const confirmed = await verifyCandidate(company.name, found.official_website, budget);
-        if (confirmed && confirmed.score >= CONFIDENCE_FLOOR) {
+  let provider = company.ats_provider as AtsProvider | "" | "none";
+  let token = company.ats_token;
+  const hasKnownAts = Boolean(provider) && provider !== "none";
+
+  // 1) Reuse known data first. An already-resolved ATS mapping -- readable or not -- needs no
+  // rediscovery, and this now runs *before* anything about the website: the ATS is the actual
+  // discovery target (see this file's header), the website is corroborating evidence, not a
+  // prerequisite. Previously this reuse check only ever ran downstream of a website already being
+  // confirmed (it sat after the `if (!company.website) return ...` guard below), so a company with
+  // a perfectly good saved Greenhouse token but no stored website was reported "unresolved" on
+  // every single scan and its own saved board was never read.
+  if (!hasKnownAts) {
+    // 2) Direct ATS discovery, every readable provider ApplyGo supports, bounded and budget-aware --
+    // "does this employer have a board on Greenhouse? Lever? Ashby? SmartRecruiters? ..." asked
+    // systematically, independent of whether a website is known. See atsdiscovery.ts.
+    let sweepReason: FailureReason = "";
+    let sweepRejected: { provider: AtsProvider; token: string; boardUrl: string; bestScore: number } | undefined;
+    if (budget.remaining > 1) {
+      const sweep = await sweepAtsProviders(
+        { name: company.name, urls: [company.careers_url, company.board_url].filter((u): u is string => Boolean(u)) },
+        budget,
+      );
+      if (sweep.status === "found") {
+        provider = sweep.provider;
+        token = sweep.token;
+        await writeCompanyState(env, company.id, {
+          identity: "verified",
+          jobSource: "pending",
+          boardUrl: sweep.boardUrl,
+          atsProvider: sweep.provider,
+          atsToken: sweep.token,
+          websiteEvidence: sweep.evidence,
+          discoveryMethod: "direct_ats",
+          scanNote: `Found their ${atsDisplayName(sweep.provider)} board directly (confidence ${sweep.confidence}); reading it next.`,
+          touchScanned: false,
+        });
+      } else {
+        sweepReason = sweep.reason;
+        sweepRejected = sweep.rejectedCandidate;
+      }
+    }
+
+    // 3) The website/careers-page route -- one way to find the ATS now, not a prerequisite for
+    // success. Only reached when the direct sweep above didn't already produce a verified board.
+    if (!provider || provider === "none") {
+      if (!company.website) {
+        // Free deterministic waterfall first (cleaned-name candidates, each confirmed against what
+        // the page says about itself). Runs on every scan -- a company unresolvable last week may
+        // be resolvable today, and it costs nothing beyond a couple of metered HTTP requests.
+        const deterministic = await resolveWebsiteDeterministic(
+          { name: company.name, location: company.location, signal: company.signal },
+          budget,
+        );
+        if (deterministic.status === "resolved") {
           await writeCompanyState(env, company.id, {
             identity: "verified",
             jobSource: "pending",
-            website: confirmed.url,
-            websiteConfidence: confirmed.score,
-            websiteEvidence: `search: ${found.reason} | confirmed: ${confirmed.evidence}`,
-            websiteSource: "search",
-            careersUrl: found.careers_url || "",
-            scanNote: "Website found by search and confirmed; checking its job board next.",
+            website: deterministic.website,
+            websiteConfidence: deterministic.confidence,
+            websiteEvidence: deterministic.evidence,
+            websiteSource: deterministic.source,
+            discoveryMethod: "website",
+            scanNote: "Website confirmed; checking its job board next.",
             touchScanned: false,
           });
-          company = { ...company, website: confirmed.url, careers_url: found.careers_url || company.careers_url };
-        } else {
+          company = { ...company, website: deterministic.website };
+        } else if (!company.last_scanned_at && budget.remaining > 1) {
+          // Paid, search-grounded fallback. Only on a company's first scan (it costs real money),
+          // and only once the two free routes above (direct ATS sweep, deterministic website guess)
+          // have both already come up empty. Manual entry stays available regardless of how this
+          // goes. Proposes an official website AND/OR an ATS board URL -- see websearch.ts -- and
+          // neither is ever trusted on the model's word: both are re-verified against real page
+          // evidence before anything is persisted.
+          budget.remaining -= 1;
+          const found = await resolveWebsiteViaSearch(env, { name: company.name, location: company.location, signal: company.signal });
+          if (found?.ats_board_url) {
+            // The model proposes; deterministic code verifies and owns persisted truth. A board URL
+            // a search turned up is trusted for nothing until (a) it actually matches a provider
+            // this app recognizes and (b) that board's own public page confirms this employer's
+            // name -- the exact same scoreSiteMatch check applied to a guessed website, applied here
+            // to a search-proposed board instead.
+            const guessed = detectAtsFromUrl(found.ats_board_url);
+            if (guessed && budget.remaining > 0) {
+              budget.remaining -= 1;
+              const pageRes = await fetchWithTimeout(boardUrlFor(guessed.provider, guessed.token) || found.ats_board_url, 8000);
+              const html = pageRes && pageRes.ok ? await pageRes.text().catch(() => "") : "";
+              const identity = html ? scoreSiteMatch(company.name, html) : { score: 0, evidence: "" };
+              if (identity.score >= ATS_IDENTITY_FLOOR) {
+                provider = guessed.provider;
+                token = guessed.token;
+                await writeCompanyState(env, company.id, {
+                  identity: "verified",
+                  jobSource: "pending",
+                  boardUrl: boardUrlFor(guessed.provider, guessed.token) || found.ats_board_url,
+                  atsProvider: guessed.provider,
+                  atsToken: guessed.token,
+                  websiteEvidence: `search proposed their ${atsDisplayName(guessed.provider)} board, confirmed on the board's own page: ${identity.evidence}`,
+                  discoveryMethod: "search",
+                  scanNote: `Found their ${atsDisplayName(guessed.provider)} board via search; reading it next.`,
+                  touchScanned: false,
+                });
+              }
+            }
+          }
+          if ((!provider || provider === "none") && found && found.official_website && found.confidence >= WEBSITE_SEARCH_CONFIDENCE_FLOOR) {
+            // Never trusted on the model's word: the proposed URL is re-verified against real page
+            // evidence, exactly like a guessed one.
+            const confirmed = await verifyCandidate(company.name, found.official_website, budget);
+            if (confirmed && confirmed.score >= CONFIDENCE_FLOOR) {
+              await writeCompanyState(env, company.id, {
+                identity: "verified",
+                jobSource: "pending",
+                website: confirmed.url,
+                websiteConfidence: confirmed.score,
+                websiteEvidence: `search: ${found.reason} | confirmed: ${confirmed.evidence}`,
+                websiteSource: "search",
+                careersUrl: found.careers_url || "",
+                discoveryMethod: "search",
+                scanNote: "Website found by search and confirmed; checking its job board next.",
+                touchScanned: false,
+              });
+              company = { ...company, website: confirmed.url, careers_url: found.careers_url || company.careers_url };
+            } else if (!provider || provider === "none") {
+              await writeCompanyState(env, company.id, {
+                identity: "ambiguous",
+                jobSource: "pending",
+                website: found.official_website,
+                websiteConfidence: confirmed?.score ?? found.confidence,
+                websiteEvidence: `search proposed ${found.official_website} but the page did not confirm it: ${confirmed?.evidence ?? "unreachable"}`,
+                websiteSource: "search",
+                scanNote: "A website was proposed but could not be confirmed as this company. Confirm or correct it by hand.",
+              });
+              return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
+            }
+          } else if ((!provider || provider === "none") && found && found.official_website) {
+            await writeCompanyState(env, company.id, {
+              identity: "ambiguous",
+              jobSource: "pending",
+              website: found.official_website,
+              websiteConfidence: found.confidence,
+              websiteEvidence: found.reason,
+              websiteSource: "search",
+              scanNote: `Multiple companies could match this name. ${found.reason}`.trim(),
+            });
+            return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
+          }
+        } else if (deterministic.status === "ambiguous") {
           await writeCompanyState(env, company.id, {
             identity: "ambiguous",
             jobSource: "pending",
-            website: found.official_website,
-            websiteConfidence: confirmed?.score ?? found.confidence,
-            websiteEvidence: `search proposed ${found.official_website} but the page did not confirm it: ${confirmed?.evidence ?? "unreachable"}`,
-            websiteSource: "search",
-            scanNote: "A website was proposed but could not be confirmed as this company. Confirm or correct it by hand.",
+            website: deterministic.website,
+            websiteConfidence: deterministic.confidence,
+            websiteEvidence: deterministic.evidence,
+            websiteSource: deterministic.source,
+            scanNote: "A possible website was found but not confirmed as this company. Confirm or correct it by hand.",
           });
           return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
         }
-      } else if (found && found.official_website) {
-        await writeCompanyState(env, company.id, {
-          identity: "ambiguous",
-          jobSource: "pending",
-          website: found.official_website,
-          websiteConfidence: found.confidence,
-          websiteEvidence: found.reason,
-          websiteSource: "search",
-          scanNote: `Multiple companies could match this name. ${found.reason}`.trim(),
-        });
-        return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
       }
-    } else if (deterministic.status === "ambiguous") {
-      await writeCompanyState(env, company.id, {
-        identity: "ambiguous",
-        jobSource: "pending",
-        website: deterministic.website,
-        websiteConfidence: deterministic.confidence,
-        websiteEvidence: deterministic.evidence,
-        websiteSource: deterministic.source,
-        scanNote: "A possible website was found but not confirmed as this company. Confirm or correct it by hand.",
-      });
-      return { jobs: 0, newJobs: 0, note: "ambiguous company identity", status: "unverified" };
-    }
-  }
-  if (!company.website) {
-    await writeCompanyState(env, company.id, {
-      identity: "unresolved",
-      jobSource: "pending",
-      scanNote: "No website could be confirmed for this company yet. Retried automatically, or add one by hand.",
-    });
-    return { jobs: 0, newJobs: 0, note: "no website confirmed", status: "unverified" };
-  }
 
-  let provider = company.ats_provider as AtsProvider | "" | "none";
-  let token = company.ats_token;
+      // Still no ATS after the direct sweep, and no website either (deterministic guess and search
+      // both came up empty, or search was skipped). This is a genuine identity failure -- but it is
+      // no longer reported as a bare "no website confirmed": the direct sweep's own diagnostic
+      // (a specific FailureReason, or a rejected same-slug-different-employer candidate) survives
+      // into failure_reason/scan_note so a developer can tell "genuinely unreachable" apart from
+      // "a board exists here but isn't this employer" apart from "nothing tried yet".
+      if ((!provider || provider === "none") && !company.website) {
+        await writeCompanyState(env, company.id, {
+          identity: "unresolved",
+          jobSource: "pending",
+          failureReason: sweepReason,
+          scanNote: sweepRejected
+            ? `A ${atsDisplayName(sweepRejected.provider)} board exists at a guessed address (${sweepRejected.boardUrl}) but could not be confirmed as this company, and no website was confirmed either. Retried automatically, or add one by hand.`
+            : "No website or job board could be confirmed for this company yet. Retried automatically, or add one by hand.",
+        });
+        return { jobs: 0, newJobs: 0, note: "no website or ATS confirmed", status: "unverified" };
+      }
 
-  if (!provider || provider === "none") {
-    // Any URL already on the row may itself name an ATS. This is free and used to be skipped
-    // entirely: the patterns only ever ran against careers-page HTML, never against a URL already
-    // resolved and stored, which is how a readable Greenhouse board sat on a row labelled "no job
-    // board" with its jobs never imported.
-    const fromStoredUrl = detectAtsFromUrl(company.careers_url) ?? detectAtsFromUrl(company.board_url ?? "");
-    const resolved = fromStoredUrl ?? (await resolveBoard(company.website, company.careers_url, company.name, budget));
-    if (!resolved) {
-      // A careers page we found but could not classify is NOT "no job board" -- the link is the
-      // useful thing to show. Only a company with no hiring surface at all gets no_board.
-      const careersUrl = company.careers_url || "";
-      await writeCompanyState(env, company.id, {
-        identity: "verified",
-        jobSource: careersUrl ? "careers_only" : "no_board",
-        website: company.website,
-        boardUrl: careersUrl,
-        scanNote: careersUrl
-          ? "Careers page found, but it does not run on a job-board system this app can read. Use the link to browse it directly."
-          : "Checked the careers page, common careers paths, and likely Greenhouse, Lever, Ashby, and SmartRecruiters addresses. No job board was found.",
-      });
-      return { jobs: 0, newJobs: 0, note: careersUrl ? "careers page only" : "no job board found", status: "unverified" };
+      // A website is now known (already stored, or freshly resolved just above) but no ATS yet --
+      // look for one on it the same way this app always has: careers-page link, common paths, then
+      // a bounded slug guess against each provider with a public API.
+      if (!provider || provider === "none") {
+        const fromStoredUrl = detectAtsFromUrl(company.careers_url) ?? detectAtsFromUrl(company.board_url ?? "");
+        const resolved = fromStoredUrl ?? (await resolveBoard(company.website, company.careers_url, company.name, budget));
+        if (!resolved) {
+          // A careers page we found but could not classify is NOT "no job board" -- the link is the
+          // useful thing to show. Only a company with no hiring surface at all gets no_board.
+          const careersUrl = company.careers_url || "";
+          await writeCompanyState(env, company.id, {
+            identity: "verified",
+            jobSource: careersUrl ? "careers_only" : "no_board",
+            website: company.website,
+            boardUrl: careersUrl,
+            failureReason: careersUrl ? "" : sweepReason,
+            discoveryMethod: "website",
+            scanNote: careersUrl
+              ? "Careers page found, but it does not run on a job-board system this app can read. Use the link to browse it directly."
+              : "Checked the careers page, common careers paths, and every ATS provider this app supports for a guessable board. No job board was found.",
+          });
+          return { jobs: 0, newJobs: 0, note: careersUrl ? "careers page only" : "no job board found", status: "unverified" };
+        }
+        provider = resolved.provider;
+        token = resolved.token;
+        await writeCompanyState(env, company.id, {
+          identity: "verified",
+          jobSource: "pending",
+          website: company.website,
+          atsProvider: provider,
+          atsToken: token,
+          boardUrl: boardUrlFor(provider, token) || company.careers_url,
+          discoveryMethod: "website",
+          scanNote: "Job board found on their website; reading it next.",
+          touchScanned: false,
+        });
+      }
     }
-    provider = resolved.provider;
-    token = resolved.token;
   }
 
   // Some ATS platforms are recognized by their URL but publish no public API to read listings
@@ -3593,13 +3690,14 @@ async function scanOneCompany(
   // list and why). Recognizing the platform is still real progress over "nothing found": the
   // candidate gets a working link straight to the board instead of a dead end, even though this
   // app can't auto-score postings on it. This check runs on every call, not just a fresh
-  // resolution, since a company already labeled this way from a prior scan skips resolveBoard
-  // above entirely and would otherwise fall through into fetchBoardJobs with a provider it has no
-  // case for.
+  // resolution, since a company already labeled this way from a prior scan skips discovery above
+  // entirely and would otherwise fall through into fetchBoardJobs with a provider it has no case
+  // for.
   if (!isReadableAtsProvider(provider as AtsProvider)) {
-    const boardUrl = token.includes(".") ? `https://${token}` : company.careers_url || company.website;
+    const boardUrl = boardUrlFor(provider as AtsProvider, token) || company.careers_url || company.website;
     const label = atsDisplayName(provider as AtsProvider);
-    // Verified company, unsupported board. The limitation is ApplyGo's, not the employer's, and the
+    // Verified company, unsupported board -- an unsupported ATS is still a *found* ATS, and must
+    // never be reported as "no board". The limitation is ApplyGo's, not the employer's, and the
     // state model now says so instead of filing this under "unverified".
     await writeCompanyState(env, company.id, {
       identity: "verified",
@@ -3771,15 +3869,18 @@ async function updateCompany(request: Request, env: Env, id: string): Promise<Re
     .bind(id)
     .first<{ website: string; ats_provider: string; ats_token: string; board_url: string; website_confidence: number | null }>();
   const readable = row?.ats_provider ? isReadableAtsProvider(row.ats_provider as AtsProvider) : false;
+  // A verified ATS board is sufficient evidence on its own -- website_url == null must not
+  // invalidate an otherwise-verified identity (see companystate.ts's relaxed invariant).
+  const hasEvidence = Boolean(row?.website || row?.board_url);
   const { identity } = await writeCompanyState(env, id, {
-    identity: row?.website ? "verified" : "pending",
-    jobSource: !row?.website
+    identity: hasEvidence ? "verified" : "pending",
+    jobSource: !hasEvidence
       ? "pending"
       : readable
         ? "supported"
-        : row.ats_provider
+        : row?.ats_provider
           ? "unsupported_ats"
-          : row.board_url
+          : row?.board_url
             ? "careers_only"
             : "pending",
     website: row?.website ?? "",
@@ -9681,18 +9782,39 @@ const DASHBOARD_PAGE = `<!doctype html>
       careers_only: 'Careers page only',
       no_board: 'No job board',
       board_unreachable: 'Board unavailable',
+      access_blocked: 'Access blocked',
+    };
+    // Plain-language labels for the structured failure_reason column -- companies.ts's FailureReason
+    // taxonomy. Shown as a small technical aside beneath the human explanation, so a developer (or a
+    // candidate debugging their own instance) can tell "ApplyGo genuinely cannot reach this" apart
+    // from "our resolver/parser is broken" without digging into logs.
+    var FAILURE_REASON_LABELS = {
+      dns_or_network: 'DNS/network failure',
+      timeout: 'Request timed out',
+      http_403: 'HTTP 403 Forbidden',
+      http_404: 'HTTP 404 Not Found',
+      http_429: 'HTTP 429 (rate limited)',
+      access_restricted: 'Access restricted',
+      cloudflare_challenge: 'Cloudflare challenge page',
+      probable_captcha: 'Probable CAPTCHA',
+      login_required: 'Login required',
+      js_challenge_page: 'JavaScript challenge page',
+      malformed_response: 'Malformed provider response',
+      budget_exhausted: 'Scan budget exhausted',
+      identity_unverified_on_board: 'A board exists, but the employer could not be confirmed',
     };
     var STATE_EXPLANATIONS = {
       'identity:pending': 'Discovered from a real job posting. Identity has not been checked yet.',
-      'identity:unresolved': 'No website could be confirmed for this company. It stays on the list and is retried automatically.',
+      'identity:unresolved': 'No website or job board could be confirmed for this company. It stays on the list and is retried automatically.',
       'identity:ambiguous': 'A possible website was found, but not with enough evidence to be sure it is this company rather than a similarly named one.',
       'identity:not_a_company': 'This employer field held a job-board page title rather than a company name.',
-      'source:pending': 'Website confirmed. Its job board has not been checked yet.',
-      'source:supported': 'Website and job board confirmed. Jobs are imported from it automatically.',
-      'source:unsupported_ats': 'Website confirmed. They hire through a system ApplyGo cannot read automatically yet — use the board link to browse it directly.',
-      'source:careers_only': 'Website and careers page confirmed, but the careers page does not run on a job-board system ApplyGo can read.',
-      'source:no_board': 'Website confirmed, but no job board or careers page could be found on it.',
-      'source:board_unreachable': 'Website and job board confirmed, but reading the board failed. This is usually temporary and is retried.',
+      'source:pending': 'Identity confirmed. Its job board has not been checked yet.',
+      'source:supported': 'Job board confirmed. Jobs are imported from it automatically.',
+      'source:unsupported_ats': 'They hire through a system ApplyGo cannot read automatically yet — use the board link to browse it directly.',
+      'source:careers_only': 'A careers page was confirmed, but it does not run on a job-board system ApplyGo can read.',
+      'source:no_board': 'No job board or careers page could be found.',
+      'source:board_unreachable': 'A job board was confirmed, but reading it failed. This is usually temporary and is retried.',
+      'source:access_blocked': 'A board or careers page was found, but the request was blocked by a CAPTCHA, a Cloudflare/JS challenge, or a login wall — this is ApplyGo being unable to reach the page, not a defect in the employer’s listing.',
     };
     function explainCompanyState(company) {
       if (company.identity_status !== 'verified') {
@@ -9761,6 +9883,15 @@ const DASHBOARD_PAGE = `<!doctype html>
           // candidate may want to judge it themselves.
           if (company.website_evidence && company.identity_status !== 'verified') {
             body.push(el('div', { className: 'row-meta', textContent: 'Evidence: ' + company.website_evidence }));
+          }
+          // Not enormous internal traces -- just the one-line structured diagnostic, so a developer
+          // can tell "genuinely unreachable" apart from "our own resolver/parser is broken" without
+          // digging into logs. Deliberately small/muted, not the primary badge.
+          if (company.failure_reason) {
+            body.push(el('div', {
+              className: 'row-meta',
+              textContent: 'Diagnostic: ' + (FAILURE_REASON_LABELS[company.failure_reason] || company.failure_reason),
+            }));
           }
         }
         if (company.scan_note) body.push(el('div', { className: 'row-meta', textContent: company.scan_note }));

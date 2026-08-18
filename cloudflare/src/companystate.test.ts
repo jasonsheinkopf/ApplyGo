@@ -19,6 +19,8 @@ const state = (overrides: Partial<CompanyState> = {}): CompanyState => ({
   boardUrl: "",
   atsProvider: "",
   atsToken: "",
+  failureReason: "",
+  discoveryMethod: "",
   ...overrides,
 });
 
@@ -89,10 +91,43 @@ test("careers_only without a URL collapses back to no_board", () => {
   assert.deepEqual(stateViolations(fixed), []);
 });
 
-test("verified-without-a-website is a violation and repairs to unresolved", () => {
+test("verified with neither website nor board URL is a violation and repairs to unresolved", () => {
   const s = state({ identity: "verified" });
-  assert.ok(stateViolations(s).some((v) => /verified but no website/.test(v)));
+  assert.ok(stateViolations(s).some((v) => /neither a website nor a board URL/.test(v)));
   assert.equal(reconcileCompanyState(s).state.identity, "unresolved");
+});
+
+// ---------------------------------------------------------------------------
+// ATS-without-website: the core new success condition
+// ---------------------------------------------------------------------------
+
+test("a verified ATS board with no website is a legal, violation-free state", () => {
+  const s = state({
+    identity: "verified",
+    jobSource: "supported",
+    atsProvider: "greenhouse",
+    atsToken: "acme",
+    boardUrl: "https://job-boards.greenhouse.io/acme",
+    discoveryMethod: "direct_ats",
+  });
+  assert.deepEqual(stateViolations(s), []);
+  assert.equal(reconcileCompanyState(s).repaired.length, 0, "website_url == null must not invalidate an otherwise verified ATS");
+  assert.equal(isScannable(s), true);
+});
+
+test("website_url missing does not downgrade an otherwise-verified ATS board", () => {
+  const { state: fixed, repaired } = reconcileCompanyState(
+    state({ identity: "verified", jobSource: "supported", atsProvider: "lever", atsToken: "acme", boardUrl: "https://jobs.lever.co/acme" }),
+  );
+  assert.equal(fixed.identity, "verified");
+  assert.equal(fixed.jobSource, "supported");
+  assert.deepEqual(repaired, []);
+});
+
+test("access_blocked is a distinct, violation-free job source", () => {
+  const s = verified({ jobSource: "access_blocked", boardUrl: "https://acme.icims.com", failureReason: "probable_captcha" });
+  assert.deepEqual(stateViolations(s), []);
+  assert.match(explainState(s), /CAPTCHA|challenge|login wall/i);
 });
 
 test("unresolved-with-a-website repairs to ambiguous rather than silently claiming verified", () => {
@@ -150,6 +185,8 @@ test("every legal state combination is violation-free", () => {
     verified({ jobSource: "no_board" }),
     verified({ jobSource: "careers_only", boardUrl: "https://acme.com/careers" }),
     verified({ jobSource: "board_unreachable", atsProvider: "greenhouse", boardUrl: "https://job-boards.greenhouse.io/acme" }),
+    verified({ jobSource: "access_blocked", boardUrl: "https://acme.icims.com", failureReason: "probable_captcha" }),
+    state({ identity: "verified", jobSource: "supported", atsProvider: "greenhouse", atsToken: "acme", boardUrl: "https://job-boards.greenhouse.io/acme" }),
   ];
   for (const s of legal) {
     assert.deepEqual(stateViolations(s), [], JSON.stringify({ identity: s.identity, jobSource: s.jobSource }));
