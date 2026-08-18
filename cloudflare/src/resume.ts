@@ -20,6 +20,7 @@ import {
   callStructuredWithImage,
 } from "./llm";
 import { getManagedPrompt } from "./langfuse";
+import { RESUME_COMPOSE_MASTER_PROMPT, RESUME_COMPOSE_PROMPT } from "./prompts";
 import {
   type CareerProfile,
   profileEvidenceStrings,
@@ -216,28 +217,38 @@ async function composePrompt(
       : "This may run to two US Letter pages, but only if the second page is genuinely full.";
 
   if (options.master) {
-    return getManagedPrompt(env, "resume/compose_master", {
-      user_instructions: instructions ? `USER INSTRUCTIONS:\n${instructions}` : "",
-      revision_feedback: feedback ? `\nREVISION FEEDBACK -- address this specifically:\n${feedback}` : "",
-      candidate_profile: renderCareerProfile(profile),
-    });
+    return getManagedPrompt(
+      env,
+      "resume/compose_master",
+      {
+        user_instructions: instructions ? `USER INSTRUCTIONS:\n${instructions}` : "",
+        revision_feedback: feedback ? `\nREVISION FEEDBACK -- address this specifically:\n${feedback}` : "",
+        candidate_profile: renderCareerProfile(profile),
+      },
+      RESUME_COMPOSE_MASTER_PROMPT,
+    );
   }
 
-  return getManagedPrompt(env, "resume/compose", {
-    page_budget: budget,
-    summary_rule: layout.show_summary
-      ? "Include a short summary."
-      : "Omit the summary -- return an empty string for it. The page needs the space.",
-    plan_directive: options.planDirective ? `${options.planDirective}\n` : "",
-    target_roles: desiredRoles
-      ? `TARGET ROLES (what this resume should be angled toward):\n${desiredRoles}`
-      : "TARGET ROLES: none specified. Produce a strong general-purpose resume for the candidate's evident field.",
-    user_instructions: instructions
-      ? `USER INSTRUCTIONS FOR THIS VERSION (these take priority over the strong defaults):\n${instructions}`
-      : "USER INSTRUCTIONS: none.",
-    revision_feedback: feedback ? `\nREVISION FEEDBACK -- address this specifically in your rewrite:\n${feedback}` : "",
-    candidate_profile: renderCareerProfile(profile),
-  });
+  return getManagedPrompt(
+    env,
+    "resume/compose",
+    {
+      page_budget: budget,
+      summary_rule: layout.show_summary
+        ? "Include a short summary."
+        : "Omit the summary -- return an empty string for it. The page needs the space.",
+      plan_directive: options.planDirective ? `${options.planDirective}\n` : "",
+      target_roles: desiredRoles
+        ? `TARGET ROLES (what this resume should be angled toward):\n${desiredRoles}`
+        : "TARGET ROLES: none specified. Produce a strong general-purpose resume for the candidate's evident field.",
+      user_instructions: instructions
+        ? `USER INSTRUCTIONS FOR THIS VERSION (these take priority over the strong defaults):\n${instructions}`
+        : "USER INSTRUCTIONS: none.",
+      revision_feedback: feedback ? `\nREVISION FEEDBACK -- address this specifically in your rewrite:\n${feedback}` : "",
+      candidate_profile: renderCareerProfile(profile),
+    },
+    RESUME_COMPOSE_PROMPT,
+  );
 }
 
 export async function composeResumeDoc(
