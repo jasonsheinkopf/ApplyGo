@@ -6870,6 +6870,16 @@ const DASHBOARD_PAGE = `<!doctype html>
   .cpf-stage-handoff h3 { margin: 0 0 0.35rem; font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; color: var(--text-muted); text-transform: uppercase; }
   .cpf-stat-primary { font-size: 20px; font-weight: 700; color: var(--text); font-family: ui-monospace, 'SF Mono', Menlo, monospace; white-space: nowrap; }
   .cpf-stat-sub { margin-top: 0.15rem; font-size: 11.5px; color: var(--text-muted); font-family: ui-monospace, 'SF Mono', Menlo, monospace; white-space: nowrap; }
+  /* Below this width, the Pre-screen card's own fixed padding + nowrap text was competing for
+     space with the Sankey diagram in the same row -- min-width:0 let the diagram shrink to make
+     room instead of wrapping, so it was rendering tiny and unreadable. Stacking the card below the
+     diagram (full width, not beside it) gives the diagram the full row and keeps the card's text
+     readable at its natural size, rather than both shrinking to fit side by side. */
+  @media (max-width: 640px) {
+    #companies-pipeline-row { flex-direction: column; align-items: stretch; gap: 0.35rem; }
+    .cpf-arrow { align-self: center; transform: rotate(90deg); }
+    .cpf-stage-handoff { width: 100%; }
+  }
   .chip-list { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.3rem 0 0.5rem; }
   .chip-list:empty::after { content: 'No search terms yet.'; font-size: 12.5px; color: var(--text-muted); }
   .chip {

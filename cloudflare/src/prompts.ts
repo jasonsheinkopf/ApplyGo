@@ -456,6 +456,87 @@ Return exactly one result per posting id in the input, with that same id, a keep
 Return only the structured output.`,
 };
 
+/**
+ * Stage 1 of resume generation (src/resume.ts's composePrompt, non-master branch): selects and
+ * rewrites from the full career profile into one page-budgeted, role-targeted resume. Had no
+ * bundled default at all before this -- unlike the prompts above (which fall back only on a stale
+ * *contract*), `resume/compose` had simply never been created in Langfuse production, so every
+ * call failed outright with `langfuse_prompt_unavailable:resume/compose` regardless of schema
+ * compatibility. See "Prompt contracts and bundled defaults" in the README.
+ */
+export const RESUME_COMPOSE_PROMPT: PromptDefault = {
+  requires: ["candidate_profile", "page_budget"],
+  schemaVersion: 1,
+  text: `You are writing one tailored resume from a candidate's full career profile. This is a
+selection and rewriting task, not a transcription task -- the full profile is far more than belongs
+on a resume, and choosing what to leave out is as important as what you keep.
+
+{{target_roles}}
+
+{{plan_directive}}PAGE BUDGET
+{{page_budget}}
+
+{{summary_rule}}
+
+{{user_instructions}}
+{{revision_feedback}}
+
+CANDIDATE PROFILE -- the only source of truth. Never invent an employer, school, title, date, or
+accomplishment that isn't in here, even to fill a gap that would otherwise look thin.
+{{candidate_profile}}
+
+HOW TO SELECT
+- Prioritize experience, projects, and skills most relevant to the target roles above (when given)
+  over strictly chronological completeness. A strong early-career role that matches the target beats
+  a more recent one that doesn't.
+- Every bullet should be an accomplishment (what changed, what shipped, what improved -- with a
+  concrete outcome or scale where the profile supports one), not a duty description ("responsible
+  for...", "helped with..."). Rewrite duty-shaped evidence into accomplishment-shaped bullets without
+  inventing numbers the profile doesn't contain.
+- Third person, no pronouns (no "I", "my", "we").
+- skill_groups: 2-4 labelled clusters (e.g. "Languages", "ML & Data", "Infrastructure"), not one flat
+  list.
+- projects: only when they materially strengthen fit for the target roles -- often empty is correct.
+- Respect the page budget above; being selective is the actual point of this step, not a constraint
+  to work around.
+
+Return only the structured output.`,
+};
+
+/**
+ * The "master"/archive posture of the same stage-1 writer (src/resume.ts's composePrompt, master
+ * branch) -- see ComposeOptions.master: no page budget, no selection, include everything the
+ * profile supports so later per-role resumes always have the full record to draw from. Same
+ * missing-in-Langfuse situation as `resume/compose` above.
+ */
+export const RESUME_COMPOSE_MASTER_PROMPT: PromptDefault = {
+  requires: ["candidate_profile"],
+  schemaVersion: 1,
+  text: `You are producing a complete career archive in resume form from a candidate's full career
+profile. Unlike a normal resume, this is NOT page-budgeted and NOT selective -- it is the exhaustive
+version every other tailored resume gets generated from, so leaving something out here means no
+later resume can ever include it.
+
+{{user_instructions}}
+{{revision_feedback}}
+
+CANDIDATE PROFILE -- the only source of truth. Never invent an employer, school, title, date, or
+accomplishment that isn't in here.
+{{candidate_profile}}
+
+HOW TO WRITE IT
+- Include every role, project, and education entry the profile contains. Do not drop anything for
+  space or relevance -- there is no page budget here.
+- Still rewrite duty-shaped evidence into accomplishment-shaped bullets (what changed, what shipped,
+  what improved), the same as a normal resume -- exhaustive does not mean a raw duty list.
+- Third person, no pronouns.
+- skill_groups: comprehensive labelled clusters covering everything in the profile, not just a
+  headline subset.
+- Every organization name (employer, school) must trace back to the profile exactly.
+
+Return only the structured output.`,
+};
+
 /** Registry consulted by getManagedPrompt. Prompts absent here behave exactly as before. */
 export const PROMPT_DEFAULTS: Record<string, PromptDefault> = {
   "profile/create": PROFILE_CREATE_PROMPT,
@@ -464,4 +545,6 @@ export const PROMPT_DEFAULTS: Record<string, PromptDefault> = {
   "roles/analyze": ROLES_ANALYZE_PROMPT,
   "roles/research": ROLES_RESEARCH_PROMPT,
   "jobs/prescreen": JOBS_PRESCREEN_PROMPT,
+  "resume/compose": RESUME_COMPOSE_PROMPT,
+  "resume/compose_master": RESUME_COMPOSE_MASTER_PROMPT,
 };
