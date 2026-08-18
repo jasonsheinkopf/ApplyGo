@@ -6909,9 +6909,13 @@ const DASHBOARD_PAGE = `<!doctype html>
   .controls label { margin-top: 0; }
   .controls select, .controls input { width: auto; min-width: 9rem; }
   .controls button { margin-top: 0; }
-  /* Sub-tab row (Ask/Resume/Cover/Apply): stays one line by scrolling horizontally instead of
-     wrapping to a second row, the same pattern the top-level nav bar already uses for the same
-     reason -- a button that wraps alone onto its own line reads as broken, not as a real tab. */
+  /* Analyze/Resume/Cover Letter/Apply row: NOT a tab selector (nothing ever toggles .active on
+     these -- each opens its own tool inline, independently, and Analyze's plain vs. the others'
+     .secondary styling is what marks Analyze as the primary next action). Deliberately left as
+     normal rounded buttons rather than the chevron treatment below, which is reserved for actual
+     mutually-exclusive tab rows (.segmented-control) -- a permanently-unhighlighted chevron row
+     here would read as broken tabs, not as an available-actions row. Still scrolls horizontally
+     instead of wrapping, the same pattern nav already uses. */
   .subtabs {
     display: flex; flex-wrap: nowrap; gap: 0.5rem; overflow-x: auto; padding-bottom: 0.2rem;
     margin-bottom: 0.9rem; -webkit-overflow-scrolling: touch; scrollbar-width: none;
@@ -6919,23 +6923,36 @@ const DASHBOARD_PAGE = `<!doctype html>
   .subtabs::-webkit-scrollbar { display: none; }
   .subtabs button { flex: none; margin-top: 0; white-space: nowrap; }
   .subtabs button.active { background: var(--accent); color: var(--accent-contrast); }
-  /* A true three-way selector for the Companies list. The connected outer track makes it read as
-     one control, while the filled active segment and inset ring remain unmistakable in either
-     color scheme instead of relying on a subtle color shift between three unrelated buttons. */
+  /* Sub-tab selector (Preferences/Examples/Location/..., Docs/Notes/Create/Improve, and the rest).
+     Same chevron/process-step shape as the main nav bar above -- one right-pointing arrow per
+     segment with a matching notch cut into its own left edge, so a sub-tab row reads as the same
+     kind of control as the top-level nav rather than an unrelated rectangle-pill row next to it.
+     Smaller (--sub-arrow) than the top-level nav's --nav-arrow since this is a secondary level. */
   .segmented-control {
-    display: inline-flex; gap: 0; overflow: hidden; padding: 3px; margin-bottom: 1rem;
-    border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface-2);
+    --sub-arrow: 10px;
+    display: flex; gap: 3px; overflow-x: auto; margin-bottom: 1rem; padding: 0;
+    border: none; border-radius: 0; background: transparent;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
   }
+  .segmented-control::-webkit-scrollbar { display: none; }
   .segmented-control button {
-    margin: 0; border: 0; border-radius: calc(var(--radius-sm) - 3px); background: transparent;
-    color: var(--text-muted); font-weight: 650;
+    flex: none; margin: 0; border: 0; background: var(--surface); color: var(--text-muted);
+    font-weight: 650; white-space: nowrap;
+    padding: 0.5rem calc(0.5rem + var(--sub-arrow) * 0.7) 0.5rem calc(0.5rem + var(--sub-arrow) * 0.5);
+    clip-path: polygon(
+      0 0, calc(100% - var(--sub-arrow)) 0, 100% 50%, calc(100% - var(--sub-arrow)) 100%, 0 100%,
+      var(--sub-arrow) 50%
+    );
   }
-  .segmented-control button:hover:not(:disabled) { background: var(--surface); color: var(--text); opacity: 1; }
-  .segmented-control button.active {
-    background: var(--accent); color: var(--accent-contrast);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.24), inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+  /* No incoming point to notch around -- same reasoning as nav button:first-child above. */
+  .segmented-control button:first-child {
+    padding-left: 0.75rem;
+    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+    clip-path: polygon(0 0, calc(100% - var(--sub-arrow)) 0, 100% 50%, calc(100% - var(--sub-arrow)) 100%, 0 100%);
   }
-  .segmented-control button:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--accent); outline-offset: -1px; }
+  .segmented-control button:hover:not(:disabled):not(.active) { background: var(--surface-2); color: var(--text); opacity: 1; }
+  .segmented-control button.active { background: var(--accent); color: var(--accent-contrast); }
+  .segmented-control button:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--accent); outline-offset: -2px; }
   /* Mobile replacement for a .segmented-control: pagination dots (current position) plus two
      large tap targets that move to the previous/next subtab explicitly -- swiping the page no
      longer changes subtabs (see the touch handling removed from initMobileSubnav's caller below),
@@ -7226,7 +7243,7 @@ const DASHBOARD_PAGE = `<!doctype html>
        target 40px wide is still a sliver. */
     .row-actions button { min-height: 44px; padding-inline: 0.9rem; }
     /* The tab bar is the primary navigation on a phone; it was ~34px. */
-    nav button, .subtabs button { min-height: 44px; }
+    nav button, .subtabs button, .segmented-control button { min-height: 44px; }
     /* A summary is a flex row so min-height actually centres its text instead of top-aligning it. */
     summary { display: flex; align-items: center; }
     /* The box itself stays visually small; the label around it is the real target, so that is what
@@ -11653,7 +11670,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       host.appendChild(el('p', {
         className: 'hint',
         textContent: 'These come from your Career Evidence Record, not a generic checklist -- answer what applies, ' +
-          'say no where it genuinely doesn\'t, or skip and come back later.',
+          "say no where it genuinely doesn't, or skip and come back later.",
       }));
       questions.forEach(function (q) { host.appendChild(renderAnalyzeQuestionCard(q)); });
     }
@@ -11700,7 +11717,7 @@ const DASHBOARD_PAGE = `<!doctype html>
       renderAnalyzeQuestions(data.questions);
       renderAnalyzeGaps(data.confirmed_gaps);
       if (data.coverage_status === 'pending') {
-        analyzeStatusEl().textContent = 'Not analyzed yet -- press Analyze Job to read this posting\'s requirements against your profile.';
+        analyzeStatusEl().textContent = "Not analyzed yet -- press Analyze Job to read this posting's requirements against your profile.";
         analyzeStatusEl().className = 'status';
       } else if (data.coverage_status === 'failed') {
         analyzeStatusEl().textContent = 'The last analysis attempt failed. Press Analyze Job to retry.';
