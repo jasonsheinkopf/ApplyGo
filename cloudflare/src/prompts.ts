@@ -537,6 +537,62 @@ HOW TO WRITE IT
 Return only the structured output.`,
 };
 
+/**
+ * The web-search fallback for company discovery (src/websearch.ts's resolveWebsiteViaSearch) --
+ * only ever reached after the free deterministic routes (direct ATS provider sweep, deterministic
+ * website guess) have both come up empty. Previously had NO bundled default at all: `resolve_website`
+ * was called with no `fallback` argument, so a Langfuse outage or an unconfigured project made every
+ * call fail outright with `langfuse_prompt_unavailable:companies/resolve_website`, and there was
+ * nothing here for `npm run prompts:check` to validate.
+ *
+ * `ats_providers` is the new variable this bundled version adds (see WEBSITE_RESOLUTION_SCHEMA's new
+ * `ats_board_url` field in websearch.ts): the model now searches for the employer's specific ATS
+ * board too, not only their corporate website -- "Steve's Insurance careers", "Steve's Insurance
+ * Greenhouse", "Steve's Insurance Lever" and so on -- because a real, readable job board is the
+ * actual discovery target, and the corporate website is not a prerequisite for finding one. The
+ * provider list itself is generated from companies.ts's ATS_SWEEP_PROVIDER_ORDER (the same registry
+ * atsdiscovery.ts's direct sweep reads), so this prompt never hardcodes a second, driftable list of
+ * what ApplyGo supports.
+ */
+export const COMPANIES_RESOLVE_WEBSITE_PROMPT: PromptDefault = {
+  requires: ["ats_providers"],
+  schemaVersion: 2,
+  text: `You are identifying a specific real company's official website and job board using live web
+search. Do not answer from memory -- company names collide, and a plausible-sounding domain or board
+recalled from training data is exactly the kind of confident wrong answer this task exists to avoid.
+Every claim you make must be grounded in what your search actually returned.
+
+COMPANY NAME: {{company_name}}
+LOCATION: {{location}}
+HIRING SIGNAL (real job titles seen for this employer): {{signal}}
+
+Search for this company's official website AND, separately, its job board -- these are not the same
+thing and finding the job board does not require first finding the website. Try queries like:
+- "{{company_name}}" careers
+- "{{company_name}}" jobs
+- "{{company_name}}" official website
+- "{{company_name}}" plus each of: {{ats_providers}}
+
+The job board is the actual target. A company that hires through one of the ATS platforms above will
+usually have a URL on that platform's own domain (for example a Greenhouse board at
+boards.greenhouse.io/<company-slug>, or a Lever board at jobs.lever.co/<company-slug>) -- if your
+search surfaces one, report it in ats_board_url even if you were not able to separately confirm their
+corporate homepage.
+
+RULES
+- Only report a website or board URL you can actually ground in a search result -- never guess a
+  domain that "seems right" for a company with this name.
+- If multiple different companies share this name (a common failure mode: a small regional business
+  vs. a larger company with a similar name), say so in reason and lower confidence accordingly rather
+  than picking one arbitrarily.
+- The location and hiring signal above are real evidence about which company is meant -- use them to
+  disambiguate when the name alone is not enough.
+- Leave official_website, careers_url, or ats_board_url as an empty string if you did not find one
+  with real search evidence, rather than filling in a low-confidence guess.
+
+Return only the structured output.`,
+};
+
 /** Registry consulted by getManagedPrompt. Prompts absent here behave exactly as before. */
 export const PROMPT_DEFAULTS: Record<string, PromptDefault> = {
   "profile/create": PROFILE_CREATE_PROMPT,
@@ -547,4 +603,5 @@ export const PROMPT_DEFAULTS: Record<string, PromptDefault> = {
   "jobs/prescreen": JOBS_PRESCREEN_PROMPT,
   "resume/compose": RESUME_COMPOSE_PROMPT,
   "resume/compose_master": RESUME_COMPOSE_MASTER_PROMPT,
+  "companies/resolve_website": COMPANIES_RESOLVE_WEBSITE_PROMPT,
 };

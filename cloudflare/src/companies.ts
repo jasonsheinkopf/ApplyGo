@@ -58,6 +58,17 @@ export function isReadableAtsProvider(provider: AtsProvider): boolean {
   return READABLE_ATS_PROVIDERS.has(provider);
 }
 
+/**
+ * Readable providers in the order a direct company -> ATS sweep should try them (atsdiscovery.ts),
+ * roughly most- to least-commonly used by employers who publish a guessable board slug. Workday is
+ * deliberately excluded: its board token is `tenant|pod|site`, and neither the pod (a numbered
+ * Workday data-center id, e.g. `wd5`) nor the site name is derivable from a company name at all --
+ * unlike the other seven, there is no bounded deterministic guess to make, only an unbounded one.
+ */
+export const ATS_SWEEP_PROVIDER_ORDER: AtsProvider[] = [
+  "greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee", "bamboohr",
+];
+
 const ATS_DISPLAY_NAMES: Record<AtsProvider, string> = {
   greenhouse: "Greenhouse",
   lever: "Lever",
@@ -316,7 +327,7 @@ const CAREERS_PATHS = [
   "/open-roles", "/join-us", "/join", "/work-with-us", "/positions",
 ];
 
-function boardApiUrl(provider: AtsProvider, token: string): string {
+export function boardApiUrl(provider: AtsProvider, token: string): string {
   switch (provider) {
     case "greenhouse":
       return `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(token)}/jobs?content=true`;
@@ -414,9 +425,146 @@ export function slugsFromName(name: string): string[] {
  * zero current openings reads the same as "not found" here. That's an acceptable miss: a company
  * with nothing open isn't useful to register a guessed token for anyway.
  */
-function boardHasListings(provider: AtsProvider, body: string): boolean {
+export function boardHasListings(provider: AtsProvider, body: string): boolean {
   if (provider === "smartrecruiters") return !body.includes('"totalFound":0');
   return body.trim() !== "[]" && !body.includes('"jobs":[]');
+}
+
+/**
+ * The public, human-readable board URL for a resolved provider/token pair -- one definition, so a
+ * board link shown in the UI and the board a read actually targets can never disagree about where
+ * the board is. Previously duplicated as a private function inside src/index.ts; centralized here
+ * so atsdiscovery.ts's direct sweep (which needs the same URL to verify a guessed slug) can share it
+ * rather than re-deriving it.
+ */
+export function boardUrlFor(provider: AtsProvider, token: string): string {
+  switch (provider) {
+    case "greenhouse": return `https://job-boards.greenhouse.io/${token}`;
+    case "lever": return `https://jobs.lever.co/${token}`;
+    case "ashby": return `https://jobs.ashbyhq.com/${token}`;
+    case "smartrecruiters": return `https://careers.smartrecruiters.com/${token}`;
+    case "workable": return `https://apply.workable.com/${token}`;
+    case "recruitee": return `https://${token}.recruitee.com`;
+    case "bamboohr": return `https://${token}.bamboohr.com/careers`;
+    case "workday": {
+      const [tenant, pod, site] = token.split("|");
+      return tenant && pod && site ? `https://${tenant}.${pod}.myworkdayjobs.com/${site}` : "";
+    }
+    default: return token.includes(".") ? `https://${token}` : "";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Failure diagnostics
+// ---------------------------------------------------------------------------
+//
+// A single, evidence-based taxonomy for *why* a fetch in the discovery/scan pipeline didn't produce
+// what was wanted -- used everywhere a caller currently only has "it failed" (resolveBoard,
+// atsdiscovery's sweep, resolveWebsiteDeterministic). The point, per the product brief this exists
+// to satisfy: a developer looking at a failed company must be able to tell "ApplyGo genuinely
+// cannot reach this" (network/DNS/timeout/budget) apart from "the site is up and our code is wrong"
+// (malformed response, provider parser failure) apart from "something is deliberately blocking us"
+// (403/429/captcha/challenge) -- three very different next actions.
+export type FailureReason =
+  | ""
+  | "dns_or_network"
+  | "timeout"
+  | "http_403"
+  | "http_404"
+  | "http_429"
+  | "access_restricted"
+  | "cloudflare_challenge"
+  | "probable_captcha"
+  | "login_required"
+  | "js_challenge_page"
+  | "malformed_response"
+  | "budget_exhausted"
+  | "identity_unverified_on_board";
+
+/** Deterministic evidence markers for a Cloudflare "checking your browser" interstitial. */
+const CLOUDFLARE_CHALLENGE_MARKERS = [
+  "cf-browser-verification", "cf_chl_", "cf-chl-", "checking your browser before accessing",
+  "attention required! | cloudflare", "just a moment...", "cdn-cgi/challenge-platform",
+];
+
+/** Deterministic evidence markers for a CAPTCHA widget actually present on the page. Kept separate
+ *  from the Cloudflare markers above: a Turnstile/reCAPTCHA/hCaptcha script can appear on a page
+ *  that isn't a Cloudflare challenge at all (a login form, a contact form). */
+const CAPTCHA_MARKERS = [
+  "g-recaptcha", "recaptcha/api.js", "hcaptcha.com", "h-captcha", "turnstile", "cf-turnstile",
+  "captcha-container", "id=\"captcha\"", "class=\"captcha", "please verify you are a human",
+  "verify you are human", "i'm not a robot",
+];
+
+const LOGIN_MARKERS = [
+  "sign in to continue", "log in to continue", "login required", "please log in to view",
+  "you must be logged in",
+];
+
+/**
+ * Classifies a fetch outcome using only deterministic evidence in the response itself -- status
+ * code, and (when a body was readable) marker strings known to belong to a specific real challenge
+ * provider. Never guesses: a genuinely ambiguous 403 with no markers is reported as the honest,
+ * weaker `access_restricted` rather than a confident-sounding `probable_captcha` the evidence
+ * doesn't support, matching the brief's "do not claim certainty with weak evidence" requirement.
+ *
+ * `timedOut` distinguishes an aborted request (the timeout actually fired) from every other reason
+ * `fetch` can throw (DNS failure, connection refused, TLS error) -- both surface as `res === null`
+ * from fetchWithTimeout, so the caller has to tell this function which one actually happened.
+ */
+export function classifyFetchFailure(
+  res: { status: number } | null,
+  html: string,
+  timedOut = false,
+): FailureReason {
+  if (!res) return timedOut ? "timeout" : "dns_or_network";
+
+  const body = html.slice(0, 20_000).toLowerCase();
+  if (CLOUDFLARE_CHALLENGE_MARKERS.some((m) => body.includes(m))) return "cloudflare_challenge";
+  if (CAPTCHA_MARKERS.some((m) => body.includes(m))) return "probable_captcha";
+
+  if (res.status === 404) return "http_404";
+  if (res.status === 429) return "http_429";
+  if (res.status === 403) return "http_403";
+  if (res.status === 401) {
+    if (LOGIN_MARKERS.some((m) => body.includes(m))) return "login_required";
+    return "access_restricted";
+  }
+  if (res.status >= 400) return "access_restricted";
+  if (LOGIN_MARKERS.some((m) => body.includes(m))) return "login_required";
+  return "";
+}
+
+/**
+ * Like fetchWithTimeout, but also reports *why* a null response happened -- specifically, whether
+ * the timeout itself fired (an AbortError from the controller below) versus any other network-level
+ * failure (DNS, connection refused, TLS). Existing callers of fetchWithTimeout are untouched; this
+ * is additive, for the new failure-classification call sites that need the distinction
+ * classifyFetchFailure's `timedOut` parameter expects.
+ */
+export async function fetchWithDiagnostics(
+  url: string,
+  ms: number,
+  init: RequestInit = {},
+): Promise<{ res: Response | null; timedOut: boolean }> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, ms);
+  try {
+    const res = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+      headers: { "user-agent": "ApplyGo/1.0 (personal job search agent)", ...(init.headers ?? {}) },
+    });
+    return { res, timedOut: false };
+  } catch {
+    return { res: null, timedOut };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

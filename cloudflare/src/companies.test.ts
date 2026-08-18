@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  boardUrlFor,
+  classifyFetchFailure,
   classifyVerification,
   type CompanySearchTerm,
   companySearchTermsFromTitles,
@@ -12,6 +14,55 @@ import {
   resolveCompanyDomain,
   titleCaseTerm,
 } from "./companies.ts";
+
+// ---------------------------------------------------------------------------
+// Failure diagnostics
+// ---------------------------------------------------------------------------
+
+test("classifyFetchFailure distinguishes timeout from other network failures", () => {
+  assert.equal(classifyFetchFailure(null, "", true), "timeout");
+  assert.equal(classifyFetchFailure(null, "", false), "dns_or_network");
+});
+
+test("classifyFetchFailure distinguishes 403, 404, and 429", () => {
+  assert.equal(classifyFetchFailure({ status: 404 }, ""), "http_404");
+  assert.equal(classifyFetchFailure({ status: 429 }, ""), "http_429");
+  assert.equal(classifyFetchFailure({ status: 403 }, "plain forbidden page, no known markers"), "http_403");
+});
+
+test("classifyFetchFailure recognizes a Cloudflare challenge page from deterministic markers", () => {
+  const html = "<html><head><title>Just a moment...</title></head><body>cf-browser-verification</body></html>";
+  assert.equal(classifyFetchFailure({ status: 403 }, html), "cloudflare_challenge");
+});
+
+test("classifyFetchFailure recognizes a CAPTCHA widget from deterministic markers, separate from Cloudflare", () => {
+  const html = '<html><body><div class="g-recaptcha" data-sitekey="x"></div></body></html>';
+  assert.equal(classifyFetchFailure({ status: 200 }, html), "probable_captcha");
+});
+
+test("classifyFetchFailure never claims a captcha/challenge without evidence -- a plain 403 stays access_restricted", () => {
+  assert.equal(classifyFetchFailure({ status: 403 }, "<html><body>Forbidden</body></html>"), "http_403");
+  assert.equal(classifyFetchFailure({ status: 401 }, "<html><body>Unauthorized</body></html>"), "access_restricted");
+});
+
+test("classifyFetchFailure recognizes a login wall", () => {
+  assert.equal(classifyFetchFailure({ status: 401 }, "Please log in to continue"), "login_required");
+});
+
+// ---------------------------------------------------------------------------
+// Provider board URLs
+// ---------------------------------------------------------------------------
+
+test("boardUrlFor produces the correct public URL for every readable provider", () => {
+  assert.equal(boardUrlFor("greenhouse", "acme"), "https://job-boards.greenhouse.io/acme");
+  assert.equal(boardUrlFor("lever", "acme"), "https://jobs.lever.co/acme");
+  assert.equal(boardUrlFor("ashby", "acme"), "https://jobs.ashbyhq.com/acme");
+  assert.equal(boardUrlFor("smartrecruiters", "acme"), "https://careers.smartrecruiters.com/acme");
+  assert.equal(boardUrlFor("workable", "acme"), "https://apply.workable.com/acme");
+  assert.equal(boardUrlFor("recruitee", "acme"), "https://acme.recruitee.com");
+  assert.equal(boardUrlFor("bamboohr", "acme"), "https://acme.bamboohr.com/careers");
+  assert.equal(boardUrlFor("workday", "acme|wd5|External"), "https://acme.wd5.myworkdayjobs.com/External");
+});
 
 function mockJson(routes: Record<string, unknown>) {
   return (async (input: RequestInfo | URL) => {
