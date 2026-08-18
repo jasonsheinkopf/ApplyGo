@@ -9,6 +9,25 @@
 
 export type InterestedJobGap = { requirement: string; kind: string; jobIds: string[]; jobLabels: string[] };
 
+/** Identifies a Profile > Improve question by what it's actually about (entity + field), independent
+ * of its current status -- the stable key a later audit pass dedupes new candidates against. */
+export function questionDedupeKey(entityType: string, entityId: string, targetField: string): string {
+  return `${entityType}|${entityId}|${targetField.trim().toLowerCase()}`;
+}
+
+export type PriorQuestionRow = { entity_type: string; entity_id: string; target_field: string };
+
+/**
+ * Every prior question's dedupe key, regardless of status. Deliberately includes 'dismissed' and
+ * 'applied' rows, not just the still-open ones: a question the candidate explicitly said "no" to, or
+ * skipped, must not simply be regenerated verbatim on the next audit pass just because it no longer
+ * counts as open. See runImproveAudit in src/index.ts, which uses this as the deterministic backstop
+ * behind the audit prompt's own "don't re-ask resolved questions" instruction.
+ */
+export function priorQuestionDedupeKeys(rows: PriorQuestionRow[]): Set<string> {
+  return new Set(rows.map((r) => questionDedupeKey(r.entity_type, r.entity_id, r.target_field)));
+}
+
 /** Loose text normalization for merging near-duplicate requirement phrasing across jobs without a
  * second LLM call just to cluster it -- see loadInterestedJobGaps' header comment for the tradeoff. */
 export function requirementDedupeKey(text: string): string {

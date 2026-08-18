@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { type InterestedJobGap, relatedJobIdsFor, renderJobRequirementContext, requirementDedupeKey } from "./interested.ts";
+import {
+  type InterestedJobGap,
+  priorQuestionDedupeKeys,
+  questionDedupeKey,
+  relatedJobIdsFor,
+  renderJobRequirementContext,
+  requirementDedupeKey,
+} from "./interested.ts";
 
 function gapMap(entries: [string, InterestedJobGap][]): Map<string, InterestedJobGap> {
   return new Map(entries);
@@ -61,4 +68,34 @@ test("relatedJobIdsFor ignores short/stopword tokens so it doesn't over-match ev
   const gaps = gapMap([["sql", { requirement: "SQL", kind: "preferred", jobIds: ["job-1"], jobLabels: ["A"] }]]);
   const question = { category: "other", target_field: "", question: "Did you have to lead this from the start?" };
   assert.deepEqual(relatedJobIdsFor(question, gaps), []);
+});
+
+test("questionDedupeKey normalizes target_field casing/whitespace so trivial rewording still matches", () => {
+  assert.equal(
+    questionDedupeKey("role", "role-1", "  Database Experience "),
+    questionDedupeKey("role", "role-1", "database experience"),
+  );
+  assert.notEqual(questionDedupeKey("role", "role-1", "database"), questionDedupeKey("role", "role-2", "database"));
+});
+
+test("priorQuestionDedupeKeys includes dismissed/applied rows -- a resolved negative must not be re-askable", () => {
+  const rows = [
+    { entity_type: "role", entity_id: "role-1", target_field: "database_experience" },
+  ];
+  const keys = priorQuestionDedupeKeys(rows);
+  // The same key a freshly-generated candidate question for that entity/field would produce is
+  // already present, regardless of what status the prior row is in -- callers never need to filter
+  // by status before calling this, which is exactly what closes the gap where a dismissed or
+  // confirmed-no question could be regenerated verbatim once it left the "open" set.
+  assert.ok(keys.has(questionDedupeKey("role", "role-1", "database_experience")));
+  assert.equal(keys.size, 1);
+});
+
+test("priorQuestionDedupeKeys treats different entities/fields as distinct, so unrelated questions are never blocked", () => {
+  const rows = [
+    { entity_type: "role", entity_id: "role-1", target_field: "database_experience" },
+    { entity_type: "role", entity_id: "role-2", target_field: "database_experience" },
+    { entity_type: "role", entity_id: "role-1", target_field: "leadership" },
+  ];
+  assert.equal(priorQuestionDedupeKeys(rows).size, 3);
 });
