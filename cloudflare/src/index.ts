@@ -10218,7 +10218,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         body: JSON.stringify({ limit: 500 }),
       });
       if (!res.ok) throw new Error(errorMessage(await res.json(), 'scan_failed'));
-      return readNdjson(res, function (event) {
+      var data = await readNdjson(res, function (event) {
         statusEl.textContent = 'Checking job boards… ' + event.done + ' of ' + event.total +
           ' (' + event.company + (event.new_jobs ? ', ' + event.new_jobs + ' openings added' : '') + ')';
         // scanCompanies is where a company's Verify outcome actually becomes known -- domain
@@ -10232,6 +10232,16 @@ const DASHBOARD_PAGE = `<!doctype html>
           companiesFlow.burst(event.verified ? 'verified->scannable' : 'verified->no_source', 1);
         }
       });
+      // Same failure mode the jobs-find-button handler already guards against: a stream that never
+      // reached its 'done' event (isolate recycled, connection dropped, a platform-level limit
+      // killed the request outright) comes back as {interrupted: true}, with no scanned/new_listings
+      // fields. Every caller here (bulk-add, single-add, Find companies) used to read those fields
+      // straight off the result and silently concatenate undefined/NaN into the status message
+      // instead of a number. Whatever was scanned before the drop is already durably saved
+      // (scanOneCompany writes before reporting), so normalizing to safe zero counts here is honest,
+      // not misleading -- it just means "checked 0 more this call", not "checked 0 ever".
+      if (data.interrupted) return { scanned: 0, new_listings: 0, eligible_total: 0, interrupted: true };
+      return data;
     }
 
     // Find companies: search real job postings for real hiring activity, then verify each new
@@ -10318,7 +10328,9 @@ const DASHBOARD_PAGE = `<!doctype html>
 
         var parts = [totalAdded ? (totalAdded + ' new compan' + (totalAdded === 1 ? 'y' : 'ies') + ' discovered.') : 'No new companies discovered this run.'];
         if (totalResolved || totalUnresolved) parts.push(totalResolved + ' website' + (totalResolved === 1 ? '' : 's') + ' confirmed, ' + totalUnresolved + " couldn't be found automatically.");
-        if (scanData) {
+        if (scanData && scanData.interrupted) {
+          parts.push('The job-board check was interrupted before finishing -- press Find companies again to pick up where it left off.');
+        } else if (scanData) {
           parts.push((scanData.new_listings ? scanData.new_listings + ' new job' + (scanData.new_listings === 1 ? '' : 's') + ' imported' : 'No new jobs found') +
             ' from ' + scanData.scanned + ' compan' + (scanData.scanned === 1 ? 'y' : 'ies') + ' checked.');
           parts.push('Those jobs are now in Jobs → Pre-screen.');
@@ -10365,7 +10377,9 @@ const DASHBOARD_PAGE = `<!doctype html>
         if (!res.ok) throw new Error(errorMessage(data, 'add_failed'));
         var scanData = data.added ? await scanNewCompanies(statusEl) : null;
         statusEl.textContent = data.added
-          ? 'Added and checked its job board' + (scanData ? '; imported ' + scanData.new_listings + ' opening' + (scanData.new_listings === 1 ? '' : 's') + '.' : '.')
+          ? (scanData && scanData.interrupted
+              ? 'Added. The job-board check was interrupted -- press Find companies to check it.'
+              : 'Added and checked its job board' + (scanData ? '; imported ' + scanData.new_listings + ' opening' + (scanData.new_listings === 1 ? '' : 's') + '.' : '.'))
           : 'Already on your list.';
         statusEl.className = 'status success';
         document.getElementById('company-form').reset();
@@ -10400,6 +10414,7 @@ const DASHBOARD_PAGE = `<!doctype html>
         statusEl.textContent = 'Added ' + data.added + ' of ' + data.total + '.' +
           (scanData ? ' Checked ' + scanData.scanned + ' job board' + (scanData.scanned === 1 ? '' : 's') +
             ' and imported ' + scanData.new_listings + ' opening' + (scanData.new_listings === 1 ? '' : 's') + '.' : '') +
+          (scanData && scanData.interrupted ? ' The job-board check was interrupted -- press Find companies to finish checking the rest.' : '') +
           (data.skipped ? ' ' + data.skipped + ' already on your list.' : '');
         statusEl.className = 'status success';
         textEl.value = '';
