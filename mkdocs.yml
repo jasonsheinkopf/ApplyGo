@@ -56,6 +56,7 @@ nav:
   - Architecture:
       - Local and Cloudflare Dual Mode: architecture/local-cloudflare-dual-mode.md
       - Task-Aware Model Routing: architecture/model-provider-routing.md
+      - Chat Agent API: architecture/chat-agent-api.md
   - Technology:
       - Technology Landscape: technology/index.md
       - Execution and Deployment: technology/execution-deployment.md
