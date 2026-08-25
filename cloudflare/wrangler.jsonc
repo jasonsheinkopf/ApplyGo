@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "applygo-personal",
-  "main": "src/index.ts",
+  "main": "src/agent-gateway.ts",
   "compatibility_date": "2026-07-26",
   "compatibility_flags": ["nodejs_compat"],
   "d1_databases": [
