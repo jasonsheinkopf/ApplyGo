@@ -1,3 +1,5 @@
+import type { CompanyCounts } from "./pipeline.ts";
+
 export const ONBOARDING_TOPICS = [
   "resume",
   "career_direction",
@@ -125,6 +127,123 @@ export function safeTextDocumentName(raw: string): string {
   if (!name) name = "resume-from-chat.txt";
   if (!/\.txt$/i.test(name)) name = name.replace(/\.[a-z0-9]{1,8}$/i, "") + ".txt";
   return name;
+}
+
+/**
+ * Fills in the fixed CompanyCounts shape pipeline.ts's companyFunnel expects from the raw
+ * key/count map GET /companies already returns as `company_pipeline`. Reused rather than
+ * recomputed -- companiesPipelineCounts in index.ts is the one place that SQL is allowed to live,
+ * per the same "one source of truth" rule pipeline.ts documents for itself.
+ */
+export function toCompanyCounts(raw: Record<string, number>): CompanyCounts {
+  return {
+    identity_pending: raw.identity_pending ?? 0,
+    identity_verified: raw.identity_verified ?? 0,
+    identity_ambiguous: raw.identity_ambiguous ?? 0,
+    identity_unresolved: raw.identity_unresolved ?? 0,
+    identity_not_a_company: raw.identity_not_a_company ?? 0,
+    identity_dismissed: raw.identity_dismissed ?? 0,
+    source_pending: raw.source_pending ?? 0,
+    source_supported: raw.source_supported ?? 0,
+    source_unsupported_ats: raw.source_unsupported_ats ?? 0,
+    source_careers_only: raw.source_careers_only ?? 0,
+    source_no_board: raw.source_no_board ?? 0,
+    source_board_unreachable: raw.source_board_unreachable ?? 0,
+    discovery_postings: raw.discovery_postings ?? 0,
+    total: raw.total ?? 0,
+  };
+}
+
+function safeJsonArray(value: unknown): string[] {
+  try {
+    const parsed = JSON.parse(String(value ?? "[]"));
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+export type ShortlistJob = {
+  id: string;
+  title: string;
+  company: string;
+  location: string;
+  fit_score: number | null;
+  fit_reason: string;
+  missing: string[];
+  url: string;
+};
+
+/**
+ * The agent-facing shortlist: strong/possible jobs at or above minScore, best first, with the
+ * rationale that already lives on the row (fit_reason, fit_missing_json) rather than a bare
+ * number -- a raw score without why it was given is not something a candidate (or an agent
+ * speaking for one) can act on.
+ */
+export function shapeShortlist(jobs: Record<string, unknown>[], minScore: number, limit: number): ShortlistJob[] {
+  return jobs
+    .filter((job) => {
+      const status = String(job.fit_status ?? "");
+      return (status === "strong" || status === "possible") && Number(job.fit_score ?? -1) >= minScore;
+    })
+    .sort((a, b) => Number(b.fit_score ?? 0) - Number(a.fit_score ?? 0))
+    .slice(0, limit)
+    .map((job) => ({
+      id: String(job.id ?? ""),
+      title: String(job.title ?? ""),
+      company: String(job.company ?? ""),
+      location: String(job.location ?? ""),
+      fit_score: job.fit_score === null || job.fit_score === undefined ? null : Number(job.fit_score),
+      fit_reason: String(job.fit_reason ?? ""),
+      missing: safeJsonArray(job.fit_missing_json),
+      url: String(job.source_url ?? ""),
+    }));
+}
+
+/** Jobs whose row was created at or after a captured watermark -- used to report what a scan actually surfaced. */
+export function newlyDiscoveredJobs(jobs: Record<string, unknown>[], sinceIso: string): Record<string, unknown>[] {
+  return jobs.filter((job) => String(job.created_at ?? "") >= sinceIso);
+}
+
+export type LegacyEvent = Record<string, unknown>;
+
+/**
+ * Collapses a legacy route's response into one JSON-safe summary regardless of whether it replied
+ * with a single JSON object or an NDJSON progress stream (several of the pipeline routes this
+ * gateway wraps -- /companies/scan, /jobs/process -- report progress that way for the browser UI's
+ * live view). An MCP tool call gets one result, not a stream, so this is what makes those routes
+ * usable as agent tools without teaching every caller the NDJSON shape.
+ */
+export function summarizeLegacyBody(bodyText: string): Record<string, unknown> {
+  const lines = bodyText.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines.length <= 1) {
+    try {
+      return JSON.parse(bodyText || "{}") as Record<string, unknown>;
+    } catch {
+      return { raw: bodyText.slice(0, 2000) };
+    }
+  }
+  const events: LegacyEvent[] = [];
+  for (const line of lines) {
+    try {
+      events.push(JSON.parse(line) as LegacyEvent);
+    } catch {
+      // One malformed progress line must not lose the rest of a real stream.
+    }
+  }
+  const eventCounts: Record<string, number> = {};
+  const errors: LegacyEvent[] = [];
+  for (const event of events) {
+    const key = [event.type, event.stage, event.phase].filter(Boolean).join(".") || "event";
+    eventCounts[key] = (eventCounts[key] ?? 0) + 1;
+    if (event.phase === "failed" || event.type === "error") errors.push(event);
+  }
+  return {
+    event_counts: eventCounts,
+    errors: errors.slice(0, 10),
+    final_event: events[events.length - 1] ?? {},
+    total_events: events.length,
+  };
 }
 
 /** Add one small entry point to the existing Settings > Devices UI without editing index.ts. */

@@ -193,6 +193,88 @@ A fresh agent should ask these topics in order and write each answer immediately
 
 After the six topics are confirmed, the agent follows `next_action`: generate the canonical structured profile, then analyze Career role families, then begin job discovery.
 
+## Job search, evaluation, profile feedback, and materials (v1.1)
+
+The slice above intentionally stopped at `ready_for_job_search`. Everything below extends the same
+`/agent/v1/*` surface, under the same `ago_*` bearer auth, to cover the rest of the workflow the
+website's Companies/Jobs/Profile/Interested tabs already expose. Every route is a thin translation
+over an existing legacy route -- discovery, scoring, and generation are not reimplemented here, only
+gated and reshaped for a single-shot tool call instead of a browser session.
+
+**Hard boundary, unchanged:** none of these routes submit an application or contact an employer.
+ApplyGo has no automated-submission route at all today -- `/applications/*` backs a browser-extension
+autofill flow, not automated submission -- so that boundary holds by omission, not by a check that
+could be bypassed.
+
+### Streaming legacy routes become one summarized result
+
+`/companies/scan`, `/companies/discover`, `/jobs/process`, and `/profile/improve/audit` report
+progress to the browser as NDJSON (one JSON object per line) so a long-running scan can show live
+counts. An MCP tool call gets one result, not a stream, so every wrapper below collapses that into
+a single object: `event_counts` (a tally by `type.stage.phase`), `errors` (up to the first 10 failed
+events), `final_event`, and `total_events`. A route that never streamed (most `GET`/`PUT` routes)
+passes its JSON straight through unchanged.
+
+### Companies
+
+- `POST /agent/v1/companies/discover` -- wraps `POST /companies/discover`.
+- `POST /agent/v1/companies/scan` -- wraps `POST /companies/scan`.
+- `GET /agent/v1/companies/search-terms` / `PUT /agent/v1/companies/search-terms` -- wrap the same-named legacy routes.
+
+### Jobs
+
+- `POST /agent/v1/jobs/search` -- there is no discovery primitive independent of the company
+  pipeline (new companies come from `/companies/discover`; new postings come from scanning them).
+  This runs `/companies/scan` then the fit pipeline, and reports only postings whose `created_at`
+  is at or after when the call started: `{ scan, evaluate, newly_found_count, newly_found }`.
+- `POST /agent/v1/jobs/process` -- thin wrap of `POST /jobs/process` (the bulk screen-then-assess
+  pipeline over whatever is currently `unassessed`). Body: `{ provider?, calls? }`.
+- `POST /agent/v1/jobs/evaluate` -- runs the same pipeline, then returns a ranked, rationale-rich
+  shortlist rather than raw scores: `{ pipeline_run, ranked: [{ id, title, company, location,
+  fit_score, fit_reason, missing, url }] }`. Body adds `min_score` (default 40) and `limit`
+  (default 20) on top of `jobs/process`'s fields. There is no narrower "score just this job"
+  primitive in the app -- the pipeline only ever touches `unassessed` rows, so it is safe to call
+  repeatedly and cheap when nothing new is waiting.
+- `GET /agent/v1/jobs/shortlist?min_score=&limit=` -- read-only version of the ranked list above,
+  without triggering a pipeline run first.
+
+### Profile feedback loop
+
+The task's "surface gaps as targeted questions" loop is the existing Profile > Improve workflow
+(`profile_improvement_questions` / `profile_improvement_audits`, feeding confirmed answers into
+`candidate_evidence`), exposed as four routes rather than one, matching the legacy route shapes:
+
+- `GET /agent/v1/profile/questions` -- wraps `GET /profile/improve/questions`.
+- `POST /agent/v1/profile/questions/audit` -- wraps `POST /profile/improve/audit` (finds new gaps
+  between the profile and the jobs it's been matched against).
+- `PUT /agent/v1/profile/questions/:id` -- wraps `PUT /profile/improve/questions/:id` (answer one
+  question).
+- `POST /agent/v1/profile/questions/apply` -- wraps `POST /profile/improve/apply` (commits answered
+  questions into `candidate_evidence`).
+
+### Application materials
+
+- `POST /agent/v1/materials/resume` -- body `{ job_id, provider?, regenerate? }`, wraps
+  `POST /jobs/:id/resume`. Generation reads `candidate_evidence`/`source_documents` exactly as the
+  website's Interested tab does; nothing here gives the model latitude to state a qualification the
+  profile doesn't back.
+- `POST /agent/v1/materials/cover-letter` -- same shape, wraps `POST /jobs/:id/cover-letter`.
+
+### Pipeline status (QC)
+
+`GET /agent/v1/pipeline/status` answers "why aren't we finding enough good jobs": the same
+company/job funnel the dashboard renders (via `pipeline.ts`'s `companyFunnel`, so the arithmetic is
+guaranteed to reconcile -- `funnel_violations` is empty on a healthy pipeline), plus three signals a
+funnel count alone can't show: `model_call_failures_24h` (from `llm_traces`),
+`discovery_streams_with_pages_remaining` (from `company_discovery_streams`), and
+`duplicate_title_company_groups` (postings that collided on title+company).
+
 ## Current product integration note
 
-The Agent API is the stable backend contract; MCP is an adapter, not the data model. This matters because ChatGPT plan/surface support for custom write-capable MCP apps is still evolving. The existing ApplyGo MCP server remains read-only, while this API can be used by the Cloudflare integration now and by a future remote MCP/Apps SDK adapter without another schema redesign.
+The Agent API is the stable backend contract; MCP is an adapter, not the data model. The existing
+`mcp/` server is a **local, stdio, read-only** server for Claude Desktop/Code, authenticated with a
+manually-copied `read_only` device token -- it is not reachable by a Claude.ai web Connector, which
+requires a remote HTTP server speaking OAuth 2.1 with dynamic client registration. That remote,
+write-capable server is `/mcp/*` on this same Worker (see `docs/architecture/mcp-connector.md`); it
+calls this Agent API's routes as its tool implementations rather than duplicating any of the logic
+above.

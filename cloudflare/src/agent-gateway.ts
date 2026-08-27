@@ -9,13 +9,31 @@ import {
   inferConfirmedFromExisting,
   injectAgentSettingsLink,
   mergeAgentPreferences,
+  newlyDiscoveredJobs,
   safeTextDocumentName,
+  shapeShortlist,
+  summarizeLegacyBody,
+  toCompanyCounts,
 } from "./agent";
+import { companyFunnel, companyToJobHandoff, funnelViolations, runSummaryLine } from "./pipeline";
+import { OAuthProvider, type AuthRequest, type ClientInfo, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import { type AgentCall, handleMcpRequest } from "./mcp-server";
 
 interface Env {
   DB: D1Database;
   FILES: R2Bucket;
+  /** Bound by @cloudflare/workers-oauth-provider; see wrangler.jsonc's kv_namespaces entry. */
+  OAUTH_KV: KVNamespace;
+  /** Injected by OAuthProvider at request time -- not a real Wrangler binding, so it is never present outside a request that OAuthProvider itself dispatched. */
+  OAUTH_PROVIDER: OAuthHelpers;
 }
+
+/** What an approved OAuth grant carries into every authenticated /mcp call, via ctx.props. */
+type McpGrantProps = {
+  agentToken: string;
+  credentialId: string;
+  label: string;
+};
 
 type DashboardSession = {
   id: string;
@@ -578,15 +596,29 @@ async function listActivity(request: Request, env: Env): Promise<Response> {
   return json({ activity: rows.results ?? [] });
 }
 
-async function callLegacyAction(
+/**
+ * Every legacy call this gateway makes on an agent's behalf goes through here: it stands up a
+ * short-lived (10-minute) full session, replays the request against the existing Worker under
+ * that session, records one activity entry, and tears the session down whether the call succeeded
+ * or not. This is the mechanism PR #107 introduced for profile.generate/careers.analyze; the
+ * routes below reuse it rather than each inventing their own internal-session dance.
+ *
+ * `method`/`path`/`bodyText` are explicit rather than derived from `request` because several
+ * callers need to translate an agent-shaped request into a differently-shaped (or differently
+ * routed) legacy call -- e.g. POST /agent/v1/materials/resume {job_id} becomes
+ * POST /jobs/:id/resume with a trimmed body. `request` is kept only to resolve `path` against the
+ * same origin the legacy Worker already expects.
+ */
+async function bridgeLegacy(
   request: Request,
   env: Env,
   ctx: ExecutionContext,
   principal: Principal,
+  method: string,
   path: string,
   action: string,
+  bodyText = "{}",
 ): Promise<Response> {
-  const bodyText = await request.text();
   const internalToken = randomToken();
   const sessionId = crypto.randomUUID();
   await env.DB.prepare(
@@ -597,40 +629,401 @@ async function callLegacyAction(
     .run();
   try {
     const url = new URL(path, request.url);
+    const hasBody = method !== "GET" && method !== "DELETE";
     const legacyRequest = new Request(url.toString(), {
-      method: "POST",
+      method,
       headers: {
         authorization: `Bearer ${internalToken}`,
-        "content-type": request.headers.get("content-type") || "application/json",
+        "content-type": "application/json",
         accept: "application/json",
       },
-      body: bodyText || "{}",
+      ...(hasBody ? { body: bodyText || "{}" } : {}),
     });
-    const response = await app.fetch(
-      legacyRequest,
-      env as Parameters<typeof app.fetch>[1],
-      ctx,
-    );
-    if (response.ok) {
-      const profileId = await getOrCreateProfileId(env);
-      if (action === "profile.generate") {
-        await ensureOnboardingState(env, profileId);
-        await env.DB.prepare(
-          "UPDATE agent_onboarding_state SET profile_dirty = 0, career_dirty = 1, updated_at = CURRENT_TIMESTAMP WHERE profile_id = ?",
-        ).bind(profileId).run();
-      }
-      if (action === "careers.analyze") {
-        await ensureOnboardingState(env, profileId);
-        await env.DB.prepare(
-          "UPDATE agent_onboarding_state SET career_dirty = 0, updated_at = CURRENT_TIMESTAMP WHERE profile_id = ?",
-        ).bind(profileId).run();
-      }
-    }
+    const response = await app.fetch(legacyRequest, env as unknown as Parameters<typeof app.fetch>[1], ctx);
     await recordActivity(env, principal, action, `HTTP ${response.status}`);
     return response;
   } finally {
     await env.DB.prepare("DELETE FROM device_sessions WHERE id = ?").bind(sessionId).run().catch(() => undefined);
   }
+}
+
+/** profile.generate/careers.analyze need one extra side effect on success: clearing the dirty flag the legacy action just satisfied. */
+async function callLegacyAction(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  principal: Principal,
+  path: string,
+  action: string,
+): Promise<Response> {
+  const bodyText = await request.text();
+  const response = await bridgeLegacy(request, env, ctx, principal, "POST", path, action, bodyText);
+  if (response.ok) {
+    const profileId = await getOrCreateProfileId(env);
+    if (action === "profile.generate") {
+      await ensureOnboardingState(env, profileId);
+      await env.DB.prepare(
+        "UPDATE agent_onboarding_state SET profile_dirty = 0, career_dirty = 1, updated_at = CURRENT_TIMESTAMP WHERE profile_id = ?",
+      ).bind(profileId).run();
+    }
+    if (action === "careers.analyze") {
+      await ensureOnboardingState(env, profileId);
+      await env.DB.prepare(
+        "UPDATE agent_onboarding_state SET career_dirty = 0, updated_at = CURRENT_TIMESTAMP WHERE profile_id = ?",
+      ).bind(profileId).run();
+    }
+  }
+  return response;
+}
+
+/** Reads a legacy JSON response's body without disturbing its status for the caller that forwards it. */
+async function readLegacyJson(response: Response): Promise<Record<string, unknown>> {
+  try {
+    return (await response.json()) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Job search, evaluation, and application materials (v1.1) -- the slice PR #107 deliberately
+// stopped short of. Every route below is a thin translation over an existing legacy route; none
+// of them re-implements discovery, scoring, or generation. None of them submits an application,
+// contacts an employer, or sends anything external -- ApplyGo has no such route today (the
+// /applications/* endpoints back a browser-extension autofill flow, not automated submission),
+// so that boundary is preserved simply by not adding one.
+// ---------------------------------------------------------------------------------------------
+
+async function companiesList(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const response = await bridgeLegacy(request, env, ctx, principal, "GET", "/companies", "companies.list");
+  return json(await readLegacyJson(response), response.status);
+}
+
+async function jobsList(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const response = await bridgeLegacy(request, env, ctx, principal, "GET", "/jobs", "jobs.list");
+  return json(await readLegacyJson(response), response.status);
+}
+
+async function companiesDiscover(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const bodyText = await request.text();
+  const response = await bridgeLegacy(request, env, ctx, principal, "POST", "/companies/discover", "companies.discover", bodyText);
+  return json(summarizeLegacyBody(await response.text()), response.status);
+}
+
+async function companiesScan(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const bodyText = await request.text();
+  const response = await bridgeLegacy(request, env, ctx, principal, "POST", "/companies/scan", "companies.scan", bodyText);
+  return json(summarizeLegacyBody(await response.text()), response.status);
+}
+
+async function companiesSearchTermsRead(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const response = await bridgeLegacy(request, env, ctx, principal, "GET", "/companies/search-terms", "companies.search_terms.read");
+  return json(await readLegacyJson(response), response.status);
+}
+
+async function companiesSearchTermsWrite(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const bodyText = await request.text();
+  const response = await bridgeLegacy(request, env, ctx, principal, "PUT", "/companies/search-terms", "companies.search_terms.write", bodyText);
+  return json(await readLegacyJson(response), response.status);
+}
+
+/**
+ * Runs ApplyGo's one scoring pipeline (screen, then assess -- see fit.ts) over whatever is
+ * currently unassessed. There is no narrower "score just this job" primitive in the app today;
+ * the pipeline is already scoped to unassessed rows and safe to call repeatedly, so this is the
+ * real underlying action behind both /agent/v1/jobs/process (bulk trigger) and
+ * /agent/v1/jobs/evaluate (trigger, then hand back a rationale-rich shortlist) below.
+ */
+async function runFitPipeline(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  principal: Principal,
+  bodyText: string,
+): Promise<{ response: Response; summary: Record<string, unknown> }> {
+  const response = await bridgeLegacy(request, env, ctx, principal, "POST", "/jobs/process", "jobs.evaluate", bodyText || "{}");
+  const text = await response.text();
+  return { response, summary: summarizeLegacyBody(text) };
+}
+
+async function jobsProcess(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const bodyText = await request.text();
+  const { response, summary } = await runFitPipeline(request, env, ctx, principal, bodyText);
+  return json(summary, response.status);
+}
+
+async function jobsEvaluate(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const body = (await request.json().catch(() => ({}))) as { provider?: string; calls?: number; min_score?: number; limit?: number };
+  const { response, summary } = await runFitPipeline(
+    request,
+    env,
+    ctx,
+    principal,
+    JSON.stringify({ provider: body.provider, calls: body.calls }),
+  );
+  if (!response.ok) return json(summary, response.status);
+  const jobsResponse = await bridgeLegacy(request, env, ctx, principal, "GET", "/jobs", "jobs.evaluate.read");
+  const jobsData = await readLegacyJson(jobsResponse);
+  const minScore = Math.min(Math.max(Number(body.min_score) || 40, 0), 100);
+  const limit = Math.min(Math.max(Number(body.limit) || 20, 1), 100);
+  const jobs = Array.isArray(jobsData.jobs) ? jobsData.jobs as Record<string, unknown>[] : [];
+  return json({ pipeline_run: summary, ranked: shapeShortlist(jobs, minScore, limit) });
+}
+
+/**
+ * "Search" in ApplyGo terms is scan known companies for new postings, then score whatever came
+ * in -- there is no separate job-discovery primitive independent of the company pipeline (new
+ * companies are found by /companies/discover; new postings come from scanning them). This wraps
+ * both steps and reports only what is new since the call started, using each job's own created_at
+ * as the watermark.
+ */
+async function jobsSearch(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const bodyText = await request.text();
+  const since = new Date().toISOString();
+  const scanResponse = await bridgeLegacy(request, env, ctx, principal, "POST", "/companies/scan", "jobs.search.scan", bodyText || "{}");
+  const scanSummary = summarizeLegacyBody(await scanResponse.text());
+  if (!scanResponse.ok) return json({ scan: scanSummary }, scanResponse.status);
+
+  const { response: evalResponse, summary: evalSummary } = await runFitPipeline(request, env, ctx, principal, "{}");
+  if (!evalResponse.ok) return json({ scan: scanSummary, evaluate: evalSummary }, evalResponse.status);
+
+  const jobsResponse = await bridgeLegacy(request, env, ctx, principal, "GET", "/jobs", "jobs.search.read");
+  const jobsData = await readLegacyJson(jobsResponse);
+  const allJobs = Array.isArray(jobsData.jobs) ? jobsData.jobs as Record<string, unknown>[] : [];
+  const newly = newlyDiscoveredJobs(allJobs, since);
+  return json({
+    scan: scanSummary,
+    evaluate: evalSummary,
+    newly_found_count: newly.length,
+    newly_found: shapeShortlist(newly, 0, 50),
+  });
+}
+
+async function jobsShortlist(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const url = new URL(request.url);
+  const minScore = Math.min(Math.max(Number(url.searchParams.get("min_score")) || 60, 0), 100);
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20, 1), 100);
+  const jobsResponse = await bridgeLegacy(request, env, ctx, principal, "GET", "/jobs", "jobs.shortlist");
+  const jobsData = await readLegacyJson(jobsResponse);
+  const jobs = Array.isArray(jobsData.jobs) ? jobsData.jobs as Record<string, unknown>[] : [];
+  return json({ shortlist: shapeShortlist(jobs, minScore, limit) });
+}
+
+async function profileQuestionsList(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const response = await bridgeLegacy(request, env, ctx, principal, "GET", "/profile/improve/questions", "profile.questions.read");
+  return json(await readLegacyJson(response), response.status);
+}
+
+async function profileQuestionsAudit(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const bodyText = await request.text();
+  const response = await bridgeLegacy(request, env, ctx, principal, "POST", "/profile/improve/audit", "profile.questions.audit", bodyText);
+  return json(summarizeLegacyBody(await response.text()), response.status);
+}
+
+async function profileQuestionsAnswer(request: Request, env: Env, ctx: ExecutionContext, principal: Principal, id: string): Promise<Response> {
+  const bodyText = await request.text();
+  const response = await bridgeLegacy(
+    request,
+    env,
+    ctx,
+    principal,
+    "PUT",
+    `/profile/improve/questions/${encodeURIComponent(id)}`,
+    "profile.questions.answer",
+    bodyText,
+  );
+  return json(await readLegacyJson(response), response.status);
+}
+
+async function profileQuestionsApply(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const bodyText = await request.text();
+  const response = await bridgeLegacy(request, env, ctx, principal, "POST", "/profile/improve/apply", "profile.questions.apply", bodyText);
+  return json(await readLegacyJson(response), response.status);
+}
+
+/** Shared by both material routes: pull {job_id, ...rest} apart and forward `rest` to the per-job legacy route. */
+async function materialsRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  principal: Principal,
+  legacyPathSuffix: "resume" | "cover-letter",
+  action: string,
+): Promise<Response> {
+  const body = (await request.json().catch(() => ({}))) as { job_id?: string; provider?: string; regenerate?: boolean };
+  const jobId = String(body.job_id ?? "").trim();
+  if (!jobId) return json({ error: "job_id_required" }, 400);
+  const legacyBody = JSON.stringify({ provider: body.provider, regenerate: body.regenerate });
+  const response = await bridgeLegacy(
+    request,
+    env,
+    ctx,
+    principal,
+    "POST",
+    `/jobs/${encodeURIComponent(jobId)}/${legacyPathSuffix}`,
+    action,
+    legacyBody,
+  );
+  return json(await readLegacyJson(response), response.status);
+}
+
+async function materialsResume(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  return materialsRequest(request, env, ctx, principal, "resume", "materials.resume");
+}
+
+async function materialsCoverLetter(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  return materialsRequest(request, env, ctx, principal, "cover-letter", "materials.cover_letter");
+}
+
+/**
+ * Read-only QC view for the agent's "why aren't we finding enough good jobs" role: the same
+ * company/job funnel the dashboard renders (via pipeline.ts, so the arithmetic is guaranteed to
+ * reconcile -- see funnelViolations), plus three signals that funnel doesn't cover: recent model
+ * failures, discovery streams that still have unfetched pages, and duplicate postings by
+ * title+company, which a funnel count alone can't reveal.
+ */
+async function pipelineStatus(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const [companiesResponse, jobsResponse] = await Promise.all([
+    bridgeLegacy(request, env, ctx, principal, "GET", "/companies", "pipeline.status"),
+    bridgeLegacy(request, env, ctx, principal, "GET", "/jobs", "pipeline.status"),
+  ]);
+  const companiesData = await readLegacyJson(companiesResponse);
+  const jobsData = await readLegacyJson(jobsResponse);
+  const counts = toCompanyCounts((companiesData.company_pipeline as Record<string, number>) ?? {});
+  const stages = companyFunnel(counts);
+  const violations = funnelViolations(stages);
+  const jobCounts = (jobsData.counts as Record<string, number>) ?? {};
+  const handoff = companyToJobHandoff(counts, Number(jobCounts.unassessed ?? 0));
+  const summaryLine = runSummaryLine(counts, Number(jobCounts.unassessed ?? 0), false);
+
+  const [failedTraces, openStreams, duplicates] = await Promise.all([
+    env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM llm_traces WHERE ok = 0 AND created_at > datetime('now', '-24 hours')",
+    ).first<{ n: number }>(),
+    env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM company_discovery_streams WHERE exhausted = 0",
+    ).first<{ n: number }>()
+      .catch(() => ({ n: 0 })),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM (
+         SELECT title, company FROM job_postings GROUP BY title, company HAVING COUNT(*) > 1
+       )`,
+    ).first<{ n: number }>(),
+  ]);
+
+  return json({
+    summary: summaryLine,
+    stages,
+    handoff,
+    funnel_violations: violations,
+    diagnostics: {
+      model_call_failures_24h: failedTraces?.n ?? 0,
+      discovery_streams_with_pages_remaining: openStreams?.n ?? 0,
+      duplicate_title_company_groups: duplicates?.n ?? 0,
+    },
+  });
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
+}
+
+/** Shown instead of the consent page when the browser has no signed-in ApplyGo dashboard session. */
+function authorizeSignInPage(): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in required</title>
+<style>:root{font-family:system-ui,sans-serif;color:#171717;background:#f5f5f7}body{margin:0;padding:24px 16px;max-width:480px}a{color:#222}</style>
+</head><body><h1>Sign in to ApplyGo first</h1>
+<p>This browser isn't signed in to ApplyGo. <a href="/">Sign in</a>, then use the connector's "Connect" button again to reopen this authorization request.</p>
+</body></html>`;
+}
+
+/**
+ * The consent screen a human sees before Claude.ai (or any other MCP client) is granted an
+ * `ago_*` agent credential. The same preserved OAuth query string is resubmitted on the form's
+ * `action` so the POST handler below can re-parse the identical AuthRequest -- this is a
+ * stateless round trip, not a stored draft.
+ */
+function authorizeConsentPage(client: ClientInfo, oauthRequest: AuthRequest): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Authorize agent access</title>
+<style>:root{font-family:system-ui,sans-serif;color:#171717;background:#f5f5f7}*{box-sizing:border-box}body{margin:0;padding:24px 16px;max-width:480px}
+section{background:white;border:1px solid #ddd;border-radius:14px;padding:18px;margin:14px 0}
+button{appearance:none;border:1px solid #222;background:#222;color:white;padding:10px 14px;border-radius:9px;font:inherit;font-weight:600;cursor:pointer;margin-right:10px}
+button.secondary{background:white;color:#222}
+ul{padding-left:20px;color:#444}</style>
+</head><body>
+<h1>Authorize agent access</h1>
+<section>
+<p><strong>${escapeHtml(client.clientName || client.clientId)}</strong> wants to access your ApplyGo data as a trusted job agent.</p>
+<p>This grants the same access level as an <a href="/agent">agent key</a> created from Settings: it can search for jobs, evaluate fit, update your search preferences, answer profile questions, and generate resumes/cover letters. It cannot submit an application, send email, or delete career data -- ApplyGo has no route that does either.</p>
+<p>Scopes requested: ${oauthRequest.scope.length ? oauthRequest.scope.map((s) => `<code>${escapeHtml(s)}</code>`).join(", ") : "(none declared)"}</p>
+<form method="POST">
+<button type="submit" name="decision" value="approve">Allow access</button>
+<button type="submit" name="decision" value="deny" class="secondary">Deny</button>
+</form>
+</section>
+<p><a href="/agent">Manage existing agent keys</a></p>
+</body></html>`;
+}
+
+/**
+ * The `/authorize` step of the OAuth dance -- not handled by OAuthProvider itself (see its own
+ * docs: "This URL is used in OAuth metadata and is not handled by the provider itself"). GET shows
+ * a consent screen gated on the existing full dashboard session; POST records the human's decision
+ * and, on approval, mints a fresh `ago_*` credential exactly like the "Create agent key" button on
+ * `/agent` does, then completes the grant with that token as `props` so every future `/mcp` call
+ * under this grant authenticates as that credential.
+ */
+async function handleAuthorizeRequest(request: Request, env: Env): Promise<Response> {
+  await ensureAgentSchema(env);
+  const session = await requireFullDashboardSession(request, env);
+  if (session instanceof Response) {
+    return new Response(authorizeSignInPage(), { status: 401, headers: { "content-type": "text/html; charset=utf-8" } });
+  }
+
+  let oauthRequest: AuthRequest;
+  try {
+    oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+  } catch (error) {
+    return json({ error: "invalid_authorize_request", detail: (error as Error).message }, 400);
+  }
+  const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
+  if (!client) return json({ error: "unknown_oauth_client" }, 400);
+
+  if (request.method === "GET") {
+    return new Response(authorizeConsentPage(client, oauthRequest), { headers: { "content-type": "text/html; charset=utf-8" } });
+  }
+
+  const form = await request.formData().catch(() => null);
+  const approved = form?.get("decision") === "approve";
+  if (!approved) {
+    if (!oauthRequest.redirectUri) return json({ error: "access_denied" }, 400);
+    const redirect = new URL(oauthRequest.redirectUri);
+    redirect.searchParams.set("error", "access_denied");
+    if (oauthRequest.state) redirect.searchParams.set("state", oauthRequest.state);
+    return Response.redirect(redirect.toString(), 302);
+  }
+
+  const token = `ago_${randomToken()}`;
+  const tokenHash = await sha256(token);
+  const credentialId = crypto.randomUUID();
+  const label = `Claude connector (${client.clientName || client.clientId})`.slice(0, 120);
+  await env.DB.prepare(
+    `INSERT INTO agent_credentials (id, token_hash, label, expires_at) VALUES (?, ?, ?, datetime('now', '+365 days'))`,
+  ).bind(credentialId, tokenHash, label).run();
+  await recordActivity(env, { kind: "dashboard", id: session.id, label: session.device_name }, "credential.create", label);
+
+  const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+    request: oauthRequest,
+    // One candidate per ApplyGo deployment -- the dashboard session id is a stable enough per-install
+    // subject identifier; there is no separate user table this could reference instead.
+    userId: session.id,
+    metadata: { clientName: client.clientName ?? client.clientId, credentialId },
+    scope: oauthRequest.scope,
+    props: { agentToken: token, credentialId, label } satisfies McpGrantProps,
+  });
+  return Response.redirect(redirectTo, 302);
 }
 
 function agentPage(): string {
@@ -661,7 +1054,13 @@ load();
 </script></body></html>`;
 }
 
-async function handleAgentRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+/**
+ * The whole `/agent/*` surface, including `/agent/v1/*`. Exported so the MCP layer
+ * (mcp-server.ts) can call it in-process -- constructing a synthetic Request carrying an
+ * `ago_*` bearer token and reading the Response back -- instead of making a real network
+ * subrequest back to this same Worker.
+ */
+export async function handleAgentRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   await ensureAgentSchema(env);
   const url = new URL(request.url);
 
@@ -695,17 +1094,48 @@ async function handleAgentRequest(request: Request, env: Env, ctx: ExecutionCont
     return callLegacyAction(request, env, ctx, principal, "/desired-roles/analyze", "careers.analyze");
   }
 
+  // ----- v1.1: job search, evaluation, profile feedback, and application materials -----
+  if (request.method === "GET" && url.pathname === "/agent/v1/companies") return companiesList(request, env, ctx, principal);
+  if (request.method === "GET" && url.pathname === "/agent/v1/jobs") return jobsList(request, env, ctx, principal);
+  if (request.method === "POST" && url.pathname === "/agent/v1/companies/discover") return companiesDiscover(request, env, ctx, principal);
+  if (request.method === "POST" && url.pathname === "/agent/v1/companies/scan") return companiesScan(request, env, ctx, principal);
+  if (request.method === "GET" && url.pathname === "/agent/v1/companies/search-terms") return companiesSearchTermsRead(request, env, ctx, principal);
+  if (request.method === "PUT" && url.pathname === "/agent/v1/companies/search-terms") return companiesSearchTermsWrite(request, env, ctx, principal);
+
+  if (request.method === "POST" && url.pathname === "/agent/v1/jobs/search") return jobsSearch(request, env, ctx, principal);
+  if (request.method === "POST" && url.pathname === "/agent/v1/jobs/process") return jobsProcess(request, env, ctx, principal);
+  if (request.method === "POST" && url.pathname === "/agent/v1/jobs/evaluate") return jobsEvaluate(request, env, ctx, principal);
+  if (request.method === "GET" && url.pathname === "/agent/v1/jobs/shortlist") return jobsShortlist(request, env, ctx, principal);
+
+  if (request.method === "GET" && url.pathname === "/agent/v1/profile/questions") return profileQuestionsList(request, env, ctx, principal);
+  if (request.method === "POST" && url.pathname === "/agent/v1/profile/questions/audit") return profileQuestionsAudit(request, env, ctx, principal);
+  if (request.method === "POST" && url.pathname === "/agent/v1/profile/questions/apply") return profileQuestionsApply(request, env, ctx, principal);
+  const profileQuestionMatch = url.pathname.match(/^\/agent\/v1\/profile\/questions\/([^/]+)$/);
+  if (request.method === "PUT" && profileQuestionMatch) return profileQuestionsAnswer(request, env, ctx, principal, profileQuestionMatch[1]);
+
+  if (request.method === "POST" && url.pathname === "/agent/v1/materials/resume") return materialsResume(request, env, ctx, principal);
+  if (request.method === "POST" && url.pathname === "/agent/v1/materials/cover-letter") return materialsCoverLetter(request, env, ctx, principal);
+
+  if (request.method === "GET" && url.pathname === "/agent/v1/pipeline/status") return pipelineStatus(request, env, ctx, principal);
+
   return json({ error: "not_found" }, 404);
 }
 
-export default {
+/**
+ * Everything that isn't the OAuth-protected `/mcp` endpoint: the existing `/agent/*` surface,
+ * the new `/authorize` consent step, and every legacy ApplyGo route unchanged. This is what
+ * OAuthProvider calls `defaultHandler` -- every request that isn't `/mcp` with a valid access
+ * token passes through here exactly as it did before this file added OAuth.
+ */
+const applyGoHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/authorize") return handleAuthorizeRequest(request, env);
     if (url.pathname === "/agent" || url.pathname.startsWith("/agent/")) {
       return handleAgentRequest(request, env, ctx);
     }
 
-    const response = await app.fetch(request, env as Parameters<typeof app.fetch>[1], ctx);
+    const response = await app.fetch(request, env as unknown as Parameters<typeof app.fetch>[1], ctx);
     if (request.method === "GET" && url.pathname === "/" && response.ok && (response.headers.get("content-type") || "").includes("text/html")) {
       const html = injectAgentSettingsLink(await response.text());
       const headers = new Headers(response.headers);
@@ -715,3 +1145,46 @@ export default {
     return response;
   },
 };
+
+/**
+ * The `/mcp` endpoint itself. OAuthProvider only calls this once a bearer token from a completed
+ * grant has been verified, with that grant's `props` (see McpGrantProps) attached to `ctx.props`.
+ * The tool implementations in mcp-server.ts never see D1, R2, or the ago_* token directly -- they
+ * only see `callAgent`, which is exactly the same in-process call to handleAgentRequest that a real
+ * `ago_*`-authenticated HTTP request to `/agent/v1/*` would make.
+ */
+const mcpApiHandler = {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const props = (ctx as unknown as { props?: McpGrantProps }).props;
+    if (!props?.agentToken) return json({ error: "missing_grant_props" }, 500);
+
+    const callAgent: AgentCall = async (method, path, body) => {
+      const agentRequest = new Request(new URL(path, request.url), {
+        method,
+        headers: {
+          authorization: `Bearer ${props.agentToken}`,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        ...(method === "GET" ? {} : { body: JSON.stringify(body ?? {}) }),
+      });
+      const response = await handleAgentRequest(agentRequest, env, ctx);
+      const responseBody = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+      return { status: response.status, body: responseBody };
+    };
+
+    return handleMcpRequest(request, callAgent);
+  },
+};
+
+export default new OAuthProvider<Env>({
+  apiRoute: "/mcp",
+  apiHandler: mcpApiHandler,
+  defaultHandler: applyGoHandler,
+
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/oauth/token",
+  clientRegistrationEndpoint: "/oauth/register",
+
+  scopesSupported: ["applygo:agent"],
+});

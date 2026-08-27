@@ -18,6 +18,15 @@
       "bucket_name": "applygo-private"
     }
   ],
+  // Used by @cloudflare/workers-oauth-provider (the /mcp OAuth layer -- see agent-gateway.ts
+  // and docs/architecture/mcp-connector.md) to store OAuth clients, grants, and tokens.
+  // Create with `wrangler kv namespace create OAUTH_KV --env=""` and paste the returned id here.
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "REPLACE_WITH_YOUR_OAUTH_KV_ID"
+    }
+  ],
   "browser": {
     "binding": "BROWSER"
   },
@@ -46,6 +55,14 @@
         {
           "binding": "FILES",
           "bucket_name": "applygo-prod-private"
+        }
+      ],
+      // Create with `wrangler kv namespace create OAUTH_KV --env production` (a separate
+      // namespace from local dev's above, same as the D1/R2 bindings above it).
+      "kv_namespaces": [
+        {
+          "binding": "OAUTH_KV",
+          "id": "REPLACE_WITH_YOUR_PRODUCTION_OAUTH_KV_ID"
         }
       ],
       "browser": {
