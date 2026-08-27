@@ -92,25 +92,18 @@ serves more than one signed-in user.
 
 ## One-time setup before this can deploy
 
-This session has no Cloudflare credentials, so none of the following was run -- do this before
-merging (or before the next deploy, if merging first):
+The two `OAUTH_KV` namespaces both exist and `wrangler.jsonc` already carries their real ids
+(`fa3ecab8...` for local dev, `2073d56d...` for production) -- created via the Cloudflare account
+API rather than the `wrangler` CLI, since this session had API access but no interactive `wrangler
+login`. What's left:
 
-1. **Create the KV namespace** the OAuth provider needs, once per environment:
-   ```bash
-   cd cloudflare
-   npx wrangler kv namespace create OAUTH_KV --env=""
-   npx wrangler kv namespace create OAUTH_KV --env production
-   ```
-   Paste the two returned ids into `wrangler.jsonc`, replacing `REPLACE_WITH_YOUR_OAUTH_KV_ID` and
-   `REPLACE_WITH_YOUR_PRODUCTION_OAUTH_KV_ID` (same pattern as the existing D1 database id
-   placeholder above them).
-2. **Deploy.** `npm run release:production` (or merge this PR -- Cloudflare Workers Builds deploys
+1. **Deploy.** `npm run release:production` (or merge this PR -- Cloudflare Workers Builds deploys
    `main` automatically, same as every prior release). No new secret is required: this layer only
    adds a KV binding, not a new API key.
-3. **Add the connector in Claude.ai:** Settings -> Connectors -> Add connector -> paste
+2. **Add the connector in Claude.ai:** Settings -> Connectors -> Add connector -> paste
    `https://<your-worker-domain>/mcp` -> follow the OAuth prompt (this is the `/authorize` consent
    screen above) -> approve.
-4. **Verify the metadata endpoints resolve** (useful when something's wrong before involving
+3. **Verify the metadata endpoints resolve** (useful when something's wrong before involving
    Claude.ai at all):
    ```bash
    curl https://<your-worker-domain>/.well-known/oauth-authorization-server
