@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { callWithWebSearch, type LlmEnv, screenProvider } from "./llm.ts";
+import { callWithWebSearch, type LlmEnv, modelFor, priceFor, screenProvider } from "./llm.ts";
 
 const ENV: LlmEnv = { ANTHROPIC_API_KEY: "key123" };
 
@@ -103,4 +103,39 @@ test("callWithWebSearch surfaces the provider's error body on a non-ok response"
   } finally {
     globalThis.fetch = previous;
   }
+});
+
+// ---------------------------------------------------------------------------
+// The reason tier's fallback model
+// ---------------------------------------------------------------------------
+
+test("the GPT-5.6 family is priced, so a fallback call records a cost rather than a null", () => {
+  // An unpriced model records null, which is correct but makes the cost view blind to exactly the
+  // spend that happens during an Anthropic outage -- the calls most worth accounting for.
+  for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+    assert.notEqual(priceFor(model), null, model);
+  }
+});
+
+test("the reason tier falls back to a current-generation model, not the previous one", () => {
+  assert.equal(modelFor({} as never, "openai", "reason"), "gpt-5.6-terra");
+});
+
+test("the screen tier stays on the cheap model -- it only ever sees a job title", () => {
+  assert.equal(modelFor({} as never, "openai", "screen"), "gpt-4o-mini");
+});
+
+test("configured models still win over both defaults", () => {
+  const env = { OPENAI_MODEL: "pinned-reason", OPENAI_SCREEN_MODEL: "pinned-screen" } as never;
+  assert.equal(modelFor(env, "openai", "reason"), "pinned-reason");
+  assert.equal(modelFor(env, "openai", "screen"), "pinned-screen");
+});
+
+test("the reason fallback is not priced above the model it replaced on input", () => {
+  // The point of the upgrade is that it is a newer generation without being a cost regression on
+  // the input side, which dominates here: a full posting in, a short verdict out.
+  const terra = priceFor("gpt-5.6-terra");
+  const legacy = priceFor("gpt-4o");
+  assert.ok(terra && legacy);
+  assert.ok(terra.in <= legacy.in, `${terra.in} should not exceed ${legacy.in}`);
 });

@@ -82,6 +82,14 @@ const PRICING: Record<string, Price> = {
   "claude-sonnet-4-6": { in: 3, out: 15 },
   "claude-haiku-4-5": { in: 1, out: 5 },
   "claude-fable-5": { in: 10, out: 50 },
+  // The GPT-5.6 family (Sol/Terra/Luna), generally available 9 July 2026. Terra is the reason
+  // tier's fallback: a generation newer than gpt-4o and cheaper on input, which makes the
+  // Anthropic-outage path a smaller quality drop than it was. Rates checked against OpenAI's
+  // published pricing 29 August 2026 -- re-check before trusting them for billing rather than
+  // comparison, per this table's note above.
+  "gpt-5.6-sol": { in: 5, out: 30 },
+  "gpt-5.6-terra": { in: 2, out: 12 },
+  "gpt-5.6-luna": { in: 0.2, out: 1.2 },
   "gpt-4o": { in: 2.5, out: 10 },
   "gpt-4o-mini": { in: 0.15, out: 0.6 },
 };
@@ -194,9 +202,9 @@ function openaiUsage(data: unknown): Usage {
  */
 export type Tier = "reason" | "screen";
 
-function modelFor(env: LlmEnv, provider: Provider, tier: Tier): string {
+export function modelFor(env: LlmEnv, provider: Provider, tier: Tier): string {
   if (provider === "openai") {
-    return tier === "screen" ? env.OPENAI_SCREEN_MODEL || "gpt-4o-mini" : env.OPENAI_MODEL || "gpt-4o";
+    return tier === "screen" ? env.OPENAI_SCREEN_MODEL || "gpt-4o-mini" : env.OPENAI_MODEL || "gpt-5.6-terra";
   }
   return tier === "screen"
     ? env.ANTHROPIC_SCREEN_MODEL || "claude-haiku-4-5-20251001"
@@ -310,10 +318,11 @@ export async function callText(
   /** Bypasses the configured model entirely. Only the eval harness sets this. */
   modelOverride?: string,
 ): Promise<string> {
-  // Free-text calls have always used the reason-tier model directly rather than going through
-  // modelFor, so the tier is named explicitly here to keep the trace honest about what ran.
-  const model =
-    modelOverride ?? (provider === "openai" ? env.OPENAI_MODEL || "gpt-4o" : env.ANTHROPIC_MODEL || "claude-sonnet-5");
+  // Free-text calls use the reason-tier model, and say so explicitly so the trace is honest about
+  // what ran. Resolved through modelFor rather than repeating the defaults inline: three copies of
+  // "which model do we use when nothing is configured" is three places to forget when one changes,
+  // and this file had exactly that until the fallback model was upgraded.
+  const model = modelOverride ?? modelFor(env, provider, "reason");
 
   const meta = promptMeta(prompt);
   return traced(env, { task, provider, model, tier: "reason", ...meta }, async () => {
@@ -486,7 +495,7 @@ export async function callStructuredWithImage<T>(
   toolName: string,
   maxTokens = 4000,
 ): Promise<T> {
-  const model = provider === "openai" ? env.OPENAI_MODEL || "gpt-4o" : env.ANTHROPIC_MODEL || "claude-sonnet-5";
+  const model = modelFor(env, provider, "reason");
   // The image itself is not stored on the trace -- a base64 screenshot would dwarf every other
   // record in the table. The prompt is noted as carrying one so the trace isn't misread as the
   // whole input.

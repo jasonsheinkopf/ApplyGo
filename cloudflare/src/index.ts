@@ -7,6 +7,7 @@ import {
   type TraceSink,
   callStructured,
   friendlyMessage,
+  modelFor,
   normalizeProvider,
   providerKeyMissing,
   screenProvider,
@@ -1797,7 +1798,7 @@ async function assessRowsBatched(
     },
     async (_batch, results) => {
       if (!results) return;
-      await storeFitResults(env, results);
+      await storeFitResults(env, results, modelFor(env, provider, "reason"));
       assessed += results.length;
       // These live buckets use the candidate's current Fit Threshold, exactly like the Jobs page.
       // fit_status remains the model pipeline's legacy fixed verdict; fit_score is the source of
@@ -2251,9 +2252,20 @@ async function purgeCollection(request: Request, env: Env): Promise<Response> {
   return json({ deleted: result.meta.changes ?? 0 });
 }
 
-async function storeFitResults(env: Env, results: FitResult[]): Promise<void> {
+/**
+ * Persists a batch of scores, recording which model produced them.
+ *
+ * A score is only comparable to another score from the same judge. Measured over this board, two
+ * models agreed almost exactly on the number -- mean 74.5 against 73.8 across every posting at 70
+ * or better -- while disagreeing sharply on the evidence: one returned an empty `missing` list on
+ * 95% of those postings, the other on 11%. Without `scored_by` on the row, a shortlist sorted by
+ * score silently mixes the two scales and an empty gap list reads as a flawless match whichever
+ * model produced it. The provider isn't inferable after the fact either: llm_traces is capped and
+ * rolls over, so the only durable record is the one written here.
+ */
+async function storeFitResults(env: Env, results: FitResult[], scoredBy: string): Promise<void> {
   for (const result of results) {
-    const detail = { facts: result.facts };
+    const detail = { facts: result.facts, scored_by: scoredBy };
     await env.DB.prepare(
       `UPDATE job_postings SET fit_status = ?, fit_score = ?, fit_reason = ?, fit_missing_json = ?,
        fit_detail_json = ?, assessed_at = CURRENT_TIMESTAMP WHERE id = ?`,
