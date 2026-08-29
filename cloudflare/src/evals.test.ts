@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { type ScoredRun, summarizeExperiment } from "./evals.ts";
+import {
+  type ScoredRun,
+  caseIsExperimentReady,
+  screenCaseBatches,
+  screenCaseNotes,
+  summarizeExperiment,
+} from "./evals.ts";
 
 /** Terse fixture builder -- most tests only care about case, variant and score. */
 function run(case_id: string, variant: string, judge_score: number | null, extra: Partial<ScoredRun> = {}): ScoredRun {
@@ -136,4 +142,85 @@ test("an empty experiment produces an empty summary rather than throwing", () =>
   const summary = summarizeExperiment([]);
   assert.deepEqual(summary.variants, []);
   assert.deepEqual(summary.head_to_head, []);
+});
+
+// ---------------------------------------------------------------------------
+// Cases that can actually take part in an experiment
+// ---------------------------------------------------------------------------
+
+test("a case without recorded inputs is not experiment-ready", () => {
+  // Every case created before migration 0037's columns were written looks like this. It replays
+  // fine against another model; it cannot be rendered through another wording.
+  assert.equal(caseIsExperimentReady({ variables_json: "{}" }), false);
+  assert.equal(caseIsExperimentReady({ variables_json: "" }), false);
+  assert.equal(caseIsExperimentReady({ variables_json: null }), false);
+  assert.equal(caseIsExperimentReady({ variables_json: "not json" }), false);
+});
+
+test("a case carrying its inputs is experiment-ready", () => {
+  assert.equal(caseIsExperimentReady({ variables_json: '{"postings":"[]"}' }), true);
+});
+
+// ---------------------------------------------------------------------------
+// Batching -- the part that decides whether the eval measures anything
+// ---------------------------------------------------------------------------
+
+function labelled(n: number, label: "keep" | "drop"): ScreenCase[] {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `${label}-${i}`,
+    title: `${label} title ${i}`,
+    location: "San Francisco, CA",
+    label,
+    why: "test fixture",
+  }));
+}
+type ScreenCase = Parameters<typeof screenCaseBatches>[0][number];
+
+test("every batch contains both labels, so keeping everything cannot score perfectly", () => {
+  const batches = screenCaseBatches([...labelled(9, "keep"), ...labelled(9, "drop")], 6);
+  assert.ok(batches.length > 0);
+  for (const batch of batches) {
+    assert.ok(batch.some((p) => p.label === "keep"), "a batch of only drops rewards dropping everything");
+    assert.ok(batch.some((p) => p.label === "drop"), "a batch of only keeps rewards keeping everything");
+  }
+});
+
+test("no batch is emitted when one label is missing entirely", () => {
+  assert.deepEqual(screenCaseBatches(labelled(20, "keep"), 5), []);
+  assert.deepEqual(screenCaseBatches(labelled(20, "drop"), 5), []);
+  assert.deepEqual(screenCaseBatches([], 5), []);
+});
+
+test("a scarce label is spread across batches rather than spent on the first one", () => {
+  // Two drops among many keeps must produce two usable batches, not one batch holding both.
+  const batches = screenCaseBatches([...labelled(12, "keep"), ...labelled(2, "drop")], 6);
+  assert.equal(batches.length, 2);
+  for (const batch of batches) {
+    assert.equal(batch.filter((p) => p.label === "drop").length, 1);
+  }
+});
+
+test("batches respect the requested size", () => {
+  const batches = screenCaseBatches([...labelled(10, "keep"), ...labelled(10, "drop")], 4);
+  for (const batch of batches) assert.ok(batch.length <= 4, `batch of ${batch.length} exceeds 4`);
+});
+
+// ---------------------------------------------------------------------------
+// The grading key handed to the judge
+// ---------------------------------------------------------------------------
+
+test("the grading key names every posting under the verdict it should have received", () => {
+  const batch = [...labelled(2, "keep"), ...labelled(1, "drop")];
+  const notes = screenCaseNotes(batch);
+  const mustKeep = notes.slice(notes.indexOf("MUST KEEP"), notes.indexOf("SHOULD DROP"));
+  const shouldDrop = notes.slice(notes.indexOf("SHOULD DROP"));
+  assert.ok(mustKeep.includes("keep-0") && mustKeep.includes("keep-1"));
+  assert.ok(shouldDrop.includes("drop-0"));
+  assert.ok(!mustKeep.includes("drop-0"), "a should-drop must not appear under MUST KEEP");
+});
+
+test("the grading key states the asymmetry, and refuses to reward keeping everything", () => {
+  const notes = screenCaseNotes([...labelled(1, "keep"), ...labelled(1, "drop")]);
+  assert.match(notes, /permanently/, "a wrong drop is the permanent error and must be named as such");
+  assert.match(notes, /keeps everything is not a good response/);
 });

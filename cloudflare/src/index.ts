@@ -22,12 +22,15 @@ import {
 import { getManagedPrompt, langfuseConfigured, langfuseTraceUrl } from "./langfuse";
 import { resumeFilenameFor } from "./resume-filename.ts";
 import {
+  type LabelledPosting,
   type ReplaySpec,
   createEvalCase,
   createEvalRun,
   getEvalCase,
   judgeRun,
   listEvalCases,
+  screenCaseBatches,
+  screenCaseNotes,
   listEvalRuns,
   replayTask,
   updateEvalCase,
@@ -50,6 +53,7 @@ import {
   PROFILE_CREATE_PROMPT,
   PROFILE_IMPROVE_APPLY_PROMPT,
   PROFILE_IMPROVE_AUDIT_PROMPT,
+  JOBS_PRESCREEN_PROMPT,
   ROLES_ANALYZE_PROMPT,
 } from "./prompts";
 import { MARKET_RESEARCH_TTL_DAYS, marketCacheKey, researchRoleMarket } from "./market";
@@ -13038,6 +13042,81 @@ async function devConsole(request: Request, env: Env, url: URL): Promise<Respons
 
   if (method === "GET" && path === "/dev/evals/cases") {
     return json({ cases: await listEvalCases(env.DB, url.searchParams.get("task") || undefined) });
+  }
+
+  // Mints a screen eval dataset from postings whose outcome is already known, which is the only
+  // honest source of labels available: `keep` is a posting the full assessment later rated worth
+  // surfacing, so dropping it on the title would have lost it for good; `drop` is a posting whose
+  // own assessment put it at the floor, i.e. the cheap tier could have caught it and saved a read.
+  //
+  // Nothing here is hand-labelled. The screen sees only a title and location, and the grading key
+  // is built from what the *full* read concluded afterward, so the eval measures the one thing this
+  // tier can actually get wrong in a way that matters: throwing away something good, unread.
+  if (method === "POST" && path === "/dev/evals/build-screen-cases") {
+    const body = (await request.json().catch(() => ({}))) as { batch_size?: number; keep_floor?: number; drop_ceiling?: number };
+    const batchSize = Math.min(40, Math.max(4, Math.floor(body.batch_size ?? 12)));
+    const keepFloor = Math.max(0, Math.min(100, body.keep_floor ?? 55));
+    const dropCeiling = Math.max(0, Math.min(100, body.drop_ceiling ?? 10));
+    if (dropCeiling >= keepFloor) return json({ error: "drop_ceiling_must_be_below_keep_floor" }, 400);
+
+    const profileRow = await env.DB.prepare(
+      "SELECT id, preferences_json, structured_json FROM candidate_profiles ORDER BY created_at ASC LIMIT 1",
+    ).first<{ id: string; preferences_json: string; structured_json: string }>();
+    const structured = readStructuredProfile(profileRow?.structured_json ?? "{}");
+    if (!structured) return json({ error: "no_profile" }, 400);
+
+    const rows = await env.DB.prepare(
+      `SELECT id, title, location, fit_score FROM job_postings
+       WHERE assessed_at IS NOT NULL AND removed_at IS NULL AND (fit_score >= ? OR fit_score <= ?)`,
+    )
+      .bind(keepFloor, dropCeiling)
+      .all<{ id: string; title: string; location: string; fit_score: number }>();
+
+    const labelled: LabelledPosting[] = (rows.results ?? []).map((row) => ({
+      id: row.id,
+      title: row.title,
+      location: row.location ?? "",
+      label: row.fit_score >= keepFloor ? "keep" : "drop",
+      why: row.fit_score >= keepFloor
+        ? `the full read scored this ${row.fit_score} -- worth surfacing`
+        : `the full read scored this ${row.fit_score} -- catching it here saves a read`,
+    }));
+
+    const desiredRoles = readDesiredRoles(profileRow?.preferences_json ?? "{}");
+    const disqualifiers = await loadDisqualifiers(env, profileRow!.id);
+    const matchProfile = buildMatchProfile(structured);
+    const batches = screenCaseBatches(labelled, batchSize);
+
+    const created: string[] = [];
+    for (const [index, batch] of batches.entries()) {
+      // The same variables screenJobsBatch compiles, so a candidate wording is rendered over
+      // exactly the inputs production would have given it.
+      const variables = {
+        disqualifiers: disqualifiers.length
+          ? `The candidate has already rejected roles for these reasons:\n${disqualifiers.map((d) => `- ${d}`).join("\n")}\n`
+          : "",
+        target_roles: desiredRoles ? `WANTS (any ONE of the following, not all at once): ${desiredRoles.slice(0, 600)}\n` : "",
+        candidate_profile: matchProfile,
+        postings: JSON.stringify(batch.map((p: LabelledPosting) => ({ id: p.id, title: p.title, location: p.location }))),
+      };
+      const compiled = await getManagedPrompt(env, "jobs/prescreen", variables, JOBS_PRESCREEN_PROMPT);
+      created.push(
+        await createEvalCase(env.DB, {
+          task: "fit.screen",
+          name: `screen batch ${index + 1} (${batch.filter((p: LabelledPosting) => p.label === "keep").length} keep / ${batch.filter((p: LabelledPosting) => p.label === "drop").length} drop)`,
+          prompt: compiled.text,
+          notes: screenCaseNotes(batch),
+          variables,
+          promptName: "jobs/prescreen",
+        }),
+      );
+    }
+    return json({
+      created: created.length,
+      cases: created,
+      labelled: { keep: labelled.filter((p) => p.label === "keep").length, drop: labelled.filter((p) => p.label === "drop").length },
+      batch_size: batchSize,
+    });
   }
 
   if (method === "POST" && path === "/dev/evals/cases") {

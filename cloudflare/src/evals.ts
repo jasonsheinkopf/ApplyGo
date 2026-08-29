@@ -16,7 +16,7 @@
 // one exception: it runs through the real env and is traced normally under its own "evals.judge"
 // task, because judging genuinely costs money and the user should see that cost like any other.
 
-import { type LlmEnv, type Provider, type LlmTrace, callStructured, callText } from "./llm.ts";
+import { type LlmEnv, type Provider, type LlmTrace, callStructured, callText, providerKeyMissing } from "./llm.ts";
 import { compilePrompt, getManagedPrompt } from "./langfuse.ts";
 
 export type ReplaySpec = { kind: "text" } | { kind: "structured"; schema: unknown; toolName: string; maxTokens: number };
@@ -279,6 +279,27 @@ const JUDGE_SCHEMA = {
  * judge toward what actually matters for that specific prompt (a rubric, a known edge case, a
  * reference answer) without the harness needing per-task rubric authoring.
  */
+/**
+ * Which provider scores a run.
+ *
+ * Anthropic is the default and stays the default: every experiment should be judged on one scale,
+ * and silently rotating judges between runs would make two arms incomparable for a reason that has
+ * nothing to do with either prompt. But a hardcoded provider means one vendor's outage or spend cap
+ * takes the whole harness down -- which is not hypothetical: the cap was reached mid-session and
+ * every judge call would have failed with the evaluation itself perfectly healthy.
+ *
+ * So the fallback is deliberately narrow. It fires only when the preferred judge has no usable key
+ * at all, never to spread load or save money, and callers can see which provider ran from the run
+ * record. A judged-by-the-other-model experiment is worth flagging; a wholly unjudged one is worth
+ * nothing.
+ */
+export function judgeProvider(env: LlmEnv): Provider {
+  const preferred: Provider = "anthropic";
+  if (!providerKeyMissing(env, preferred)) return preferred;
+  const alternate: Provider = "openai";
+  return providerKeyMissing(env, alternate) ? preferred : alternate;
+}
+
 export async function judgeRun(
   env: LlmEnv,
   taskWhat: string,
@@ -286,7 +307,7 @@ export async function judgeRun(
   response: string,
   notes: string,
 ): Promise<{ score: number; reasoning: string }> {
-  const provider: Provider = "anthropic";
+  const provider = judgeProvider(env);
   const judgePrompt = await getManagedPrompt(env, "evaluation/judge", {
     task_description: taskWhat,
     case_notes: notes.trim()
@@ -353,17 +374,61 @@ export type EvalRunRow = {
 
 export async function createEvalCase(
   db: Db,
-  input: { task: string; name: string; prompt: string; notes?: string; sourceTraceId?: string | null },
+  input: {
+    task: string;
+    name: string;
+    prompt: string;
+    notes?: string;
+    sourceTraceId?: string | null;
+    /**
+     * The inputs the prompt was compiled from. Without these a case can only ever be replayed as
+     * the exact string it was saved as, which is enough to compare two *models* and useless for
+     * comparing two *wordings* -- runExperiment needs to render a different template over the same
+     * data. Migration 0037 added the column and runExperiment reads it, but nothing ever wrote it,
+     * so every case reached an experiment with `{}` and no variant could be rendered. An
+     * experiment over such cases doesn't fail loudly; it just has nothing to compare.
+     */
+    variables?: Record<string, string>;
+    /** Which managed prompt those variables were compiled against, for provenance. */
+    promptName?: string;
+  },
 ): Promise<string> {
   const id = crypto.randomUUID();
   await db
     .prepare(
-      `INSERT INTO eval_cases (id, task, name, prompt, source_trace_id, notes)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO eval_cases (id, task, name, prompt, source_trace_id, notes, variables_json, prompt_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .bind(id, input.task, input.name, input.prompt, input.sourceTraceId ?? null, input.notes ?? "")
+    .bind(
+      id,
+      input.task,
+      input.name,
+      input.prompt,
+      input.sourceTraceId ?? null,
+      input.notes ?? "",
+      JSON.stringify(input.variables ?? {}),
+      input.promptName ?? "",
+    )
     .run();
   return id;
+}
+
+/**
+ * True when a case carries enough to be rendered through an alternative prompt template.
+ *
+ * A case saved before variables were recorded still replays fine against different models -- its
+ * saved prompt string is intact -- but it cannot take part in a prompt A/B test, because there is
+ * nothing to compile the candidate wording over. Experiments filter on this rather than running
+ * the case and reporting a template error, so a mixed dataset shrinks the sample honestly instead
+ * of filling the record with failures that say nothing about the variant.
+ */
+export function caseIsExperimentReady(row: { variables_json?: string | null }): boolean {
+  try {
+    const parsed = JSON.parse(row.variables_json || "{}") as Record<string, unknown>;
+    return !!parsed && typeof parsed === "object" && Object.keys(parsed).length > 0;
+  } catch {
+    return false;
+  }
 }
 
 /** Cases grouped by task, each carrying its run count and best score for quick scanning. */
@@ -565,7 +630,12 @@ export async function runExperiment(
   },
 ): Promise<void> {
   try {
-    for (const evalCase of input.cases) {
+    // Cases predating recorded variables replay fine against a different model but cannot be
+    // rendered through a different wording, so they are excluded up front rather than run and
+    // logged as template failures. The sample shrinks honestly instead of filling with runs that
+    // say nothing about either variant.
+    const runnable = input.cases.filter(caseIsExperimentReady);
+    for (const evalCase of runnable) {
       let variables: Record<string, string> = {};
       try {
         variables = JSON.parse(evalCase.variables_json || "{}") as Record<string, string>;
@@ -642,4 +712,95 @@ export async function listEvalRuns(db: Db, caseId: string): Promise<EvalRunRow[]
     .bind(caseId)
     .all<EvalRunRow>();
   return rows.results ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Building a screen case set out of postings whose outcome is already known
+// ---------------------------------------------------------------------------
+
+/**
+ * One posting with the verdict the cheap screen *should* have reached on it, and why.
+ *
+ * The labels come from what actually happened downstream rather than from anyone's opinion:
+ * `keep` is a posting the full assessment later rated worth surfacing, so dropping it on the title
+ * would have lost a real opportunity permanently; `drop` is a posting whose title names a different
+ * profession entirely, which is the only thing this tier is asked to catch.
+ */
+export type LabelledPosting = {
+  id: string;
+  title: string;
+  location: string;
+  label: "keep" | "drop";
+  why: string;
+};
+
+/**
+ * Splits labelled postings into batches that each contain both labels.
+ *
+ * This is the part that decides whether the eval measures anything. The screen returns a keep/drop
+ * per posting, so a batch of only must-keeps is aced by a variant that keeps everything, and a
+ * batch of only must-drops is aced by one that drops everything -- in both cases the judge sees a
+ * perfect score for a prompt that isn't discriminating at all. Interleaving the two labels means a
+ * variant has to actually separate them to score well.
+ *
+ * A batch that cannot be given both labels is not emitted. Returning a degenerate batch would be
+ * worse than returning fewer: the experiment would report a confident result built partly on cases
+ * that could not distinguish the arms.
+ */
+export function screenCaseBatches(postings: LabelledPosting[], batchSize: number): LabelledPosting[][] {
+  const size = Math.max(2, Math.floor(batchSize));
+  const keeps = postings.filter((p) => p.label === "keep");
+  const drops = postings.filter((p) => p.label === "drop");
+  if (!keeps.length || !drops.length) return [];
+
+  // Capped by the scarcer label, because every batch is owed one of each -- and by how many
+  // batches the postings can actually fill, so a large pool of both labels doesn't produce a long
+  // tail of two-item batches.
+  const count = Math.min(keeps.length, drops.length, Math.max(1, Math.ceil(postings.length / size)));
+  const batches: LabelledPosting[][] = Array.from({ length: count }, () => []);
+
+  // Seed both labels first. Doing this before any filling is what makes the guarantee structural
+  // rather than something the distribution happens to satisfy.
+  for (const batch of batches) {
+    batch.push(keeps.shift() as LabelledPosting, drops.shift() as LabelledPosting);
+  }
+
+  // Then fill the remainder, taking the first batch still under size. Later batches may end up
+  // smaller than the first, which is fine: the size cap is a ceiling for prompt cost, not a shape
+  // every batch has to hit.
+  for (const posting of [...keeps, ...drops]) {
+    const target = batches.find((batch) => batch.length < size);
+    if (!target) break;
+    target.push(posting);
+  }
+  return batches;
+}
+
+/**
+ * The gold labels for one batch, written for the judge rather than for a diff.
+ *
+ * `judgeRun` passes a case's notes to the judge and tells it to weigh them heavily, which is the
+ * only place in this harness where a known-correct answer can be stated. Spelling the expected
+ * verdict out per id turns a vague "is this a good screening decision" into a checkable one, and
+ * naming the asymmetry keeps the judge from rewarding an aggressive variant: a wrong drop loses a
+ * real posting for good, while a wrong keep costs one more cheap read.
+ */
+export function screenCaseNotes(batch: LabelledPosting[]): string {
+  const keeps = batch.filter((p) => p.label === "keep");
+  const drops = batch.filter((p) => p.label === "drop");
+  const lines = [
+    "GRADING KEY -- these verdicts are known from what happened to each posting after this stage.",
+    "",
+    "MUST KEEP (a full assessment later rated each of these worth surfacing to the candidate; a",
+    "drop here would have lost a real opportunity permanently and is the most serious error):",
+    ...keeps.map((p) => `- ${p.id} -- "${p.title}" (${p.why})`),
+    "",
+    "SHOULD DROP (a different profession; keeping one is only a wasted read, not a lost chance):",
+    ...drops.map((p) => `- ${p.id} -- "${p.title}" (${p.why})`),
+    "",
+    "Score recall on MUST KEEP far more heavily than precision on SHOULD DROP. A response that",
+    "keeps everything is not a good response -- it passes every must-keep while doing none of the",
+    "filtering this stage exists for -- but missing a must-keep is worse than keeping a should-drop.",
+  ];
+  return lines.join("\n");
 }
