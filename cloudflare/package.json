@@ -22,9 +22,12 @@
   },
   "dependencies": {
     "@cloudflare/puppeteer": "latest",
+    "@cloudflare/workers-oauth-provider": "^0.10.3",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "puppeteer-core": "^25.6.0",
     "unpdf": "latest",
-    "word-extractor": "^1.0.4"
+    "word-extractor": "^1.0.4",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "latest",

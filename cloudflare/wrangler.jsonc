@@ -18,6 +18,14 @@
       "bucket_name": "applygo-private"
     }
   ],
+  // Used by @cloudflare/workers-oauth-provider (the /mcp OAuth layer -- see agent-gateway.ts
+  // and docs/architecture/mcp-connector.md) to store OAuth clients, grants, and tokens.
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "fa3ecab8dd8e495993136401f8954a4b"
+    }
+  ],
   "browser": {
     "binding": "BROWSER"
   },
@@ -46,6 +54,13 @@
         {
           "binding": "FILES",
           "bucket_name": "applygo-prod-private"
+        }
+      ],
+      // A separate namespace from local dev's above, same as the D1/R2 bindings above it.
+      "kv_namespaces": [
+        {
+          "binding": "OAUTH_KV",
+          "id": "2073d56d77914f6e981735e24c6c35ff"
         }
       ],
       "browser": {
