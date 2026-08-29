@@ -224,3 +224,35 @@ test("the grading key states the asymmetry, and refuses to reward keeping everyt
   assert.match(notes, /permanently/, "a wrong drop is the permanent error and must be named as such");
   assert.match(notes, /keeps everything is not a good response/);
 });
+
+// ---------------------------------------------------------------------------
+// A model bake-off is the same machinery with the template held fixed
+// ---------------------------------------------------------------------------
+
+test("cost and latency are summarized per arm, so a model comparison needs no extra statistics", () => {
+  // Holding the template identical and varying the model makes each arm a model. The summary a
+  // wording comparison already produces is then exactly the quality/cost/speed table wanted.
+  const { variants } = summarizeExperiment([
+    run("a", "control", 80, { cost_usd: 0.06, latency_ms: 12000 }),
+    run("b", "control", 70, { cost_usd: 0.08, latency_ms: 16000 }),
+    run("a", "cheap-model", 74, { cost_usd: 0.01, latency_ms: 3000 }),
+    run("b", "cheap-model", 72, { cost_usd: 0.01, latency_ms: 5000 }),
+  ]);
+  const cheap = variants.find((v) => v.variant === "cheap-model");
+  assert.equal(cheap?.mean_cost_usd, 0.01);
+  assert.equal(cheap?.mean_latency_ms, 4000);
+  assert.equal(cheap?.mean_score, 73);
+});
+
+test("a cheaper arm that scores within noise is reported as a wash, not a win", () => {
+  // The result that matters most in a bake-off: same quality, lower price. The verdict must not
+  // dress that up as the cheap model being *better*, because the cost case stands on its own and
+  // an inflated quality claim is what would get a worse model shipped later.
+  const runs = Array.from({ length: 10 }, (_, i) => [
+    run(`c${i}`, "control", 70, { cost_usd: 0.07 }),
+    run(`c${i}`, "cheap-model", 71, { cost_usd: 0.01 }),
+  ]).flat();
+  const summary = summarizeExperiment(runs);
+  assert.match(summary.verdict, /no meaningful difference/);
+  assert.doesNotMatch(summary.verdict, /better by/);
+});

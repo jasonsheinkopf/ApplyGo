@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { callWithWebSearch, type LlmEnv, modelFor, priceFor, screenProvider } from "./llm.ts";
+import { callWithWebSearch, estimateCostUsd, type LlmEnv, modelFor, priceFor, screenProvider } from "./llm.ts";
 
 const ENV: LlmEnv = { ANTHROPIC_API_KEY: "key123" };
 
@@ -138,4 +138,34 @@ test("the reason fallback is not priced above the model it replaced on input", (
   const legacy = priceFor("gpt-4o");
   assert.ok(terra && legacy);
   assert.ok(terra.in <= legacy.in, `${terra.in} should not exceed ${legacy.in}`);
+});
+
+// ---------------------------------------------------------------------------
+// Sonnet 5's introductory rate became the standard rate
+// ---------------------------------------------------------------------------
+
+test("Sonnet 5 costs the same on either side of the old introductory cutoff", () => {
+  // The $2/$10 launch rate was advertised as expiring 31 August 2026 and this table encoded the
+  // step up to $3/$15. Anthropic confirmed the increase will not happen. Had the schedule stayed,
+  // every Sonnet call from 1 September would have been costed 50% high -- and an overstatement
+  // looks exactly like a real cost on a dashboard, so nothing would have flagged it.
+  const august = estimateCostUsd("claude-sonnet-5", 1_000_000, 1_000_000, new Date("2026-08-31T00:00:00Z"));
+  const september = estimateCostUsd("claude-sonnet-5", 1_000_000, 1_000_000, new Date("2026-09-01T00:00:00Z"));
+  assert.equal(august, 12, "$2 in + $10 out per million");
+  assert.equal(september, august, "the rate no longer changes at the cutoff");
+});
+
+test("a dated model snapshot still prices as its base model", () => {
+  assert.deepEqual(priceFor("claude-haiku-4-5-20251001"), priceFor("claude-haiku-4-5"));
+});
+
+test("every model the bake-off compares is priced, or its cost reads as null", () => {
+  // A model missing here records null rather than zero, which is correct but makes an arm of a
+  // model comparison unscoreable on cost -- the whole point of running one.
+  for (const model of [
+    "claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5",
+    "gpt-5.6-terra", "gpt-5.6-luna", "gpt-4o-mini",
+  ]) {
+    assert.notEqual(priceFor(model), null, model);
+  }
 });

@@ -208,11 +208,13 @@ export function buildApplyGoMcpServer(call: AgentCall): McpServer {
     {
       title: "A/B test prompt variants",
       description:
-        "Run two or more wordings of the same pipeline prompt over a shared set of saved eval cases, " +
+        "Run two or more arms of the same pipeline prompt over a shared set of saved eval cases, " +
         "score every result with the same LLM judge, and record the comparison. One variant must be " +
-        "labelled 'control' — it is the incumbent the others are measured against. Returns immediately " +
-        "with an experiment id; poll get_experiment for the result. Cost is cases x variants x 2 model " +
-        "calls, so keep max_cases modest while iterating.",
+        "labelled 'control' — it is the incumbent the others are measured against. Vary the templates " +
+        "to compare WORDINGS; hold the template identical and set provider/model per variant to " +
+        "compare MODELS, which reports quality, cost per call and latency per arm from one run. " +
+        "Returns immediately with an experiment id; poll get_experiment for the result. Cost is " +
+        "cases x variants x 2 model calls, so keep max_cases modest while iterating.",
       inputSchema: {
         task: z.string().describe("Which pipeline prompt is under test, e.g. 'jobs.prescreen' or 'fit.assess'."),
         name: z.string().optional(),
@@ -220,6 +222,10 @@ export function buildApplyGoMcpServer(call: AgentCall): McpServer {
         variants: z.array(z.object({
           label: z.string().describe("'control' for the incumbent; any label for candidates."),
           template: z.string().describe("The prompt template, using the same {{variables}} the cases recorded."),
+          provider: z.enum(["anthropic", "openai"]).optional()
+            .describe("Overrides the experiment provider for this arm. Set it on every arm, with an identical template, to compare MODELS instead of wordings."),
+          model: z.string().optional()
+            .describe("Overrides the experiment model for this arm, e.g. 'claude-haiku-4-5' or 'gpt-5.6-luna'."),
         })).describe("At least two, one of which must be labelled 'control'."),
         provider: z.enum(["anthropic", "openai"]).optional(),
         model: z.string().optional(),
