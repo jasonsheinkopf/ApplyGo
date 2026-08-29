@@ -16,6 +16,16 @@ import {
   toCompanyCounts,
 } from "./agent";
 import { companyFunnel, companyToJobHandoff, funnelViolations, runSummaryLine } from "./pipeline";
+import {
+  createExperiment,
+  getExperiment,
+  listExperiments,
+  loadExperimentCases,
+  loadExperimentRuns,
+  runExperiment,
+  summarizeExperiment,
+} from "./evals";
+import { normalizeProvider, providerKeyMissing } from "./llm";
 import { OAuthProvider, type AuthRequest, type ClientInfo, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { type AgentCall, handleMcpRequest } from "./mcp-server";
 
@@ -959,6 +969,80 @@ async function pipelineStatus(request: Request, env: Env, ctx: ExecutionContext,
   });
 }
 
+/**
+ * Starts a prompt A/B experiment and returns immediately.
+ *
+ * Every case is run through every variant and then judged, so the call count is
+ * `cases x variants x 2` -- a ten-case, two-variant comparison is forty model calls and minutes of
+ * wall clock. No HTTP client waits that long, so the work goes to waitUntil and the caller polls
+ * the experiment by id, the same shape as /agent/v1/pipeline/run.
+ */
+async function startExperiment(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const body = (await request.json().catch(() => ({}))) as {
+    name?: string;
+    task?: string;
+    hypothesis?: string;
+    variants?: { label: string; template: string }[];
+    provider?: string;
+    model?: string;
+    max_cases?: number;
+    task_description?: string;
+  };
+
+  const task = String(body.task ?? "").trim();
+  const variants = Array.isArray(body.variants) ? body.variants : [];
+  if (!task) return json({ error: "task_required" }, 400);
+  if (variants.length < 2) {
+    return json({ error: "two_variants_required", detail: "An experiment needs a control and at least one candidate." }, 400);
+  }
+  if (!variants.some((v) => v.label === "control")) {
+    return json({ error: "control_variant_required", detail: "Label the incumbent prompt 'control' so the comparison has a reference point." }, 400);
+  }
+
+  const maxCases = Math.min(Math.max(Number(body.max_cases) || 10, 1), 40);
+  const cases = await loadExperimentCases(env.DB, task, maxCases);
+  if (!cases.length) {
+    return json({
+      error: "no_usable_cases",
+      detail: `No eval cases for task "${task}" have recorded input variables, so no variant can be rendered over them. ` +
+        "Save cases with their variables before running an experiment.",
+    }, 400);
+  }
+
+  const provider = normalizeProvider(body.provider);
+  const keyMissing = providerKeyMissing(env, provider);
+  if (keyMissing) return json({ error: keyMissing }, 501);
+  const model = String(body.model ?? "").trim() || (provider === "openai" ? "gpt-4o" : "claude-sonnet-5");
+
+  const experimentId = await createExperiment(env.DB, {
+    name: String(body.name ?? `${task} prompt comparison`).slice(0, 200),
+    task,
+    hypothesis: String(body.hypothesis ?? "").slice(0, 2000),
+  });
+
+  ctx.waitUntil(
+    runExperiment(env, env.DB, {
+      experimentId,
+      task,
+      taskDescription: String(body.task_description ?? `The "${task}" step of ApplyGo's job pipeline.`),
+      spec: { kind: "text" },
+      provider,
+      model,
+      variants,
+      cases,
+    }).catch(() => undefined),
+  );
+
+  await recordActivity(env, principal, "evals.experiment.start", `${task}: ${variants.length} variants x ${cases.length} cases`);
+  return json({
+    experiment_id: experimentId,
+    variants: variants.map((v) => v.label),
+    cases: cases.length,
+    estimated_model_calls: cases.length * variants.length * 2,
+    detail: "Running in the background. Poll GET /agent/v1/evals/experiments/{id} for the comparison.",
+  }, 202);
+}
+
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
 }
@@ -1152,6 +1236,20 @@ export async function handleAgentRequest(request: Request, env: Env, ctx: Execut
   if (request.method === "POST" && url.pathname === "/agent/v1/materials/cover-letter") return materialsCoverLetter(request, env, ctx, principal);
 
   if (request.method === "GET" && url.pathname === "/agent/v1/pipeline/status") return pipelineStatus(request, env, ctx, principal);
+
+  if (request.method === "GET" && url.pathname === "/agent/v1/evals/experiments") {
+    return json({ experiments: await listExperiments(env.DB) });
+  }
+  if (request.method === "POST" && url.pathname === "/agent/v1/evals/experiments") {
+    return startExperiment(request, env, ctx, principal);
+  }
+  const experimentMatch = url.pathname.match(/^\/agent\/v1\/evals\/experiments\/([^/]+)$/);
+  if (request.method === "GET" && experimentMatch) {
+    const experiment = await getExperiment(env.DB, experimentMatch[1]);
+    if (!experiment) return json({ error: "not_found" }, 404);
+    const runs = await loadExperimentRuns(env.DB, experiment.id);
+    return json({ experiment, summary: summarizeExperiment(runs, experiment.control_variant) });
+  }
 
   // The same pass the cron trigger runs, on demand. Exists so the scheduled path is testable
   // without waiting for a tick, and so "go work on it now" is a thing a caller can actually ask
