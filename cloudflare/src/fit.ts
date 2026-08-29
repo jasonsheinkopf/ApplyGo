@@ -13,6 +13,7 @@
 import { type LlmEnv, type Provider, callStructured } from "./llm.ts";
 import { getManagedPrompt } from "./langfuse.ts";
 import { JOBS_PRESCREEN_PROMPT } from "./prompts.ts";
+import { locationMatches } from "./companies.ts";
 
 /**
  * The compact candidate rendering used by high-volume prescreening lives in src/profile.ts, next to
@@ -198,6 +199,64 @@ export async function deriveCareAboutTopics(
  * through as a "stretch". Calibrated to what actually reads as fine vs. not: needing 5 when you
  * have 3 is a normal reach; needing 7 when you have 3 is a different job level entirely.
  */
+// ---------------------------------------------------------------------------
+// Geography -- settled in code, not argued in prose
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a posting's location is reachable, decided by the same `locationMatches` gate that
+ * governs what gets imported in the first place -- and stated to the model as a finding rather
+ * than left to it as a judgement call.
+ *
+ * The model used to be handed the raw location string and the candidate's geography rule and asked
+ * to apply one to the other. On a single-location posting that worked. On a posting listing several
+ * offices it did not: given `San Francisco, CA | New York City, NY | Seattle, WA` it read the rule
+ * as a test of whether the posting was California-*exclusive* rather than California-*reachable*,
+ * and marked a San Francisco role as failing a California requirement because New York sat beside
+ * it. Five of the strongest postings on the board lost 12-23 points that way.
+ *
+ * `locationMatches` never had that problem -- it asks whether any acceptable place appears at all,
+ * which is the actual question. So the verdict is computed here and passed in already decided. The
+ * model is told the answer and told not to re-derive it, which is the same model-proposes /
+ * code-owns-the-record split the rest of this file runs on.
+ */
+export function geographyVerdict(location: string, terms: string[]): string {
+  const stated = String(location ?? "").trim();
+  if (!terms.length) return "No location constraint stated -- do not score geography at all.";
+  if (!stated) return "The posting states no location. Do not deduct for geography on an unstated location.";
+  if (!locationMatches(stated, terms)) {
+    return "OUTSIDE the candidate's stated area. This is a hard disqualifier -- score it accordingly.";
+  }
+  return (
+    "ACCEPTABLE -- already checked against the candidate's stated area and it passes. " +
+    "Treat this as settled fact and do not re-derive it: a posting that lists several offices " +
+    "qualifies as soon as ONE of them is reachable, and the others are irrelevant. Do not deduct " +
+    "any points for geography, and do not list location, relocation, or onsite presence as a gap."
+  );
+}
+
+/** Words that only ever appear in a gap that is about *where* the job is. */
+const GEOGRAPHY_GAP = /\b(relocat\w*|onsite|on-site|on site|hybrid|in-office|in office|based in|located in|location|commut\w*|geograph\w*|residen\w*)\b/i;
+
+/**
+ * Removes location gaps from a posting whose geography already passed the code gate.
+ *
+ * The prompt says not to raise one; this makes it true regardless. A gap the candidate reads as
+ * "you cannot take this job, it is in the wrong place" is uniquely costly when it is wrong -- it
+ * argues them out of a posting they are in fact eligible for -- so it is worth removing
+ * deterministically rather than trusting an instruction to hold every time.
+ *
+ * Deliberately narrow: it drops an entry only when a geography word appears AND the code gate
+ * already said yes. Everything else survives untouched, including a genuine gap that happens to
+ * mention a place ("no experience with EU data residency" keeps its meaning elsewhere in `missing`
+ * only if it does not match -- and that is the intended trade: a rare over-drop of one advisory
+ * line beats a wrong location rejection on a good posting).
+ */
+export function dropSettledGeographyGaps(missing: string[], geographyAcceptable: boolean): string[] {
+  if (!geographyAcceptable) return missing;
+  return missing.filter((entry) => !GEOGRAPHY_GAP.test(String(entry ?? "")));
+}
+
 async function fitPrompt(
   env: LlmEnv,
   profileJson: string,
@@ -206,6 +265,7 @@ async function fitPrompt(
   customPreferences: string,
   careAboutTopics: CareAboutTopic[],
   jobs: JobToAssess[],
+  locationTerms: string[],
 ): Promise<import("./langfuse").ManagedPrompt> {
   const customPreferencesSection = customPreferences
     ? [
@@ -252,6 +312,11 @@ async function fitPrompt(
       title: j.title,
       company: j.company,
       location: j.location,
+      // Decided by code before the model ever sees the posting -- see geographyVerdict. It rides
+      // inside the postings payload rather than as its own prompt variable so it reaches the model
+      // whatever template version Langfuse is currently serving; a new {{variable}} an older
+      // published prompt does not mention would compile away to nothing, silently.
+      geography: geographyVerdict(j.location, locationTerms),
       // Matches the storage cap (src/index.ts) and the scrape cap (DESCRIPTION_CAP in
       // companies.ts) -- compensation, remote/onsite, hours, and travel facts routinely sit at
       // the very end of a real posting, past where a tighter slice here used to cut them off
@@ -312,13 +377,16 @@ export async function assessJobFitBatch(
   customPreferences: string,
   careAboutTopics: CareAboutTopic[],
   jobs: JobToAssess[],
+  // Defaults to unconstrained so an existing caller behaves exactly as it did: with no terms,
+  // geographyVerdict tells the model there is no location constraint to score.
+  locationTerms: string[] = [],
 ): Promise<FitResult[]> {
   if (!jobs.length) return [];
   const { results } = await callStructured<{ results: FitResult[] }>(
     env,
     provider,
     "fit.assess",
-    await fitPrompt(env, profileJson, desiredRoles, disqualifiers, customPreferences, careAboutTopics, jobs),
+    await fitPrompt(env, profileJson, desiredRoles, disqualifiers, customPreferences, careAboutTopics, jobs, locationTerms),
     FIT_BATCH_SCHEMA,
     "submit_fit_assessment",
     // Bumped alongside the richer per-posting schema (up to 8 candidate-defined facts per posting) --
@@ -337,7 +405,10 @@ export async function assessJobFitBatch(
       id: job.id,
       score,
       reason: found.reason ?? "",
-      missing: found.missing ?? [],
+      missing: dropSettledGeographyGaps(
+        found.missing ?? [],
+        !locationTerms.length || locationMatches(job.location, locationTerms),
+      ),
       facts: alignFactsToTopics(careAboutTopics, found.facts),
     };
   });

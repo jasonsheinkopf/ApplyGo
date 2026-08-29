@@ -1754,6 +1754,7 @@ async function assessRowsBatched(
   disqualifiers: string[],
   dealbreakers: string,
   careAboutTopics: CareAboutTopic[],
+  locationTerms: string[],
   rows: JobRow[],
   total: number,
   fitThreshold: number,
@@ -1781,6 +1782,7 @@ async function assessRowsBatched(
         // token cost is worth optimizing, and it already uses the compact match profile.
         return await assessJobFitBatch(
           env, provider, renderCareerProfile(structured), desiredRoles, disqualifiers, dealbreakers, careAboutTopics, batch,
+          locationTerms,
         );
       } catch (err) {
         errors.push(`assess: ${(err as Error).message}`);
@@ -1970,6 +1972,7 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
     const careAboutTopics = await ensureCareAboutTopics(env, provider, profileId, profileRow?.preferences_json ?? "{}");
     const assessResult = await assessRowsBatched(
       env, provider, structured, desiredRoles, disqualifiers, dealbreakers, careAboutTopics,
+      parseLocationFilter(readDesiredLocations(profileRow?.preferences_json ?? "{}")),
       assessRows.results ?? [], assessTotal, readMatchThreshold(profileRow?.preferences_json ?? "{}"), emit,
     );
     assessed = assessResult.assessed;
@@ -2492,6 +2495,7 @@ async function recomputeJobFit(env: Env, provider: Provider, jobId: string, prof
   const [result] = await assessJobFitBatch(
     env, provider, renderCareerProfile(structured), desiredRoles, disqualifiers, dealbreakers, careAboutTopics,
     [{ id: job.id, title: job.title, company: job.company, location: job.location, description: job.raw_description ?? "" }],
+    parseLocationFilter(readDesiredLocations(profileRow?.preferences_json ?? "{}")),
   );
   if (!result) return null;
 

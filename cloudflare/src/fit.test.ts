@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { assessPriorityOrder, titleTermsFromRoles, verdictForScore } from "./fit.ts";
+import {
+  assessPriorityOrder,
+  dropSettledGeographyGaps,
+  geographyVerdict,
+  titleTermsFromRoles,
+  verdictForScore,
+} from "./fit.ts";
 
 // ---------------------------------------------------------------------------
 // Title terms
@@ -117,4 +123,66 @@ test("score bands map to the verdicts the Jobs tab filters on", () => {
   assert.equal(verdictForScore(40), "possible");
   assert.equal(verdictForScore(39), "reject");
   assert.equal(verdictForScore(0), "reject");
+});
+
+// ---------------------------------------------------------------------------
+// Geography -- the defect that cost five good postings 12-23 points each
+// ---------------------------------------------------------------------------
+
+const CA = ["california"];
+
+test("a posting listing several offices passes as soon as one of them is reachable", () => {
+  // The exact strings that were mis-scored on the live board.
+  for (const location of [
+    "San Francisco, CA | New York City, NY | Seattle, WA",
+    "New York City, NY; San Francisco, CA; Seattle, WA",
+    "San Francisco, CA; New York, NY",
+  ]) {
+    assert.match(geographyVerdict(location, CA), /^ACCEPTABLE/, location);
+  }
+});
+
+test("the acceptable verdict tells the model the question is closed, not open", () => {
+  const verdict = geographyVerdict("San Francisco, CA | New York City, NY", CA);
+  assert.match(verdict, /settled fact/);
+  assert.match(verdict, /do not re-derive/i);
+  assert.match(verdict, /ONE of them/, "the multi-office rule has to be stated, not implied");
+  assert.match(verdict, /[Dd]o not deduct/);
+});
+
+test("a posting genuinely elsewhere is still called a hard disqualifier", () => {
+  for (const location of ["London, United Kingdom", "Austin, Texas", "Remote - Canada"]) {
+    assert.match(geographyVerdict(location, CA), /^OUTSIDE/, location);
+  }
+});
+
+test("neither an unstated location nor an unstated preference invents a penalty", () => {
+  assert.match(geographyVerdict("", CA), /Do not deduct/);
+  assert.match(geographyVerdict("Anywhere at all", []), /No location constraint/);
+});
+
+test("a location gap is dropped once the code gate has already said yes", () => {
+  const missing = dropSettledGeographyGaps(
+    [
+      "Based in San Francisco rather than California-remote",
+      "Requires relocation to New York",
+      "Onsite presence expected",
+      "No production Kubernetes experience",
+    ],
+    true,
+  );
+  assert.deepEqual(missing, ["No production Kubernetes experience"]);
+});
+
+test("a real location gap survives when the code gate says the posting is elsewhere", () => {
+  const missing = ["Requires relocation to London", "No Rust experience"];
+  assert.deepEqual(dropSettledGeographyGaps(missing, false), missing);
+});
+
+test("scrubbing geography leaves every other gap exactly as the model wrote it", () => {
+  const missing = [
+    "4+ years experience vs candidate's ~2 years",
+    "Deep production agent deployment experience at enterprise scale",
+  ];
+  assert.deepEqual(dropSettledGeographyGaps(missing, true), missing);
 });
