@@ -171,6 +171,77 @@ function expandLocationTerm(term: string): string[] {
   return Array.from(out);
 }
 
+/**
+ * Cities that are unambiguously inside a state, so a posting that names only the city still
+ * matches a candidate who stated the state.
+ *
+ * A board that writes "San Francisco" with no state used to fail a "california" preference
+ * outright: expandLocationTerm produced {california, ca} and neither string appears in
+ * "san francisco". OpenAI's board is written exactly that way, and the effect was total -- of 758
+ * open roles, the only 27 that ever reached the database were the "US - Remote" ones, which got in
+ * through the remote path instead. Every city-located role was dropped at import, so no amount of
+ * scoring work downstream could recover them.
+ */
+const STATE_CITIES: Record<string, string[]> = {
+  california: [
+    "san francisco", "south san francisco", "san jose", "palo alto", "mountain view", "menlo park",
+    "sunnyvale", "santa clara", "cupertino", "redwood city", "san mateo", "foster city", "milpitas",
+    "fremont", "campbell", "los gatos", "emeryville", "berkeley", "oakland", "walnut creek",
+    "burlingame", "san bruno", "santa cruz", "sacramento", "los angeles", "santa monica",
+    "culver city", "el segundo", "playa vista", "marina del rey", "west hollywood", "torrance",
+    "long beach", "irvine", "costa mesa", "newport beach", "huntington beach", "anaheim",
+    "santa ana", "san diego", "carlsbad", "santa barbara",
+  ],
+};
+
+/**
+ * A city name alone is weaker evidence than a state, because cities repeat across borders. Two
+ * guards keep the expansion above from over-matching, and both look for a *contradiction* rather
+ * than for permission -- a bare "San Francisco" has nothing to contradict it and passes.
+ */
+const FOREIGN_MARKER = new RegExp(
+  "\\b(canada|mexico|costa rica|united kingdom|uk|england|scotland|ireland|india|australia|" +
+    "new zealand|germany|france|spain|portugal|netherlands|belgium|switzerland|austria|poland|" +
+    "czechia|hungary|romania|ukraine|sweden|norway|denmark|finland|italy|greece|turkey|israel|" +
+    "uae|south africa|nigeria|kenya|egypt|brazil|argentina|chile|colombia|peru|japan|china|" +
+    "singapore|korea|taiwan|vietnam|indonesia|malaysia|thailand|philippines|hong kong)\\b",
+);
+
+/**
+ * State abbreviations distinctive enough to read as a state wherever they appear. The ambiguous
+ * ones are deliberately absent -- "or", "in", "me", "la", "ok", "de", "hi", "pa", "wa", "id",
+ * "ma", "co", "mt", "ne" are all ordinary English words, and "Remote or Hybrid" must not read as
+ * an Oregon posting. Full state names below catch those cases instead.
+ */
+const DISTINCT_STATE_ABBRS = [
+  "tx", "ny", "fl", "ga", "nc", "sc", "va", "nj", "az", "nv", "ut", "mn", "wi", "mi", "il", "oh",
+  "ky", "tn", "ms", "ar", "ks", "nd", "sd", "wy", "ak", "ri", "ct", "nh", "vt", "nm", "wv", "mo",
+  "md", "dc",
+];
+
+/** True when the location names a state other than `state`, which a bare city cannot outrank. */
+function namesAConflictingState(haystack: string, state: string): boolean {
+  for (const full of Object.values(US_STATES)) {
+    if (full !== state && new RegExp(`\\b${full}\\b`).test(haystack)) return true;
+  }
+  for (const abbr of DISTINCT_STATE_ABBRS) {
+    if (US_STATES[abbr] !== state && new RegExp(`\\b${abbr}\\b`).test(haystack)) return true;
+  }
+  return false;
+}
+
+/**
+ * True when a posting names a city of `state` and nothing in the location contradicts it.
+ * "San Francisco" passes; "San Jose, Costa Rica" and "Pasadena, TX" do not.
+ */
+export function cityOfStateMatches(haystack: string, state: string): boolean {
+  const cities = STATE_CITIES[state];
+  if (!cities) return false;
+  if (FOREIGN_MARKER.test(haystack)) return false;
+  if (namesAConflictingState(haystack, state)) return false;
+  return cities.some((city) => new RegExp(`\\b${city}\\b`).test(haystack));
+}
+
 /** Words that mark a posting as remote without naming where it is remote *from*. */
 const REMOTE_MARKER = "\\b(remote|anywhere|distributed|global|worldwide|virtual)\\b";
 
@@ -222,6 +293,15 @@ export function locationMatches(location: string, terms: string[]): boolean {
           : new RegExp(variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
       if (pattern.test(haystack)) return true;
     }
+  }
+
+  // Last: a stated state also accepts a posting that names only one of its cities. Checked after
+  // the literal terms so the cheap, unambiguous match still wins, and guarded so a city never
+  // outranks a contradiction stated beside it.
+  for (const term of terms) {
+    if (cityOfStateMatches(haystack, term)) return true;
+    const expanded = US_STATES[term];
+    if (expanded && cityOfStateMatches(haystack, expanded)) return true;
   }
   return false;
 }

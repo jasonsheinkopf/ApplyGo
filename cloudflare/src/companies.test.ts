@@ -471,3 +471,39 @@ test("fetchBoardJobs (Workday) with no budget argument paginates fully, exactly 
     globalThis.fetch = previous;
   }
 });
+
+// ---------------------------------------------------------------------------
+// A stated state accepts a posting that names only one of its cities
+// ---------------------------------------------------------------------------
+
+test("a posting naming only a city still matches the state the candidate stated", () => {
+  // OpenAI's board writes locations this way. Of 758 open roles, only the 27 "US - Remote" ones
+  // ever reached the database -- every city-located role was dropped before it could be scored.
+  for (const location of ["San Francisco", "Menlo Park", "Mountain View", "Los Angeles", "San Diego"]) {
+    assert.equal(locationMatches(location, CA), true, location);
+  }
+});
+
+test("a city outside the stated state is not accepted just because the name repeats", () => {
+  // Pasadena is in California and in Texas; San Jose is in California and in Costa Rica.
+  assert.equal(locationMatches("Pasadena, TX", CA), false);
+  assert.equal(locationMatches("San Jose, Costa Rica", CA), false);
+  assert.equal(locationMatches("Oakland, New Zealand", CA), false);
+});
+
+test("a city keeps matching when what sits beside it agrees rather than contradicts", () => {
+  assert.equal(locationMatches("San Francisco, CA, USA", CA), true);
+  assert.equal(locationMatches("San Francisco Bay Area", CA), true);
+  assert.equal(locationMatches("Menlo Park, California - Hybrid", CA), true);
+});
+
+test("an ordinary English word is not read as a state abbreviation", () => {
+  // "or" is Oregon and also a conjunction; a location that merely offers a choice must not be
+  // treated as naming another state and lose its city match.
+  assert.equal(locationMatches("San Francisco or Remote", CA), true);
+  assert.equal(locationMatches("Palo Alto, onsite or hybrid", CA), true);
+});
+
+test("the city expansion accepts a state abbreviation as the stated term too", () => {
+  assert.equal(locationMatches("San Francisco", ["ca"]), true);
+});
