@@ -10,10 +10,57 @@ import {
   fetchBoardJobs,
   fetchMissingDescriptions,
   isReadableAtsProvider,
+  locationMatches,
   mergeCompanySearchTerms,
+  parseLocationFilter,
   resolveCompanyDomain,
   titleCaseTerm,
 } from "./companies.ts";
+
+// ---------------------------------------------------------------------------
+// Geography gate
+// ---------------------------------------------------------------------------
+
+const CA = parseLocationFilter("California");
+
+test("a bare remote posting, or one remote across the whole US, is accepted", () => {
+  for (const location of ["Remote", "Remote - US", "US Remote", "Remote - United States", "Remote (USA)", "Remote - North America"]) {
+    assert.equal(locationMatches(location, CA), true, location);
+  }
+});
+
+test("a remote posting that names somewhere outside the filter is rejected", () => {
+  // The regression this exists for: "remote" used to short-circuit the whole check, so every one
+  // of these passed a California-only filter and went on to be scored.
+  for (const location of [
+    "Remote - United Kingdom",
+    "Remote - Canada",
+    "Remote - EMEA",
+    "Aarhus, Denmark; Remote - Denmark",
+    "Remote - Washington D.C.",
+    "US-NC-Remote",
+  ]) {
+    assert.equal(locationMatches(location, CA), false, location);
+  }
+});
+
+test("a remote posting that names an acceptable place is still accepted", () => {
+  for (const location of ["Remote - California", "Remote - CA", "San Francisco, CA; Remote", "Remote - California; Remote - Oregon"]) {
+    assert.equal(locationMatches(location, CA), true, location);
+  }
+});
+
+test("non-remote locations are unaffected by the remote handling", () => {
+  assert.equal(locationMatches("Mountain View, CA", CA), true);
+  assert.equal(locationMatches("Irvine, California", CA), true);
+  assert.equal(locationMatches("Austin, Texas", CA), false);
+  assert.equal(locationMatches("London, UK", CA), false);
+});
+
+test("an empty location or an empty filter still passes, so nothing is dropped for silence", () => {
+  assert.equal(locationMatches("", CA), true);
+  assert.equal(locationMatches("Remote - United Kingdom", []), true);
+});
 
 // ---------------------------------------------------------------------------
 // Failure diagnostics

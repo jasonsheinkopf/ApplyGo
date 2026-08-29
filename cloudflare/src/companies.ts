@@ -171,6 +171,16 @@ function expandLocationTerm(term: string): string[] {
   return Array.from(out);
 }
 
+/** Words that mark a posting as remote without naming where it is remote *from*. */
+const REMOTE_MARKER = "\\b(remote|anywhere|distributed|global|worldwide|virtual)\\b";
+
+/**
+ * Country-wide qualifiers that can sit beside a remote marker without naming a real place. A
+ * posting is either remote from a whole country the candidate lives in, or it is remote from
+ * somewhere specific -- and only the second kind has a place left to check.
+ */
+const COUNTRY_WIDE = "\\b(us|usa|u s a|united states(?: of america)?|north america|americas|nationwide|countrywide|domestic)\\b";
+
 /**
  * True when a company or posting sits in one of the requested places. Unconstrained and
  * unknown locations pass -- an empty location field should not silently drop a real result --
@@ -180,7 +190,28 @@ export function locationMatches(location: string, terms: string[]): boolean {
   if (!terms.length) return true;
   const haystack = normalizeLocationText(location);
   if (!haystack) return true;
-  if (/\b(remote|anywhere|distributed|global|worldwide)\b/.test(haystack)) return true;
+
+  // A remote role still has to be remote from somewhere the candidate can actually live, so the
+  // marker alone is not a pass. Strip the marker and any country-wide qualifier and see what
+  // place, if any, is left:
+  //
+  //   "remote"                 -> nothing left     -> accept
+  //   "remote us" / "us remote"-> nothing left     -> accept
+  //   "remote california"      -> "california"     -> matched below like any other location
+  //   "remote united kingdom"  -> "united kingdom" -> falls through, and is rejected
+  //
+  // Returning true on the bare marker (the previous behavior) meant every "Remote - <somewhere
+  // else>" posting passed the geography gate untouched, which is how UK and Denmark roles reached
+  // a California-only shortlist -- the word "remote" short-circuited the check before anything
+  // ever read the country beside it.
+  if (new RegExp(REMOTE_MARKER).test(haystack)) {
+    const named = haystack
+      .replace(new RegExp(REMOTE_MARKER, "g"), " ")
+      .replace(new RegExp(COUNTRY_WIDE, "g"), " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!named) return true;
+  }
 
   for (const term of terms) {
     for (const variant of expandLocationTerm(term)) {
