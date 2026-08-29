@@ -13145,7 +13145,22 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext, url: UR
     if (request.method === "GET" && url.pathname === "/") {
       const auth = await requireSession(request, env);
       if (auth instanceof Response) return Response.redirect(new URL("/enroll", request.url).toString(), 302);
-      return dashboardPage();
+      const response = dashboardPage();
+      // Re-stamps an already-valid session cookie with the *current* cookie attributes on every
+      // dashboard load. A browser enforces SameSite (and every other flag) from whenever a cookie
+      // was actually set, not from whatever the server's code says today -- a session created
+      // before applygo_session moved from SameSite=Strict to SameSite=Lax (see sessionCookie's own
+      // comment) keeps being sent as a Strict cookie, silently, until it is reissued. This is what
+      // reissues it without forcing a re-login: the raw token is already sitting in the request's
+      // own cookie, so it's just echoed back with today's attributes and a fresh Max-Age.
+      const cookieToken = cookieValue(request, "applygo_session");
+      if (cookieToken) {
+        const days = Math.min(Math.max(Number(env.SESSION_DAYS || "90"), 1), 365);
+        const headers = new Headers(response.headers);
+        headers.set("set-cookie", sessionCookie(cookieToken, days * 86400));
+        return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+      }
+      return response;
     }
     if (request.method === "GET" && url.pathname === "/profile") return getProfile(request, env);
     if (request.method === "PUT" && url.pathname === "/profile") return upsertProfile(request, env);
