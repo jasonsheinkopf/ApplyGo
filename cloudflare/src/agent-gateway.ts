@@ -26,6 +26,10 @@ interface Env {
   OAUTH_KV: KVNamespace;
   /** Injected by OAuthProvider at request time -- not a real Wrangler binding, so it is never present outside a request that OAuthProvider itself dispatched. */
   OAUTH_PROVIDER: OAuthHelpers;
+  /** How many company boards one scheduled pass rescans. Default 8, capped at 50. */
+  CRON_SCAN_COMPANIES?: string;
+  /** Model-call budget for one scheduled pass's evaluation stage. Default 12, capped at 24. */
+  CRON_EVALUATE_CALLS?: string;
 }
 
 /** What an approved OAuth grant carries into every authenticated /mcp call, via ctx.props. */
@@ -1149,6 +1153,20 @@ export async function handleAgentRequest(request: Request, env: Env, ctx: Execut
 
   if (request.method === "GET" && url.pathname === "/agent/v1/pipeline/status") return pipelineStatus(request, env, ctx, principal);
 
+  // The same pass the cron trigger runs, on demand. Exists so the scheduled path is testable
+  // without waiting for a tick, and so "go work on it now" is a thing a caller can actually ask
+  // for. Returns as soon as the work is handed off rather than holding the connection open for a
+  // full scan-and-judge cycle, which no MCP client would wait through.
+  if (request.method === "POST" && url.pathname === "/agent/v1/pipeline/run") {
+    ctx.waitUntil(runScheduledPass(env, ctx));
+    await recordActivity(env, principal, "pipeline.run.manual", "started");
+    return json({
+      started: true,
+      detail: "Scan and evaluation are running in the background. Poll /agent/v1/pipeline/status, " +
+        "or read the activity log, to see what it did.",
+    }, 202);
+  }
+
   return json({ error: "not_found" }, 404);
 }
 
@@ -1208,7 +1226,7 @@ const mcpApiHandler = {
   },
 };
 
-export default new OAuthProvider<Env>({
+const oauth = new OAuthProvider<Env>({
   apiRoute: "/mcp",
   apiHandler: mcpApiHandler,
   defaultHandler: applyGoHandler,
@@ -1219,3 +1237,77 @@ export default new OAuthProvider<Env>({
 
   scopesSupported: ["applygo:agent"],
 });
+
+/**
+ * Origin used to build the synthetic request the scheduled pass hands to `bridgeLegacy`.
+ *
+ * A cron invocation has no inbound request to take an origin from, and `bridgeLegacy` only ever
+ * uses one to resolve a relative path (`new URL(path, request.url)`) before the Worker routes on
+ * the pathname alone. So any absolute origin works here, and a deliberately unroutable one is
+ * clearer about that than pretending a real hostname was involved.
+ */
+const INTERNAL_ORIGIN = "https://applygo.internal";
+
+/** Who the scheduled pass records its activity as, so a cron write is distinguishable from a human's. */
+const CRON_PRINCIPAL: Principal = { kind: "agent", id: "cron", label: "Scheduled pass" };
+
+/**
+ * The unattended pass: scan company boards for new postings, then judge whatever came in.
+ *
+ * This exists because every other route into the pipeline depends on a client being connected --
+ * the dashboard needs a browser, the MCP tools need a live connector in someone's chat. Neither is
+ * something an unattended schedule can rely on, and in practice the connector toggling off is what
+ * kept stalling progress. Running the same two allowlisted legacy actions from a cron trigger makes
+ * the pipeline advance on its own, and leaves the interactive surfaces to do what they are actually
+ * good at: reading the results.
+ *
+ * Deliberately modest per run. A cron invocation has its own wall-clock budget, and the goal is
+ * steady progress on a schedule rather than clearing a whole backlog at once -- a run that finishes
+ * and leaves the queue shorter beats one killed halfway through. Both budgets are environment vars
+ * so they can be tuned without a deploy.
+ */
+export async function runScheduledPass(env: Env, ctx: ExecutionContext): Promise<void> {
+  await ensureAgentSchema(env);
+  const request = new Request(INTERNAL_ORIGIN);
+  const companies = Math.min(Math.max(Number(env.CRON_SCAN_COMPANIES) || 8, 1), 50);
+  const calls = Math.min(Math.max(Number(env.CRON_EVALUATE_CALLS) || 12, 1), 24);
+
+  try {
+    const scan = await bridgeLegacy(
+      request, env, ctx, CRON_PRINCIPAL, "POST", "/companies/scan", "cron.scan",
+      JSON.stringify({ limit: companies }),
+    );
+    const scanned = summarizeLegacyBody(await scan.text());
+
+    const evaluate = await bridgeLegacy(
+      request, env, ctx, CRON_PRINCIPAL, "POST", "/jobs/process", "cron.evaluate",
+      JSON.stringify({ calls }),
+    );
+    const judged = summarizeLegacyBody(await evaluate.text());
+
+    // One compact line per run, so `GET /agent/v1/activity` and the dev console read as a history
+    // of what the schedule actually did rather than just that it fired.
+    const final = (judged.final_event ?? {}) as Record<string, unknown>;
+    await recordActivity(
+      env, CRON_PRINCIPAL, "cron.pass",
+      `scanned ${JSON.stringify(scanned.final_event ?? {}).slice(0, 160)}; ` +
+      `screened ${Number(final.screened ?? 0)}, assessed ${Number(final.assessed ?? 0)}`,
+    );
+  } catch (error) {
+    // A failed run must not take the Worker down or go unrecorded -- the next tick should simply
+    // try again, and whoever looks at the activity log should be able to see that it failed.
+    await recordActivity(env, CRON_PRINCIPAL, "cron.failed", String((error as Error).message).slice(0, 400))
+      .catch(() => undefined);
+  }
+}
+
+export default {
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return oauth.fetch(request, env, ctx);
+  },
+  scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): void {
+    // waitUntil rather than await: the scheduled handler returns immediately and the pass runs to
+    // completion in the background, which is what keeps a slow board from failing the invocation.
+    ctx.waitUntil(runScheduledPass(env, ctx));
+  },
+};
