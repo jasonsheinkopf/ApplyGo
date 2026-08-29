@@ -752,14 +752,28 @@ async function jobsProcess(request: Request, env: Env, ctx: ExecutionContext, pr
   return json(summary, response.status);
 }
 
+/**
+ * How many model calls one evaluate pass spends by default.
+ *
+ * Deliberately small. An MCP client gives up on a tool call after about a minute, and the
+ * underlying pipeline route streams until its whole budget is spent -- at the previous default of
+ * 6 the call reliably outlived the client, which then reported a timeout for work that had in fact
+ * completed. A bounded pass that finishes and reports what is still queued is far more useful to a
+ * caller than an unbounded one whose result it never sees, so the budget is capped here and the
+ * caller loops instead.
+ */
+const EVALUATE_DEFAULT_CALLS = 4;
+const EVALUATE_MAX_CALLS = 8;
+
 async function jobsEvaluate(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
   const body = (await request.json().catch(() => ({}))) as { provider?: string; calls?: number; min_score?: number; limit?: number };
+  const calls = Math.min(Math.max(Number(body.calls) || EVALUATE_DEFAULT_CALLS, 1), EVALUATE_MAX_CALLS);
   const { response, summary } = await runFitPipeline(
     request,
     env,
     ctx,
     principal,
-    JSON.stringify({ provider: body.provider, calls: body.calls }),
+    JSON.stringify({ provider: body.provider, calls }),
   );
   if (!response.ok) return json(summary, response.status);
   const jobsResponse = await bridgeLegacy(request, env, ctx, principal, "GET", "/jobs", "jobs.evaluate.read");
@@ -767,7 +781,19 @@ async function jobsEvaluate(request: Request, env: Env, ctx: ExecutionContext, p
   const minScore = Math.min(Math.max(Number(body.min_score) || 40, 0), 100);
   const limit = Math.min(Math.max(Number(body.limit) || 20, 1), 100);
   const jobs = Array.isArray(jobsData.jobs) ? jobsData.jobs as Record<string, unknown>[] : [];
-  return json({ pipeline_run: summary, ranked: shapeShortlist(jobs, minScore, limit) });
+
+  // What this pass could not reach, so the caller knows whether to run another one rather than
+  // having to infer it from the raw event tally.
+  const counts = ((summary.final_event as Record<string, unknown> | undefined)?.counts ?? {}) as Record<string, number>;
+  const remaining = Number(counts.unassessed ?? 0) + Number(counts.screened_in ?? 0);
+
+  return json({
+    pipeline_run: summary,
+    calls_spent: calls,
+    remaining_to_evaluate: remaining,
+    more_work_available: remaining > 0,
+    ranked: shapeShortlist(jobs, minScore, limit),
+  });
 }
 
 /**

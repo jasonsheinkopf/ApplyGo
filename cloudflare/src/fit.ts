@@ -10,9 +10,9 @@
 // disqualifier fed back into future assessments. An AI misjudgment that never gets confirmed by
 // the user can't reinforce itself into a permanent rule -- see index.ts's job_feedback writes.
 
-import { type LlmEnv, type Provider, callStructured } from "./llm";
-import { getManagedPrompt } from "./langfuse";
-import { JOBS_PRESCREEN_PROMPT } from "./prompts";
+import { type LlmEnv, type Provider, callStructured } from "./llm.ts";
+import { getManagedPrompt } from "./langfuse.ts";
+import { JOBS_PRESCREEN_PROMPT } from "./prompts.ts";
 
 /**
  * The compact candidate rendering used by high-volume prescreening lives in src/profile.ts, next to
@@ -24,7 +24,7 @@ import { JOBS_PRESCREEN_PROMPT } from "./prompts";
  * postings, while deep assessment and career analysis take the full record from
  * `renderCareerProfile` -- see its header comment for why that trade runs the way it does.
  */
-export { buildMatchProfile } from "./profile";
+export { buildMatchProfile } from "./profile.ts";
 
 export type FitVerdict = "strong" | "possible" | "reject";
 
@@ -426,6 +426,64 @@ export async function screenJobsBatch(
     if (!found) return { id: job.id, keep: true, note: "" };
     return { id: job.id, keep: found.keep !== false, note: found.note ?? "" };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Assessment ordering
+// ---------------------------------------------------------------------------
+
+/** Title fragments naming a level rather than a skill bar -- assessed last, never dropped here. */
+const SENIORITY_MARKERS = [
+  "staff", "principal", "director", "head of", "vice president",
+  "senior manager", "distinguished", "fellow",
+];
+
+/**
+ * The "Title terms:" lines the desired-roles document lists under each target lane, flattened and
+ * de-duplicated. Parsed out of the profile rather than hand-maintained here, so adding a lane to
+ * the candidate's roles automatically teaches this queue what that lane's titles look like.
+ */
+export function titleTermsFromRoles(desiredRoles: string): string[] {
+  const out = new Set<string>();
+  for (const line of String(desiredRoles ?? "").split("\n")) {
+    const match = line.match(/^\s*title terms\s*:\s*(.+)$/i);
+    if (!match) continue;
+    for (const term of match[1].split(",")) {
+      const cleaned = term.trim().toLowerCase();
+      if (cleaned.length > 2) out.add(cleaned);
+    }
+  }
+  return Array.from(out);
+}
+
+/**
+ * An ORDER BY fragment, and its bindings, that puts the most plausible postings at the front of
+ * the assessment queue.
+ *
+ * The assess tier is budget-capped, so whatever it reaches first is what actually gets scored.
+ * In board order that meant paying reasoning-model rates to rate "Senior Software Engineer,
+ * Database Engine Internals" while the Forward Deployed Engineer and Solutions Architect roles
+ * sat unscored behind it and the budget ran out. Sorting by "does this title name a lane the
+ * candidate actually wants" spends the identical budget on the postings most likely to survive.
+ *
+ * Nothing is filtered out here -- a seniority-marked title still gets assessed, just last, so the
+ * model keeps making the accept/reject call rather than a LIKE pattern making it silently.
+ */
+export function assessPriorityOrder(titleTerms: string[]): { sql: string; binds: string[] } {
+  const binds: string[] = [];
+
+  const onTarget = titleTerms.length ? titleTerms.map(() => "lower(title) LIKE ?").join(" OR ") : "0";
+  for (const term of titleTerms) binds.push(`%${term}%`);
+
+  const senior = SENIORITY_MARKERS.map(() => "lower(title) LIKE ?").join(" OR ");
+  for (const marker of SENIORITY_MARKERS) binds.push(`%${marker}%`);
+
+  return {
+    sql:
+      `ORDER BY (CASE WHEN ${onTarget} THEN 0 ELSE 1 END), ` +
+      `(CASE WHEN ${senior} THEN 1 ELSE 0 END), created_at ASC`,
+    binds,
+  };
 }
 
 export const SCREEN_BATCH_SIZE = 60;
