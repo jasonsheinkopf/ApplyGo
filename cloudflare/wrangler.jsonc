@@ -86,7 +86,7 @@
         // set separately as Worker secrets (`wrangler secret put ... --env production`),
         // never here. Bump these if a model id is retired.
         "ANTHROPIC_MODEL": "claude-sonnet-5",
-        "OPENAI_MODEL": "gpt-4o",
+        "OPENAI_MODEL": "gpt-5.6-terra",
         // Cheap, high-volume tier. Used for the bulk yes/no job screen, where most postings are
         // obvious misses and paying reasoning-model rates to find that out is the expensive path.
         "ANTHROPIC_SCREEN_MODEL": "claude-haiku-4-5-20251001",
