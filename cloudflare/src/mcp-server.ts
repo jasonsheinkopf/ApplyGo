@@ -230,6 +230,26 @@ export function buildApplyGoMcpServer(call: AgentCall): McpServer {
   );
 
   server.registerTool(
+    "build_screen_eval_cases",
+    {
+      title: "Build a screening eval dataset from known outcomes",
+      description:
+        "Create eval cases for the cheap screening prompt out of postings whose outcome is already " +
+        "known: a posting the full assessment later rated worth surfacing is labelled must-keep " +
+        "(dropping it on the title alone would have lost it permanently), and one its own assessment " +
+        "put at the floor is labelled should-drop. Nothing is hand-labelled. Every batch is given " +
+        "both labels, so a variant that simply keeps everything cannot score well. Spends no model " +
+        "budget — it only compiles prompts. Run this before run_prompt_experiment.",
+      inputSchema: {
+        batch_size: z.number().optional().describe("Postings per case, 4-40. Default 12."),
+        keep_floor: z.number().optional().describe("Fit score at or above which a posting is a must-keep. Default 55."),
+        drop_ceiling: z.number().optional().describe("Fit score at or below which a posting is a should-drop. Default 10."),
+      },
+    },
+    async (body) => run(call, "POST", "/agent/v1/evals/screen-cases", body),
+  );
+
+  server.registerTool(
     "get_experiment",
     {
       title: "Read a prompt experiment",

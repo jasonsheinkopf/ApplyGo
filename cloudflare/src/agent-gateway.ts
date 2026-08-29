@@ -1243,6 +1243,16 @@ export async function handleAgentRequest(request: Request, env: Env, ctx: Execut
   if (request.method === "POST" && url.pathname === "/agent/v1/evals/experiments") {
     return startExperiment(request, env, ctx, principal);
   }
+  // Building a case set spends no model budget -- it compiles prompts from postings already
+  // assessed -- so it is safe to expose to the agent surface directly. Running the experiment,
+  // which does spend, stays behind the existing POST above.
+  if (request.method === "POST" && url.pathname === "/agent/v1/evals/screen-cases") {
+    const bodyText = await request.text().catch(() => "{}");
+    const response = await bridgeLegacy(
+      request, env, ctx, principal, "POST", "/dev/evals/build-screen-cases", "evals.build_screen_cases", bodyText || "{}",
+    );
+    return json(await readLegacyJson(response), response.status);
+  }
   const experimentMatch = url.pathname.match(/^\/agent\/v1\/evals\/experiments\/([^/]+)$/);
   if (request.method === "GET" && experimentMatch) {
     const experiment = await getExperiment(env.DB, experimentMatch[1]);
