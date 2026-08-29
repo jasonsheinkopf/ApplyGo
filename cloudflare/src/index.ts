@@ -115,9 +115,11 @@ import {
   SCREEN_BATCH_SCHEMA,
   SCREEN_BATCH_SIZE,
   assessJobFitBatch,
+  assessPriorityOrder,
   buildMatchProfile,
   deriveCareAboutTopics,
   screenJobsBatch,
+  titleTermsFromRoles,
   verdictForScore,
 } from "./fit";
 import {
@@ -1950,11 +1952,14 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
     // of the function, since tier 1 above is what populates this queue in the first place.
     const assessTotal = (await env.DB.prepare("SELECT COUNT(*) AS n FROM job_postings WHERE fit_status = 'screened_in'").first<{ n: number }>())?.n ?? 0;
 
+    // Most plausible postings first, not board order -- see assessPriorityOrder for why the
+    // budget was previously being spent on whatever the ATS happened to list earliest.
+    const assessOrder = assessPriorityOrder(titleTermsFromRoles(desiredRoles));
     const assessRows = await env.DB.prepare(
       `SELECT id, title, company, location, raw_description FROM job_postings
-       WHERE fit_status = 'screened_in' ORDER BY created_at ASC LIMIT ?`,
+       WHERE fit_status = 'screened_in' ${assessOrder.sql} LIMIT ?`,
     )
-      .bind(budget.remaining * FIT_BATCH_SIZE)
+      .bind(...assessOrder.binds, budget.remaining * FIT_BATCH_SIZE)
       .all<JobRow>();
 
     const dealbreakers = readDealbreakers(profileRow?.preferences_json ?? "{}");

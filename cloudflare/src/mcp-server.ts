@@ -254,14 +254,17 @@ export function buildApplyGoMcpServer(call: AgentCall): McpServer {
       title: "Evaluate job fit",
       description:
         "Run ApplyGo's fit pipeline (cheap screen, then a full scored assessment) over whatever postings are " +
-        "currently unassessed, then return a ranked shortlist with rationale for each. Safe to call repeatedly.",
+        "currently unassessed, then return a ranked shortlist with rationale for each. Each call does a bounded " +
+        "chunk of work so it returns well inside the tool timeout: check `more_work_available` in the result and " +
+        "call again until it is false. Safe to call repeatedly; it only ever touches postings not yet judged.",
       inputSchema: {
         provider: z.enum(["anthropic", "openai"]).optional(),
         min_score: z.number().optional().describe("Floor for the returned shortlist, default 40."),
         limit: z.number().optional().describe("Default 20."),
+        calls: z.number().optional().describe("Model calls to spend this pass. Default 4, max 8. Raise only if calls are returning quickly."),
       },
     },
-    async ({ provider, min_score, limit }) => run(call, "POST", "/agent/v1/jobs/evaluate", { provider, min_score, limit }),
+    async ({ provider, min_score, limit, calls }) => run(call, "POST", "/agent/v1/jobs/evaluate", { provider, min_score, limit, calls }),
   );
 
   server.registerTool(
