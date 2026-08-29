@@ -756,13 +756,18 @@ async function jobsProcess(request: Request, env: Env, ctx: ExecutionContext, pr
  * How many model calls one evaluate pass spends by default.
  *
  * Deliberately small. An MCP client gives up on a tool call after about a minute, and the
- * underlying pipeline route streams until its whole budget is spent -- at the previous default of
- * 6 the call reliably outlived the client, which then reported a timeout for work that had in fact
- * completed. A bounded pass that finishes and reports what is still queued is far more useful to a
- * caller than an unbounded one whose result it never sees, so the budget is capped here and the
- * caller loops instead.
+ * underlying pipeline route streams until its whole budget is spent, so an unbounded pass reliably
+ * outlived its caller -- which then reported a timeout for work that had in fact completed and been
+ * written. A bounded pass whose result the caller actually sees is worth far more than a longer one
+ * it never does, so the budget is capped here and the caller loops instead.
+ *
+ * Two, not four, and measured rather than guessed: the split reserves half the budget for each
+ * tier, so this is one screen call (~60 postings, cheap model, a few seconds) plus one assess call
+ * (8 postings with full descriptions through the reasoning model, ~25s). A four-call pass came in
+ * consistently over the limit on a real board. Raise it only for a caller with a longer timeout
+ * than MCP's, via the `calls` parameter.
  */
-const EVALUATE_DEFAULT_CALLS = 4;
+const EVALUATE_DEFAULT_CALLS = 2;
 const EVALUATE_MAX_CALLS = 8;
 
 async function jobsEvaluate(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
