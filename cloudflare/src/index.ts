@@ -533,12 +533,19 @@ function cookieValue(request: Request, name: string): string | null {
   return null;
 }
 
+// SameSite=Lax, not Strict, for the same reason as the Gmail state cookie below: the MCP OAuth
+// connector's /authorize step (agent-gateway.ts) is reached by a top-level cross-site GET redirect
+// from the connecting client (e.g. claude.ai), and a Strict cookie is withheld on exactly that kind
+// of navigation -- so a genuinely signed-in browser would see /authorize as signed out. Lax still
+// withholds the cookie from cross-site subresource loads and from cross-site POST/PUT/PATCH/DELETE
+// (every mutating route in this app), which is what actually matters for CSRF; only a top-level GET
+// navigation -- the case this exists to allow -- is different between the two.
 function sessionCookie(token: string, maxAgeSeconds: number): string {
-  return `applygo_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAgeSeconds}`;
+  return `applygo_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
 }
 
 function clearSessionCookie(): string {
-  return "applygo_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0";
+  return "applygo_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0";
 }
 
 // SameSite=Lax, not Strict: Google's redirect back to /gmail/callback is a top-level cross-site
