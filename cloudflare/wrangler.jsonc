@@ -90,7 +90,13 @@
         // Cheap, high-volume tier. Used for the bulk yes/no job screen, where most postings are
         // obvious misses and paying reasoning-model rates to find that out is the expensive path.
         "ANTHROPIC_SCREEN_MODEL": "claude-haiku-4-5-20251001",
-        "OPENAI_SCREEN_MODEL": "gpt-4o-mini"
+        "OPENAI_SCREEN_MODEL": "gpt-4o-mini",
+        // Screening runs on OpenAI even when the rest of the job runs on Anthropic. Measured over
+        // real batches, a screen call is $0.0161 on Haiku against $0.0021 on gpt-4o-mini -- about
+        // eight times cheaper for a yes/no decision made on a job title alone. Deep assessment,
+        // where model quality genuinely changes the verdict, still runs on the reasoning model.
+        // Remove this line to put both tiers back on one provider.
+        "SCREEN_PROVIDER": "openai"
       }
     }
   }

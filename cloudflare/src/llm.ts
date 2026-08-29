@@ -17,6 +17,8 @@ export interface LlmEnv extends LangfuseEnv {
   OPENAI_MODEL?: string;
   ANTHROPIC_SCREEN_MODEL?: string;
   OPENAI_SCREEN_MODEL?: string;
+  /** Provider for the cheap screen tier only. Unset means "same as whatever is running the job". */
+  SCREEN_PROVIDER?: string;
   /**
    * Where completed calls get recorded. Populated once per request by the router; left unset in
    * tests and whenever tracing is switched off, in which case every call runs untraced.
@@ -203,6 +205,25 @@ function modelFor(env: LlmEnv, provider: Provider, tier: Tier): string {
 
 export function normalizeProvider(value: unknown): Provider {
   return value === "openai" ? "openai" : "anthropic";
+}
+
+/**
+ * Which provider runs the cheap screen tier, which need not be the one running the rest of a job.
+ *
+ * The two tiers do genuinely different work, and the price gap between them is not small. Measured
+ * over real batches: a screen call costs $0.0161 on Haiku against $0.0021 on gpt-4o-mini, roughly
+ * eight times, for what is a yes/no keep decision made on a job title. Deep assessment is where
+ * model quality actually changes the answer and keeps the reasoning model; screening goes wherever
+ * it is cheapest.
+ *
+ * Falls back to the run's own provider whenever SCREEN_PROVIDER is unset or names a provider whose
+ * key isn't configured, so a deployment holding only one API key keeps working rather than failing
+ * half a pipeline on a config value nobody set.
+ */
+export function screenProvider(env: LlmEnv, runProvider: Provider): Provider {
+  if (!env.SCREEN_PROVIDER) return runProvider;
+  const configured = normalizeProvider(env.SCREEN_PROVIDER);
+  return providerKeyMissing(env, configured) ? runProvider : configured;
 }
 
 /** Returns an error response code if the chosen provider has no key configured. */

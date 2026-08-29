@@ -9,6 +9,7 @@ import {
   friendlyMessage,
   normalizeProvider,
   providerKeyMissing,
+  screenProvider,
 } from "./llm";
 import {
   DEV_PAGE,
@@ -1839,6 +1840,9 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
   const provider = normalizeProvider(body.provider);
   const keyError = providerKeyMissing(env, provider);
   if (keyError) return json({ error: keyError }, 501);
+  // The bulk screen can run on a different, cheaper provider than the deep assessment -- see
+  // screenProvider. Resolved once here so every batch in this run screens on the same model.
+  const screenTier = screenProvider(env, provider);
 
   const profileId = await getOrCreateProfileId(env);
   const profileRow = await env.DB.prepare(
@@ -1906,7 +1910,7 @@ async function processJobs(request: Request, env: Env, ctx: ExecutionContext): P
         if (screenFailed) return null;
         await emit({ type: "pipeline", stage: "screen", phase: "dispatched", ids: batch.map((item) => item.id) });
         try {
-          return await screenJobsBatch(env, provider, matchProfile, desiredRoles, disqualifiers, batch);
+          return await screenJobsBatch(env, screenTier, matchProfile, desiredRoles, disqualifiers, batch);
         } catch (err) {
           errors.push(`screen: ${(err as Error).message}`);
           screenFailed = true;
