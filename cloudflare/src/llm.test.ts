@@ -1,9 +1,37 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { callWithWebSearch, type LlmEnv } from "./llm.ts";
+import { callWithWebSearch, type LlmEnv, screenProvider } from "./llm.ts";
 
 const ENV: LlmEnv = { ANTHROPIC_API_KEY: "key123" };
+
+// ---------------------------------------------------------------------------
+// Per-tier provider selection
+// ---------------------------------------------------------------------------
+
+const BOTH_KEYS: LlmEnv = { ANTHROPIC_API_KEY: "a", OPENAI_API_KEY: "o" };
+
+test("screening moves to the configured provider while the rest of the run stays put", () => {
+  assert.equal(screenProvider({ ...BOTH_KEYS, SCREEN_PROVIDER: "openai" }, "anthropic"), "openai");
+  assert.equal(screenProvider({ ...BOTH_KEYS, SCREEN_PROVIDER: "anthropic" }, "openai"), "anthropic");
+});
+
+test("an unset SCREEN_PROVIDER leaves both tiers on the run's own provider", () => {
+  assert.equal(screenProvider(BOTH_KEYS, "anthropic"), "anthropic");
+  assert.equal(screenProvider(BOTH_KEYS, "openai"), "openai");
+});
+
+test("a configured provider with no key falls back rather than failing half the pipeline", () => {
+  const anthropicOnly: LlmEnv = { ANTHROPIC_API_KEY: "a", SCREEN_PROVIDER: "openai" };
+  assert.equal(screenProvider(anthropicOnly, "anthropic"), "anthropic");
+
+  const openaiOnly: LlmEnv = { OPENAI_API_KEY: "o", SCREEN_PROVIDER: "anthropic" };
+  assert.equal(screenProvider(openaiOnly, "openai"), "openai");
+});
+
+test("an unrecognized SCREEN_PROVIDER value resolves to anthropic, never to undefined", () => {
+  assert.equal(screenProvider({ ...BOTH_KEYS, SCREEN_PROVIDER: "gemini" }, "openai"), "anthropic");
+});
 
 const SCHEMA = { type: "object", properties: { official_website: { type: "string" } }, required: ["official_website"] };
 
