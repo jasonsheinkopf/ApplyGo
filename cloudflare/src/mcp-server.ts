@@ -204,6 +204,55 @@ export function buildApplyGoMcpServer(call: AgentCall): McpServer {
   );
 
   server.registerTool(
+    "run_prompt_experiment",
+    {
+      title: "A/B test prompt variants",
+      description:
+        "Run two or more wordings of the same pipeline prompt over a shared set of saved eval cases, " +
+        "score every result with the same LLM judge, and record the comparison. One variant must be " +
+        "labelled 'control' — it is the incumbent the others are measured against. Returns immediately " +
+        "with an experiment id; poll get_experiment for the result. Cost is cases x variants x 2 model " +
+        "calls, so keep max_cases modest while iterating.",
+      inputSchema: {
+        task: z.string().describe("Which pipeline prompt is under test, e.g. 'jobs.prescreen' or 'fit.assess'."),
+        name: z.string().optional(),
+        hypothesis: z.string().optional().describe("What you expect to happen, recorded before the result is known."),
+        variants: z.array(z.object({
+          label: z.string().describe("'control' for the incumbent; any label for candidates."),
+          template: z.string().describe("The prompt template, using the same {{variables}} the cases recorded."),
+        })).describe("At least two, one of which must be labelled 'control'."),
+        provider: z.enum(["anthropic", "openai"]).optional(),
+        model: z.string().optional(),
+        max_cases: z.number().optional().describe("Cases to run each variant over. Default 10, max 40."),
+      },
+    },
+    async (body) => run(call, "POST", "/agent/v1/evals/experiments", body),
+  );
+
+  server.registerTool(
+    "get_experiment",
+    {
+      title: "Read a prompt experiment",
+      description:
+        "The comparison for one experiment: per-variant mean, median and spread of judge scores, cost and " +
+        "latency, plus a paired head-to-head against the control and a plain-language verdict. The verdict " +
+        "deliberately refuses to call a winner on too few cases or on a gap inside judge noise.",
+      inputSchema: { id: z.string() },
+    },
+    async ({ id }) => run(call, "GET", `/agent/v1/evals/experiments/${encodeURIComponent(id)}`),
+  );
+
+  server.registerTool(
+    "list_experiments",
+    {
+      title: "List prompt experiments",
+      description: "Every prompt A/B experiment run so far, newest first, with its hypothesis, status and run count.",
+      inputSchema: {},
+    },
+    async () => run(call, "GET", "/agent/v1/evals/experiments"),
+  );
+
+  server.registerTool(
     "run_pipeline_pass",
     {
       title: "Run a full pipeline pass now",
