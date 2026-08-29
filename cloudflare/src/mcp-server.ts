@@ -204,6 +204,20 @@ export function buildApplyGoMcpServer(call: AgentCall): McpServer {
   );
 
   server.registerTool(
+    "run_pipeline_pass",
+    {
+      title: "Run a full pipeline pass now",
+      description:
+        "Kick off the same unattended pass the daily schedule runs: rescan company boards for new " +
+        "postings, then score whatever came in. Returns immediately -- the work continues in the " +
+        "background, so follow up with get_pipeline_status or get_shortlist rather than expecting " +
+        "results from this call. Use this for 'go find me jobs now'.",
+      inputSchema: {},
+    },
+    async () => run(call, "POST", "/agent/v1/pipeline/run", {}),
+  );
+
+  server.registerTool(
     "get_pipeline_status",
     {
       title: "Get pipeline status",

@@ -69,8 +69,19 @@
       "observability": {
         "enabled": true
       },
+      // The unattended pass (see runScheduledPass in src/agent-gateway.ts): scan boards for new
+      // postings, then judge what came in. Daily at 13:23 UTC, roughly 6:23am Pacific, so a fresh
+      // shortlist is waiting in the morning. Deliberately off the hour and off :00/:30 -- every
+      // schedule that asks for "6am" lands on the same instant otherwise.
+      "triggers": {
+        "crons": ["23 13 * * *"]
+      },
       "vars": {
         "SESSION_DAYS": "90",
+        // How much one scheduled pass is allowed to spend. Tunable without a code change:
+        // 8 boards and 12 model calls is roughly a dollar a day at current rates.
+        "CRON_SCAN_COMPANIES": "8",
+        "CRON_EVALUATE_CALLS": "12",
         // Non-secret model identifiers. ANTHROPIC_API_KEY / OPENAI_API_KEY are
         // set separately as Worker secrets (`wrangler secret put ... --env production`),
         // never here. Bump these if a model id is retired.
