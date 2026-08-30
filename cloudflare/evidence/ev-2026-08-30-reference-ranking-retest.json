@@ -1,7 +1,7 @@
 {
   "slug": "ev-2026-08-30-reference-ranking-retest",
-  "recorded_at": "2026-08-30T11:29:15.490Z",
-  "what": "Test-retest of the Opus reference arm. Identical eval cases, identical templates, identical model and effort as experiment c71ee5b1; the only difference is that this is a second sampling. Measures the noise floor the rest of the benchmark rests on.",
+  "recorded_at": "2026-08-30T11:48:43.268Z",
+  "what": "Test-retest of BOTH reference arms. Identical eval cases, templates, models and effort as the original benchmark; only the sampling differs. Measures the noise floor the rest of the benchmark rests on.",
   "strengthens": "ev-2026-08-30-reference-ranking-benchmark",
   "headline": {
     "opus_rich_run1_vs_run2": {
@@ -28,7 +28,45 @@
       "n": 24,
       "spearman": 0.759,
       "p_permutation": 0.00004
-    }
+    },
+    "sol_rich_run1_vs_run2": {
+      "n": 24,
+      "spearman": 0.922,
+      "p_permutation": 0,
+      "mean_abs_delta": 3.4,
+      "mean_signed_delta": -3,
+      "max_abs_delta": 12
+    },
+    "sol_production_context_run1_vs_run2": {
+      "n": 25,
+      "spearman": 0.923,
+      "p_permutation": 0,
+      "mean_abs_delta": 3.8,
+      "max_abs_delta": 23
+    },
+    "cross_model_all_four_pairings": {
+      "opus1_vs_sol1": {
+        "n": 24,
+        "spearman": 0.81,
+        "mean_abs_delta": 17.8
+      },
+      "opus2_vs_sol2": {
+        "n": 25,
+        "spearman": 0.783,
+        "mean_abs_delta": 14.2
+      },
+      "opus1_vs_sol2": {
+        "n": 25,
+        "spearman": 0.788,
+        "mean_abs_delta": 15.1
+      },
+      "opus2_vs_sol1": {
+        "n": 24,
+        "spearman": 0.759,
+        "mean_abs_delta": 16.7
+      }
+    },
+    "uuid_corruption": "sol corrupted one posting UUID in run 1 and none in run 2 - 1 occurrence across 12 sol calls. Opus: 0 across 12."
   },
   "production_comparison_under_both_runs": {
     "sonnet5_vs_opus_run1": {
@@ -63,7 +101,9 @@
       "retest_delta": 4,
       "opus5_production_context_run1": 82,
       "opus5_production_context_run2": 82,
-      "sol_rich": 96
+      "sol_rich_run1": 96,
+      "sol_rich_run2": 93,
+      "sol_retest_delta": -3
     },
     {
       "posting_id_prefix": "c68c209d",
@@ -75,7 +115,9 @@
       "retest_delta": 0,
       "opus5_production_context_run1": 80,
       "opus5_production_context_run2": 80,
-      "sol_rich": 84
+      "sol_rich_run1": 84,
+      "sol_rich_run2": 82,
+      "sol_retest_delta": -2
     },
     {
       "posting_id_prefix": "84810767",
@@ -87,7 +129,9 @@
       "retest_delta": 3,
       "opus5_production_context_run1": 74,
       "opus5_production_context_run2": 74,
-      "sol_rich": 76
+      "sol_rich_run1": 76,
+      "sol_rich_run2": 67,
+      "sol_retest_delta": -9
     },
     {
       "posting_id_prefix": "05f23081",
@@ -99,7 +143,9 @@
       "retest_delta": 2,
       "opus5_production_context_run1": 76,
       "opus5_production_context_run2": 78,
-      "sol_rich": 93
+      "sol_rich_run1": 93,
+      "sol_rich_run2": 90,
+      "sol_retest_delta": -3
     },
     {
       "posting_id_prefix": "5fdf14b9",
@@ -111,7 +157,9 @@
       "retest_delta": -2,
       "opus5_production_context_run1": 85,
       "opus5_production_context_run2": 85,
-      "sol_rich": 94
+      "sol_rich_run1": 94,
+      "sol_rich_run2": 88,
+      "sol_retest_delta": -6
     },
     {
       "posting_id_prefix": "86f508b5",
@@ -123,7 +171,9 @@
       "retest_delta": 0,
       "opus5_production_context_run1": 72,
       "opus5_production_context_run2": 76,
-      "sol_rich": 82
+      "sol_rich_run1": 82,
+      "sol_rich_run2": 74,
+      "sol_retest_delta": -8
     },
     {
       "posting_id_prefix": "e09f71d6",
@@ -135,7 +185,9 @@
       "retest_delta": 0,
       "opus5_production_context_run1": 63,
       "opus5_production_context_run2": 66,
-      "sol_rich": 78
+      "sol_rich_run1": 78,
+      "sol_rich_run2": 78,
+      "sol_retest_delta": 0
     },
     {
       "posting_id_prefix": "25d00a92",
@@ -147,7 +199,9 @@
       "retest_delta": -2,
       "opus5_production_context_run1": 80,
       "opus5_production_context_run2": 80,
-      "sol_rich": 88
+      "sol_rich_run1": 88,
+      "sol_rich_run2": 76,
+      "sol_retest_delta": -12
     },
     {
       "posting_id_prefix": "5abd7cee",
@@ -159,7 +213,9 @@
       "retest_delta": -6,
       "opus5_production_context_run1": 52,
       "opus5_production_context_run2": 68,
-      "sol_rich": 87
+      "sol_rich_run1": 87,
+      "sol_rich_run2": 86,
+      "sol_retest_delta": -1
     },
     {
       "posting_id_prefix": "dbc5cd70",
@@ -171,7 +227,9 @@
       "retest_delta": 0,
       "opus5_production_context_run1": 62,
       "opus5_production_context_run2": 62,
-      "sol_rich": 89
+      "sol_rich_run1": 89,
+      "sol_rich_run2": 84,
+      "sol_retest_delta": -5
     },
     {
       "posting_id_prefix": "19578c4d",
@@ -183,7 +241,9 @@
       "retest_delta": 2,
       "opus5_production_context_run1": 78,
       "opus5_production_context_run2": 78,
-      "sol_rich": 93
+      "sol_rich_run1": 93,
+      "sol_rich_run2": 90,
+      "sol_retest_delta": -3
     },
     {
       "posting_id_prefix": "c8b03968",
@@ -195,7 +255,9 @@
       "retest_delta": 4,
       "opus5_production_context_run1": 42,
       "opus5_production_context_run2": 40,
-      "sol_rich": 47
+      "sol_rich_run1": 47,
+      "sol_rich_run2": 48,
+      "sol_retest_delta": 1
     },
     {
       "posting_id_prefix": "58a6c39f",
@@ -207,7 +269,9 @@
       "retest_delta": -2,
       "opus5_production_context_run1": 45,
       "opus5_production_context_run2": 45,
-      "sol_rich": 75
+      "sol_rich_run1": 75,
+      "sol_rich_run2": 72,
+      "sol_retest_delta": -3
     },
     {
       "posting_id_prefix": "47dfc10a",
@@ -219,7 +283,9 @@
       "retest_delta": 0,
       "opus5_production_context_run1": 66,
       "opus5_production_context_run2": 66,
-      "sol_rich": 86
+      "sol_rich_run1": 86,
+      "sol_rich_run2": 84,
+      "sol_retest_delta": -2
     },
     {
       "posting_id_prefix": "da248248",
@@ -231,7 +297,9 @@
       "retest_delta": 6,
       "opus5_production_context_run1": 78,
       "opus5_production_context_run2": 80,
-      "sol_rich": 87
+      "sol_rich_run1": 87,
+      "sol_rich_run2": 88,
+      "sol_retest_delta": 1
     },
     {
       "posting_id_prefix": "6b1dfa2b",
@@ -243,7 +311,9 @@
       "retest_delta": 1,
       "opus5_production_context_run1": 38,
       "opus5_production_context_run2": 33,
-      "sol_rich": 88
+      "sol_rich_run1": 88,
+      "sol_rich_run2": 89,
+      "sol_retest_delta": 1
     },
     {
       "posting_id_prefix": "761ede20",
@@ -255,7 +325,9 @@
       "retest_delta": 0,
       "opus5_production_context_run1": 58,
       "opus5_production_context_run2": 58,
-      "sol_rich": 87
+      "sol_rich_run1": 87,
+      "sol_rich_run2": 87,
+      "sol_retest_delta": 0
     },
     {
       "posting_id_prefix": "92c8e754",
@@ -267,7 +339,9 @@
       "retest_delta": -2,
       "opus5_production_context_run1": 62,
       "opus5_production_context_run2": 58,
-      "sol_rich": 82
+      "sol_rich_run1": 82,
+      "sol_rich_run2": 81,
+      "sol_retest_delta": -1
     },
     {
       "posting_id_prefix": "225b53f3",
@@ -279,7 +353,9 @@
       "retest_delta": 2,
       "opus5_production_context_run1": 30,
       "opus5_production_context_run2": 30,
-      "sol_rich": null
+      "sol_rich_run1": null,
+      "sol_rich_run2": 31,
+      "sol_retest_delta": null
     },
     {
       "posting_id_prefix": "d68481b9",
@@ -291,7 +367,9 @@
       "retest_delta": 6,
       "opus5_production_context_run1": 80,
       "opus5_production_context_run2": 82,
-      "sol_rich": 91
+      "sol_rich_run1": 91,
+      "sol_rich_run2": 87,
+      "sol_retest_delta": -4
     },
     {
       "posting_id_prefix": "605557b0",
@@ -303,7 +381,9 @@
       "retest_delta": 5,
       "opus5_production_context_run1": 74,
       "opus5_production_context_run2": 78,
-      "sol_rich": 67
+      "sol_rich_run1": 67,
+      "sol_rich_run2": 68,
+      "sol_retest_delta": 1
     },
     {
       "posting_id_prefix": "02187537",
@@ -315,7 +395,9 @@
       "retest_delta": 5,
       "opus5_production_context_run1": 76,
       "opus5_production_context_run2": 76,
-      "sol_rich": 84
+      "sol_rich_run1": 84,
+      "sol_rich_run2": 84,
+      "sol_retest_delta": 0
     },
     {
       "posting_id_prefix": "46f0f2c4",
@@ -327,7 +409,9 @@
       "retest_delta": -2,
       "opus5_production_context_run1": 30,
       "opus5_production_context_run2": 33,
-      "sol_rich": 38
+      "sol_rich_run1": 38,
+      "sol_rich_run2": 31,
+      "sol_retest_delta": -7
     },
     {
       "posting_id_prefix": "07f65544",
@@ -339,7 +423,9 @@
       "retest_delta": 4,
       "opus5_production_context_run1": 63,
       "opus5_production_context_run2": 62,
-      "sol_rich": 61
+      "sol_rich_run1": 61,
+      "sol_rich_run2": 54,
+      "sol_retest_delta": -7
     },
     {
       "posting_id_prefix": "50b7c8f2",
@@ -351,7 +437,9 @@
       "retest_delta": 3,
       "opus5_production_context_run1": 42,
       "opus5_production_context_run2": 40,
-      "sol_rich": 43
+      "sol_rich_run1": 43,
+      "sol_rich_run2": 44,
+      "sol_retest_delta": 1
     }
   ]
 }
