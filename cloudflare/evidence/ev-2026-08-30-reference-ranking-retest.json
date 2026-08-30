@@ -1,0 +1,357 @@
+{
+  "slug": "ev-2026-08-30-reference-ranking-retest",
+  "recorded_at": "2026-08-30T11:29:15.490Z",
+  "what": "Test-retest of the Opus reference arm. Identical eval cases, identical templates, identical model and effort as experiment c71ee5b1; the only difference is that this is a second sampling. Measures the noise floor the rest of the benchmark rests on.",
+  "strengthens": "ev-2026-08-30-reference-ranking-benchmark",
+  "headline": {
+    "opus_rich_run1_vs_run2": {
+      "n": 25,
+      "spearman": 0.976,
+      "p_permutation": 0,
+      "mean_abs_delta": 2.5,
+      "max_abs_delta": 6
+    },
+    "opus_production_context_run1_vs_run2": {
+      "n": 25,
+      "spearman": 0.972,
+      "p_permutation": 0,
+      "mean_abs_delta": 2,
+      "max_abs_delta": 16
+    },
+    "top8_overlap": "8 of 8",
+    "opus_run1_vs_sol_rich": {
+      "n": 24,
+      "spearman": 0.81,
+      "p_permutation": 0
+    },
+    "opus_run2_vs_sol_rich": {
+      "n": 24,
+      "spearman": 0.759,
+      "p_permutation": 0.00004
+    }
+  },
+  "production_comparison_under_both_runs": {
+    "sonnet5_vs_opus_run1": {
+      "n": 13,
+      "spearman": 0.598,
+      "p": 0.0336
+    },
+    "sonnet5_vs_opus_run2": {
+      "n": 13,
+      "spearman": 0.684,
+      "p": 0.012
+    },
+    "terra_vs_opus_run1": {
+      "n": 13,
+      "spearman": -0.466,
+      "p": 0.1089
+    },
+    "terra_vs_opus_run2": {
+      "n": 13,
+      "spearman": -0.446,
+      "p": 0.128
+    }
+  },
+  "per_posting": [
+    {
+      "posting_id_prefix": "89d9778d",
+      "title": "Demo Experience Engineer, Technical Success",
+      "company": "OpenAI",
+      "production_fit_score": 90,
+      "opus5_rich_run1": 74,
+      "opus5_rich_run2": 78,
+      "retest_delta": 4,
+      "opus5_production_context_run1": 82,
+      "opus5_production_context_run2": 82,
+      "sol_rich": 96
+    },
+    {
+      "posting_id_prefix": "c68c209d",
+      "title": "Software Engineer, AI",
+      "company": "Factory",
+      "production_fit_score": 89,
+      "opus5_rich_run1": 62,
+      "opus5_rich_run2": 62,
+      "retest_delta": 0,
+      "opus5_production_context_run1": 80,
+      "opus5_production_context_run2": 80,
+      "sol_rich": 84
+    },
+    {
+      "posting_id_prefix": "84810767",
+      "title": "Applied AI Engineer, Codex Core Agent",
+      "company": "OpenAI",
+      "production_fit_score": 84,
+      "opus5_rich_run1": 55,
+      "opus5_rich_run2": 58,
+      "retest_delta": 3,
+      "opus5_production_context_run1": 74,
+      "opus5_production_context_run2": 74,
+      "sol_rich": 76
+    },
+    {
+      "posting_id_prefix": "05f23081",
+      "title": "AI Deployment Manager - Builder",
+      "company": "OpenAI",
+      "production_fit_score": 84,
+      "opus5_rich_run1": 68,
+      "opus5_rich_run2": 70,
+      "retest_delta": 2,
+      "opus5_production_context_run1": 76,
+      "opus5_production_context_run2": 78,
+      "sol_rich": 93
+    },
+    {
+      "posting_id_prefix": "5fdf14b9",
+      "title": "Technical Enablement Lead, Claude Platform",
+      "company": "Anthropic",
+      "production_fit_score": 82,
+      "opus5_rich_run1": 82,
+      "opus5_rich_run2": 80,
+      "retest_delta": -2,
+      "opus5_production_context_run1": 85,
+      "opus5_production_context_run2": 85,
+      "sol_rich": 94
+    },
+    {
+      "posting_id_prefix": "86f508b5",
+      "title": "Research Engineer",
+      "company": "Factory",
+      "production_fit_score": 79,
+      "opus5_rich_run1": 45,
+      "opus5_rich_run2": 45,
+      "retest_delta": 0,
+      "opus5_production_context_run1": 72,
+      "opus5_production_context_run2": 76,
+      "sol_rich": 82
+    },
+    {
+      "posting_id_prefix": "e09f71d6",
+      "title": "AI Operations Engineer, Partnerships",
+      "company": "Anthropic",
+      "production_fit_score": 78,
+      "opus5_rich_run1": 48,
+      "opus5_rich_run2": 48,
+      "retest_delta": 0,
+      "opus5_production_context_run1": 63,
+      "opus5_production_context_run2": 66,
+      "sol_rich": 78
+    },
+    {
+      "posting_id_prefix": "25d00a92",
+      "title": "Developer Experience Engineer",
+      "company": "OpenAI",
+      "production_fit_score": 78,
+      "opus5_rich_run1": 76,
+      "opus5_rich_run2": 74,
+      "retest_delta": -2,
+      "opus5_production_context_run1": 80,
+      "opus5_production_context_run2": 80,
+      "sol_rich": 88
+    },
+    {
+      "posting_id_prefix": "5abd7cee",
+      "title": "Developer Relations Engineer",
+      "company": "Sierra",
+      "production_fit_score": 77,
+      "opus5_rich_run1": 58,
+      "opus5_rich_run2": 52,
+      "retest_delta": -6,
+      "opus5_production_context_run1": 52,
+      "opus5_production_context_run2": 68,
+      "sol_rich": 87
+    },
+    {
+      "posting_id_prefix": "dbc5cd70",
+      "title": "Software Engineer, Enterprise AI Platform",
+      "company": "OpenAI",
+      "production_fit_score": 76,
+      "opus5_rich_run1": 58,
+      "opus5_rich_run2": 58,
+      "retest_delta": 0,
+      "opus5_production_context_run1": 62,
+      "opus5_production_context_run2": 62,
+      "sol_rich": 89
+    },
+    {
+      "posting_id_prefix": "19578c4d",
+      "title": "Forward Deployed Engineer, Applied AI",
+      "company": "Snowflake",
+      "production_fit_score": 74,
+      "opus5_rich_run1": 87,
+      "opus5_rich_run2": 89,
+      "retest_delta": 2,
+      "opus5_production_context_run1": 78,
+      "opus5_production_context_run2": 78,
+      "sol_rich": 93
+    },
+    {
+      "posting_id_prefix": "c8b03968",
+      "title": "Foundation Model Data, Software Engineer",
+      "company": "Waymo",
+      "production_fit_score": 69,
+      "opus5_rich_run1": 41,
+      "opus5_rich_run2": 45,
+      "retest_delta": 4,
+      "opus5_production_context_run1": 42,
+      "opus5_production_context_run2": 40,
+      "sol_rich": 47
+    },
+    {
+      "posting_id_prefix": "58a6c39f",
+      "title": "Software Engineer, Codex - User Activation",
+      "company": "OpenAI",
+      "production_fit_score": 69,
+      "opus5_rich_run1": 44,
+      "opus5_rich_run2": 42,
+      "retest_delta": -2,
+      "opus5_production_context_run1": 45,
+      "opus5_production_context_run2": 45,
+      "sol_rich": 75
+    },
+    {
+      "posting_id_prefix": "47dfc10a",
+      "title": "Forward Deployed Engineer, GenAI",
+      "company": "Scale AI",
+      "production_fit_score": 68,
+      "opus5_rich_run1": 76,
+      "opus5_rich_run2": 76,
+      "retest_delta": 0,
+      "opus5_production_context_run1": 66,
+      "opus5_production_context_run2": 66,
+      "sol_rich": 86
+    },
+    {
+      "posting_id_prefix": "da248248",
+      "title": "Frontier Agents Engineer (Applied AI)",
+      "company": "Scale AI",
+      "production_fit_score": 68,
+      "opus5_rich_run1": 72,
+      "opus5_rich_run2": 78,
+      "retest_delta": 6,
+      "opus5_production_context_run1": 78,
+      "opus5_production_context_run2": 80,
+      "sol_rich": 87
+    },
+    {
+      "posting_id_prefix": "6b1dfa2b",
+      "title": "Solutions Engineer, Enterprise",
+      "company": "Scale AI",
+      "production_fit_score": 68,
+      "opus5_rich_run1": 62,
+      "opus5_rich_run2": 63,
+      "retest_delta": 1,
+      "opus5_production_context_run1": 38,
+      "opus5_production_context_run2": 33,
+      "sol_rich": 88
+    },
+    {
+      "posting_id_prefix": "761ede20",
+      "title": "Applied AI Architect, Commercial",
+      "company": "Anthropic",
+      "production_fit_score": 68,
+      "opus5_rich_run1": 72,
+      "opus5_rich_run2": 72,
+      "retest_delta": 0,
+      "opus5_production_context_run1": 58,
+      "opus5_production_context_run2": 58,
+      "sol_rich": 87
+    },
+    {
+      "posting_id_prefix": "92c8e754",
+      "title": "Solutions Engineer",
+      "company": "Factory",
+      "production_fit_score": 68,
+      "opus5_rich_run1": 68,
+      "opus5_rich_run2": 66,
+      "retest_delta": -2,
+      "opus5_production_context_run1": 62,
+      "opus5_production_context_run2": 58,
+      "sol_rich": 82
+    },
+    {
+      "posting_id_prefix": "225b53f3",
+      "title": "Agent Post-Training, Computer Use Research",
+      "company": "OpenAI",
+      "production_fit_score": 68,
+      "opus5_rich_run1": 18,
+      "opus5_rich_run2": 20,
+      "retest_delta": 2,
+      "opus5_production_context_run1": 30,
+      "opus5_production_context_run2": 30,
+      "sol_rich": null
+    },
+    {
+      "posting_id_prefix": "d68481b9",
+      "title": "Applied AI Engineer, Enterprise Tech",
+      "company": "Anthropic",
+      "production_fit_score": 66,
+      "opus5_rich_run1": 78,
+      "opus5_rich_run2": 84,
+      "retest_delta": 6,
+      "opus5_production_context_run1": 80,
+      "opus5_production_context_run2": 82,
+      "sol_rich": 91
+    },
+    {
+      "posting_id_prefix": "605557b0",
+      "title": "Applied AI Software Engineer, GTM Growth Engineering",
+      "company": "OpenAI",
+      "production_fit_score": 66,
+      "opus5_rich_run1": 55,
+      "opus5_rich_run2": 60,
+      "retest_delta": 5,
+      "opus5_production_context_run1": 74,
+      "opus5_production_context_run2": 78,
+      "sol_rich": 67
+    },
+    {
+      "posting_id_prefix": "02187537",
+      "title": "Applied AI Architect, Startups",
+      "company": "Anthropic",
+      "production_fit_score": 65,
+      "opus5_rich_run1": 74,
+      "opus5_rich_run2": 79,
+      "retest_delta": 5,
+      "opus5_production_context_run1": 76,
+      "opus5_production_context_run2": 76,
+      "sol_rich": 84
+    },
+    {
+      "posting_id_prefix": "46f0f2c4",
+      "title": "Machine Learning Engineer - Inference",
+      "company": "Together AI",
+      "production_fit_score": 65,
+      "opus5_rich_run1": 26,
+      "opus5_rich_run2": 24,
+      "retest_delta": -2,
+      "opus5_production_context_run1": 30,
+      "opus5_production_context_run2": 33,
+      "sol_rich": 38
+    },
+    {
+      "posting_id_prefix": "07f65544",
+      "title": "Software Engineer, ML Inference Platform",
+      "company": "Nuro",
+      "production_fit_score": 65,
+      "opus5_rich_run1": 58,
+      "opus5_rich_run2": 62,
+      "retest_delta": 4,
+      "opus5_production_context_run1": 63,
+      "opus5_production_context_run2": 62,
+      "sol_rich": 61
+    },
+    {
+      "posting_id_prefix": "50b7c8f2",
+      "title": "Helix AI Engineer, Generative AI",
+      "company": "Figure AI",
+      "production_fit_score": 65,
+      "opus5_rich_run1": 30,
+      "opus5_rich_run2": 33,
+      "retest_delta": 3,
+      "opus5_production_context_run1": 42,
+      "opus5_production_context_run2": 40,
+      "sol_rich": 43
+    }
+  ]
+}
