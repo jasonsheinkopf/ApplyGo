@@ -5736,7 +5736,12 @@ async function loadEvidencePlan(
     if (!requirements.requirements.length) return null;
 
     return await planEvidence(env, provider, structured, requirements, `${job.title} at ${job.company}`);
-  } catch {
+  } catch (err) {
+    // Deliberately degrade rather than block resume generation (see doc comment above), but a
+    // silent catch here made every planner failure invisible -- plan_json sat at '{}' on every
+    // generated resume with no signal why. Logged so a real outage shows up in tail/logs instead
+    // of only being discoverable by noticing the resume looks untailored.
+    console.error(`loadEvidencePlan failed for job ${jobId}: ${(err as Error)?.message || err}`);
     return null;
   }
 }
