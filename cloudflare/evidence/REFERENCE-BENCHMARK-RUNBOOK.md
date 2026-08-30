@@ -36,3 +36,17 @@ Twelve calls, $1.73, ~30–49 s each. Experiments `c71ee5b1…` (Opus) and `6652
 
 `node analyze.js` over the per-posting rows in the JSON. Spearman with 200,000-shuffle permutation
 p-values; the reference-vs-reference comparison uses the 24 postings both arms scored.
+
+## Retest, 2026-08-30
+
+The Opus arm was re-run unchanged (experiment `c6ab577f…`, $0.78) to put an error bar on the
+benchmark. Result: **Spearman 0.976 run-to-run, mean absolute difference 2.5 points, identical top
+eight**. Recorded as `ev-2026-08-30-reference-ranking-retest`.
+
+That noise floor is what makes the rest of the benchmark readable: 0.81 between Opus and sol is
+genuine shared signal, the 17.8-point Opus/sol offset is calibration rather than variance, and the
+0.17 correlation between the live board and the reference cannot be blamed on the reference moving.
+
+**The resume race is avoidable by hand.** After a timed-out invocation, poll `eval_runs` until the
+row count stops changing before re-invoking. Doing that produced zero duplicates on this run, where
+firing straight back produced one. The real fix is still to claim work before the call.
