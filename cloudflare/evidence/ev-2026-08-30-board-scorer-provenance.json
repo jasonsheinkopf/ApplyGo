@@ -1,0 +1,1193 @@
+{
+  "slug": "ev-2026-08-30-board-scorer-provenance",
+  "recorded_at": "2026-08-30T11:54:59.521Z",
+  "what": "Provenance audit of the 162 postings on the shortlist (fit_status strong or possible), grouped by which model produced the score. Explains why the board ordering correlates only 0.17 with the reference ranking.",
+  "headline": {
+    "by_scorer": [
+      {
+        "scorer": "legacy (no scored_by recorded)",
+        "n": 134,
+        "distinct_scores": 12,
+        "pct_multiple_of_5": 92.5,
+        "pct_at_55_60_65": 23.9,
+        "mean_score": 49.5,
+        "note": "Scored before the scored_by instrumentation landed, by whatever model was configured at the time. Twelve distinct values across 134 postings."
+      },
+      {
+        "scorer": "gpt-5.6-terra",
+        "n": 26,
+        "distinct_scores": 22,
+        "pct_multiple_of_5": 3.8,
+        "pct_at_55_60_65": 0,
+        "mean_score": 67.1
+      },
+      {
+        "scorer": "claude-sonnet-5",
+        "n": 2,
+        "distinct_scores": 2,
+        "pct_multiple_of_5": 50,
+        "pct_at_55_60_65": 0,
+        "mean_score": 66,
+        "note": "too few to characterise"
+      }
+    ],
+    "top25_composition": {
+      "gpt-5.6-terra": 14,
+      "legacy": 10,
+      "claude-sonnet-5": 1
+    },
+    "legacy_score_histogram": {
+      "40": 34,
+      "45": 30,
+      "48": 1,
+      "49": 1,
+      "50": 28,
+      "55": 16,
+      "58": 1,
+      "59": 1,
+      "60": 5,
+      "65": 11,
+      "68": 5,
+      "69": 1
+    },
+    "board_vs_opus_reference_spearman": 0.172
+  },
+  "interpretation": "The legacy scorer emitted twelve distinct values across 134 postings, 92.5% of them multiples of five, with large ties at exactly 40, 45, 50, 55 and 65. A shortlist 83% composed of such scores has very little ordering in it to begin with, which is a sufficient explanation for the 0.17 rank correlation against the reference without any appeal to model disagreement. gpt-5.6-terra by contrast produced 22 distinct scores across 26 postings. Where terra re-scored a legacy posting it usually moved it down sharply (78 to 52, 75 to 49, 80 to 48), consistent with the earlier finding that the legacy model returned high scores with empty gap lists - scoring without analysing.",
+  "snapshot_note": "Full pre-rescore snapshot of all 162 shortlist rows, so the re-score is reversible and the before/after measurable. fit_score_previous holds only one prior reading, so for postings terra had already re-scored this file is the only surviving record of the legacy value.",
+  "rows": [
+    {
+      "pid": "89d9778d",
+      "s": 90,
+      "prev": 75,
+      "by": "gpt-5.6-terra",
+      "st": "strong"
+    },
+    {
+      "pid": "c68c209d",
+      "s": 89,
+      "prev": null,
+      "by": "gpt-5.6-terra",
+      "st": "strong"
+    },
+    {
+      "pid": "84810767",
+      "s": 84,
+      "prev": 80,
+      "by": "gpt-5.6-terra",
+      "st": "strong"
+    },
+    {
+      "pid": "05f23081",
+      "s": 84,
+      "prev": 70,
+      "by": "gpt-5.6-terra",
+      "st": "strong"
+    },
+    {
+      "pid": "5fdf14b9",
+      "s": 82,
+      "prev": 18,
+      "by": "claude-sonnet-5",
+      "st": "strong"
+    },
+    {
+      "pid": "86f508b5",
+      "s": 79,
+      "prev": null,
+      "by": "gpt-5.6-terra",
+      "st": "strong"
+    },
+    {
+      "pid": "e09f71d6",
+      "s": 78,
+      "prev": null,
+      "by": "gpt-5.6-terra",
+      "st": "strong"
+    },
+    {
+      "pid": "25d00a92",
+      "s": 78,
+      "prev": 85,
+      "by": "gpt-5.6-terra",
+      "st": "strong"
+    },
+    {
+      "pid": "5abd7cee",
+      "s": 77,
+      "prev": null,
+      "by": "gpt-5.6-terra",
+      "st": "strong"
+    },
+    {
+      "pid": "dbc5cd70",
+      "s": 76,
+      "prev": 80,
+      "by": "gpt-5.6-terra",
+      "st": "strong"
+    },
+    {
+      "pid": "19578c4d",
+      "s": 74,
+      "prev": 78,
+      "by": "gpt-5.6-terra",
+      "st": "strong"
+    },
+    {
+      "pid": "c8b03968",
+      "s": 69,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "58a6c39f",
+      "s": 69,
+      "prev": 70,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "6b1dfa2b",
+      "s": 68,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "47dfc10a",
+      "s": 68,
+      "prev": 45,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "da248248",
+      "s": 68,
+      "prev": 55,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "761ede20",
+      "s": 68,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "92c8e754",
+      "s": 68,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "225b53f3",
+      "s": 68,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "d68481b9",
+      "s": 66,
+      "prev": 62,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "605557b0",
+      "s": 66,
+      "prev": 75,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "5f8ef021",
+      "s": 65,
+      "prev": 50,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "02187537",
+      "s": 65,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "5742a292",
+      "s": 65,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "fd6d29db",
+      "s": 65,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "9560139e",
+      "s": 65,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "46f0f2c4",
+      "s": 65,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "c3b7ef8a",
+      "s": 65,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "fa4ac511",
+      "s": 65,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "f09d6a3e",
+      "s": 65,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "07f65544",
+      "s": 65,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "50b7c8f2",
+      "s": 65,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "6834a448",
+      "s": 64,
+      "prev": null,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "f6b8910f",
+      "s": 63,
+      "prev": null,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "820175ea",
+      "s": 61,
+      "prev": null,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "b4a28a3c",
+      "s": 60,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "0bad89ef",
+      "s": 60,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "e1b9d633",
+      "s": 60,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "704db778",
+      "s": 60,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "86c401e0",
+      "s": 60,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "2ae91ba4",
+      "s": 59,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "1f20d4f1",
+      "s": 59,
+      "prev": null,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "589ede08",
+      "s": 58,
+      "prev": 60,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "7f849fcd",
+      "s": 58,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "a003b2ef",
+      "s": 58,
+      "prev": 70,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "e55978ba",
+      "s": 57,
+      "prev": null,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "096a54a6",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "aab9e2ad",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "45c634f8",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "466c74d1",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "1c31c205",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "03a59c67",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "81b48212",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "fedc4e88",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "95770cf8",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "0d6ac69e",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "235009e7",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "d3af5d54",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "d6801797",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "4c5c39df",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "d2f60348",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "78bee21a",
+      "s": 55,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "d8bea747",
+      "s": 54,
+      "prev": null,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "6ffe2dbd",
+      "s": 52,
+      "prev": 78,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "6660b6e4",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "309e1f1f",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "f99f8ee8",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "fa42c64f",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "554f0e73",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "5e651dd7",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "2ea65705",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "351a80af",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "2480bf68",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "2f63e203",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "5b7761b2",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "1d90760f",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "2b20888f",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "8f711ace",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "fe2ab021",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "21748915",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "d13e8f6c",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "7cde6e85",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "68152a32",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "e337d523",
+      "s": 50,
+      "prev": 0,
+      "by": "claude-sonnet-5",
+      "st": "possible"
+    },
+    {
+      "pid": "74e6db0e",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "6665bd59",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "d077ed5d",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "9e7f318d",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "d7bf8f25",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "43248818",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "96ca9d25",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "3d663e63",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "ed9a3d94",
+      "s": 50,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "5643c906",
+      "s": 49,
+      "prev": 75,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "89a6a680",
+      "s": 49,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "41910d6e",
+      "s": 48,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "909f7f3f",
+      "s": 48,
+      "prev": 80,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "9a688807",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "9ca7dfe2",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "a5bbe0c9",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "b7dd4816",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "063844a1",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "da0e9b48",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "d3b0d508",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "cae00317",
+      "s": 45,
+      "prev": 45,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "07717d81",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "bbf5159d",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "1828a6de",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "5b459c16",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "cd275f2a",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "8fd8dca1",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "8e74bfa9",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "34d3a823",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "472d91c6",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "719a63c5",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "c8366b9f",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "2011f6d3",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "44573e31",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "6973e8c9",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "ac205f76",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "59ab128b",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "ac1edb62",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "063e1b7e",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "70380d79",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "e622c46e",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "3857e31c",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "a82239b0",
+      "s": 45,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "62838082",
+      "s": 43,
+      "prev": null,
+      "by": "gpt-5.6-terra",
+      "st": "possible"
+    },
+    {
+      "pid": "3465cd46",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "ce990b4c",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "73a5c913",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "5a60b494",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "0dcaba65",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "b23d1a37",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "439a0238",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "5800b0d7",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "9c3cacb4",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "2b2554cb",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "c506b155",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "2fb6bfdf",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "3b8b7b77",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "c76cb912",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "149c2b4a",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "29ca9f32",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "eb176829",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "c4a8f73f",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "b2117aa3",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "a263e379",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "51e512c5",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "9bdae1c4",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "32556c9e",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "0d1e2694",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "c2618f5c",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "6a96b088",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "85018cd6",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "7572d5f2",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "6f3238d7",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "8a97f419",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "47de238e",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "5ce71474",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "b0a1af6d",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    },
+    {
+      "pid": "63d88c40",
+      "s": 40,
+      "prev": null,
+      "by": "",
+      "st": "possible"
+    }
+  ]
+}
