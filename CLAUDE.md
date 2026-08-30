@@ -1,0 +1,47 @@
+# ApplyGo — working notes
+
+## Operating this repo from a Claude session
+
+**Adding an MCP tool mid-session drops the connector.** When a new tool is added to
+`cloudflare/src/mcp-server.ts` and deployed, the Apply Go connector can disconnect for the session
+that is running — the observed cause is that the new tool has no standing permission, and it is not
+covered by the tools the user previously approved. Two consequences worth planning around:
+
+- A session's MCP tool list is fixed when the session starts. Re-attaching the connector restores
+  the *old* list; a tool added after the session began stays uncallable until a new session. Route
+  new capability through a parameter of an existing tool where possible — `task` and `model` on
+  `run_prompt_experiment` were used exactly this way to reach a new replay spec without needing a
+  new tool to be callable.
+- Ship tool additions at the end of a work session, not the middle, and expect the next session
+  rather than this one to be able to use them.
+
+**There is no `CLOUDFLARE_API_TOKEN` in the session environment.** `wrangler d1 execute --remote`
+and any other authenticated wrangler command will fail. Use the Cloudflare MCP D1 query tool, and
+keep single statements small enough to write by hand — large payloads belong in
+`cloudflare/evidence/` in git, referenced from the database row.
+
+**D1 columns that are NOT NULL and easy to trip over:** `job_postings.fit_reason`,
+`job_postings.fit_detail_json`. Resetting a posting for re-assessment must set `fit_status` and
+`assessed_at` only; nulling either of those fails the statement.
+
+**`fit_score_previous` holds one prior reading.** Re-scoring twice loses the middle one. Snapshot
+before the second pass if all three readings matter.
+
+## Evidence and decisions
+
+Measurements go in `evidence_records`, changes in `decision_records` (migration 0038, helpers in
+`cloudflare/src/evidence.ts`). Raw per-item data goes in `cloudflare/evidence/<slug>.json` and is
+referenced from `provenance_json.raw_data_file`. Confidence and limitations are stored apart from
+the conclusion so a tentative finding cannot later be quoted as settled. An overturned finding is
+marked superseded, never edited.
+
+Prefer deterministic metrics. Use the LLM judge only where they cannot decide — `selectDisagreements`
+exists to spend that budget on the cases that can still change an outcome.
+
+## Model tiers
+
+`screen` reads a title and location and answers yes/no; `reason` reads the whole posting and scores
+it. They are configured separately (`*_SCREEN_MODEL` vs `*_MODEL`) and should be chosen separately:
+the screen tier is a cheap classification where model quality buys little, and the reason tier is
+where it decides what the candidate sees. `fit.reference_rank` is the deliberately expensive task
+used to build a reference ranking, not to score daily volume.

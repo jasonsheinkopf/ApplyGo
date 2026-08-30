@@ -400,6 +400,30 @@ export async function callText(
  * OpenAI gets JSON mode plus the schema inlined as a system message, since it has no
  * equivalent of `tool_choice` for an arbitrary schema on this endpoint.
  */
+/**
+ * How much deliberation a call gets before answering.
+ *
+ * Deliberately coarse. The pipeline has exactly two regimes: bulk calls where the answer is a cheap
+ * classification and thinking buys nothing, and the handful of calls where a better answer is the
+ * product -- building a reference ranking, adjudicating a disagreement. A dial with five settings
+ * would invite tuning that no measurement supports.
+ */
+export type Effort = "none" | "low" | "medium" | "high";
+
+/**
+ * Thinking budget in tokens, per effort level.
+ *
+ * These are budgets, not targets: a model that reaches its answer sooner stops, and the unused
+ * budget is not billed. The high tier is sized for a task that has to hold ~25 postings and a full
+ * candidate profile in mind at once and produce a defensible ordering across all of them.
+ */
+export function thinkingBudget(effort: Effort): number {
+  if (effort === "high") return 16000;
+  if (effort === "medium") return 6000;
+  if (effort === "low") return 2000;
+  return 0;
+}
+
 export async function callStructured<T>(
   env: LlmEnv,
   provider: Provider,
@@ -411,6 +435,13 @@ export async function callStructured<T>(
   tier: Tier = "reason",
   /** Bypasses the configured model entirely. Only the eval harness sets this. */
   modelOverride?: string,
+  /**
+   * Extra deliberation before answering, for the small number of calls where the answer is worth
+   * more than the tokens. Off by default: the pipeline's bulk calls are cheap classification where
+   * thinking buys nothing, and paying for it on every posting would be the whole cost saving
+   * thrown away. Reserved for building a reference ranking, where a better answer is the product.
+   */
+  effort?: Effort,
 ): Promise<T> {
   const model = modelOverride ?? modelFor(env, provider, tier);
 
@@ -423,6 +454,7 @@ export async function callStructured<T>(
         body: JSON.stringify({
           model,
           response_format: { type: "json_object" },
+          ...(effort && effort !== "none" ? { reasoning_effort: effort } : {}),
           messages: [
             {
               role: "system",
@@ -445,10 +477,18 @@ export async function callStructured<T>(
       headers: anthropicHeaders(env),
       body: JSON.stringify({
         model,
-        max_tokens: maxTokens,
+        // Thinking tokens are drawn from max_tokens, so a budget must leave room for the answer
+        // itself. Without this the call returns a truncated tool payload, which the caller sees as
+        // a malformed response rather than as "the budget was spent thinking".
+        max_tokens: effort && effort !== "none" ? maxTokens + thinkingBudget(effort) : maxTokens,
         messages: [{ role: "user", content: meta.prompt }],
         tools: [{ name: toolName, input_schema: schema }],
-        tool_choice: { type: "tool", name: toolName },
+        // A forced tool choice is incompatible with extended thinking, so a thinking call asks for
+        // the tool rather than requiring it. resultsArray and the caller's missing-result handling
+        // already cover a response that arrives in another shape.
+        ...(effort && effort !== "none"
+          ? { thinking: { type: "enabled", budget_tokens: thinkingBudget(effort) }, tool_choice: { type: "auto" } }
+          : { tool_choice: { type: "tool", name: toolName } }),
       }),
     });
     if (!res.ok) throw await failure(provider, res);
