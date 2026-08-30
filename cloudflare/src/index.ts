@@ -12955,7 +12955,7 @@ function corsHeaders(origin: string): Record<string, string> {
  * `resume.design_review` (needs a screenshot, never stored) and `evals.judge` (not a savable case)
  * fall through to null, matching `replayable: false` in tasks.ts.
  */
-function replaySpecFor(task: string): ReplaySpec | null {
+export function replaySpecFor(task: string): ReplaySpec | null {
   switch (task) {
     case "fit.screen":
       return { kind: "structured", schema: SCREEN_BATCH_SCHEMA, toolName: "submit_screen", maxTokens: 4000 };

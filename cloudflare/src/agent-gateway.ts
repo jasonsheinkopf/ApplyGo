@@ -1,4 +1,4 @@
-import app from "./index";
+import app, { replaySpecFor } from "./index";
 import {
   type AgentProfileFacts,
   type OnboardingConfirmed,
@@ -25,7 +25,7 @@ import {
   runExperiment,
   summarizeExperiment,
 } from "./evals";
-import { normalizeProvider, providerKeyMissing } from "./llm";
+import { modelFor, normalizeProvider, providerKeyMissing } from "./llm";
 import { OAuthProvider, type AuthRequest, type ClientInfo, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { type AgentCall, handleMcpRequest } from "./mcp-server";
 
@@ -982,7 +982,7 @@ async function startExperiment(request: Request, env: Env, ctx: ExecutionContext
     name?: string;
     task?: string;
     hypothesis?: string;
-    variants?: { label: string; template: string }[];
+    variants?: { label: string; template: string; provider?: string; model?: string }[];
     provider?: string;
     model?: string;
     max_cases?: number;
@@ -1012,7 +1012,25 @@ async function startExperiment(request: Request, env: Env, ctx: ExecutionContext
   const provider = normalizeProvider(body.provider);
   const keyMissing = providerKeyMissing(env, provider);
   if (keyMissing) return json({ error: keyMissing }, 501);
-  const model = String(body.model ?? "").trim() || (provider === "openai" ? "gpt-4o" : "claude-sonnet-5");
+  const model = String(body.model ?? "").trim() || modelFor(env, provider, "reason");
+
+  // A variant may name its own provider/model, which is how a model bake-off is expressed: one
+  // template, many arms. Every named provider is key-checked here rather than at call time, so an
+  // experiment cannot start, spend on the arms that do work, and then report a comparison in which
+  // one arm failed for a reason that has nothing to do with the model.
+  const arms = variants.map((variant) => ({
+    label: String(variant.label ?? "").trim(),
+    template: String(variant.template ?? ""),
+    provider: variant.provider ? normalizeProvider(variant.provider) : undefined,
+    model: variant.model ? String(variant.model).trim() : undefined,
+  }));
+  for (const arm of arms) {
+    if (!arm.provider) continue;
+    const armKeyMissing = providerKeyMissing(env, arm.provider);
+    if (armKeyMissing) {
+      return json({ error: armKeyMissing, detail: `Variant "${arm.label}" names a provider with no key configured.` }, 501);
+    }
+  }
 
   const experimentId = await createExperiment(env.DB, {
     name: String(body.name ?? `${task} prompt comparison`).slice(0, 200),
@@ -1025,18 +1043,23 @@ async function startExperiment(request: Request, env: Env, ctx: ExecutionContext
       experimentId,
       task,
       taskDescription: String(body.task_description ?? `The "${task}" step of ApplyGo's job pipeline.`),
-      spec: { kind: "text" },
+      // The task's real replay shape, not a text call. Every pipeline prompt this harness can test
+      // returns structured output through a tool schema; replaying it as free text would have the
+      // arms produce prose the production path never sees, and the judge would then be scoring a
+      // format neither variant is actually used in. Falls back to text only for a task with no
+      // registered spec.
+      spec: replaySpecFor(task) ?? { kind: "text" },
       provider,
       model,
-      variants,
+      variants: arms,
       cases,
     }).catch(() => undefined),
   );
 
-  await recordActivity(env, principal, "evals.experiment.start", `${task}: ${variants.length} variants x ${cases.length} cases`);
+  await recordActivity(env, principal, "evals.experiment.start", `${task}: ${arms.length} variants x ${cases.length} cases`);
   return json({
     experiment_id: experimentId,
-    variants: variants.map((v) => v.label),
+    variants: arms.map((v) => ({ label: v.label, provider: v.provider ?? provider, model: v.model ?? model })),
     cases: cases.length,
     estimated_model_calls: cases.length * variants.length * 2,
     detail: "Running in the background. Poll GET /agent/v1/evals/experiments/{id} for the comparison.",

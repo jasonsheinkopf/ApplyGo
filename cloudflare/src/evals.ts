@@ -532,7 +532,17 @@ export async function createEvalRun(
 // ---------------------------------------------------------------------------------------------
 
 /** One arm of an experiment: a label plus the prompt template that arm sends. */
-export type Variant = { label: string; template: string };
+/**
+ * One arm of an experiment.
+ *
+ * `provider` and `model` are optional and default to the experiment's own. Supplying them is what
+ * turns this harness into a model bake-off: hold `template` identical across every arm and vary
+ * only the model, and the existing paired statistics answer "which model is better on this task"
+ * using the same machinery that answers "which wording is better" -- same judge, same cases, same
+ * refusal to call a winner on too few pairs. VariantSummary already carries mean cost and mean
+ * latency per arm, so quality, price and speed come out of one run rather than three.
+ */
+export type Variant = { label: string; template: string; provider?: Provider; model?: string };
 
 export type ExperimentRow = {
   id: string;
@@ -652,8 +662,8 @@ export async function runExperiment(
           // and recording it as a failed run says so instead of quietly shrinking the sample.
           await createEvalRun(db, {
             caseId: evalCase.id,
-            provider: input.provider,
-            model: input.model,
+            provider: variant.provider ?? input.provider,
+            model: variant.model ?? input.model,
             prompt: variant.template,
             outcome: {
               ok: false, response: "", inputTokens: 0, outputTokens: 0,
@@ -667,7 +677,17 @@ export async function runExperiment(
           continue;
         }
 
-        const outcome = await replayTask(env, input.task, input.spec, input.provider, input.model, prompt);
+        // A variant's own provider/model wins when set, so one experiment can vary the model while
+        // holding the prompt fixed. Recorded per run, so a summary can never attribute a score to
+        // the wrong model.
+        const outcome = await replayTask(
+          env,
+          input.task,
+          input.spec,
+          variant.provider ?? input.provider,
+          variant.model ?? input.model,
+          prompt,
+        );
         let judgeScore: number | null = null;
         let judgeReasoning: string | null = null;
         if (outcome.ok) {
@@ -681,8 +701,8 @@ export async function runExperiment(
         }
         await createEvalRun(db, {
           caseId: evalCase.id,
-          provider: input.provider,
-          model: input.model,
+          provider: variant.provider ?? input.provider,
+          model: variant.model ?? input.model,
           prompt,
           outcome,
           judgeScore,

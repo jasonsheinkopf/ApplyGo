@@ -73,15 +73,23 @@ type Price = {
 };
 
 const PRICING: Record<string, Price> = {
+  "claude-fable-5": { in: 10, out: 50 },
+  "claude-mythos-5": { in: 10, out: 50 },
   "claude-opus-5": { in: 5, out: 25 },
   "claude-opus-4-8": { in: 5, out: 25 },
-  // Sonnet 5 is running an introductory rate that expires at the end of August 2026. Encoding both
-  // means the dashboard reports what was actually spent on each side of that date instead of
-  // overstating today's calls by 50%.
-  "claude-sonnet-5": { in: 3, out: 15, introIn: 2, introOut: 10, introUntil: "2026-08-31" },
+  "claude-opus-4-7": { in: 5, out: 25 },
+  "claude-opus-4-6": { in: 5, out: 25 },
+  "claude-opus-4-5": { in: 5, out: 25 },
+  // Sonnet 5 was launched on an introductory $2/$10 rate advertised as expiring 31 August 2026,
+  // and this table encoded the scheduled step up to $3/$15 so that spend either side of that date
+  // was reported honestly. Anthropic has since confirmed the introductory rate is now the standard
+  // price and the increase will not happen, so the schedule is removed rather than left to fire.
+  // Had it stayed, every Sonnet call from 1 September would have been costed 50% high -- silently,
+  // because an overstatement looks exactly like a real one on a dashboard.
+  "claude-sonnet-5": { in: 2, out: 10 },
   "claude-sonnet-4-6": { in: 3, out: 15 },
+  "claude-sonnet-4-5": { in: 3, out: 15 },
   "claude-haiku-4-5": { in: 1, out: 5 },
-  "claude-fable-5": { in: 10, out: 50 },
   // The GPT-5.6 family (Sol/Terra/Luna), generally available 9 July 2026. Terra is the reason
   // tier's fallback: a generation newer than gpt-4o and cheaper on input, which makes the
   // Anthropic-outage path a smaller quality drop than it was. Rates checked against OpenAI's
