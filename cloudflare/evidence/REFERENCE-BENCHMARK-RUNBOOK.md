@@ -1,63 +1,38 @@
-# Reference-ranking benchmark — ready to run
+# Reference-ranking benchmark — RUN, 2026-08-30
 
-Everything that can be prepared without model access is prepared. What remains needs a session
-holding the **Apply Go** MCP connector (`run_prompt_experiment`).
+Executed. Results in `ev-2026-08-30-reference-ranking-benchmark.json` and evidence record
+`ev-2026-08-30-reference-ranking-benchmark`; the decision it fed is
+`dec-2026-08-30-keep-sonnet5-reason-tier`.
 
-## State as of 2026-08-30 07:40 UTC
+## What was run
 
-**Staged in D1 (`eval_cases`, task `fit.reference_rank`), 25 postings across 3 cases:**
+25 postings (the highest-scoring on the board), split into three eval cases of 9/8/8 with
+descriptions truncated to 2200 characters. Four arms, one run each:
 
-| case | postings | note |
+| arm | model | context |
 |---|---|---|
-| Reference ranking chunk 1 of 3 - postings 1-9 | 9 | ranks 1–9 by production `fit_score` |
-| Reference ranking chunk 2 of 3 - postings 10-17 | 8 | ranks 10–17 |
-| Reference ranking chunk 3 of 3 - postings 18-25 | 8 | ranks 18–25 |
+| control | claude-opus-5 | rich — full profile, ordered role-targeting doc, lived experience, past rejections |
+| production-context | claude-opus-5 | the lean production prompt |
+| control | gpt-5.6-sol | rich |
+| production-context | gpt-5.6-sol | lean |
 
-All three share one variable envelope (`candidate_profile`, `hard_constraints`, `role_targeting`,
-`lived_experience`, `past_rejections`) and differ only in `postings`. Descriptions are truncated to
-2200 characters in every chunk so the arms stay comparable. `json_type(variables_json,'$.postings')`
-is `text` in all three — see CLAUDE.md on why that matters.
+Twelve calls, $1.73, ~30–49 s each. Experiments `c71ee5b1…` (Opus) and `66527391…` (sol).
 
-Chunked deliberately: one 25-posting prompt is a single very long deliberative call, and three
-smaller ones fit the bounded runner (`advanceExperiment`, PR #126) without any one call dominating.
-Scores are still comparable across chunks because the rubric and context are identical; only
-*within-chunk* relative calibration is guaranteed, which is a limitation to record.
+## Operational notes for the next run
 
-**Experiments:** all five earlier `fit.reference_rank` experiments are renamed `VOID …` and set to
-`failed`. They hold no usable data — two arms 400'd on the old thinking parameters, two returned
-empty because of the `[object Object]` variable bug. Rows preserved in
-`ev-2026-08-30-reference-ranking-void-attempts.json`. Start new experiments under new names; the
-runner resumes by name, so reusing an old one would skip the work.
+- **The MCP call times out at 60 s but the worker keeps going.** Two calls complete per invocation
+  on Opus, one on sol. Re-invoke with the same `name` and `task` to resume; the runner derives
+  what is left from `eval_runs`. Only the final invocation returns a result rather than a timeout.
+- **That resume races.** A call still running inside a timed-out invocation is not yet in
+  `eval_runs`, so the next invocation re-dispatches it. It happened once here (sol,
+  production-context, chunk 1), cost ~$0.115, and was deduplicated by keeping the earliest row per
+  (experiment, variant, case). Worth fixing with a claim row before the call rather than after.
+- **gpt-5.6-sol corrupted a posting UUID** in its rich-context arm — `…f4ecc19d363f` came back as
+  `…f4ecc19d6c35`. Opus did not. Any pipeline that joins model output back to postings by id needs
+  to treat unmatched ids as a failure rather than silently dropping the row; that is exactly how a
+  posting would vanish from a board without anything looking wrong.
 
-## To run
+## Reproducing the statistics
 
-Two experiments, each swept across all three cases, both using the two variants recorded in the
-void-attempts file's sibling notes (control = rich context, production-context = the lean prompt):
-
-- **A** — `anthropic` / `claude-opus-5`, effort `high`
-- **B** — `openai` / `gpt-5.6-sol`, high reasoning
-
-Call `run_prompt_experiment` repeatedly with the same name and task, `max_calls: 1`, until
-`remaining_calls` is 0. Twelve calls total (2 experiments × 2 variants × 3 chunks).
-
-## Pre-registered hypothesis
-
-Production treats all of California as equally acceptable, but the targeting document ranks Orange
-County / Irvine first, Southern California second, Bay Area third — and all 25 postings are San
-Francisco. It also ranks industries (medical devices, then automotive, robotics, industrial) and
-prefers AI applied to physical products over enterprise software, while this set is mostly dev tools
-and enterprise AI. The rich-context arm should therefore reorder the top of the board and push
-dev-tools roles down. If the two arms agree closely, the extra context is *not* doing the work — a
-real result, and a cheaper reference than assumed.
-
-## Then
-
-Spearman between the two references; each production model (sonnet-5, gpt-5.6-terra, rows in
-`ev-2026-08-30-reason-tier-sonnet5-vs-gpt56terra.json`) against each reference; rich vs production
-context within each model. Write `ev-2026-08-30-reference-ranking-benchmark` with raw rows here and
-`provenance_json.raw_data_file` pointing at them.
-
-Limitations to record separately from any conclusion: two model opinions are a silver standard, not
-ground truth; n=25; one run per arm, so within-model variance is unmeasured; chunking guarantees
-calibration within a chunk, not across; and the set is drawn from postings production already scored
-highly, so it cannot measure what production wrongly *rejected* — the more costly error.
+`node analyze.js` over the per-posting rows in the JSON. Spearman with 200,000-shuffle permutation
+p-values; the reference-vs-reference comparison uses the 24 postings both arms scored.
