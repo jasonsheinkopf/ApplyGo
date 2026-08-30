@@ -730,6 +730,19 @@ async function companiesScan(request: Request, env: Env, ctx: ExecutionContext, 
   return json(summarizeLegacyBody(await response.text()), response.status);
 }
 
+/**
+ * Directly register one company the caller has already identified and verified themselves --
+ * e.g. a candidate list sourced by web search, where the ATS board was confirmed by hand rather
+ * than through discover_companies' own aggregator sweep. Bypasses discovery, not verification:
+ * the caller is expected to have actually confirmed board_url resolves to this company's real
+ * postings before calling this, the same bar discover_companies' own resolver holds itself to.
+ */
+async function companiesAdd(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
+  const bodyText = await request.text();
+  const response = await bridgeLegacy(request, env, ctx, principal, "POST", "/companies", "companies.add", bodyText);
+  return json(await readLegacyJson(response), response.status);
+}
+
 async function companiesSearchTermsRead(request: Request, env: Env, ctx: ExecutionContext, principal: Principal): Promise<Response> {
   const response = await bridgeLegacy(request, env, ctx, principal, "GET", "/companies/search-terms", "companies.search_terms.read");
   return json(await readLegacyJson(response), response.status);
@@ -1262,6 +1275,7 @@ export async function handleAgentRequest(request: Request, env: Env, ctx: Execut
   if (request.method === "GET" && url.pathname === "/agent/v1/companies") return companiesList(request, env, ctx, principal);
   if (request.method === "GET" && url.pathname === "/agent/v1/jobs") return jobsList(request, env, ctx, principal);
   if (request.method === "POST" && url.pathname === "/agent/v1/companies/discover") return companiesDiscover(request, env, ctx, principal);
+  if (request.method === "POST" && url.pathname === "/agent/v1/companies/add") return companiesAdd(request, env, ctx, principal);
   if (request.method === "POST" && url.pathname === "/agent/v1/companies/scan") return companiesScan(request, env, ctx, principal);
   if (request.method === "GET" && url.pathname === "/agent/v1/companies/search-terms") return companiesSearchTermsRead(request, env, ctx, principal);
   if (request.method === "PUT" && url.pathname === "/agent/v1/companies/search-terms") return companiesSearchTermsWrite(request, env, ctx, principal);
