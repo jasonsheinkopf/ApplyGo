@@ -67,3 +67,15 @@ it. They are configured separately (`*_SCREEN_MODEL` vs `*_MODEL`) and should be
 the screen tier is a cheap classification where model quality buys little, and the reason tier is
 where it decides what the candidate sees. `fit.reference_rank` is the deliberately expensive task
 used to build a reference ranking, not to score daily volume.
+
+**Scheduled triggers inherit no connectors.** A routine created with `create_trigger` from a session
+that holds no MCP connectors stores none, and the session it fires cannot reach the Apply Go
+connector — so it cannot run anything that goes through the worker. The trigger fires, the session
+starts, and it no-ops. Combined with the rule above (a session's tool list is fixed at start), this
+means **pipeline work cannot be scheduled from inside a session that has lost the connector**. A
+routine that needs the connector has to be created from the claude.ai routines UI, or the work has
+to be done in a fresh chat session that has it enabled. Setting a timer is not a workaround.
+
+**Every worker route needs a session cookie or OAuth** (`requireSession`, including `/dev/*`). There
+is no unauthenticated path in from a shell, so a session without the connector cannot substitute
+curl for it.
