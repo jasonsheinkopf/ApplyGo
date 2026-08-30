@@ -102,6 +102,35 @@ const PRICING: Record<string, Price> = {
   "gpt-4o-mini": { in: 0.15, out: 0.6 },
 };
 
+/**
+ * Reads the array out of a structured `{ results: [...] }` tool response, tolerating the one shape
+ * models reliably get wrong.
+ *
+ * A tool schema declaring an array of objects is usually honoured, but occasionally a model emits
+ * the array *as a JSON string* instead -- `{"results":"[{\"id\":...}]"}` rather than
+ * `{"results":[{"id":...}]}`. The payload is complete and correct; only the encoding is wrong.
+ *
+ * Observed in production on a batch of eight job assessments: the caller did `results.map(...)`,
+ * threw `results.map is not a function`, and discarded all eight finished assessments along with
+ * the tokens spent producing them. Parsing the string recovers the entire batch. Anything that is
+ * neither an array nor a string parsing to one yields an empty array, so a genuinely malformed
+ * response still degrades to the caller's own missing-result handling rather than crashing.
+ */
+export function resultsArray<T>(payload: { results?: unknown } | null | undefined): T[] {
+  const raw = payload?.results;
+  if (Array.isArray(raw)) return raw as T[];
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) return parsed as T[];
+    } catch {
+      // Falls through to the empty array below -- an unparseable string is a malformed response,
+      // not a recoverable encoding slip.
+    }
+  }
+  return [];
+}
+
 /** Strips a trailing date snapshot so `claude-haiku-4-5-20251001` prices as `claude-haiku-4-5`. */
 function priceKey(model: string): string {
   return model.replace(/-\d{8}$/, "");

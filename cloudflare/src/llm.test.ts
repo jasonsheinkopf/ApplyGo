@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { callWithWebSearch, estimateCostUsd, type LlmEnv, modelFor, priceFor, screenProvider } from "./llm.ts";
+import {
+  callWithWebSearch,
+  estimateCostUsd,
+  type LlmEnv,
+  modelFor,
+  priceFor,
+  resultsArray,
+  screenProvider,
+} from "./llm.ts";
 
 const ENV: LlmEnv = { ANTHROPIC_API_KEY: "key123" };
 
@@ -167,5 +175,40 @@ test("every model the bake-off compares is priced, or its cost reads as null", (
     "gpt-5.6-terra", "gpt-5.6-luna", "gpt-4o-mini",
   ]) {
     assert.notEqual(priceFor(model), null, model);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Structured responses whose array arrived as a string
+// ---------------------------------------------------------------------------
+
+test("a results array is returned unchanged", () => {
+  assert.deepEqual(resultsArray<{ id: string }>({ results: [{ id: "a" }] }), [{ id: "a" }]);
+});
+
+test("a results array encoded as a JSON string is recovered, not discarded", () => {
+  // Observed in production: Sonnet returned {"results":"[{...}]"} for one batch of eight job
+  // assessments while returning a real array for the batches either side of it. The payload was
+  // complete; only the encoding was wrong. The caller did results.map(...), threw, and threw away
+  // all eight finished assessments and the tokens that produced them.
+  const encoded = { results: JSON.stringify([{ id: "a", score: 78 }, { id: "b", score: 30 }]) };
+  assert.deepEqual(resultsArray<{ id: string; score: number }>(encoded), [
+    { id: "a", score: 78 },
+    { id: "b", score: 30 },
+  ]);
+});
+
+test("a genuinely malformed response degrades to empty rather than throwing", () => {
+  // Empty lets the caller's own missing-result handling run. Throwing loses the whole batch.
+  for (const payload of [
+    { results: "not json at all" },
+    { results: '{"not":"an array"}' },
+    { results: 42 } as unknown as { results?: unknown },
+    { results: null },
+    {},
+    null,
+    undefined,
+  ]) {
+    assert.deepEqual(resultsArray(payload as never), []);
   }
 });
