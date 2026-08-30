@@ -48,10 +48,10 @@
 // the candidate's profile. A confident fabrication is the one failure mode that makes this whole
 // feature worse than useless, so it is caught in code rather than trusted to a prompt.
 
-import { type LlmEnv, type Provider, callStructured } from "./llm";
-import { getManagedPrompt } from "./langfuse";
-import type { StructuredProfile } from "./resume";
-import { profileEvidenceStrings, renderCareerProfile } from "./profile";
+import { type LlmEnv, type Provider, callStructured } from "./llm.ts";
+import { getManagedPrompt } from "./langfuse.ts";
+import type { StructuredProfile } from "./resume.ts";
+import { profileEvidenceStrings, renderCareerProfile } from "./profile.ts";
 
 // ---------------------------------------------------------------------------
 // Requirements model -- what the target actually asks for
@@ -131,7 +131,7 @@ export async function extractJobRequirements(
     job_description: job.description.slice(0, 8000),
   });
 
-  const raw = await callStructured<{ role_summary?: string; requirements?: { text?: string; kind?: string }[] }>(
+  const raw = await callStructured<{ role_summary?: string; requirements?: unknown }>(
     env,
     provider,
     "resume.requirements",
@@ -143,11 +143,39 @@ export async function extractJobRequirements(
   return normalizeRequirements(raw);
 }
 
-/** Code owns the ids and the kind enum, so a reworded or invented kind can't corrupt the record. */
-export function normalizeRequirements(raw: {
+/**
+ * Anthropic's tool-calling occasionally wraps the whole answer as a JSON *string* under a field
+ * that happens to share the schema's own top-level property name -- observed live in llm_traces
+ * for this exact call: `{"requirements": "{\"role_summary\": ..., \"requirements\": [...]}"}`
+ * instead of the schema's flat `{role_summary, requirements}`. Silent and expensive when missed:
+ * `for (const item of raw.requirements ?? [])` then iterates the *characters* of that string,
+ * each one fails `item?.text`, and a real, correctly-extracted requirements list collapses to
+ * zero with no error anywhere -- which is exactly what starved every resume generated against
+ * this job of its evidence plan. Detected and unwrapped once here rather than trusted never to
+ * recur, since nothing in the schema stops the model from doing it again on some other posting.
+ */
+function repairDoubleEncodedRequirements(raw: {
   role_summary?: string;
-  requirements?: { text?: string; kind?: string }[];
+  requirements?: unknown;
+}): { role_summary?: string; requirements?: { text?: string; kind?: string }[] } {
+  if (typeof raw.requirements !== "string") return raw as { role_summary?: string; requirements?: { text?: string; kind?: string }[] };
+  try {
+    const inner = JSON.parse(raw.requirements) as { role_summary?: string; requirements?: { text?: string; kind?: string }[] };
+    if (Array.isArray(inner?.requirements)) {
+      return { role_summary: raw.role_summary || inner.role_summary, requirements: inner.requirements };
+    }
+  } catch {
+    // Not JSON either -- fall through to the empty-requirements case below, same as before.
+  }
+  return { role_summary: raw.role_summary, requirements: [] };
+}
+
+/** Code owns the ids and the kind enum, so a reworded or invented kind can't corrupt the record. */
+export function normalizeRequirements(rawInput: {
+  role_summary?: string;
+  requirements?: unknown;
 }): JobRequirements {
+  const raw = repairDoubleEncodedRequirements(rawInput);
   const seen = new Set<string>();
   const requirements: JobRequirement[] = [];
   for (const item of raw.requirements ?? []) {

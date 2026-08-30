@@ -317,6 +317,31 @@ export function buildApplyGoMcpServer(call: AgentCall): McpServer {
   );
 
   server.registerTool(
+    "add_company",
+    {
+      title: "Manually add a verified company",
+      description:
+        "Register one company directly, for a lead sourced outside ApplyGo's own discovery (e.g. web search) " +
+        "that you have already verified yourself -- confirmed the company is real and, if claiming an ATS " +
+        "board, confirmed board_url actually resolves to that company's live postings. Skips " +
+        "discover_companies' own aggregator sweep, not its verification bar: only add companies you'd stand " +
+        "behind if asked how you know. Pass board_url for a known Greenhouse/Lever/Ashby/SmartRecruiters " +
+        "board (e.g. https://jobs.ashbyhq.com/token) to land it scannable immediately; otherwise it's added " +
+        "pending identity/board resolution like any other manual entry. Run scan_companies afterward to pull " +
+        "its postings.",
+      inputSchema: {
+        name: z.string().describe("Company name."),
+        board_url: z.string().optional().describe("The company's live ATS board URL, if known and confirmed (e.g. https://jobs.ashbyhq.com/acme)."),
+        website: z.string().optional().describe("The company's official website, if known."),
+        careers_url: z.string().optional().describe("Careers page URL, if different from board_url."),
+        location: z.string().optional(),
+        bio: z.string().optional().describe("One or two sentences on what the company does."),
+      },
+    },
+    async (company) => run(call, "POST", "/agent/v1/companies/add", company),
+  );
+
+  server.registerTool(
     "scan_companies",
     {
       title: "Scan companies for postings",

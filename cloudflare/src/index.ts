@@ -2732,6 +2732,8 @@ async function addCompanyRow(
     websiteEvidence?: string;
     websiteSource?: string;
     boardUrl?: string;
+    atsProvider?: string;
+    atsToken?: string;
     scan_note?: string;
     signal?: string;
   },
@@ -2744,8 +2746,8 @@ async function addCompanyRow(
     websiteConfidence: company.websiteConfidence ?? null,
     websiteEvidence: company.websiteEvidence ?? "",
     boardUrl: company.boardUrl ?? "",
-    atsProvider: "",
-    atsToken: "",
+    atsProvider: company.atsProvider ?? "",
+    atsToken: company.atsToken ?? "",
     failureReason: "",
     discoveryMethod: "",
   });
@@ -2754,8 +2756,9 @@ async function addCompanyRow(
     `INSERT OR IGNORE INTO companies
        (id, profile_id, name, name_key, source_name, website, careers_url, bio, location,
         status, verify_reason, identity_status, job_source_status, website_source,
-        website_confidence, website_evidence, board_url, source, scan_note, signal)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        website_confidence, website_evidence, board_url, ats_provider, ats_token, source,
+        scan_note, signal)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       crypto.randomUUID(),
@@ -2776,6 +2779,8 @@ async function addCompanyRow(
       state.websiteConfidence,
       state.websiteEvidence,
       state.boardUrl,
+      state.atsProvider,
+      state.atsToken,
       company.source,
       company.scan_note ?? "",
       company.signal ?? "",
@@ -2814,20 +2819,32 @@ async function createCompany(request: Request, env: Env): Promise<Response> {
     careers_url?: string;
     bio?: string;
     location?: string;
+    board_url?: string;
   };
   const name = (body.name ?? "").trim();
   if (!name) return json({ error: "name_required" }, 400);
+  const website = (body.website ?? "").trim();
+  const boardUrl = (body.board_url ?? "").trim();
+  // A board URL supplied directly -- already confirmed against the live ATS by the caller, not
+  // guessed -- is stronger identity evidence than a website, and lets a manual add skip straight to
+  // "supported" instead of waiting on scan_companies to rediscover what's already known.
+  const detected = boardUrl ? detectAtsFromUrl(boardUrl) : null;
   const profileId = await getOrCreateProfileId(env);
   const added = await addCompanyRow(env, profileId, {
     name,
-    website: (body.website ?? "").trim(),
+    website,
     careers_url: (body.careers_url ?? "").trim(),
     bio: (body.bio ?? "").trim(),
     location: (body.location ?? "").trim(),
-    // A website the candidate typed themselves is identity evidence -- they know who they meant, so
-    // it needs no resolver confirmation. Without one, identity stays pending for the resolver.
-    identity: (body.website ?? "").trim() ? "verified" : "pending",
-    websiteSource: (body.website ?? "").trim() ? "manual" : "",
+    // A website or board the candidate/caller supplied directly is identity evidence -- they know
+    // who they meant, so it needs no resolver confirmation. Without either, identity stays pending
+    // for the resolver.
+    identity: website || boardUrl ? "verified" : "pending",
+    websiteSource: website ? "manual" : "",
+    boardUrl,
+    jobSource: detected ? "supported" : boardUrl ? "careers_only" : "pending",
+    atsProvider: detected?.provider ?? "",
+    atsToken: detected?.token ?? "",
     source: "manual",
   });
   return json({ added }, added ? 201 : 200);
@@ -5719,7 +5736,12 @@ async function loadEvidencePlan(
     if (!requirements.requirements.length) return null;
 
     return await planEvidence(env, provider, structured, requirements, `${job.title} at ${job.company}`);
-  } catch {
+  } catch (err) {
+    // Deliberately degrade rather than block resume generation (see doc comment above), but a
+    // silent catch here made every planner failure invisible -- plan_json sat at '{}' on every
+    // generated resume with no signal why. Logged so a real outage shows up in tail/logs instead
+    // of only being discoverable by noticing the resume looks untailored.
+    console.error(`loadEvidencePlan failed for job ${jobId}: ${(err as Error)?.message || err}`);
     return null;
   }
 }
