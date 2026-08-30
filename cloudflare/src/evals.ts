@@ -629,7 +629,76 @@ export async function loadExperimentCases(db: Db, task: string, limit: number): 
  * Failures are recorded rather than thrown. A variant that errors on a case is a real finding
  * about that variant, and summarizeExperiment counts it separately from a low score.
  */
-export async function runExperiment(
+/**
+ * One unit of experiment work: a single case rendered through a single variant.
+ *
+ * The unit is deliberately one model call rather than one case or one experiment. That is what
+ * makes an experiment resumable, and resumability is what this harness was missing: it dispatched
+ * the whole thing to `ctx.waitUntil` and returned 202, which works while every call is a cheap
+ * classification and silently loses everything once a call takes minutes. Three reference-ranking
+ * experiments across two providers recorded zero runs that way -- not failed runs, no rows at all,
+ * because the background work was reclaimed before any call returned. Evidence:
+ * ev-2026-08-30-experiment-runner-drops-long-calls.
+ */
+export type PendingWork = { evalCase: EvalCaseRow; variant: Variant };
+
+/**
+ * The (case, variant) pairs an experiment still owes, derived from what is already recorded rather
+ * than from a cursor.
+ *
+ * Deriving it means a caller can stop and resume at any point, a crashed run leaves no phantom
+ * progress, and re-invoking is idempotent: work already in `eval_runs` is simply not pending any
+ * more. A stored position would have to be kept in step with the rows and would drift the first
+ * time a run failed halfway.
+ */
+export function pendingWork(cases: EvalCaseRow[], variants: Variant[], done: { case_id: string; variant: string }[]): PendingWork[] {
+  const finished = new Set(done.map((row) => `${row.case_id}\u0000${row.variant}`));
+  const out: PendingWork[] = [];
+  for (const evalCase of cases.filter(caseIsExperimentReady)) {
+    for (const variant of variants) {
+      if (finished.has(`${evalCase.id}\u0000${variant.label}`)) continue;
+      out.push({ evalCase, variant });
+    }
+  }
+  return out;
+}
+
+/** Runs already recorded for an experiment, as the (case, variant) pairs they cover. */
+export async function recordedPairs(db: Db, experimentId: string): Promise<{ case_id: string; variant: string }[]> {
+  const rows = await db
+    .prepare("SELECT case_id, variant FROM eval_runs WHERE experiment_id = ?")
+    .bind(experimentId)
+    .all<{ case_id: string; variant: string }>();
+  return rows.results ?? [];
+}
+
+/**
+ * Whether a task's output is the measurement itself, rather than something a judge should score.
+ *
+ * A reference ranking exists to produce scores that other models are compared against. Asking a
+ * judge to grade it inverts the relationship, doubles the call count, and doubles the time a
+ * bounded run has to fit inside -- so the judge is skipped and the arm's own scores are the result.
+ */
+export function taskIsItsOwnMeasurement(task: string): boolean {
+  return task.startsWith("fit.reference_rank");
+}
+
+/**
+ * Advances an experiment by at most `maxCalls` model calls, synchronously, and reports what is
+ * left.
+ *
+ * Bounded and synchronous on purpose. The previous design handed the whole experiment to
+ * `ctx.waitUntil` and returned immediately, which is fine while every call is a cheap
+ * classification and fails silently once a call takes minutes -- the isolate is reclaimed, no row
+ * is written, and the experiment sits at `running` for ever with nothing to show and no error to
+ * read. Doing the work inside the request instead means each call is awaited by something that
+ * will still be alive when it returns, and the caller decides how much to do per invocation. It is
+ * the same shape the job pipeline already uses successfully for its own batched work.
+ *
+ * Resumption is derived from `eval_runs` rather than stored, so calling this repeatedly is
+ * idempotent and a failure halfway through loses only the call it was making.
+ */
+export async function advanceExperiment(
   env: LlmEnv,
   db: Db,
   input: {
@@ -641,94 +710,81 @@ export async function runExperiment(
     model: string;
     variants: Variant[];
     cases: EvalCaseRow[];
+    maxCalls: number;
   },
-): Promise<void> {
-  try {
-    // Cases predating recorded variables replay fine against a different model but cannot be
-    // rendered through a different wording, so they are excluded up front rather than run and
-    // logged as template failures. The sample shrinks honestly instead of filling with runs that
-    // say nothing about either variant.
-    const runnable = input.cases.filter(caseIsExperimentReady);
-    for (const evalCase of runnable) {
-      let variables: Record<string, string> = {};
+): Promise<{ completed: number; remaining: number; errors: string[] }> {
+  const done = await recordedPairs(db, input.experimentId);
+  const pending = pendingWork(input.cases, input.variants, done);
+  const budget = Math.max(1, Math.floor(input.maxCalls));
+  const errors: string[] = [];
+  let completed = 0;
+
+  for (const { evalCase, variant } of pending.slice(0, budget)) {
+    let variables: Record<string, string> = {};
+    try {
+      variables = JSON.parse(evalCase.variables_json || "{}") as Record<string, string>;
+    } catch {
+      continue; // A case whose inputs won't parse can't be rendered through any variant.
+    }
+
+    const provider = variant.provider ?? input.provider;
+    const model = variant.model ?? input.model;
+
+    let prompt: string;
+    try {
+      prompt = compilePrompt(variant.template, variables);
+    } catch (error) {
+      // A template that doesn't accept this case's variables is a real defect in the variant, and
+      // recording it as a failed run says so instead of quietly shrinking the sample.
+      await createEvalRun(db, {
+        caseId: evalCase.id, provider, model, prompt: variant.template,
+        outcome: {
+          ok: false, response: "", inputTokens: 0, outputTokens: 0,
+          costUsd: null, latencyMs: 0, error: `template_error: ${(error as Error).message}`,
+        },
+        judgeScore: null, judgeReasoning: null,
+        experimentId: input.experimentId, variant: variant.label,
+      });
+      completed += 1;
+      errors.push(`${variant.label}: template_error`);
+      continue;
+    }
+
+    const outcome = await replayTask(env, input.task, input.spec, provider, model, prompt);
+    let judgeScore: number | null = null;
+    let judgeReasoning: string | null = null;
+    // A reference ranking is the measurement, not a candidate for one -- judging it would invert
+    // the relationship and double both the cost and the time this bounded run has to fit inside.
+    if (outcome.ok && !taskIsItsOwnMeasurement(input.task)) {
       try {
-        variables = JSON.parse(evalCase.variables_json || "{}") as Record<string, string>;
-      } catch {
-        continue; // A case whose inputs won't parse can't be rendered through any variant.
-      }
-
-      for (const variant of input.variants) {
-        let prompt: string;
-        try {
-          prompt = compilePrompt(variant.template, variables);
-        } catch (error) {
-          // A template that doesn't accept this case's variables is a real defect in the variant,
-          // and recording it as a failed run says so instead of quietly shrinking the sample.
-          await createEvalRun(db, {
-            caseId: evalCase.id,
-            provider: variant.provider ?? input.provider,
-            model: variant.model ?? input.model,
-            prompt: variant.template,
-            outcome: {
-              ok: false, response: "", inputTokens: 0, outputTokens: 0,
-              costUsd: null, latencyMs: 0, error: `template_error: ${(error as Error).message}`,
-            },
-            judgeScore: null,
-            judgeReasoning: null,
-            experimentId: input.experimentId,
-            variant: variant.label,
-          });
-          continue;
-        }
-
-        // A variant's own provider/model wins when set, so one experiment can vary the model while
-        // holding the prompt fixed. Recorded per run, so a summary can never attribute a score to
-        // the wrong model.
-        const outcome = await replayTask(
-          env,
-          input.task,
-          input.spec,
-          variant.provider ?? input.provider,
-          variant.model ?? input.model,
-          prompt,
-        );
-        let judgeScore: number | null = null;
-        let judgeReasoning: string | null = null;
-        if (outcome.ok) {
-          try {
-            const judged = await judgeRun(env, input.taskDescription, prompt, outcome.response, evalCase.notes);
-            judgeScore = judged.score;
-            judgeReasoning = judged.reasoning;
-          } catch (error) {
-            judgeReasoning = `judge_failed: ${(error as Error).message}`;
-          }
-        }
-        await createEvalRun(db, {
-          caseId: evalCase.id,
-          provider: variant.provider ?? input.provider,
-          model: variant.model ?? input.model,
-          prompt,
-          outcome,
-          judgeScore,
-          judgeReasoning,
-          experimentId: input.experimentId,
-          variant: variant.label,
-        });
+        const judged = await judgeRun(env, input.taskDescription, prompt, outcome.response, evalCase.notes);
+        judgeScore = judged.score;
+        judgeReasoning = judged.reasoning;
+      } catch (error) {
+        judgeReasoning = `judge_failed: ${(error as Error).message}`;
       }
     }
-    await db
-      .prepare("UPDATE eval_experiments SET status = 'complete', completed_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .bind(input.experimentId)
-      .run();
-  } catch (error) {
-    await db
-      .prepare("UPDATE eval_experiments SET status = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .bind(input.experimentId)
-      .run()
-      .catch(() => undefined);
-    throw error;
+    await createEvalRun(db, {
+      caseId: evalCase.id, provider, model, prompt, outcome,
+      judgeScore, judgeReasoning,
+      experimentId: input.experimentId, variant: variant.label,
+    });
+    completed += 1;
+    if (!outcome.ok && outcome.error) errors.push(`${variant.label}: ${outcome.error.slice(0, 160)}`);
   }
+
+  const remaining = Math.max(0, pending.length - completed);
+  await db
+    .prepare(
+      remaining === 0
+        ? "UPDATE eval_experiments SET status = 'complete', completed_at = CURRENT_TIMESTAMP WHERE id = ?"
+        : "UPDATE eval_experiments SET status = 'running' WHERE id = ?",
+    )
+    .bind(input.experimentId)
+    .run();
+  return { completed, remaining, errors };
 }
+
 
 export async function listEvalRuns(db: Db, caseId: string): Promise<EvalRunRow[]> {
   const rows = await db

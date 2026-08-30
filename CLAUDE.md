@@ -41,6 +41,14 @@ Sonnet 5, Opus 4.6+ and Fable 5 take `thinking: {type: "adaptive"}` with
 Anthropic request code — this exact drift is in its table, and writing it from memory cost a full
 round of failed Opus calls.
 
+**`ctx.waitUntil` will not carry a long model call.** Background work dispatched from the fetch
+handler is reclaimed before a multi-minute call returns: no row is written, no error is raised, and
+the record sits at `running` for ever. Short calls on the same path complete fine, and the
+*scheduled* handler runs much heavier work reliably — so the limit is specific to background work
+started from a request. Long work belongs in a bounded synchronous loop the caller re-invokes
+(`advanceExperiment`, `evaluate_jobs`), with progress derived from what is already recorded rather
+than from a stored cursor.
+
 ## Evidence and decisions
 
 Measurements go in `evidence_records`, changes in `decision_records` (migration 0038, helpers in

@@ -4,9 +4,11 @@ import test from "node:test";
 import {
   type ScoredRun,
   caseIsExperimentReady,
+  pendingWork,
   screenCaseBatches,
   screenCaseNotes,
   summarizeExperiment,
+  taskIsItsOwnMeasurement,
 } from "./evals.ts";
 
 /** Terse fixture builder -- most tests only care about case, variant and score. */
@@ -255,4 +257,74 @@ test("a cheaper arm that scores within noise is reported as a wash, not a win", 
   const summary = summarizeExperiment(runs);
   assert.match(summary.verdict, /no meaningful difference/);
   assert.doesNotMatch(summary.verdict, /better by/);
+});
+
+// ---------------------------------------------------------------------------
+// Resumability -- the property that keeps a long experiment from vanishing
+// ---------------------------------------------------------------------------
+
+function evalCase(id: string, ready = true) {
+  return { id, variables_json: ready ? '{"postings":"[]"}' : "{}" } as Parameters<typeof pendingWork>[0][number];
+}
+function variant(label: string) {
+  return { label, template: "t" } as Parameters<typeof pendingWork>[1][number];
+}
+
+test("with nothing recorded, every case-variant pair is pending", () => {
+  const pending = pendingWork([evalCase("a"), evalCase("b")], [variant("control"), variant("candidate")], []);
+  assert.equal(pending.length, 4);
+});
+
+test("pairs already recorded are not pending again, so re-invoking is idempotent", () => {
+  // This is what makes a bounded runner safe to call repeatedly: progress is derived from the runs
+  // table, not from a stored cursor that could drift when a call fails halfway.
+  const pending = pendingWork(
+    [evalCase("a"), evalCase("b")],
+    [variant("control"), variant("candidate")],
+    [{ case_id: "a", variant: "control" }, { case_id: "a", variant: "candidate" }],
+  );
+  assert.deepEqual(pending.map((p) => `${p.evalCase.id}/${p.variant.label}`), ["b/control", "b/candidate"]);
+});
+
+test("a half-finished case resumes at the variant it stopped on, not at the start", () => {
+  const pending = pendingWork([evalCase("a")], [variant("control"), variant("candidate")], [
+    { case_id: "a", variant: "control" },
+  ]);
+  assert.deepEqual(pending.map((p) => p.variant.label), ["candidate"]);
+});
+
+test("nothing is pending once every pair is recorded", () => {
+  const pending = pendingWork([evalCase("a")], [variant("control")], [{ case_id: "a", variant: "control" }]);
+  assert.deepEqual(pending, []);
+});
+
+test("a case with no recorded inputs is never pending, however often it is asked for", () => {
+  // It cannot be rendered through any variant, so counting it as owed work would leave an
+  // experiment permanently unable to finish.
+  assert.deepEqual(pendingWork([evalCase("legacy", false)], [variant("control")], []), []);
+});
+
+test("a run recorded for one variant does not excuse the same case under another label", () => {
+  // Matching on the pair rather than on the case is what lets arms progress independently.
+  const pending = pendingWork([evalCase("a")], [variant("control"), variant("gpt")], [
+    { case_id: "a", variant: "control" },
+  ]);
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].variant.label, "gpt");
+});
+
+// ---------------------------------------------------------------------------
+// When a judge would be the wrong instrument
+// ---------------------------------------------------------------------------
+
+test("a reference ranking is not sent to a judge", () => {
+  // It is the measurement other models are compared against. Judging it inverts the relationship
+  // and doubles both the cost and the time a bounded run has to fit inside.
+  assert.equal(taskIsItsOwnMeasurement("fit.reference_rank"), true);
+});
+
+test("ordinary pipeline tasks are still judged", () => {
+  for (const task of ["fit.assess", "fit.screen", "roles.analyze"]) {
+    assert.equal(taskIsItsOwnMeasurement(task), false, task);
+  }
 });

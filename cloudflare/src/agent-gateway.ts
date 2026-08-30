@@ -22,7 +22,7 @@ import {
   listExperiments,
   loadExperimentCases,
   loadExperimentRuns,
-  runExperiment,
+  advanceExperiment,
   summarizeExperiment,
 } from "./evals";
 import { modelFor, normalizeProvider, providerKeyMissing } from "./llm";
@@ -986,6 +986,7 @@ async function startExperiment(request: Request, env: Env, ctx: ExecutionContext
     provider?: string;
     model?: string;
     max_cases?: number;
+    max_calls?: number;
     task_description?: string;
   };
 
@@ -1032,38 +1033,59 @@ async function startExperiment(request: Request, env: Env, ctx: ExecutionContext
     }
   }
 
-  const experimentId = await createExperiment(env.DB, {
+  // Resume an experiment of the same name and task rather than starting a parallel one. The runner
+  // is bounded, so finishing an experiment takes several invocations; without this, each one would
+  // create a fresh experiment and the work would never converge. Matching on name+task keeps that
+  // within what the existing tool schema can express -- there is no experiment_id parameter to pass
+  // back, and adding one would need a tool the running session cannot call.
+  const existing = await env.DB
+    .prepare("SELECT id FROM eval_experiments WHERE task = ? AND name = ? AND status = 'running' ORDER BY created_at DESC LIMIT 1")
+    .bind(task, String(body.name ?? `${task} prompt comparison`).slice(0, 200))
+    .first<{ id: string }>();
+
+  const experimentId = existing?.id ?? await createExperiment(env.DB, {
     name: String(body.name ?? `${task} prompt comparison`).slice(0, 200),
     task,
     hypothesis: String(body.hypothesis ?? "").slice(0, 2000),
   });
 
-  ctx.waitUntil(
-    runExperiment(env, env.DB, {
-      experimentId,
-      task,
-      taskDescription: String(body.task_description ?? `The "${task}" step of ApplyGo's job pipeline.`),
-      // The task's real replay shape, not a text call. Every pipeline prompt this harness can test
-      // returns structured output through a tool schema; replaying it as free text would have the
-      // arms produce prose the production path never sees, and the judge would then be scoring a
-      // format neither variant is actually used in. Falls back to text only for a task with no
-      // registered spec.
-      spec: replaySpecFor(task) ?? { kind: "text" },
-      provider,
-      model,
-      variants: arms,
-      cases,
-    }).catch(() => undefined),
-  );
+  // How many model calls this invocation makes. Small by default because the caller is an MCP
+  // client with its own timeout, and one deliberative call can take most of it -- better to return
+  // real progress and be called again than to be cut off mid-call with nothing recorded.
+  const maxCalls = Math.min(Math.max(Number(body.max_calls) || 2, 1), 8);
 
-  await recordActivity(env, principal, "evals.experiment.start", `${task}: ${arms.length} variants x ${cases.length} cases`);
+  const progress = await advanceExperiment(env, env.DB, {
+    experimentId,
+    task,
+    taskDescription: String(body.task_description ?? `The "${task}" step of ApplyGo's job pipeline.`),
+    // The task's real replay shape, not a text call. Every pipeline prompt this harness can test
+    // returns structured output through a tool schema; replaying it as free text would have the
+    // arms produce prose the production path never sees, and the judge would then be scoring a
+    // format neither variant is actually used in.
+    spec: replaySpecFor(task) ?? { kind: "text" },
+    provider,
+    model,
+    variants: arms,
+    cases,
+    maxCalls,
+  });
+
+  await recordActivity(
+    env, principal, "evals.experiment.advance",
+    `${task}: ${progress.completed} calls, ${progress.remaining} remaining`,
+  );
   return json({
     experiment_id: experimentId,
+    resumed: !!existing,
     variants: arms.map((v) => ({ label: v.label, provider: v.provider ?? provider, model: v.model ?? model })),
     cases: cases.length,
-    estimated_model_calls: cases.length * variants.length * 2,
-    detail: "Running in the background. Poll GET /agent/v1/evals/experiments/{id} for the comparison.",
-  }, 202);
+    completed_this_call: progress.completed,
+    remaining_calls: progress.remaining,
+    errors: progress.errors,
+    detail: progress.remaining === 0
+      ? "Experiment complete. Read it with get_experiment."
+      : `${progress.remaining} calls still to make. Call again with the same task and name to continue.`,
+  });
 }
 
 function escapeHtml(value: string): string {
