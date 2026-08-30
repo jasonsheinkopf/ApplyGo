@@ -12955,23 +12955,34 @@ function corsHeaders(origin: string): Record<string, string> {
  * `resume.design_review` (needs a screenshot, never stored) and `evals.judge` (not a savable case)
  * fall through to null, matching `replayable: false` in tasks.ts.
  */
+/**
+ * Same output shape as fit.assess, run deliberately expensively: a bigger answer budget and
+ * extended thinking. Its purpose is not to score the pipeline's daily volume but to build the
+ * reference ranking the pipeline's own models are then measured against, so it is the one task
+ * where paying several times the going rate for a better answer is the entire point. Separated by
+ * task name rather than by a flag because the replay spec is what carries the effort, and a task
+ * that is sometimes cheap and sometimes not would make two runs incomparable.
+ */
+function referenceRankSpec(): ReplaySpec {
+  return {
+    kind: "structured", schema: FIT_BATCH_SCHEMA, toolName: "submit_fit_assessment",
+    maxTokens: 16000, effort: "high",
+  };
+}
+
 export function replaySpecFor(task: string): ReplaySpec | null {
+  // Suffixed variants -- "fit.reference_rank.rejected" and any later dataset -- get the same
+  // expensive spec. A reference over a second population is the same task on different postings,
+  // and it needs its own name only so the runner, which selects cases by task, can reach one
+  // dataset without dragging in the other. `taskIsItsOwnMeasurement` already matches this family
+  // by prefix; matching it here too is what keeps the two agreeing about what a reference run is.
+  if (task.startsWith("fit.reference_rank")) return referenceRankSpec();
+
   switch (task) {
     case "fit.screen":
       return { kind: "structured", schema: SCREEN_BATCH_SCHEMA, toolName: "submit_screen", maxTokens: 4000 };
     case "fit.assess":
       return { kind: "structured", schema: FIT_BATCH_SCHEMA, toolName: "submit_fit_assessment", maxTokens: 7000 };
-    // Same output shape as fit.assess, run deliberately expensively: a bigger answer budget and
-    // extended thinking. Its purpose is not to score the pipeline's daily volume but to build the
-    // reference ranking the pipeline's own models are then measured against, so it is the one task
-    // where paying several times the going rate for a better answer is the entire point. Separated
-    // by task name rather than by a flag because the replay spec is what carries the effort, and a
-    // task that is sometimes cheap and sometimes not would make two runs incomparable.
-    case "fit.reference_rank":
-      return {
-        kind: "structured", schema: FIT_BATCH_SCHEMA, toolName: "submit_fit_assessment",
-        maxTokens: 16000, effort: "high",
-      };
     case "fit.criteria":
       return { kind: "structured", schema: CARE_ABOUT_TOPICS_SCHEMA, toolName: "submit_topics", maxTokens: 1200 };
     case "profile.structure":

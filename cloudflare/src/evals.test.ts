@@ -328,3 +328,15 @@ test("ordinary pipeline tasks are still judged", () => {
     assert.equal(taskIsItsOwnMeasurement(task), false, task);
   }
 });
+
+// ---------------------------------------------------------------------------
+// The reference-task family
+// ---------------------------------------------------------------------------
+
+test("a suffixed reference task is still its own measurement", () => {
+  // A reference built over a second population -- the postings the pipeline rejected -- is the
+  // same task on different postings. It needs its own name only because the runner selects cases
+  // by task, and one dataset must be reachable without dragging in the other.
+  assert.equal(taskIsItsOwnMeasurement("fit.reference_rank.rejected"), true);
+  assert.equal(taskIsItsOwnMeasurement("fit.assess"), false);
+});
