@@ -5732,6 +5732,7 @@ async function loadEvidencePlan(
         { title: job.title, company: job.company, description: job.raw_description ?? "" },
         (raw) => { capturedRaw = raw; },
       );
+      let debugInsertError = "";
       try {
         await env.DB.prepare(
           "INSERT INTO _debug_requirements (id, job_id, raw_typeof, raw_json, result_count) VALUES (?, ?, ?, ?, ?)",
@@ -5742,11 +5743,17 @@ async function loadEvidencePlan(
           JSON.stringify(capturedRaw).slice(0, 4000),
           requirements.requirements.length,
         ).run();
-      } catch {
-        // Diagnostic itself must never break resume generation.
+      } catch (diagErr) {
+        // Diagnostic itself must never break resume generation -- but piggyback the failure onto
+        // the write path already proven reliable, since the dedicated insert's own silence is
+        // exactly what's under investigation.
+        debugInsertError = (diagErr as Error)?.message || String(diagErr);
       }
+      const toStore = debugInsertError
+        ? { ...requirements, _debug_insert_error: debugInsertError, _debug_raw_typeof: typeof (capturedRaw as { requirements?: unknown } | null)?.requirements }
+        : requirements;
       await env.DB.prepare("UPDATE job_postings SET requirements_json = ? WHERE id = ?")
-        .bind(JSON.stringify(requirements), jobId)
+        .bind(JSON.stringify(toStore), jobId)
         .run();
     }
     if (!requirements.requirements.length) return null;
