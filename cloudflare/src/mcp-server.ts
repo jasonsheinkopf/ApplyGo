@@ -230,6 +230,10 @@ export function buildApplyGoMcpServer(call: AgentCall): McpServer {
         provider: z.enum(["anthropic", "openai"]).optional(),
         model: z.string().optional(),
         max_cases: z.number().optional().describe("Cases to run each variant over. Default 10, max 40."),
+        max_calls: z.number().optional().describe(
+          "Model calls to make in THIS invocation, 1-8 (default 2). The runner is bounded and resumable: " +
+          "call again with the same task and name to continue an unfinished experiment. Keep this at 1 for " +
+          "slow deliberative tasks so the call returns before the client times out."),
       },
     },
     async (body) => run(call, "POST", "/agent/v1/evals/experiments", body),
