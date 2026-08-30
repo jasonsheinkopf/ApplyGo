@@ -10,7 +10,7 @@
 // disqualifier fed back into future assessments. An AI misjudgment that never gets confirmed by
 // the user can't reinforce itself into a permanent rule -- see index.ts's job_feedback writes.
 
-import { type LlmEnv, type Provider, callStructured } from "./llm.ts";
+import { type LlmEnv, type Provider, callStructured, resultsArray } from "./llm.ts";
 import { getManagedPrompt } from "./langfuse.ts";
 import { JOBS_PRESCREEN_PROMPT } from "./prompts.ts";
 import { locationMatches } from "./companies.ts";
@@ -382,7 +382,7 @@ export async function assessJobFitBatch(
   locationTerms: string[] = [],
 ): Promise<FitResult[]> {
   if (!jobs.length) return [];
-  const { results } = await callStructured<{ results: FitResult[] }>(
+  const payload = await callStructured<{ results: FitResult[] }>(
     env,
     provider,
     "fit.assess",
@@ -394,6 +394,7 @@ export async function assessJobFitBatch(
     // truncating a full 8-item batch now that the fact count is candidate-controlled.
     7000,
   );
+  const results = resultsArray<FitResult>(payload);
   const byId = new Map(results.map((r) => [r.id, r]));
   return jobs.map((job) => {
     const found = byId.get(job.id);
@@ -478,7 +479,7 @@ export async function screenJobsBatch(
     JOBS_PRESCREEN_PROMPT,
   );
 
-  const { results } = await callStructured<{ results: ScreenResult[] }>(
+  const screenPayload = await callStructured<{ results: ScreenResult[] }>(
     env,
     provider,
     "fit.screen",
@@ -490,7 +491,7 @@ export async function screenJobsBatch(
     4000,
     "screen",
   );
-  const byId = new Map((results ?? []).map((r) => [r.id, r]));
+  const byId = new Map(resultsArray<ScreenResult>(screenPayload).map((r) => [r.id, r]));
   // Anything the model didn't return survives to the next tier rather than being dropped silently.
   return jobs.map((job) => {
     const found = byId.get(job.id);
