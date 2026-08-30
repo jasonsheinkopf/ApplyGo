@@ -124,11 +124,6 @@ export async function extractJobRequirements(
   env: LlmEnv,
   provider: Provider,
   job: { title: string; company: string; description: string },
-  // TEMPORARY diagnostic hook -- attributing a production discrepancy that survived unit-testing
-  // the repair logic in isolation (it passes in isolation against the exact captured payload).
-  // Takes the caller's own DB reference rather than reading one off `env` here, since that's the
-  // one thing proven to work in this exact call path. Remove once resolved.
-  onRawForDebug?: (raw: unknown) => void,
 ): Promise<JobRequirements> {
   const prompt = await getManagedPrompt(env, "resume/requirements", {
     job_title: job.title,
@@ -145,7 +140,6 @@ export async function extractJobRequirements(
     "submit_requirements",
     3000,
   );
-  onRawForDebug?.(raw);
   return normalizeRequirements(raw);
 }
 
