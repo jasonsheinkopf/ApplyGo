@@ -27,6 +27,20 @@ keep single statements small enough to write by hand — large payloads belong i
 **`fit_score_previous` holds one prior reading.** Re-scoring twice loses the middle one. Snapshot
 before the second pass if all three readings matter.
 
+**Prompt variables must be strings.** `compilePrompt` substitutes with `String(value)`, so a JSON
+array or object stored in `eval_cases.variables_json` renders as `[object Object]` and the model
+receives a prompt with the data silently missing. It does not error — the model answers the prompt
+it was actually given, which is how a reference run once returned an empty result set that looked
+like a model failure. When building variables in SQL, concatenate to TEXT (`'[' || group_concat(...)
+|| ']'`) so `json_set` stores a string rather than a JSON array.
+
+**Extended thinking: `budget_tokens` is rejected, not deprecated, on current models.** Opus 5,
+Sonnet 5, Opus 4.6+ and Fable 5 take `thinking: {type: "adaptive"}` with
+`output_config: {effort: ...}`. Sending the older `{type: "enabled", budget_tokens: N}` returns a
+400. Pre-4.6 models still require the budget form. Load the `claude-api` skill before writing any
+Anthropic request code — this exact drift is in its table, and writing it from memory cost a full
+round of failed Opus calls.
+
 ## Evidence and decisions
 
 Measurements go in `evidence_records`, changes in `decision_records` (migration 0038, helpers in
