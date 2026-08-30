@@ -140,7 +140,26 @@ export async function extractJobRequirements(
     "submit_requirements",
     3000,
   );
-  return normalizeRequirements(raw);
+  const result = normalizeRequirements(raw);
+  // TEMPORARY diagnostic -- attributing a production discrepancy that survived unit-testing the
+  // repair logic in isolation. Remove once resolved (see PR discussion / commit history).
+  try {
+    const db = (env as unknown as { DB?: D1Database }).DB;
+    if (db) {
+      await db.prepare(
+        "INSERT INTO _debug_requirements (id, job_id, raw_typeof, raw_json, result_count) VALUES (?, ?, ?, ?, ?)",
+      ).bind(
+        crypto.randomUUID(),
+        `${job.title}|${job.company}`,
+        typeof raw.requirements,
+        JSON.stringify(raw).slice(0, 4000),
+        result.requirements.length,
+      ).run();
+    }
+  } catch {
+    // Diagnostic itself must never break resume generation.
+  }
+  return result;
 }
 
 /**
