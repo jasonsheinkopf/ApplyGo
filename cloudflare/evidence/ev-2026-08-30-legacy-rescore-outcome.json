@@ -1,0 +1,991 @@
+{
+  "slug": "ev-2026-08-30-legacy-rescore-outcome",
+  "recorded_at": "2026-08-30T12:05:51.745Z",
+  "what": "Outcome of re-scoring the 134 legacy-scored shortlist postings identified in ev-2026-08-30-board-scorer-provenance, on claude-sonnet-5 (the retained reason-tier default).",
+  "headline": {
+    "shortlist_before": 162,
+    "shortlist_after": 63,
+    "dropped": 99,
+    "legacy_postings_rescored": 134,
+    "distinct_scores_legacy_before": 12,
+    "distinct_scores_after_rescore": 20,
+    "pct_multiple_of_5_before": 92.5,
+    "pct_multiple_of_5_after": 79.9,
+    "cost_calls": 16
+  },
+  "interpretation": "Re-scoring on sonnet-5 fixed the specific defect: distinct values across the 134 nearly doubled (12 to 20) and round-number clustering fell (92.5% to 79.9% multiples of five). 99 of 162 shortlisted postings dropped below the 40 floor once actually read, most of them the round-40/45/50 legacy scores that were carrying no real judgment. This is not a full resolution: sonnet-5 itself still returns a multiple of five four times in five, which is a milder version of the same rounding tendency and worth watching rather than treating as solved. The rescore does not change the model-quality question the reference benchmark raised - sonnet-5 correlates only moderately with the Opus reference - it only removes the much larger, purely mechanical defect of a stale scorer with 12 possible outputs.",
+  "board_before_after": [
+    {
+      "pid": "89d9778d",
+      "before": 90,
+      "after": 90,
+      "dropped": false
+    },
+    {
+      "pid": "c68c209d",
+      "before": 89,
+      "after": 89,
+      "dropped": false
+    },
+    {
+      "pid": "84810767",
+      "before": 84,
+      "after": 84,
+      "dropped": false
+    },
+    {
+      "pid": "05f23081",
+      "before": 84,
+      "after": 84,
+      "dropped": false
+    },
+    {
+      "pid": "5fdf14b9",
+      "before": 82,
+      "after": 82,
+      "dropped": false
+    },
+    {
+      "pid": "86f508b5",
+      "before": 79,
+      "after": 79,
+      "dropped": false
+    },
+    {
+      "pid": "e09f71d6",
+      "before": 78,
+      "after": 78,
+      "dropped": false
+    },
+    {
+      "pid": "25d00a92",
+      "before": 78,
+      "after": 78,
+      "dropped": false
+    },
+    {
+      "pid": "5abd7cee",
+      "before": 77,
+      "after": 77,
+      "dropped": false
+    },
+    {
+      "pid": "dbc5cd70",
+      "before": 76,
+      "after": 76,
+      "dropped": false
+    },
+    {
+      "pid": "19578c4d",
+      "before": 74,
+      "after": 74,
+      "dropped": false
+    },
+    {
+      "pid": "c8b03968",
+      "before": 69,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "58a6c39f",
+      "before": 69,
+      "after": 69,
+      "dropped": false
+    },
+    {
+      "pid": "6b1dfa2b",
+      "before": 68,
+      "after": 55,
+      "dropped": false
+    },
+    {
+      "pid": "47dfc10a",
+      "before": 68,
+      "after": 72,
+      "dropped": false
+    },
+    {
+      "pid": "da248248",
+      "before": 68,
+      "after": 68,
+      "dropped": false
+    },
+    {
+      "pid": "761ede20",
+      "before": 68,
+      "after": 72,
+      "dropped": false
+    },
+    {
+      "pid": "92c8e754",
+      "before": 68,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "225b53f3",
+      "before": 68,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "d68481b9",
+      "before": 66,
+      "after": 66,
+      "dropped": false
+    },
+    {
+      "pid": "605557b0",
+      "before": 66,
+      "after": 66,
+      "dropped": false
+    },
+    {
+      "pid": "5f8ef021",
+      "before": 65,
+      "after": 58,
+      "dropped": false
+    },
+    {
+      "pid": "02187537",
+      "before": 65,
+      "after": 68,
+      "dropped": false
+    },
+    {
+      "pid": "5742a292",
+      "before": 65,
+      "after": 72,
+      "dropped": false
+    },
+    {
+      "pid": "fd6d29db",
+      "before": 65,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "9560139e",
+      "before": 65,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "46f0f2c4",
+      "before": 65,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "c3b7ef8a",
+      "before": 65,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "fa4ac511",
+      "before": 65,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "f09d6a3e",
+      "before": 65,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "07f65544",
+      "before": 65,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "50b7c8f2",
+      "before": 65,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "6834a448",
+      "before": 64,
+      "after": 64,
+      "dropped": false
+    },
+    {
+      "pid": "f6b8910f",
+      "before": 63,
+      "after": 63,
+      "dropped": false
+    },
+    {
+      "pid": "820175ea",
+      "before": 61,
+      "after": 61,
+      "dropped": false
+    },
+    {
+      "pid": "b4a28a3c",
+      "before": 60,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "0bad89ef",
+      "before": 60,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "e1b9d633",
+      "before": 60,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "704db778",
+      "before": 60,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "86c401e0",
+      "before": 60,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "2ae91ba4",
+      "before": 59,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "1f20d4f1",
+      "before": 59,
+      "after": 59,
+      "dropped": false
+    },
+    {
+      "pid": "589ede08",
+      "before": 58,
+      "after": 58,
+      "dropped": false
+    },
+    {
+      "pid": "7f849fcd",
+      "before": 58,
+      "after": 68,
+      "dropped": false
+    },
+    {
+      "pid": "a003b2ef",
+      "before": 58,
+      "after": 58,
+      "dropped": false
+    },
+    {
+      "pid": "e55978ba",
+      "before": 57,
+      "after": 57,
+      "dropped": false
+    },
+    {
+      "pid": "096a54a6",
+      "before": 55,
+      "after": 68,
+      "dropped": false
+    },
+    {
+      "pid": "aab9e2ad",
+      "before": 55,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "45c634f8",
+      "before": 55,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "466c74d1",
+      "before": 55,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "1c31c205",
+      "before": 55,
+      "after": 60,
+      "dropped": false
+    },
+    {
+      "pid": "03a59c67",
+      "before": 55,
+      "after": 58,
+      "dropped": false
+    },
+    {
+      "pid": "81b48212",
+      "before": 55,
+      "after": 55,
+      "dropped": false
+    },
+    {
+      "pid": "fedc4e88",
+      "before": 55,
+      "after": 55,
+      "dropped": false
+    },
+    {
+      "pid": "95770cf8",
+      "before": 55,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "0d6ac69e",
+      "before": 55,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "235009e7",
+      "before": 55,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "d3af5d54",
+      "before": 55,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "d6801797",
+      "before": 55,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "4c5c39df",
+      "before": 55,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "d2f60348",
+      "before": 55,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "78bee21a",
+      "before": 55,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "d8bea747",
+      "before": 54,
+      "after": 54,
+      "dropped": false
+    },
+    {
+      "pid": "6ffe2dbd",
+      "before": 52,
+      "after": 52,
+      "dropped": false
+    },
+    {
+      "pid": "21748915",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "43248818",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "6660b6e4",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "309e1f1f",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "f99f8ee8",
+      "before": 50,
+      "after": 50,
+      "dropped": false
+    },
+    {
+      "pid": "fa42c64f",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "554f0e73",
+      "before": 50,
+      "after": 50,
+      "dropped": false
+    },
+    {
+      "pid": "5e651dd7",
+      "before": 50,
+      "after": 50,
+      "dropped": false
+    },
+    {
+      "pid": "2ea65705",
+      "before": 50,
+      "after": 48,
+      "dropped": false
+    },
+    {
+      "pid": "351a80af",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "2480bf68",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "2f63e203",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "5b7761b2",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "1d90760f",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "2b20888f",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "8f711ace",
+      "before": 50,
+      "after": 58,
+      "dropped": false
+    },
+    {
+      "pid": "fe2ab021",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "d13e8f6c",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "7cde6e85",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "68152a32",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "e337d523",
+      "before": 50,
+      "after": 50,
+      "dropped": false
+    },
+    {
+      "pid": "74e6db0e",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "6665bd59",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "d077ed5d",
+      "before": 50,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "9e7f318d",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "d7bf8f25",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "96ca9d25",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "3d663e63",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "ed9a3d94",
+      "before": 50,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "5643c906",
+      "before": 49,
+      "after": 49,
+      "dropped": false
+    },
+    {
+      "pid": "89a6a680",
+      "before": 49,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "41910d6e",
+      "before": 48,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "909f7f3f",
+      "before": 48,
+      "after": 48,
+      "dropped": false
+    },
+    {
+      "pid": "9a688807",
+      "before": 45,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "9ca7dfe2",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "a5bbe0c9",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "b7dd4816",
+      "before": 45,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "063844a1",
+      "before": 45,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "da0e9b48",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "d3b0d508",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "cae00317",
+      "before": 45,
+      "after": 40,
+      "dropped": false
+    },
+    {
+      "pid": "07717d81",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "bbf5159d",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "1828a6de",
+      "before": 45,
+      "after": 58,
+      "dropped": false
+    },
+    {
+      "pid": "5b459c16",
+      "before": 45,
+      "after": 68,
+      "dropped": false
+    },
+    {
+      "pid": "cd275f2a",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "8fd8dca1",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "8e74bfa9",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "34d3a823",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "472d91c6",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "719a63c5",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "c8366b9f",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "2011f6d3",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "44573e31",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "6973e8c9",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "ac205f76",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "59ab128b",
+      "before": 45,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "ac1edb62",
+      "before": 45,
+      "after": 40,
+      "dropped": false
+    },
+    {
+      "pid": "063e1b7e",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "70380d79",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "e622c46e",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "3857e31c",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "a82239b0",
+      "before": 45,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "62838082",
+      "before": 43,
+      "after": 43,
+      "dropped": false
+    },
+    {
+      "pid": "3465cd46",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "ce990b4c",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "73a5c913",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "5a60b494",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "0dcaba65",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "b23d1a37",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "439a0238",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "5800b0d7",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "9c3cacb4",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "2b2554cb",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "c506b155",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "2fb6bfdf",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "3b8b7b77",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "c76cb912",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "149c2b4a",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "29ca9f32",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "eb176829",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "c4a8f73f",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "b2117aa3",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "a263e379",
+      "before": 40,
+      "after": 45,
+      "dropped": false
+    },
+    {
+      "pid": "51e512c5",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "9bdae1c4",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "32556c9e",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "0d1e2694",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "c2618f5c",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "6a96b088",
+      "before": 40,
+      "after": 55,
+      "dropped": false
+    },
+    {
+      "pid": "85018cd6",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "7572d5f2",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "6f3238d7",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "8a97f419",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "47de238e",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "5ce71474",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "b0a1af6d",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    },
+    {
+      "pid": "63d88c40",
+      "before": 40,
+      "after": null,
+      "dropped": true
+    }
+  ]
+}
