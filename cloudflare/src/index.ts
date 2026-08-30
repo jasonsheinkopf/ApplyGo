@@ -12961,6 +12961,17 @@ export function replaySpecFor(task: string): ReplaySpec | null {
       return { kind: "structured", schema: SCREEN_BATCH_SCHEMA, toolName: "submit_screen", maxTokens: 4000 };
     case "fit.assess":
       return { kind: "structured", schema: FIT_BATCH_SCHEMA, toolName: "submit_fit_assessment", maxTokens: 7000 };
+    // Same output shape as fit.assess, run deliberately expensively: a bigger answer budget and
+    // extended thinking. Its purpose is not to score the pipeline's daily volume but to build the
+    // reference ranking the pipeline's own models are then measured against, so it is the one task
+    // where paying several times the going rate for a better answer is the entire point. Separated
+    // by task name rather than by a flag because the replay spec is what carries the effort, and a
+    // task that is sometimes cheap and sometimes not would make two runs incomparable.
+    case "fit.reference_rank":
+      return {
+        kind: "structured", schema: FIT_BATCH_SCHEMA, toolName: "submit_fit_assessment",
+        maxTokens: 16000, effort: "high",
+      };
     case "fit.criteria":
       return { kind: "structured", schema: CARE_ABOUT_TOPICS_SCHEMA, toolName: "submit_topics", maxTokens: 1200 };
     case "profile.structure":

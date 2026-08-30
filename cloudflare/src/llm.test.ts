@@ -9,6 +9,7 @@ import {
   priceFor,
   resultsArray,
   screenProvider,
+  thinkingBudget,
 } from "./llm.ts";
 
 const ENV: LlmEnv = { ANTHROPIC_API_KEY: "key123" };
@@ -211,4 +212,21 @@ test("a genuinely malformed response degrades to empty rather than throwing", ()
   ]) {
     assert.deepEqual(resultsArray(payload as never), []);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Deliberation budget
+// ---------------------------------------------------------------------------
+
+test("effort levels are ordered, and none means none", () => {
+  assert.equal(thinkingBudget("none"), 0);
+  assert.ok(thinkingBudget("low") < thinkingBudget("medium"));
+  assert.ok(thinkingBudget("medium") < thinkingBudget("high"));
+});
+
+test("the high budget is large enough to hold a whole reference set in mind", () => {
+  // The reference ranking has to weigh ~25 postings against one profile and produce a defensible
+  // ordering across all of them. A budget that only covers one posting at a time would produce 25
+  // independent judgements, which is the thing the reference exists to improve on.
+  assert.ok(thinkingBudget("high") >= 16000, "high must be sized for whole-set reasoning");
 });

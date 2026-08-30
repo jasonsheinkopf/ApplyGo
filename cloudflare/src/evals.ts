@@ -16,10 +16,12 @@
 // one exception: it runs through the real env and is traced normally under its own "evals.judge"
 // task, because judging genuinely costs money and the user should see that cost like any other.
 
-import { type LlmEnv, type Provider, type LlmTrace, callStructured, callText, providerKeyMissing } from "./llm.ts";
+import { type Effort, type LlmEnv, type Provider, type LlmTrace, callStructured, callText, providerKeyMissing } from "./llm.ts";
 import { compilePrompt, getManagedPrompt } from "./langfuse.ts";
 
-export type ReplaySpec = { kind: "text" } | { kind: "structured"; schema: unknown; toolName: string; maxTokens: number };
+export type ReplaySpec =
+  | { kind: "text"; effort?: Effort }
+  | { kind: "structured"; schema: unknown; toolName: string; maxTokens: number; effort?: Effort };
 
 export type ReplayOutcome = {
   ok: boolean;
@@ -58,7 +60,9 @@ export async function replayTask(
     if (spec.kind === "text") {
       await callText(isolatedEnv, provider, task, prompt, model);
     } else {
-      await callStructured(isolatedEnv, provider, task, prompt, spec.schema, spec.toolName, spec.maxTokens, "reason", model);
+      await callStructured(
+        isolatedEnv, provider, task, prompt, spec.schema, spec.toolName, spec.maxTokens, "reason", model, spec.effort,
+      );
     }
   } catch {
     // The isolated sink already captured the failed trace (ok:false, error set) before the throw
