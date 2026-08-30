@@ -1,0 +1,289 @@
+{
+ "arms": [
+  {
+   "label": "claude-sonnet-5",
+   "provider": "anthropic",
+   "mean_score": 53.71,
+   "median_score": 65.0,
+   "stdev_score": 24.82,
+   "min": 3,
+   "max": 80,
+   "mean_gaps": 1.62,
+   "cost_usd_total": 0.3333,
+   "cost_usd_per_posting": 0.01389,
+   "calls": 4,
+   "input_tokens": 107236,
+   "output_tokens": 11878,
+   "avg_latency_ms": 29642
+  },
+  {
+   "label": "gpt-5.6-terra",
+   "provider": "openai",
+   "mean_score": 60.83,
+   "median_score": 65.0,
+   "stdev_score": 24.0,
+   "min": 2,
+   "max": 90,
+   "mean_gaps": 3.29,
+   "cost_usd_total": 0.1897,
+   "cost_usd_per_posting": 0.0079,
+   "calls": 3,
+   "input_tokens": 45671,
+   "output_tokens": 8197,
+   "avg_latency_ms": 26126
+  }
+ ],
+ "paired": {
+  "n": 24,
+  "mean_delta_terra_minus_sonnet": 7.12,
+  "median_delta": 9.0,
+  "terra_higher": 17,
+  "terra_lower": 7,
+  "ties": 0,
+  "spearman_rank_correlation": 0.541,
+  "max_abs_disagreement": 62
+ },
+ "cost_ratio_terra_vs_sonnet": 0.569,
+ "per_posting": [
+  {
+   "job_id": "5fdf14b9-de09-4f78-9b22-c667c2337b78",
+   "company": "Anthropic",
+   "title": "Technical Enablement Lead Claude Platform",
+   "sonnet_score": 80,
+   "terra_score": 18,
+   "delta_terra_minus_sonnet": -62,
+   "sonnet_gaps": 1,
+   "terra_gaps": 4
+  },
+  {
+   "job_id": "c68c209d-6c3e-477b-95d3-afbb339e9d7c",
+   "company": "Factory",
+   "title": "Software Engineer AI",
+   "sonnet_score": 78,
+   "terra_score": 89,
+   "delta_terra_minus_sonnet": 11,
+   "sonnet_gaps": 1,
+   "terra_gaps": 0
+  },
+  {
+   "job_id": "d68481b9-325c-425a-8307-b438defca1a9",
+   "company": "Anthropic",
+   "title": "Applied AI Engineer Enterprise Tech",
+   "sonnet_score": 78,
+   "terra_score": 66,
+   "delta_terra_minus_sonnet": -12,
+   "sonnet_gaps": 1,
+   "terra_gaps": 4
+  },
+  {
+   "job_id": "19578c4d-08c8-4841-a902-49d2e98ef6bd",
+   "company": "Snowflake",
+   "title": "Forward Deployed Engineer Applied AI",
+   "sonnet_score": 75,
+   "terra_score": 74,
+   "delta_terra_minus_sonnet": -1,
+   "sonnet_gaps": 1,
+   "terra_gaps": 5
+  },
+  {
+   "job_id": "da248248-5c57-4ffa-b908-543e95d8cf51",
+   "company": "Scale AI",
+   "title": "Frontier Agents Engineer Applied AI",
+   "sonnet_score": 75,
+   "terra_score": 68,
+   "delta_terra_minus_sonnet": -7,
+   "sonnet_gaps": 1,
+   "terra_gaps": 4
+  },
+  {
+   "job_id": "89d9778d-5a90-480b-a86f-4b8d87ed2769",
+   "company": "OpenAI",
+   "title": "Demo Experience Engineer Technical Success",
+   "sonnet_score": 74,
+   "terra_score": 90,
+   "delta_terra_minus_sonnet": 16,
+   "sonnet_gaps": 1,
+   "terra_gaps": 1
+  },
+  {
+   "job_id": "84810767-b036-411f-a964-a2ff441c72e5",
+   "company": "OpenAI",
+   "title": "Applied AI Engineer Codex Core Agent",
+   "sonnet_score": 72,
+   "terra_score": 84,
+   "delta_terra_minus_sonnet": 12,
+   "sonnet_gaps": 1,
+   "terra_gaps": 2
+  },
+  {
+   "job_id": "86f508b5-634e-4290-bab6-b3b15c68491b",
+   "company": "Factory",
+   "title": "Research Engineer",
+   "sonnet_score": 72,
+   "terra_score": 79,
+   "delta_terra_minus_sonnet": 7,
+   "sonnet_gaps": 0,
+   "terra_gaps": 2
+  },
+  {
+   "job_id": "f6b8910f-efd1-4b3b-89f1-3b9a8dbaa227",
+   "company": "Scale AI",
+   "title": "Software Engineer AI Enablement",
+   "sonnet_score": 72,
+   "terra_score": 63,
+   "delta_terra_minus_sonnet": -9,
+   "sonnet_gaps": 1,
+   "terra_gaps": 3
+  },
+  {
+   "job_id": "25d00a92-3021-4353-a9a6-750cd877261f",
+   "company": "OpenAI",
+   "title": "Developer Experience Engineer",
+   "sonnet_score": 68,
+   "terra_score": 78,
+   "delta_terra_minus_sonnet": 10,
+   "sonnet_gaps": 2,
+   "terra_gaps": 2
+  },
+  {
+   "job_id": "589ede08-356f-4368-bf6d-598f405f00c7",
+   "company": "Anthropic",
+   "title": "Forward Deployed Engineer",
+   "sonnet_score": 68,
+   "terra_score": 58,
+   "delta_terra_minus_sonnet": -10,
+   "sonnet_gaps": 2,
+   "terra_gaps": 5
+  },
+  {
+   "job_id": "dbc5cd70-cde7-408d-9a75-94bc0d7733aa",
+   "company": "OpenAI",
+   "title": "Software Engineer Enterprise AI Platform",
+   "sonnet_score": 68,
+   "terra_score": 76,
+   "delta_terra_minus_sonnet": 8,
+   "sonnet_gaps": 2,
+   "terra_gaps": 3
+  },
+  {
+   "job_id": "05f23081-6f7f-4ecc-8e10-58c1839bfc8e",
+   "company": "OpenAI",
+   "title": "AI Deployment Manager Builder",
+   "sonnet_score": 62,
+   "terra_score": 84,
+   "delta_terra_minus_sonnet": 22,
+   "sonnet_gaps": 1,
+   "terra_gaps": 2
+  },
+  {
+   "job_id": "5abd7cee-bf13-4b8b-bd0c-5ac3e69c707c",
+   "company": "Sierra",
+   "title": "Developer Relations Engineer",
+   "sonnet_score": 58,
+   "terra_score": 77,
+   "delta_terra_minus_sonnet": 19,
+   "sonnet_gaps": 1,
+   "terra_gaps": 4
+  },
+  {
+   "job_id": "6834a448-08c5-4510-9890-49389b3b311d",
+   "company": "Deepgram",
+   "title": "Solutions Architect SF",
+   "sonnet_score": 58,
+   "terra_score": 64,
+   "delta_terra_minus_sonnet": 6,
+   "sonnet_gaps": 2,
+   "terra_gaps": 3
+  },
+  {
+   "job_id": "e09f71d6-a09b-4b96-8075-9e01c1e3b310",
+   "company": "Anthropic",
+   "title": "AI Operations Engineer Partnerships",
+   "sonnet_score": 58,
+   "terra_score": 78,
+   "delta_terra_minus_sonnet": 20,
+   "sonnet_gaps": 2,
+   "terra_gaps": 3
+  },
+  {
+   "job_id": "e55978ba-6e44-405d-96bb-40f7a2cf5c97",
+   "company": "OpenAI",
+   "title": "Machine Learning Engineer API Multicloud",
+   "sonnet_score": 45,
+   "terra_score": 57,
+   "delta_terra_minus_sonnet": 12,
+   "sonnet_gaps": 2,
+   "terra_gaps": 4
+  },
+  {
+   "job_id": "820175ea-8ff3-45c0-888b-18927a25a2ef",
+   "company": "OpenAI",
+   "title": "Applied AI Engineer Agent Enablement",
+   "sonnet_score": 40,
+   "terra_score": 61,
+   "delta_terra_minus_sonnet": 21,
+   "sonnet_gaps": 3,
+   "terra_gaps": 4
+  },
+  {
+   "job_id": "1f20d4f1-5f5c-48fd-9eaf-93253754dad4",
+   "company": "xAI",
+   "title": "Member of Technical Staff Imagine Product",
+   "sonnet_score": 25,
+   "terra_score": 59,
+   "delta_terra_minus_sonnet": 34,
+   "sonnet_gaps": 3,
+   "terra_gaps": 4
+  },
+  {
+   "job_id": "349b8307-f606-44b1-94c8-458b71748ad8",
+   "company": "Verkada",
+   "title": "Enterprise Solutions Engineer Bay Area",
+   "sonnet_score": 25,
+   "terra_score": 30,
+   "delta_terra_minus_sonnet": 5,
+   "sonnet_gaps": 3,
+   "terra_gaps": 4
+  },
+  {
+   "job_id": "62838082-b044-45dd-bd8a-ee9e1111bc24",
+   "company": "OpenAI",
+   "title": "Software Engineer Agent Infrastructure",
+   "sonnet_score": 15,
+   "terra_score": 43,
+   "delta_terra_minus_sonnet": 28,
+   "sonnet_gaps": 3,
+   "terra_gaps": 4
+  },
+  {
+   "job_id": "d8bea747-0fb0-4b20-bf6b-3cb115d123d8",
+   "company": "Nuro",
+   "title": "Software Engineer Data Platform",
+   "sonnet_score": 15,
+   "terra_score": 54,
+   "delta_terra_minus_sonnet": 39,
+   "sonnet_gaps": 2,
+   "terra_gaps": 4
+  },
+  {
+   "job_id": "cd174660-87fd-4035-b075-94aea9a25c8b",
+   "company": "Zoox",
+   "title": "Software Engineer Android",
+   "sonnet_score": 5,
+   "terra_score": 8,
+   "delta_terra_minus_sonnet": 3,
+   "sonnet_gaps": 1,
+   "terra_gaps": 3
+  },
+  {
+   "job_id": "4a556622-dfd1-4cd9-a12c-029b173e3226",
+   "company": "Nuro",
+   "title": "Senior Software Engineer Localization and Mapping",
+   "sonnet_score": 3,
+   "terra_score": 2,
+   "delta_terra_minus_sonnet": -1,
+   "sonnet_gaps": 2,
+   "terra_gaps": 5
+  }
+ ]
+}
