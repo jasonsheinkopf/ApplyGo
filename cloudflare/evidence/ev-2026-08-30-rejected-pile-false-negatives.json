@@ -1,0 +1,263 @@
+{
+  "slug": "ev-2026-08-30-rejected-pile-false-negatives",
+  "recorded_at": "2026-08-30T11:48:43.268Z",
+  "what": "False-negative probe. 24 postings the pipeline REJECTED - 12 dropped by the title+location screen without the body ever being read, 12 read and scored under 40 - scored blind by the same Opus rich-context reference arm that agrees with itself at Spearman 0.976. Strata interleaved within each chunk so the arm could not infer origin.",
+  "headline": {
+    "rejected_pile": {
+      "n": 24,
+      "mean": 15.8,
+      "median": 15,
+      "min": 0,
+      "max": 42
+    },
+    "screened_out_stratum": {
+      "n": 12,
+      "mean": 12.3,
+      "median": 10,
+      "min": 0,
+      "max": 32
+    },
+    "scored_reject_stratum": {
+      "n": 12,
+      "mean": 19.2,
+      "median": 18,
+      "min": 2,
+      "max": 42
+    },
+    "accepted_pile_for_contrast": {
+      "n": 25,
+      "mean": 59.5,
+      "median": 62,
+      "min": 18,
+      "max": 87,
+      "at_or_above_60": 13
+    },
+    "false_negatives_at_60": 0,
+    "false_negatives_at_50": 0,
+    "band_counts": {
+      "80+": 0,
+      "60-79": 0,
+      "40-59": 1,
+      "0-39": 23
+    },
+    "rich_vs_production_context_spearman": 0.932
+  },
+  "per_posting": [
+    {
+      "posting_id_prefix": "9f1be723",
+      "stratum": "reject",
+      "production_fit_score": 0,
+      "title": "Technical Program Manager, Cloud AI Partnerships",
+      "company": "OpenAI",
+      "opus5_rich": 42,
+      "opus5_production_context": 22
+    },
+    {
+      "posting_id_prefix": "22a8ff07",
+      "stratum": "reject",
+      "production_fit_score": 10,
+      "title": "Senior Machine Learning Engineer, Simulation Evaluation",
+      "company": "Waymo",
+      "opus5_rich": 33,
+      "opus5_production_context": 45
+    },
+    {
+      "posting_id_prefix": "4b4d53c7",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Technical Program Manager, RL Research",
+      "company": "Anthropic",
+      "opus5_rich": 32,
+      "opus5_production_context": 38
+    },
+    {
+      "posting_id_prefix": "b82ebd85",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Senior/Staff Engineer, Machine Learning - Online Map",
+      "company": "Nuro",
+      "opus5_rich": 30,
+      "opus5_production_context": 30
+    },
+    {
+      "posting_id_prefix": "eacfedba",
+      "stratum": "reject",
+      "production_fit_score": 30,
+      "title": "Software Engineer II, Managed Platform Services",
+      "company": "Crusoe",
+      "opus5_rich": 30,
+      "opus5_production_context": 25
+    },
+    {
+      "posting_id_prefix": "edcbb423",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Product Manager, Infrastructure",
+      "company": "Sierra",
+      "opus5_rich": 30,
+      "opus5_production_context": 12
+    },
+    {
+      "posting_id_prefix": "6bf48dc2",
+      "stratum": "reject",
+      "production_fit_score": 0,
+      "title": "Software Engineer, Localization",
+      "company": "OpenAI",
+      "opus5_rich": 25,
+      "opus5_production_context": 22
+    },
+    {
+      "posting_id_prefix": "e12a6c9e",
+      "stratum": "reject",
+      "production_fit_score": 0,
+      "title": "Senior Product Manager, Verifications",
+      "company": "Checkr",
+      "opus5_rich": 22,
+      "opus5_production_context": 15
+    },
+    {
+      "posting_id_prefix": "0f0fc403",
+      "stratum": "reject",
+      "production_fit_score": 5,
+      "title": "Data Scientist, Policy",
+      "company": "Anthropic",
+      "opus5_rich": 18,
+      "opus5_production_context": 33
+    },
+    {
+      "posting_id_prefix": "2e352731",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Performance Engineer, Inference Systems",
+      "company": "Anthropic",
+      "opus5_rich": 18,
+      "opus5_production_context": 20
+    },
+    {
+      "posting_id_prefix": "84f93c83",
+      "stratum": "reject",
+      "production_fit_score": 2,
+      "title": "Staff Software Engineer, AI Search",
+      "company": "Databricks",
+      "opus5_rich": 18,
+      "opus5_production_context": 10
+    },
+    {
+      "posting_id_prefix": "07a9553d",
+      "stratum": "reject",
+      "production_fit_score": 10,
+      "title": "Sr. Solutions Architect",
+      "company": "Databricks",
+      "opus5_rich": 15,
+      "opus5_production_context": 8
+    },
+    {
+      "posting_id_prefix": "cf8c5152",
+      "stratum": "reject",
+      "production_fit_score": 5,
+      "title": "Staff Software Engineer, AI Developer Tooling",
+      "company": "Sentry",
+      "opus5_rich": 15,
+      "opus5_production_context": 15
+    },
+    {
+      "posting_id_prefix": "8e4d61a3",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Manager, Outcome Architects",
+      "company": "Notion",
+      "opus5_rich": 12,
+      "opus5_production_context": 10
+    },
+    {
+      "posting_id_prefix": "8892179a",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Senior Marketing Operations Manager",
+      "company": "Verkada",
+      "opus5_rich": 10,
+      "opus5_production_context": 5
+    },
+    {
+      "posting_id_prefix": "57e1aa53",
+      "stratum": "reject",
+      "production_fit_score": 8,
+      "title": "Engineering Manager, AI Platform",
+      "company": "Crusoe",
+      "opus5_rich": 8,
+      "opus5_production_context": 5
+    },
+    {
+      "posting_id_prefix": "bba5ff59",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Business Systems Analyst",
+      "company": "Notion",
+      "opus5_rich": 5,
+      "opus5_production_context": 4
+    },
+    {
+      "posting_id_prefix": "f91da6ec",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Staff Hardware Systems Engineer, Performance",
+      "company": "Crusoe",
+      "opus5_rich": 4,
+      "opus5_production_context": 5
+    },
+    {
+      "posting_id_prefix": "efea7344",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Growth - Digital Marketing (Consumer)",
+      "company": "OpenAI",
+      "opus5_rich": 3,
+      "opus5_production_context": 3
+    },
+    {
+      "posting_id_prefix": "5efe33cf",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Staff/Senior Staff Software Engineer - Full Stack",
+      "company": "Zoox",
+      "opus5_rich": 3,
+      "opus5_production_context": 3
+    },
+    {
+      "posting_id_prefix": "27a917b4",
+      "stratum": "reject",
+      "production_fit_score": 2,
+      "title": "Executive Assistant, Observe, Product & Engineering",
+      "company": "Snowflake",
+      "opus5_rich": 2,
+      "opus5_production_context": 2
+    },
+    {
+      "posting_id_prefix": "1fedf2c5",
+      "stratum": "reject",
+      "production_fit_score": 10,
+      "title": "Strategic Finance Senior Associate - Compute",
+      "company": "Together AI",
+      "opus5_rich": 2,
+      "opus5_production_context": 2
+    },
+    {
+      "posting_id_prefix": "af863f88",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Senior Marketing Strategist, Paid & New Demand Channels",
+      "company": "OpenAI",
+      "opus5_rich": 1,
+      "opus5_production_context": 2
+    },
+    {
+      "posting_id_prefix": "b110119c",
+      "stratum": "screened_out",
+      "production_fit_score": null,
+      "title": "Sr. Accounting Manager",
+      "company": "Databricks",
+      "opus5_rich": 0,
+      "opus5_production_context": 2
+    }
+  ]
+}
