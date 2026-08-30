@@ -411,13 +411,36 @@ export async function callText(
 export type Effort = "none" | "low" | "medium" | "high";
 
 /**
- * Thinking budget in tokens, per effort level.
+ * Models that take adaptive thinking plus an effort level, rather than a fixed token budget.
  *
- * These are budgets, not targets: a model that reaches its answer sooner stops, and the unused
- * budget is not billed. The high tier is sized for a task that has to hold ~25 postings and a full
- * candidate profile in mind at once and produce a defensible ordering across all of them.
+ * The fixed-budget form (`thinking: {type: "enabled", budget_tokens: N}`) is not merely deprecated
+ * on these models -- it is rejected with a 400. This was learned the expensive way: the first
+ * implementation here was written from a stale recollection of the API and every Opus call failed
+ * with `"thinking.type.enabled" is not supported for this model`. The older form is still correct
+ * for pre-4.6 models, so both paths are kept rather than one being replaced.
  */
-export function thinkingBudget(effort: Effort): number {
+function usesAdaptiveThinking(model: string): boolean {
+  return /^claude-(fable|mythos)-5|^claude-opus-(5|4-[5-9])|^claude-sonnet-(5|4-6)/.test(model);
+}
+
+/** Thinking configuration for a model and effort level, or null when no thinking is requested. */
+export function thinkingConfig(model: string, effort: Effort): Record<string, unknown> | null {
+  if (effort === "none") return null;
+  if (usesAdaptiveThinking(model)) {
+    // Claude decides how much to think; `effort` sets the ceiling on overall spend. There is no
+    // budget to add to max_tokens here, because there is no fixed budget.
+    return { thinking: { type: "adaptive" }, output_config: { effort } };
+  }
+  // Pre-4.6: an explicit budget, which must leave room for the answer inside max_tokens.
+  return { thinking: { type: "enabled", budget_tokens: legacyThinkingBudget(effort) } };
+}
+
+/**
+ * Fixed thinking budget in tokens for models that still take one.
+ *
+ * Only reachable on pre-4.6 models. Current models ignore this entirely in favour of `effort`.
+ */
+export function legacyThinkingBudget(effort: Effort): number {
   if (effort === "high") return 16000;
   if (effort === "medium") return 6000;
   if (effort === "low") return 2000;
@@ -477,18 +500,14 @@ export async function callStructured<T>(
       headers: anthropicHeaders(env),
       body: JSON.stringify({
         model,
-        // Thinking tokens are drawn from max_tokens, so a budget must leave room for the answer
-        // itself. Without this the call returns a truncated tool payload, which the caller sees as
-        // a malformed response rather than as "the budget was spent thinking".
-        max_tokens: effort && effort !== "none" ? maxTokens + thinkingBudget(effort) : maxTokens,
+        // A legacy fixed budget is drawn from max_tokens, so it has to be added on top or the
+        // answer is truncated and reads to the caller as a malformed response. Adaptive thinking
+        // has no such budget and needs no adjustment.
+        max_tokens: maxTokens + legacyThinkingBudget(usesAdaptiveThinking(model) ? "none" : (effort ?? "none")),
         messages: [{ role: "user", content: meta.prompt }],
         tools: [{ name: toolName, input_schema: schema }],
-        // A forced tool choice is incompatible with extended thinking, so a thinking call asks for
-        // the tool rather than requiring it. resultsArray and the caller's missing-result handling
-        // already cover a response that arrives in another shape.
-        ...(effort && effort !== "none"
-          ? { thinking: { type: "enabled", budget_tokens: thinkingBudget(effort) }, tool_choice: { type: "auto" } }
-          : { tool_choice: { type: "tool", name: toolName } }),
+        tool_choice: { type: "tool", name: toolName },
+        ...(thinkingConfig(model, effort ?? "none") ?? {}),
       }),
     });
     if (!res.ok) throw await failure(provider, res);

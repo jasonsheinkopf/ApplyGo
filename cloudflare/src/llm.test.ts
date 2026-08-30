@@ -4,12 +4,13 @@ import test from "node:test";
 import {
   callWithWebSearch,
   estimateCostUsd,
-  type LlmEnv,
+  legacyThinkingBudget,
   modelFor,
   priceFor,
   resultsArray,
   screenProvider,
-  thinkingBudget,
+  thinkingConfig,
+  type LlmEnv,
 } from "./llm.ts";
 
 const ENV: LlmEnv = { ANTHROPIC_API_KEY: "key123" };
@@ -219,14 +220,42 @@ test("a genuinely malformed response degrades to empty rather than throwing", ()
 // ---------------------------------------------------------------------------
 
 test("effort levels are ordered, and none means none", () => {
-  assert.equal(thinkingBudget("none"), 0);
-  assert.ok(thinkingBudget("low") < thinkingBudget("medium"));
-  assert.ok(thinkingBudget("medium") < thinkingBudget("high"));
+  assert.equal(legacyThinkingBudget("none"), 0);
+  assert.ok(legacyThinkingBudget("low") < legacyThinkingBudget("medium"));
+  assert.ok(legacyThinkingBudget("medium") < legacyThinkingBudget("high"));
 });
 
 test("the high budget is large enough to hold a whole reference set in mind", () => {
   // The reference ranking has to weigh ~25 postings against one profile and produce a defensible
   // ordering across all of them. A budget that only covers one posting at a time would produce 25
   // independent judgements, which is the thing the reference exists to improve on.
-  assert.ok(thinkingBudget("high") >= 16000, "high must be sized for whole-set reasoning");
+  assert.ok(legacyThinkingBudget("high") >= 16000, "high must be sized for whole-set reasoning");
+});
+
+// ---------------------------------------------------------------------------
+// Thinking configuration -- the shape the API actually accepts
+// ---------------------------------------------------------------------------
+
+test("current models get adaptive thinking and an effort level, never a token budget", () => {
+  // The fixed-budget form is not deprecated on these models, it is rejected with a 400. The first
+  // implementation of this sent budget_tokens to Opus 5 and every call failed with
+  // '"thinking.type.enabled" is not supported for this model'.
+  for (const model of ["claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-fable-5"]) {
+    const config = thinkingConfig(model, "high") as Record<string, Record<string, unknown>>;
+    assert.equal(config.thinking.type, "adaptive", model);
+    assert.equal(config.output_config.effort, "high", model);
+    assert.ok(!("budget_tokens" in config.thinking), `${model} must not be sent a token budget`);
+  }
+});
+
+test("pre-4.6 models keep the fixed budget form, which is still correct for them", () => {
+  const config = thinkingConfig("claude-haiku-4-5", "medium") as Record<string, Record<string, unknown>>;
+  assert.equal(config.thinking.type, "enabled");
+  assert.equal(config.thinking.budget_tokens, legacyThinkingBudget("medium"));
+  assert.ok(!("output_config" in config), "effort is not a parameter these models accept");
+});
+
+test("no effort means no thinking configuration at all, on either generation", () => {
+  assert.equal(thinkingConfig("claude-opus-5", "none"), null);
+  assert.equal(thinkingConfig("claude-haiku-4-5", "none"), null);
 });
