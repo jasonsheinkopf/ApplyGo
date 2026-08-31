@@ -329,6 +329,15 @@ export function friendlyMessage(err: unknown): string {
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 
+/**
+ * Without an explicit signal, a provider fetch that hangs (dropped connection, upstream stall) never
+ * resolves or rejects -- `traced` just sits inside `await run()` forever with no error recorded and
+ * no result written. This is the timeout that turns that into a normal failure `traced` can catch.
+ * Two minutes because high-effort adaptive thinking is a legitimate multi-minute call; this exists to
+ * bound the truly stuck case, not to race ordinary slow responses.
+ */
+const LLM_FETCH_TIMEOUT_MS = 120_000;
+
 function anthropicHeaders(env: LlmEnv): Record<string, string> {
   return {
     "content-type": "application/json",
@@ -368,6 +377,7 @@ export async function callText(
         method: "POST",
         headers: openaiHeaders(env),
         body: JSON.stringify({ model, messages: [{ role: "user", content: meta.prompt }] }),
+        signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
       });
       if (!res.ok) throw await failure(provider, res);
       const data = (await res.json()) as { choices: { message: { content: string } }[] };
@@ -383,6 +393,7 @@ export async function callText(
         max_tokens: 1500,
         messages: [{ role: "user", content: meta.prompt }],
       }),
+      signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) throw await failure(provider, res);
     const data = (await res.json()) as { content: { type: string; text?: string }[] };
@@ -488,6 +499,7 @@ export async function callStructured<T>(
             { role: "user", content: meta.prompt },
           ],
         }),
+        signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
       });
       if (!res.ok) throw await failure(provider, res);
       const data = (await res.json()) as { choices: { message: { content: string } }[] };
@@ -509,6 +521,7 @@ export async function callStructured<T>(
         tool_choice: { type: "tool", name: toolName },
         ...(thinkingConfig(model, effort ?? "none") ?? {}),
       }),
+      signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) throw await failure(provider, res);
     const data = (await res.json()) as { content: { type: string; input?: T }[] };
@@ -567,6 +580,7 @@ export async function callWithWebSearch<T>(
           { name: toolName, input_schema: schema },
         ],
       }),
+      signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) throw await failure("anthropic", res);
     const data = (await res.json()) as { content: { type: string; name?: string; input?: T }[] };
@@ -622,6 +636,7 @@ export async function callStructuredWithImage<T>(
             },
           ],
         }),
+        signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
       });
       if (!res.ok) throw await failure(provider, res);
       const data = (await res.json()) as { choices: { message: { content: string } }[] };
@@ -647,6 +662,7 @@ export async function callStructuredWithImage<T>(
         tools: [{ name: toolName, input_schema: schema }],
         tool_choice: { type: "tool", name: toolName },
       }),
+      signal: AbortSignal.timeout(LLM_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) throw await failure(provider, res);
     const data = (await res.json()) as { content: { type: string; input?: T }[] };
